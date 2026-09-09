@@ -1,0 +1,248 @@
+"""
+handlers/wallet_handlers.py
+مدیریت کیف پول + احراز هویت هوشمند + معافیت ادمین‌ها
+"""
+import logging
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, ConversationHandler
+from helpers.message_utils import send_safe
+from database import DatabaseManager
+from constants import WALLET_MENU, AWAITING_WALLET_ACTION, BTN_BACK_MAIN, AWAITING_CHARGE_AMOUNT, USER_MAIN_MENU
+from handlers.general_handlers import start_command
+from services.payment_service import payment_service
+from utils.helpers import clean_number
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+async def safe_answer(query):
+    try: await query.answer()
+    except: pass
+
+async def check_permissions_and_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, bot_id: int) -> tuple[bool, str]:
+    """
+    بررسی دسترسی پرداخت:
+    1. ادمین‌ها و کاربران تایید دستی -> مجاز (بدون نیاز به کارت)
+    2. کاربران عادی -> باید کارت تایید شده داشته باشند یا کارت جدید اضافه کنند.
+    خروجی: (آیا مجاز است؟, وضعیت)
+    """
+    # 1. معافیت ادمین‌ها و تایید شده‌های دستی
+    is_god = user.get('telegram_id') in Config.ADMIN_IDS
+    is_admin = user.get('is_admin', False)
+    is_verified = user.get('is_verified', False) # تایید دستی توسط ادمین
+
+    if is_god or is_admin or is_verified:
+        return True, "exempt"
+
+    # 2. بررسی تنظیمات امنیتی
+    require_kyc = await DatabaseManager.get_security_setting("require_kyc", bot_id=bot_id)
+    if not require_kyc:
+        return True, "exempt"
+
+    # 3. بررسی کارت‌های تایید شده
+    cards = await DatabaseManager.get_user_cards(user['id'], bot_id=bot_id)
+    approved_cards = [c for c in cards if c['status'] == 'approved']
+
+    if approved_cards:
+        return True, "has_card"
+    
+    return False, "needs_kyc"
+
+async def wallet_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query: await safe_answer(update.callback_query)
+    user_id = update.effective_user.id
+    bot_id = context.bot_data.get('bot_id', 1)
+    
+    user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+    if not user:
+        tg_user = update.effective_user
+        user = await DatabaseManager.create_or_update_user({'id': user_id, 'username': tg_user.username, 'first_name': tg_user.first_name, 'last_name': tg_user.last_name}, bot_id=bot_id)
+    
+    if user and user.get('id'): 
+        stats = await DatabaseManager.get_user_stats_full(user['id'])
+    else: 
+        stats = {'total_paid': 0, 'orders_count': 0}
+    
+    active_gateway = await DatabaseManager.get_active_gateway(bot_id=bot_id)
+    gateway_name = active_gateway.get('name', 'درگاه آنلاین') if active_gateway else "غیرفعال"
+    
+    wallet_text = (
+        f"💰 **کیف پول شخصی شما**\n➖➖➖➖➖➖➖➖\n\n"
+        f"💳 **موجودی قابل برداشت:**\n💎 `{int(user['credit']):,}` **تومان**\n\n"
+        f"📊 **گزارش مالی حساب:**\n"
+        f"📉 مجموع هزینه‌ها: `{int(stats['total_paid']):,}` تومان\n"
+        f"🛍 تعداد کل سفارشات: `{stats['orders_count']}` عدد\n\n"
+        "👇 **چه کاری می‌خواهید انجام دهید؟**"
+    )
+    
+    inline_kb = [
+        [InlineKeyboardButton(f"➕ شارژ آنلاین ({gateway_name})", callback_data="charge_online")],
+        [InlineKeyboardButton("📜 تاریخچه تراکنش", callback_data="recent_transactions")],
+        [InlineKeyboardButton("💳 کارت به کارت (دستی)", callback_data="card_to_card")]
+    ]
+    
+    if update.callback_query: 
+        await update.callback_query.edit_message_text(wallet_text, reply_markup=InlineKeyboardMarkup(inline_kb), parse_mode='Markdown')
+    else:
+        await send_safe(context.bot, update.effective_chat.id, wallet_text, reply_markup=InlineKeyboardMarkup(inline_kb))
+        await send_safe(context.bot, update.effective_chat.id, "منوی دسترسی سریع:", reply_markup=ReplyKeyboardMarkup(WALLET_MENU, resize_keyboard=True))
+    
+    return AWAITING_WALLET_ACTION
+
+async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    bot_id = context.bot_data.get('bot_id', 1)
+    
+    if update.message and update.message.text:
+        choice = update.message.text
+        if BTN_BACK_MAIN in choice: return await start_command(update, context)
+        if "تراکنش" in choice: return await show_recent_transactions(update, context, is_callback=True)
+        elif "شارژ" in choice:
+            await send_safe(context.bot, update.effective_chat.id, "👇 لطفاً از دکمه‌های شیشه‌ای بالا استفاده کنید.")
+            return AWAITING_WALLET_ACTION
+            
+    elif update.callback_query:
+        query = update.callback_query
+        await safe_answer(query)
+        data = query.data
+        
+        if data == "recent_transactions": 
+            return await show_recent_transactions(update, context, is_callback=True)
+            
+        elif data == "charge_online":
+            user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+            
+            # بررسی دسترسی و کارت‌ها
+            allowed, status = await check_permissions_and_cards(update, context, user, bot_id)
+            
+            # اگر کاربر کارت ندارد و معاف هم نیست -> هدایت به KYC
+            if not allowed:
+                kb = [[InlineKeyboardButton("💳 ثبت اولین کارت بانکی", callback_data="wallet_add_new_card")]]
+                msg = "⛔️ **احراز هویت الزامی است.**\n\nبرای شارژ حساب، ابتدا باید یک کارت بانکی ثبت و تایید کنید."
+                await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+                return AWAITING_WALLET_ACTION
+            
+            # اگر مجاز است (یا کارت دارد یا معاف است)
+            # نمایش کارت‌ها (اگر معاف نباشد)
+            msg_add = ""
+            if status == "has_card":
+                cards = await DatabaseManager.get_user_cards(user['id'], bot_id=bot_id)
+                approved = [c for c in cards if c['status'] == 'approved']
+                msg_add = "\n💳 **کارت‌های تایید شده شما:**\n"
+                for c in approved:
+                    msg_add += f"✅ `{c['card_number']}`\n"
+                msg_add += "\n⚠️ پرداخت فقط با کارت‌های بالا معتبر است."
+
+            gw_instance = await DatabaseManager.get_active_gateway(bot_id=bot_id)
+            if not gw_instance:
+                await query.answer("⛔️ درگاه پرداخت غیرفعال است.", show_alert=True)
+                return AWAITING_WALLET_ACTION
+                
+            await query.delete_message()
+            
+            # نمایش دکمه افزودن کارت جدید در کنار دکمه بازگشت (فقط اگر معاف نباشد)
+            kb = []
+            
+            inline_add_kb = None
+            if status != "exempt":
+                 # دکمه افزودن کارت جدید برای کاربران عادی (چه کارت داشته باشند چه نه، البته اینجا کسانی می‌رسند که کارت دارند چون not allowed بالا فیلتر کرد)
+                 inline_add_kb = InlineKeyboardMarkup([
+                     [InlineKeyboardButton("➕ ثبت کارت جدید برای پرداخت", callback_data="wallet_add_new_card")],
+                     [InlineKeyboardButton(BTN_BACK_MAIN, callback_data="back_to_wallet")] # بازگشت به منوی قبلی
+                 ])
+
+            msg = (
+                f"💰 **افزایش موجودی حساب**\n"
+                f"درگاه: **{gw_instance['name']}**\n{msg_add}\n\n"
+                "لطفاً مبلغ (تومان) را وارد کنید:\n"
+                "🔹 حداقل: ۱,۰۰۰ تومان\n"
+                "🔹 حداکثر: ۵۰,۰۰۰,۰۰۰ تومان"
+            )
+            
+            # ارسال کیبورد پایین برای بازگشت (برای مواقعی که کاربر متن می‌نویسد)
+            reply_kb = ReplyKeyboardMarkup([[BTN_BACK_MAIN]], resize_keyboard=True)
+            
+            await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=inline_add_kb or reply_kb)
+            # اگر اینلاین فرستادیم، پیام متن پایین هم باید با کیبورد پایین باشد تا کاربر گیر نکند
+            if inline_add_kb:
+                 await send_safe(context.bot, update.effective_chat.id, "👇 یا مبلغ را وارد کنید:", reply_markup=reply_kb)
+                 
+            return AWAITING_CHARGE_AMOUNT
+
+        elif data == "wallet_add_new_card":
+            # هدایت به پروسه KYC کامل برای کارت جدید
+            # نکته: ایمپورت داخل تابع برای جلوگیری از چرخه ایمپورت
+            from handlers.kyc_handlers import start_kyc_for_new_card
+            return await start_kyc_for_new_card(update, context)
+
+        elif data == "card_to_card":
+             user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+             allowed, _ = await check_permissions_and_cards(update, context, user, bot_id)
+             
+             if not allowed:
+                 kb = [[InlineKeyboardButton("💳 ثبت اولین کارت بانکی", callback_data="wallet_add_new_card")]]
+                 msg = "⛔️ **احراز هویت الزامی است.**\n\nبرای کارت به کارت، ابتدا باید احراز هویت کنید."
+                 await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+                 return AWAITING_WALLET_ACTION
+             
+             info = ("💳 **شارژ کارت به کارت**\n\nجهت دریافت شماره کارت به پشتیبانی پیام دهید.")
+             await query.edit_message_text(info, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_wallet")]]))
+             return AWAITING_WALLET_ACTION
+             
+        elif data == "back_to_wallet": 
+            return await wallet_menu_handler(update, context)
+            
+    return AWAITING_WALLET_ACTION
+
+async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if BTN_BACK_MAIN in text: return await start_command(update, context)
+    bot_id = context.bot_data.get('bot_id', 1)
+    
+    try:
+        amount = int(clean_number(text))
+        if amount < 1000:
+            await update.message.reply_text("❌ حداقل مبلغ ۱,۰۰۰ تومان است.")
+            return AWAITING_CHARGE_AMOUNT
+            
+        tg_user = update.effective_user
+        user = await DatabaseManager.create_or_update_user({'id': tg_user.id, 'username': tg_user.username, 'first_name': tg_user.first_name, 'last_name': tg_user.last_name}, bot_id=bot_id)
+        
+        wait_msg = await update.message.reply_text("⏳ در حال اتصال به درگاه بانکی...")
+        success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id)
+        
+        if success:
+            kb = [[InlineKeyboardButton("🔗 ورود به درگاه پرداخت", url=result)]]
+            msg_text = (f"✅ **لینک پرداخت ایجاد شد.**\n\n💰 مبلغ: `{amount:,}` تومان\n👤 کاربر: {user.get('first_name', 'کاربر')}\n\n👇 برای تکمیل پرداخت روی دکمه زیر کلیک کنید:")
+            await wait_msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
+            await send_safe(context.bot, update.effective_chat.id, "پس از پرداخت موفق، حساب شارژ می‌شود.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+            return ConversationHandler.END
+        else:
+            await wait_msg.edit_text(f"❌ خطا در ایجاد لینک پرداخت:\n{result}")
+            return await wallet_menu_handler(update, context)
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً مبلغ را به صورت عدد وارد کنید.")
+        return AWAITING_CHARGE_AMOUNT
+
+async def show_recent_transactions(update, context, is_callback=False):
+    telegram_id = update.effective_user.id
+    bot_id = context.bot_data.get('bot_id', 1)
+    user = await DatabaseManager.get_user(telegram_id, bot_id=bot_id)
+    if not user: transactions = []
+    else: transactions = await DatabaseManager.get_user_transactions(user['id'], limit=10)
+    
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_wallet")]])
+    if not transactions: msg = "📭 **لیست تراکنش‌های شما خالی است.**"
+    else:
+        msg = "🧾 **۱۰ تراکنش اخیر شما:**\n➖➖➖➖➖➖➖➖\n"
+        for t in transactions:
+            is_deposit = t['amount'] > 0
+            emoji = "🟢" if is_deposit else "🔴"
+            date_str = t.get('created_at').strftime("%Y/%m/%d %H:%M")
+            desc = t.get('description', 'بدون شرح')
+            msg += (f"{emoji} `{int(abs(t['amount'])):,}` ت | {desc}\n📅 {date_str}\n──────────────────\n")
+            
+    if is_callback:
+        try: await update.callback_query.edit_message_text(msg, reply_markup=kb, parse_mode='Markdown')
+        except: await safe_answer(update.callback_query)
+    else: await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=kb)
+    return AWAITING_WALLET_ACTION

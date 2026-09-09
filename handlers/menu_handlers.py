@@ -1,0 +1,167 @@
+"""
+handlers/menu_handlers.py
+مدیریت منوهای فرعی - لیست اکانت‌ها و گزارشات (ایزوله شده)
+آپدیت شده: رفع باگ AttributeError و اضافه شدن دکمه خروج همگانی
+"""
+import logging
+import html
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, ConversationHandler
+from telegram.constants import ParseMode
+from database import DatabaseManager
+from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS
+from handlers.middleware import require_admin
+from helpers.message_utils import send_safe
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+@require_admin
+async def account_management_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # بررسی دکمه بازگشت (فقط اگر پیام متنی باشد)
+    if update.message and update.message.text == BTN_BACK: 
+        from handlers.admin_handlers import admin_panel_start
+        return await admin_panel_start(update, context)
+    
+    # اگر کالبک کوئری باشد، آن را پاسخ دهیم
+    if update.callback_query:
+        await update.callback_query.answer()
+        # اگر پیامی که دکمه را فشرده نیاز به حذف دارد (اختیاری)
+        # try: await update.callback_query.delete_message()
+        # except: pass
+    
+    # بررسی سطح دسترسی برای نمایش دکمه ویژه
+    user_id = update.effective_user.id
+    bot_id = context.bot_data.get('bot_id', 1)
+    is_god = user_id in Config.ADMIN_IDS
+    is_super = False
+    
+    if is_god:
+        is_super = True
+    else:
+        db_user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        if db_user and db_user.get('admin_role') == 'super_admin':
+            is_super = True
+            
+    # کپی منوی اصلی برای جلوگیری از تغییر سراسری
+    menu = [row[:] for row in ACCOUNT_MENU]
+    
+    # اضافه کردن دکمه فقط برای سوپر ادمین (اگر قبلاً اضافه نشده باشد)
+    has_leave_btn = any(BTN_LEAVE_ALL_CHATS in row for row in menu)
+    if is_super and not has_leave_btn:
+        menu.insert(3, [BTN_LEAVE_ALL_CHATS])
+    
+    await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+@require_admin
+async def list_accounts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """نمایش لیست اکانت‌ها با صفحه‌بندی (صفحه اول)"""
+    logger.info("Requesting account list.")
+    await show_accounts_page(update, context, page=1)
+
+async def account_pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندل کردن دکمه‌های صفحه بعد/قبل"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    try:
+        page = int(data.split("_")[2]) # format: acc_page_X
+    except:
+        page = 1
+    
+    await show_accounts_page(update, context, page=page, is_edit=True)
+
+async def show_accounts_page(update, context, page=1, is_edit=False):
+    """نمایش لیست اکانت‌ها مختص همان ربات"""
+    limit = 10
+    offset = (page - 1) * limit
+    bot_id = context.bot_data.get('bot_id', 1) # ✅ دریافت bot_id
+    
+    # دریافت اکانت‌ها + تعداد کل فقط برای این ربات
+    accounts, total_count = await DatabaseManager.get_accounts_paginated(limit=limit, offset=offset, active_only=False, bot_id=bot_id)
+    
+    if not accounts:
+        text = f"📭 <b>هیچ اکانتی در صفحه {page} یافت نشد.</b>\n(کل اکانت‌ها: {total_count})"
+        kb = None
+        if page > 1:
+             kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ صفحه قبل", callback_data=f"acc_page_{page-1}")]])
+    else:
+        astats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
+        inactive = max(0, astats.get("total", total_count) - astats.get("active", 0))
+        total_pages_hdr = (total_count + limit - 1) // limit
+        text = f"📋 <b>لیست اکانت‌های ربات</b> (صفحه {page}/{total_pages_hdr})\n"
+        text += f"📊 کل: <code>{astats.get('total', total_count)}</code> | "
+        text += f"✅ فعال: <code>{astats.get('active', 0)}</code> | "
+        text += f"❌ غیرفعال: <code>{inactive}</code> | "
+        text += f"⛔️ محدود: <code>{astats.get('limited', 0)}</code>\n➖➖➖➖➖➖\n"
+        
+        start_index = offset + 1
+        page_map = {}
+        
+        for i, acc in enumerate(accounts):
+            row_number = start_index + i
+            page_map[row_number] = acc['id']
+            
+            name = html.escape(
+                str(acc.get('name') or acc.get('username') or acc.get('first_name') or acc.get('last_name') or 'Unnamed')
+            )
+            status_icon = "✅"
+            if acc.get('account_status') != 'active':
+                status_icon = "❌ غیرفعال"
+            
+            spam_info = ""
+            if acc.get('spam_status') == 'limited':
+                spam_info = " | ⛔️ محدود"
+            
+            phone = html.escape(str(acc.get('phone_number') or "No Phone"))
+            
+            text += f"<b>{row_number}.</b> {name} | 📱 <code>{phone}</code>\n"
+            text += f"   🆔 DB_ID: <code>{acc['id']}</code>\n"
+            text += f"   وضعیت: {status_icon}{spam_info}\n"
+            text += "➖➖➖\n"
+            
+        context.user_data['list_page_map'] = page_map
+            
+        kb_buttons = []
+        total_pages = (total_count + limit - 1) // limit
+        
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"acc_page_{page-1}"))
+        
+        nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+        
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"acc_page_{page+1}"))
+            
+        if nav_row:
+            kb_buttons.append(nav_row)
+            
+        kb = InlineKeyboardMarkup(kb_buttons)
+
+    if is_edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@require_admin
+async def reporting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_id = context.bot_data.get('bot_id', 1)
+    
+    # ✅ دریافت آمار فقط برای این ربات
+    astats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
+    ostats = await DatabaseManager.get_all_order_stats(bot_id=bot_id)
+    
+    txt = (
+        "📊 <b>گزارش کلی ربات:</b>\n\n"
+        "🤖 <b>اکانت‌ها:</b>\n"
+        f"   • کل: <code>{astats['total']}</code>\n"
+        f"   • فعال: <code>{astats['active']}</code>\n"
+        f"   • محدود شده: <code>{astats['limited']}</code>\n\n"
+        "📦 <b>سفارشات:</b>\n"
+        f"   • کل سفارشات: <code>{ostats['total']}</code>\n"
+        f"   • در حال اجرا: <code>{ostats['running']}</code>"
+    )
+    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)

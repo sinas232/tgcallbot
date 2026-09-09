@@ -1,0 +1,24 @@
+پوشه‌های دیتابیس و لاگ‌ها نباید در بیلد باشند
+
+data/
+logs/
+downloads/
+
+فایل‌های سیستمی و اضافی
+
+pycache/
+*.pyc
+.git/
+.gitignore
+.env
+
+فایل‌های داکر
+
+docker-compose.yml
+Dockerfile
+restart.sh
+
+⛔️ بسیار مهم: نادیده گرفتن فایل‌های سنگین برای جلوگیری از خطای پر شدن دیسک
+
+silence.raw
+sessions/

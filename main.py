@@ -1,0 +1,782 @@
+"""
+main.py
+نسخه نهایی و کامل - اصلاح شده برای فعال‌سازی دکمه خروج همگانی
+"""
+import logging
+import os
+import time
+import asyncio
+import html
+import json
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ConversationHandler, CallbackQueryHandler, filters,
+    PicklePersistence, ContextTypes
+)
+# 🔥 تنظیمات پیشرفته شبکه برای جلوگیری از تایم‌اوت
+from telegram.request import HTTPXRequest
+
+from config import Config
+from database import DatabaseManager
+from services.order_executor import order_executor
+from services.payment_service import payment_service
+from services.health_checker import health_checker_service
+from services.bot_manager import bot_manager
+from aiohttp import web 
+
+# هندلرها
+from handlers.general_handlers import *
+from handlers.admin_handlers import *
+from handlers.order_handlers import *
+from handlers.menu_handlers import *
+from handlers.account_management import *
+from handlers.wallet_handlers import *
+from handlers.profile_handlers import *
+from handlers.kyc_handlers import *
+# ایمپورت هندلرهای تیکتینگ
+from handlers.ticket_handlers import (
+    start_ticket_support, 
+    handle_user_ticket_message, 
+    admin_tickets_list, 
+    admin_ticket_actions, 
+    handle_admin_reply_message
+)
+from constants import *
+from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
+
+# تنظیمات لاگینگ
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# کاهش سطح لاگ کتابخانه‌های پرحرف
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+# Pyrogram emits one INFO line per transport reconnect.  Operational details
+# remain in voice_calls.log; console output should expose actionable failures.
+logging.getLogger("pytgcalls").setLevel(logging.CRITICAL)
+
+
+class _PyTgCallsNoiseFilter(logging.Filter):
+    """Keep library retry chatter out of console; VoiceDiag keeps the verdict."""
+
+    def filter(self, record):
+        message = record.getMessage()
+        return not (
+            record.name.startswith("pytgcalls")
+            and (
+                "Telegram is having some internal server issues" in message
+                or "joinCallError" in message
+            )
+        )
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_PyTgCallsNoiseFilter())
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("pytgcalls").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+# فیلترهای عمومی برای ناوبری
+REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
+FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
+# فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
+STD_TEXT = filters.TEXT & ~filters.COMMAND & ~FILTER_NAV_BUTTONS & ~FILTER_BACK
+# فیلتر ورودی‌های امنیتی (شامل فوروارد)
+SECURITY_INPUT_FILTER = (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND & ~FILTER_NAV_BUTTONS & ~FILTER_BACK
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مدیریت خطاهای کلی ربات"""
+    logger.error(f"Error in bot {context.bot_data.get('bot_id', '?')}:", exc_info=context.error)
+
+# ---------------------------------------------------------
+# بخش وب‌سرور و مدیریت پرداخت‌ها
+# ---------------------------------------------------------
+
+async def process_payment_success(transaction, app, bot_id, extra_data=None):
+    """عملیات پس از پرداخت موفق: ارسال پیام به کاربر و ثبت در کانال لاگ"""
+    try:
+        user = await DatabaseManager.get_user_by_id(transaction['user_id'])
+        if not user: return
+
+        # 1. ارسال پیام به کاربر
+        try:
+            await app.bot.send_message(
+                user['telegram_id'], 
+                f"✅ پرداخت موفق!\nحساب شما به مبلغ {int(transaction['amount']):,} تومان شارژ شد."
+            )
+        except Exception as e:
+            logger.warning(f"Could not send success msg to user: {e}")
+        
+        # 2. ارسال گزارش به کانال لاگ
+        log_channel = await DatabaseManager.get_setting("log_channel_payments", bot_id=bot_id)
+        if log_channel and log_channel not in ["off", "0", ""]:
+            if extra_data is None: extra_data = {}
+            
+            gw_name = "زرین‌پال" if transaction.get('gateway_slug') == 'zarinpal' else "آقای پرداخت"
+            ref_id = extra_data.get('ref_id') or transaction.get('trans_id', '---')
+            card_pan = extra_data.get('card_pan', '---')
+            # استفاده از زمان واقعی تراکنش به جای زمان فعلی
+            transaction_time = transaction.get('created_at')
+            if transaction_time:
+                # اگر created_at یک datetime object است، مستقیماً استفاده کن
+                if isinstance(transaction_time, datetime):
+                    pay_time = format_jalali_datetime(transaction_time)
+                elif isinstance(transaction_time, str):
+                    # اگر string بود، سعی کن parse کن
+                    try:
+                        # فرمت‌های رایج: ISO format یا SQL format
+                        if 'T' in transaction_time:
+                            parsed_time = datetime.fromisoformat(transaction_time.replace('Z', '+00:00'))
+                        else:
+                            parsed_time = datetime.strptime(transaction_time, '%Y-%m-%d %H:%M:%S.%f')
+                        pay_time = format_jalali_datetime(parsed_time)
+                    except:
+                        # اگر parse نشد، از زمان فعلی استفاده کن
+                        logger.warning(f"Could not parse transaction time: {transaction_time}")
+                        pay_time = format_jalali_datetime(get_tehran_time())
+                else:
+                    # برای سایر انواع، از زمان فعلی استفاده کن
+                    pay_time = format_jalali_datetime(get_tehran_time())
+            else:
+                # fallback به زمان فعلی اگر created_at موجود نبود
+                logger.warning(f"Transaction {transaction.get('trans_id')} has no created_at field")
+                pay_time = format_jalali_datetime(get_tehran_time())
+            
+            txt = (
+                "💰 **گزارش پرداخت موفق**\n\n"
+                f"👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['telegram_id']}`)\n"
+                f"💵 مبلغ: `{int(transaction['amount']):,}` تومان\n"
+                f"🆔 کد تراکنش: `{ref_id}`\n"
+                f"💳 کارت: `{card_pan}`\n"
+                f"🏦 درگاه: {gw_name}\n"
+                f"📅 زمان: {pay_time}"
+            )
+            try: 
+                await app.bot.send_message(chat_id=log_channel, text=txt)
+            except Exception as e:
+                logger.error(f"Failed to send payment log: {e}")
+            
+    except Exception as e:
+        logger.error(f"Payment success processing error: {e}")
+
+def get_html_response(title, message, color="#4CAF50", icon="✅"):
+    """تولید صفحه HTML برای نمایش نتیجه پرداخت در مرورگر"""
+    return f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: Tahoma, Arial, sans-serif; text-align: center; padding: 50px; direction: rtl; background-color: #f4f4f9; }}
+            .card {{ background: white; padding: 40px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 400px; width: 100%; }}
+            h1 {{ color: {color}; margin-bottom: 20px; }}
+            p {{ font-size: 18px; color: #333; }}
+            .icon {{ font-size: 50px; margin-bottom: 20px; display: block; }}
+            .btn {{ display: inline-block; margin-top: 30px; padding: 10px 20px; background-color: #0088cc; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <span class="icon">{icon}</span>
+            <h1>{title}</h1>
+            <p>{message}</p>
+            <a href="tg://resolve?domain=me" class="btn">بازگشت به ربات</a>
+        </div>
+    </body>
+    </html>
+    """
+
+async def ap_callback_handler(request):
+    """کالبک آقای پرداخت"""
+    try:
+        data = await request.post()
+        trans_id = data.get('transid')
+        status = data.get('status')
+        
+        if not trans_id: 
+            return web.Response(text="Missing transid", status=400)
+        
+        transaction = await DatabaseManager.get_payment_transaction(trans_id)
+        if not transaction: 
+            return web.Response(text="تراکنش یافت نشد.", status=404)
+            
+        if transaction['status'] == 'paid': 
+            return web.Response(text=get_html_response("پرداخت تکراری", "این تراکنش قبلاً با موفقیت ثبت شده است."), content_type='text/html')
+
+        bot_id = transaction.get('bot_id', 1)
+        app = bot_manager.active_bots.get(bot_id)
+
+        if str(status) == '1':
+            success, result_data = await payment_service.verify_payment(trans_id, int(transaction['amount']), "aqayepardakht", bot_id=bot_id)
+            if success:
+                await DatabaseManager.update_payment_status(trans_id, 'paid')
+                await DatabaseManager.update_user_credit(transaction['user_id'], int(float(transaction['amount'])), "online_charge", f"شارژ آنلاین (کد: {trans_id})", bot_id=bot_id)
+                if app: await process_payment_success(transaction, app, bot_id, result_data)
+                return web.Response(text=get_html_response("پرداخت موفق", "حساب شما با موفقیت شارژ شد."), content_type='text/html')
+            else:
+                msg = result_data.get('error', 'Unknown')
+                await DatabaseManager.update_payment_status(trans_id, 'failed')
+                return web.Response(text=get_html_response("خطا در تایید", f"خطا: {msg}", color="#F44336", icon="❌"), content_type='text/html')
+        else:
+            await DatabaseManager.update_payment_status(trans_id, 'failed')
+            return web.Response(text=get_html_response("پرداخت ناموفق", "تراکنش توسط کاربر لغو شد یا ناموفق بود.", color="#F44336", icon="❌"), content_type='text/html')
+    except Exception as e:
+        logger.error(f"AP Callback Error: {e}")
+        return web.Response(text="Internal Error", status=500)
+
+async def zp_callback_handler(request):
+    """کالبک زرین پال"""
+    try:
+        authority = request.query.get('Authority')
+        status = request.query.get('Status')
+        
+        if not authority: return web.Response(text="Missing Authority", status=400)
+        
+        transaction = await DatabaseManager.get_payment_transaction(authority)
+        if not transaction: return web.Response(text="تراکنش یافت نشد.", status=404)
+        
+        if transaction['status'] == 'paid': 
+            return web.Response(text=get_html_response("پرداخت تکراری", "این تراکنش قبلاً با موفقیت ثبت شده است."), content_type='text/html')
+
+        bot_id = transaction.get('bot_id', 1)
+        app = bot_manager.active_bots.get(bot_id)
+
+        if status == 'OK':
+            # طبق مستندات رسمی زرین‌پال، مبلغ برای اعتبارسنجی باید به ریال باشد
+            # مبلغ در دیتابیس شما به تومان ذخیره شده است، پس باید در 10 ضرب شود
+            amount_in_rials = int(float(transaction['amount'])) * 10
+            
+            success, result_data = await payment_service.verify_payment(authority, amount_in_rials, "zarinpal", bot_id=bot_id)
+            
+            if success:
+                await DatabaseManager.update_payment_status(authority, 'paid')
+                await DatabaseManager.update_user_credit(
+                    transaction['user_id'],
+                    int(float(transaction['amount'])),
+                    "online_charge", 
+                    f"شارژ آنلاین زرین‌پال (Ref: {result_data.get('ref_id')})", 
+                    bot_id=bot_id
+                )
+                if app: await process_payment_success(transaction, app, bot_id, result_data)
+                return web.Response(text=get_html_response("پرداخت موفق", f"کد پیگیری: {result_data.get('ref_id')}", icon="✅"), content_type='text/html')
+            else:
+                msg = result_data.get('error', 'Verification Failed')
+                await DatabaseManager.update_payment_status(authority, 'failed')
+                return web.Response(text=get_html_response("خطای تایید", f"تایید نشد: {msg}", color="#F44336", icon="❌"), content_type='text/html')
+        else:
+            await DatabaseManager.update_payment_status(authority, 'failed')
+            return web.Response(text=get_html_response("پرداخت ناموفق", "تراکنش انجام نشد یا لغو گردید.", color="#F44336", icon="❌"), content_type='text/html')
+    except Exception as e:
+        logger.error(f"ZP Callback Error: {e}")
+        return web.Response(text="Internal Error", status=500)
+
+async def start_web_server():
+    """راه‌اندازی وب‌سرور aiohttp"""
+    app = web.Application()
+    app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
+    app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # گوش دادن روی تمام اینترفیس‌ها برای دسترسی از بیرون کانتینر
+    site = web.TCPSite(runner, '0.0.0.0', Config.PORT)
+    
+    await site.start()
+    logger.info(f"🌍 Web Server running on 0.0.0.0:{Config.PORT} (Publicly accessible via Docker)")
+
+# ---------------------------------------------------------
+# جاب‌های زمان‌بندی شده (Jobs)
+# ---------------------------------------------------------
+
+async def auto_spam_check_job(context: ContextTypes.DEFAULT_TYPE):
+    try: await health_checker_service.run_auto_check()
+    except Exception as e: logger.error(f"Auto check job error: {e}")
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """پشتیبان‌گیری خودکار زمان‌بندی شده و ارسال به کانال پشتیبان."""
+    try:
+        from services.backup_manager import backup_manager
+        bot_id = 1
+        enabled = await DatabaseManager.get_setting("auto_backup_enabled", "false", bot_id=bot_id) == "true"
+        if not enabled:
+            return
+        channel = await DatabaseManager.get_setting("backup_channel_id", "", bot_id=bot_id)
+        if not channel or channel in ["", "off"]:
+            logger.warning("Auto backup enabled but no backup channel set.")
+            return
+        try:
+            interval_hours = int(await DatabaseManager.get_setting("auto_backup_interval_hours", "24", bot_id=bot_id) or 24)
+        except Exception:
+            interval_hours = 24
+        try:
+            last_ts = float(await DatabaseManager.get_setting("last_auto_backup_ts", "0", bot_id=bot_id) or 0)
+        except Exception:
+            last_ts = 0.0
+        now = time.time()
+        if now - last_ts < max(1, interval_hours) * 3600:
+            return
+        ok, res = await backup_manager.create_backup()
+        if not ok:
+            logger.error(f"Auto backup failed: {res}")
+            return
+        app = bot_manager.active_bots.get(bot_id)
+        if app:
+            try:
+                with open(res, "rb") as f:
+                    await app.bot.send_document(
+                        chat_id=channel, document=f, filename=os.path.basename(res),
+                        caption=f"📦 پشتیبان خودکار دیتابیس\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                    )
+            except Exception as e:
+                logger.error(f"Auto backup send failed: {e}")
+        await DatabaseManager.set_setting("last_auto_backup_ts", str(now), bot_id=bot_id)
+        await DatabaseManager.set_setting("last_backup_timestamp", datetime.now().strftime('%Y-%m-%d %H:%M'), bot_id=bot_id)
+        backup_manager.cleanup_old_backups()
+    except Exception as e:
+        logger.error(f"Auto backup job error: {e}")
+
+async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        due_orders = await DatabaseManager.get_due_scheduled_orders()
+        if not due_orders: return
+        for order in due_orders:
+            bot_id = order.get('bot_id', 1)
+            await DatabaseManager.update_order_status(order['id'], 'running')
+            await order_executor.submit_order(order['id'], order)
+            try:
+                app = bot_manager.active_bots.get(bot_id)
+                if app:
+                    user = await DatabaseManager.get_user_by_id(order['user_id'])
+                    if user and user.get('telegram_id'):
+                        await app.bot.send_message(
+                            user['telegram_id'],
+                            f"⏰ **سفارش زمان‌بندی شده شما شروع شد!**\n🆔 کد سفارش: `{order['id']}`\n🚀 نوع: {order['order_type']}"
+                        )
+            except: pass
+    except Exception as e:
+        logger.error(f"Scheduled orders check error: {e}")
+
+async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    """بررسی سفارشات منقضی شده"""
+    try:
+        for bot_id, app in bot_manager.active_bots.items():
+            active_orders = await DatabaseManager.get_all_orders_extended(limit=100, offset=0, status_filter='active', bot_id=bot_id)
+            if not active_orders: continue
+            now = datetime.utcnow()
+            for item in active_orders:
+                order = item['order']
+                duration = order.get('duration_minutes', 0)
+                if duration <= 0: continue
+                # A running order without started_at is still building its
+                # verified account set; it has not entered the billable phase.
+                start_time = order.get('started_at')
+                if not start_time: continue
+                end_time = start_time + timedelta(minutes=duration)
+                
+                if now > end_time:
+                    logger.info(f"⏳ Order {order['id']} (Bot {bot_id}) expired. Finishing...")
+                    
+                    # توقف سفارش + خروج از کال/گروه
+                    await order_executor.stop_active_order(order['id'], is_expired=True, reason="Order expired")
+                    try:
+                        from services.voice_call_manager import voice_call_manager as _vcm
+                        if _vcm:
+                            await _vcm.stop_all_for_order(order['id'], leave_group=True)
+                    except Exception:
+                        pass
+                    await DatabaseManager.complete_order(order['id'])
+                    
+                    # لاگ
+                    try:
+                         await order_executor._log_to_channel("completed", order['id'], order, success_cnt=order['accounts_count'], bot_id=bot_id)
+                    except: pass
+                    
+                    # اطلاع به کاربر
+                    try:
+                        user = item['user']
+                        await app.bot.send_message(user['telegram_id'], f"✅ **سفارش شما تکمیل شد.**\n🆔 کد: `{order['id']}`\n⏰ مدت زمان: {duration} دقیقه")
+                    except: pass
+    except Exception as e:
+        logger.error(f"Expired orders check error: {e}")
+
+# ---------------------------------------------------------
+# راه‌اندازی و هندلرها
+# ---------------------------------------------------------
+
+def register_handlers(application: Application) -> None:
+    """ثبت تمام هندلرهای ربات"""
+    application.add_error_handler(error_handler)
+
+    # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
+    application.add_handler(
+        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
+        group=-1,
+    )
+    
+    # هندلرهای عمومی
+    application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    
+    # کالبک‌های ادمین (KYC)
+    application.add_handler(CallbackQueryHandler(kyc_admin_callback, pattern="^admin_kyc_"))
+
+    # تابع بازگشت عمومی
+    async def global_cancel_and_restart(update: Update, context):
+        context.user_data.clear()
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    STANDARD_FALLBACKS = [
+        CommandHandler("start", start_command),
+        CommandHandler("cancel", start_command),
+        MessageHandler(filters.CONTACT, handle_contact),
+        MessageHandler(FILTER_BACK, global_cancel_and_restart)
+    ]
+
+    # --- 1. سیستم تیکتینگ ---
+    support_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
+        states={
+            AWAITING_TICKET_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message)]
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="support_ticket", persistent=True
+    )
+    application.add_handler(support_conv)
+
+    # --- 2. احراز هویت (KYC) ---
+    application.add_handler(CallbackQueryHandler(kyc_menu_callback, pattern="^kyc_back$|^kyc_add_card$|^kyc_send_video$"))
+    
+    kyc_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_kyc_process, pattern="^start_kyc_process$")],
+        states={
+            AWAITING_KYC_CARD: [MessageHandler(STD_TEXT, handle_kyc_card)],
+            # دریافت ویدیو، عکس یا داکیومنت در مرحله دوم
+            AWAITING_KYC_VIDEO: [MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)],
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="kyc", persistent=True
+    )
+    application.add_handler(kyc_conv)
+
+    # --- 3. پنل ادمین ---
+    admin_fallbacks = [
+        CommandHandler("start", start_command),
+        CommandHandler("cancel", start_command),
+        MessageHandler(filters.CONTACT, handle_contact),
+        MessageHandler(FILTER_BACK, admin_panel_start),
+    ]
+    admin_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
+        states={
+            AWAITING_SETTINGS_ACTION: [
+                # نمایندگی
+                MessageHandler(filters.Regex("^🤖 مدیریت نمایندگی‌ها$"), reseller_management_menu),
+                CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+                MessageHandler(filters.Regex("^➕ افزودن نماینده جدید$"), add_reseller_start),
+                MessageHandler(filters.Regex("^📋 لیست نمایندگان$"), list_resellers_handler),
+                
+                # خروج
+                MessageHandler(filters.Regex(f"^{BTN_EXIT_ADMIN}$"), start_command),
+                
+                # تیکتینگ
+                MessageHandler(filters.Regex("^📩 مدیریت تیکت‌ها"), admin_tickets_list),
+                CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
+                
+                # سفارشات
+                CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
+                CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+                CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+                MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
+                
+                # اکشن‌های کاربر
+                CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_|^view_orders_|^view_trans_|^back_to_profile"),
+                
+                # تنظیمات
+                MessageHandler(filters.Regex("^⚙️ تنظیمات سیستم$"), settings_menu_handler),
+                MessageHandler(filters.Regex("^💳 مدیریت درگاه پرداخت$"), gateway_management_menu),
+                MessageHandler(filters.Regex("^🔒 تنظیمات امنیتی$"), security_settings_menu),
+                CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings"),
+                
+                # لاگ و متن
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
+                CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
+                CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_|^set_spam_"),
+                MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
+                MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
+                
+                # 💾 پشتیبان‌گیری و بازیابی
+                MessageHandler(filters.Regex(f"^{BTN_BACKUP_RESTORE}$"), backup_restore_menu),
+                CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
+                
+                # پلن‌ها
+                MessageHandler(filters.Regex("^➕ ایجاد پلن جدید$"), create_plan_start),
+                MessageHandler(filters.Regex("^✏️ ویرایش پلن$"), edit_plan_start),
+                MessageHandler(filters.Regex("^📋 مدیریت پلن‌ها$"), plan_management_menu),
+                MessageHandler(filters.Regex("^📋 لیست پلن‌ها$"), list_plans_handler),
+                MessageHandler(filters.Regex("^❌ حذف پلن$"), delete_plan_start),
+                
+                # مدیریت کاربر
+                MessageHandler(filters.Regex(r"^👤 (مدیریت کاربران|جستجوی کاربر \(پیشرفته\))$"), user_manage_menu),
+                MessageHandler(filters.Regex("^👥 مدیریت اکانت‌های ربات$"), account_management_handler),
+                MessageHandler(filters.Regex("^📊 گزارش کلی$"), reporting_handler),
+                MessageHandler(filters.Regex("^🔎 جستجوی کاربر.*$"), user_search_start),
+                MessageHandler(filters.Regex(r"^(➕ افزودن ادمین جدید|👤 ادمین عادی|⭐️ سوپر ادمین)$"), add_admin_start),
+                MessageHandler(filters.Regex("^➖ حذف ادمین$"), remove_admin_start),
+                MessageHandler(filters.Regex("^📋 لیست ادمین‌ها$"), list_admins_handler),
+                MessageHandler(filters.Regex("^📞 پیام خصوصی$"), private_message_start),
+                MessageHandler(filters.Regex("^📢 پیام همگانی$"), broadcast_start),
+                
+                # آمار
+                MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
+                MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
+                MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
+            ],
+            
+            # وضعیت‌های ادمین
+            AWAITING_ADMIN_TICKET_REPLY: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_admin_reply_message)],
+            AWAITING_GATEWAY_SELECT: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_gateway_selection)],
+            AWAITING_GATEWAY_ACTION: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_gateway_action)],
+            AWAITING_GATEWAY_CONFIG_INPUT: [MessageHandler(STD_TEXT, set_gateway_config_input)],
+            AWAITING_FORCE_JOIN_LINK: [MessageHandler(SECURITY_INPUT_FILTER, set_force_join_link)],
+            AWAITING_VERIFY_USER_ID: [MessageHandler(STD_TEXT, manual_verify_user_exec)],
+            AWAITING_PM_ID: [MessageHandler(STD_TEXT, private_message_confirm_user)],
+            AWAITING_PM_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, private_message_send)],
+            AWAITING_BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, broadcast_confirm)],
+            AWAITING_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_execute, pattern="^confirm_|^cancel_")],
+            
+            # پلن
+            AWAITING_PLAN_NAME: [MessageHandler(STD_TEXT, receive_plan_name)],
+            AWAITING_PLAN_DESC: [MessageHandler(STD_TEXT, receive_plan_desc)],
+            AWAITING_PLAN_TYPE: [MessageHandler(STD_TEXT, receive_plan_type)],
+            AWAITING_PLAN_COUNT: [MessageHandler(STD_TEXT, receive_plan_count)],
+            AWAITING_PLAN_DURATION: [MessageHandler(STD_TEXT, receive_plan_duration)],
+            AWAITING_PLAN_PRICE: [MessageHandler(STD_TEXT, receive_plan_price)],
+            AWAITING_PLAN_DELETE: [MessageHandler(STD_TEXT, perform_delete_plan)],
+            AWAITING_PLAN_DELETE_INDEX: [MessageHandler(STD_TEXT, perform_delete_plan)],
+            AWAITING_PLAN_EDIT_INDEX: [CallbackQueryHandler(handle_edit_plan_selection)],
+            AWAITING_PLAN_EDIT_SELECT: [CallbackQueryHandler(handle_edit_field_selection)],
+            AWAITING_PLAN_EDIT_VALUE: [CallbackQueryHandler(receive_plan_edit_value), MessageHandler(STD_TEXT, receive_plan_edit_value)],
+            
+            # سفارش
+            AWAITING_STOP_ORDER_INDEX: [MessageHandler(STD_TEXT, stop_order_execute)],
+            AWAITING_ORDER_USER_ID: [MessageHandler(STD_TEXT, manage_orders_user_search)],
+            
+            # کاربر
+            AWAITING_USER_SEARCH: [MessageHandler(STD_TEXT, user_search_result)],
+            AWAITING_USER_AMOUNT: [MessageHandler(STD_TEXT, set_user_credit)],
+            AWAITING_ADD_ADMIN: [MessageHandler(filters.Regex("^(👤 ادمین عادی|⭐️ سوپر ادمین)$"), perform_add_admin), MessageHandler(STD_TEXT, perform_add_admin)],
+            AWAITING_REMOVE_ADMIN: [MessageHandler(STD_TEXT, perform_remove_admin)],
+            
+            # تنظیمات
+            AWAITING_SUPPORT_TEXT: [MessageHandler(STD_TEXT, handle_setting_text_input)],
+            AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
+            AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
+            AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            
+            # 💾 پشتیبان‌گیری و بازیابی
+            AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
+            AWAITING_BACKUP_CHANNEL: [MessageHandler(STD_TEXT, receive_backup_channel)],
+            AWAITING_BACKUP_INTERVAL: [MessageHandler(STD_TEXT, receive_backup_interval)],
+            
+            # نمایندگی
+            AWAITING_RESELLER_TOKEN: [MessageHandler(STD_TEXT, receive_reseller_token)],
+            AWAITING_RESELLER_ADMIN: [MessageHandler(STD_TEXT, receive_reseller_admin)],
+            AWAITING_RESELLER_CHARGE: [MessageHandler(STD_TEXT, receive_reseller_charge)],
+            AWAITING_RESELLER_RENEW_DAYS: [MessageHandler(STD_TEXT, receive_reseller_renew_days)],
+            AWAITING_RESELLER_API_ID: [MessageHandler(STD_TEXT, receive_reseller_api_id)],
+            AWAITING_RESELLER_API_HASH: [MessageHandler(STD_TEXT, receive_reseller_api_hash)],
+            AWAITING_RESELLER_EDIT_VALUE: [MessageHandler(STD_TEXT, receive_reseller_edit_value)], 
+        },
+        fallbacks=admin_fallbacks,
+        name="admin", persistent=True
+    )
+    application.add_handler(admin_conv)
+    
+    # --- 4. کیف پول ---
+    wallet_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^💰 کیف پول من$"), wallet_menu_handler),
+            CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet")
+        ],
+        states={
+            AWAITING_WALLET_ACTION: [MessageHandler(STD_TEXT, handle_wallet_action), CallbackQueryHandler(handle_wallet_action)],
+            AWAITING_CHARGE_AMOUNT: [MessageHandler(STD_TEXT, handle_charge_amount)],
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="wallet", persistent=True
+    )
+    application.add_handler(wallet_conv)
+    
+    # --- 5. مدیریت اکانت ---
+    acc_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ افزودن اکانت \(شماره\)$"), add_account_start),
+            MessageHandler(filters.Regex("^📥 افزودن با سشن \(String\)$"), import_session_start),
+            MessageHandler(filters.Regex("^❌ حذف اکانت$"), delete_account_start),
+            MessageHandler(filters.Regex("^📋 لیست اکانت‌ها$"), list_accounts_handler),
+            CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
+            MessageHandler(filters.Regex("^📩 دریافت کد ورود$"), get_code_start),
+            # 🔥 ثبت هندلر برای دکمه خروج همگانی
+            MessageHandler(filters.Regex(f"^{BTN_LEAVE_ALL_CHATS}$"), leave_all_chats_start),
+        ],
+        states={
+            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, admin_panel_start)],
+            # 🔥 وضعیت تایید برای خروج همگانی
+            AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="acc", persistent=True
+    )
+    application.add_handler(acc_conv)
+
+    # --- 6. پروفایل ---
+    prof_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل و استوری$"), profile_settings_start),
+            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start)
+        ],
+        states={
+            AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account)],
+            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_profile_menu_action)],
+            AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler)],
+            AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler)],
+            AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler)],
+            AWAITING_NEW_LAST_NAME: [MessageHandler(STD_TEXT, set_last_name_handler)],
+            AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler)],
+            AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)],
+            AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish)],
+            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, privacy_menu_handler)],
+            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, set_privacy_level)],
+            AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="prof", persistent=True
+    )
+    application.add_handler(prof_conv)
+
+    # --- 7. خرید سرویس ---
+    buy_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start)],
+        states={
+            AWAITING_SELECT_PLAN: [
+                MessageHandler(FILTER_BACK, start_command),
+                MessageHandler(filters.Regex("^(🎙|👥|📢)"), show_plans_for_category),
+                CallbackQueryHandler(handle_plan_callback, pattern="^buy_|^cancel")
+            ],
+            AWAITING_ORDER_TIMING_TYPE: [MessageHandler(STD_TEXT, handle_timing_type)],
+            AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection)],
+            AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
+            AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation)]
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="buy", persistent=True
+    )
+    application.add_handler(buy_conv)
+
+    # هندلرهای عمومی خارج از Conversation
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stop_order", stop_order_handler))
+    application.add_handler(CommandHandler("cancel", general_cancel_handler))
+    application.add_handler(MessageHandler(filters.Regex("^📦 سفارشات من$"), my_orders_handler), group=0)
+    # ✅ هندلر ریپلای ادمین
+    application.add_handler(MessageHandler(filters.REPLY, reply_to_user_handler), group=0)
+    
+    application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"), group=0)
+    application.add_handler(CallbackQueryHandler(handle_order_history_callback, pattern="^history_"), group=0)
+    application.add_handler(CallbackQueryHandler(handle_back_to_history_menu, pattern="^back_to_history_menu"), group=0)
+
+async def main_loop():
+    """حلقه اصلی اجرای برنامه"""
+    await DatabaseManager.init_db()
+    try:
+        await DatabaseManager.reset_stuck_orders()
+        from telegram_client import TelegramAccountClient
+        await TelegramAccountClient.preload_all_clients()
+    except: pass
+    
+    # راه‌اندازی وب‌سرور پرداخت
+    await start_web_server()
+    
+    bot_manager.set_handler_registrar(register_handlers)
+    os.makedirs("data", exist_ok=True)
+    main_persistence = PicklePersistence(filepath="data/bot_data.pickle")
+    
+    # Use separate API and long-poll transports. A bounded poll timeout lets
+    # Telegram rotate the connection cleanly instead of surfacing read errors
+    # after a stale socket is silently closed by an intermediary.
+    request = HTTPXRequest(
+        connection_pool_size=20,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=15.0,
+        pool_timeout=15.0,
+    )
+    updates_request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=45.0,
+        write_timeout=30.0,
+        connect_timeout=15.0,
+        pool_timeout=15.0,
+    )
+
+    main_app = (
+        Application.builder()
+        .token(Config.BOT_TOKEN)
+        .persistence(main_persistence)
+        .request(request)
+        .get_updates_request(updates_request)
+        .build()
+    )
+    
+    main_app.bot_data['bot_id'] = 1
+    main_app.bot_data['owner_id'] = 0
+    
+    register_handlers(main_app)
+    await main_app.initialize()
+    await main_app.start()
+    
+    await main_app.updater.start_polling(
+        timeout=30,
+        bootstrap_retries=5,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    
+    bot_manager.active_bots[1] = main_app
+    logger.info("🚀 Main Bot Started.")
+    
+    # راه‌اندازی ربات‌های نمایندگی
+    await bot_manager.start_all_active_bots()
+    
+    # زمان‌بندی جاب‌ها
+    if main_app.job_queue:
+        main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
+        main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
+        main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
+        main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
+
+    # زنده نگه داشتن برنامه
+    stop_event = asyncio.Event()
+    await stop_event.wait()
+
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(main_loop())
