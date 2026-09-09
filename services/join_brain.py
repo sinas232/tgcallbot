@@ -152,6 +152,17 @@ class AdaptiveJoinBrain:
         self._orders: Dict[int, _OrderPolicy] = {}
         self._lock = asyncio.Lock()
 
+    # ── outcome classification (mirrors the module-level helper) ─────
+    @staticmethod
+    def classify_message(msg: str) -> str:
+        """Outcome classification for executor-level results.
+
+        Mirrors the module-level ``classify_message`` so callers can use
+        the singleton (``join_brain.classify_message(...)``) exactly like
+        the rest of the class API.
+        """
+        return classify_message(msg)
+
     # ── lifecycle ─────────────────────────────────────────────────────
     def register_order(self, order_id: int, *, initial: Optional[int] = None,
                        min_window: Optional[int] = None,

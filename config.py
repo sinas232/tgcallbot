@@ -79,7 +79,7 @@ class Config:
     PRESENCE_CHECK_INTERVAL = int(os.getenv('PRESENCE_CHECK_INTERVAL', '45'))  # shared monitor interval (seconds)
     VOICE_MEDIA_CHECK_INTERVAL = int(os.getenv('VOICE_MEDIA_CHECK_INTERVAL', '7'))  # media health recovery interval
     OPERATION_TIMEOUT = int(os.getenv('OPERATION_TIMEOUT', '20'))         # per-operation timeout (seconds)
-    VOICE_JOIN_PENDING_TIMEOUT = int(os.getenv('VOICE_JOIN_PENDING_TIMEOUT', '60'))  # wait for Telegram propagation
+    VOICE_JOIN_PENDING_TIMEOUT = int(os.getenv('VOICE_JOIN_PENDING_TIMEOUT', '30'))  # max wait for Telegram propagation per join attempt
 
     # ═══════════════════════════════════════════════════════════════════
     # Adaptive Batch / Parallel voice-join architecture ("Join Brain")
@@ -103,7 +103,7 @@ class Config:
     VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
     # Driver-level attempt budget per account (start_call itself already does
     # bounded retries + respects FloodWait internally).
-    VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '2'))
+    VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
     VOICE_RETRY_BACKOFF_BASE = float(os.getenv('VOICE_RETRY_BACKOFF_BASE', '8'))
     # Rejoin attempts for a CONFIRMED-disconnected account before the slot is
     # declared unrecoverable and REPLACED with a fresh account (duration phase).
@@ -124,7 +124,10 @@ class Config:
     # The constants below tune retries, rate-limit handling and monitoring.
     VOICE_JOIN_RETRY_HARD_LIMIT = int(os.getenv('VOICE_JOIN_RETRY_HARD_LIMIT', '2'))   # absolute max attempts per join op
     VOICE_VERIFICATION_GRACE_CHECKS = int(os.getenv('VOICE_VERIFICATION_GRACE_CHECKS', '3'))
-    VOICE_VERIFICATION_GRACE_INTERVAL = float(os.getenv('VOICE_VERIFICATION_GRACE_INTERVAL', '0.3'))
+    VOICE_VERIFICATION_GRACE_INTERVAL = float(os.getenv('VOICE_VERIFICATION_GRACE_INTERVAL', '1.0'))
+    # Hard deadline per adaptive wave: stragglers are cancelled and deferred
+    # to the next wave so one slow/stuck account never freezes the build.
+    VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
     # Telegram JoinGroupCall supports joining muted; keep the account muted by
     # default while the silent stream maintains the media transport.
     VOICE_JOIN_MUTED = os.getenv('VOICE_JOIN_MUTED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')

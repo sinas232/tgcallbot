@@ -152,11 +152,12 @@ REJOIN_BACKOFF_BASE = max(1.0, float(getattr(Config, 'BACKOFF_BASE', 1)))
 CONFIRMED_DISCONNECT_THRESHOLD = max(2, int(getattr(Config, 'CONFIRMED_DISCONNECT_THRESHOLD', 5)))
 
 # ─── JOIN RETRY / FLOOD-WAIT / VERIFICATION TUNING ────────────────────
-# There is NO fixed per-account join interval. Account N+1 is released ONLY
-# after Account N reaches CONFIRMED_JOINED (positive presence verification).
-# These constants limit retries and respect server-directed waits; they never
-# bypass Telegram limits or pace new-account joins artificially.
-# Optimized for faster verification without bypassing Telegram propagation.
+# Each WAVE joins up to `window` accounts CONCURRENTLY and every account is
+# positively verified before it counts; the Join Brain widens/narrows the
+# window from live feedback.  These constants bound a SINGLE attempt and
+# respect server-directed waits - they never bypass Telegram limits.
+# A stuck transport is retried with backoff (not hammered) and a whole
+# wave has a hard deadline so one slow account never freezes the build.
 VOICE_JOIN_RETRY_HARD_LIMIT = max(1, int(getattr(Config, 'VOICE_JOIN_RETRY_HARD_LIMIT', 2)))
 VOICE_VERIFICATION_GRACE_CHECKS = max(1, int(getattr(Config, 'VOICE_VERIFICATION_GRACE_CHECKS', 3)))
 VOICE_VERIFICATION_GRACE_INTERVAL = max(0.1, float(getattr(Config, 'VOICE_VERIFICATION_GRACE_INTERVAL', 0.3)))
@@ -165,7 +166,7 @@ _JOIN_ATTEMPT_TIMEOUT = max(10, int(getattr(Config, 'OPERATION_TIMEOUT', 20)))
 # Bounded deadline for a Telegram/WebRTC join that is still propagating.
 _JOIN_PENDING_TIMEOUT = max(
     _JOIN_ATTEMPT_TIMEOUT,
-    int(getattr(Config, 'VOICE_JOIN_PENDING_TIMEOUT', 60)),
+    int(getattr(Config, 'VOICE_JOIN_PENDING_TIMEOUT', 30)),
 )
 
 # Telegram can keep a call object valid for a while, but a cached object must
@@ -320,6 +321,10 @@ def _classify_error(err: Exception, message: str = "") -> str:
     """
     if isinstance(err, asyncio.CancelledError):
         return FAILURE_TEMPORARY
+    if isinstance(err, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        # Type-level network failures (an asyncio join timeout often
+        # carries an EMPTY message, so text matching alone misses it).
+        return FAILURE_NETWORK
     s = (message or str(err)).lower()
     # Ordered: most specific first.
     if isinstance(err, FloodWait) or "floodwait" in s or "retry after" in s or "420" in s \
@@ -358,6 +363,10 @@ def _failure_is_retryable(failure_class: str) -> bool:
 def _is_transient(err: Exception) -> bool:
     """Is this a transient/network error that should NOT trigger rejoin?"""
     if isinstance(err, asyncio.CancelledError):
+        return True
+    if isinstance(err, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        # Network-layer failures may carry an EMPTY message (e.g. an
+        # asyncio timeout from the join engine) - decide by type, not text.
         return True
     s = str(err).lower()
     return any(
@@ -1740,6 +1749,12 @@ class VoiceCallManager:
                     return False, "GroupCallInvalid (retrying)"
                 except Exception as e:
                     err_str = str(e)
+                    if not err_str:
+                        # Empty-message exceptions (asyncio.TimeoutError, a bare
+                        # ConnectionError, ...) must expose their type name,
+                        # otherwise the failure is logged as "Join error: "
+                        # and misclassified as non-retryable UNKNOWN.
+                        err_str = type(e).__name__
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
                         self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
@@ -1816,9 +1831,12 @@ class VoiceCallManager:
                     try:
                         join_task.result()
                     except Exception as exc:
+                        exc_str = str(exc)
+                        if not exc_str:
+                            exc_str = type(exc).__name__
                         if _is_transient(exc):
-                            return False, f"Join transport failed: {str(exc)[:80]}"
-                        return False, f"Join error: {str(exc)[:60]}"
+                            return False, f"Join transport failed: {exc_str[:80]} (retry deferred)"
+                        return False, f"Join error: {exc_str[:60]} (retry deferred)"
 
                 self._inflight_joins.pop(join_key, None)
                 self._set_state(order_id, account_id, RETRY_PENDING, "presence verification failed (timeout)")
@@ -1845,10 +1863,23 @@ class VoiceCallManager:
         base_delay = 1.0
         last_msg = "Join failed"
         attempt = 0
+        wall_timeout = _JOIN_PENDING_TIMEOUT + 30
         while attempt < hard_limit:
             attempt += 1
             started_at = time.time()
-            ok, msg = await self._join_call(pytg, app, chat_id, account_id, order_id, target)
+            try:
+                ok, msg = await asyncio.wait_for(
+                    self._join_call(pytg, app, chat_id, account_id, order_id, target),
+                    timeout=wall_timeout,
+                )
+            except asyncio.TimeoutError:
+                ok, msg = False, (
+                    f"join attempt wall-clock timeout after {wall_timeout}s "
+                    "(retry deferred)"
+                )
+            except asyncio.CancelledError:
+                # Order cancellation must always propagate.
+                raise
             finished_at = time.time()
             if ok:
                 return True, msg
