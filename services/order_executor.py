@@ -583,20 +583,51 @@ class OrderExecutor:
 	            )
 	            for acc in candidates
 	        ]
-	        results = await asyncio.gather(*wave_tasks, return_exceptions=True)
+	        # Hard wave deadline: ONE stuck account must never freeze the whole
+	        # build.  Stragglers are cancelled and deferred to a later wave —
+	        # the deferral itself does NOT consume their attempt budget.
+	        wave_timeout = max(10.0, float(getattr(Config, "VOICE_WAVE_TIMEOUT", 120)))
+	        done_w, pending_w = await asyncio.wait(
+	            wave_tasks, timeout=wave_timeout, return_when=asyncio.ALL_COMPLETED,
+	        )
+	        if pending_w:
+	            logger.warning(
+	                f"Order {order_id}: wave {wave_no} hit {wave_timeout:.0f}s deadline - "
+	                f"{len(pending_w)} account(s) still joining; deferred to a later wave"
+	            )
+	            for _t in pending_w:
+	                _t.cancel()
+	            # Let cancellation settle so the vcm state machines unwind cleanly.
+	            await asyncio.wait(list(pending_w), timeout=10)
+	        results: Dict[asyncio.Task, Any] = {}
+	        for _t in wave_tasks:
+	            if _t in done_w:
+	                try:
+	                    results[_t] = _t.result()
+	                except asyncio.CancelledError:
+	                    results[_t] = None
+	                except Exception as _exc:
+	                    results[_t] = {"success": False, "status": "error", "msg": str(_exc)}
+	            else:
+	                results[_t] = {
+	                    "success": False,
+	                    "status": "deferred",
+	                    "msg": f"wave deadline reached after {wave_timeout:.0f}s; retry deferred",
+	                }
 
 	        wave_ok = 0
 	        wave_fail = 0
 	        wave_dead = 0
-	        for acc, res in zip(candidates, results):
+	        for acc, _t in zip(candidates, wave_tasks):
+	            res = results.get(_t)
+	            if res is None:
+	                # Order was cancelled mid-flight — do not count attempts.
+	                continue
 	            aid = acc.get("id")
 	            if not aid:
 	                continue
 	            if isinstance(res, Exception):
 	                res = {"success": False, "status": "error", "msg": str(res)}
-	            if res is None:
-	                # Order was cancelled mid-flight — do not count attempts.
-	                continue
 	            if res.get("success"):
 	                if aid not in joined_ids:
 	                    joined_list.append(res)
@@ -605,48 +636,71 @@ class OrderExecutor:
 	                join_brain.report_result(order_id, OUTCOME_OK)
 	                continue
 
-	            # ── failure handling ──
-	            msg = str(res.get("msg") or "")
-	            status = res.get("status") or "failed"
-	            upper = msg.upper()
-	            if status == "dead" or any(x in upper for x in (
-	                "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-	                "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
-	            )):
-	                # Account itself is dead — mark inactive & replace.
-	                dead_count += 1
-	                wave_dead += 1
-	                self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
-	                self._voice_banned.setdefault(order_id, set()).add(aid)
-	                try:
-	                    await self._mark_account_dead(aid)
-	                except Exception:
-	                    pass
-	                join_brain.report_result(order_id, OUTCOME_DEAD, msg)
-	                wave_fail += 1
-	                continue
+	            # ── failure handling (whole block guarded: a bookkeeping bug
+	            #    for ONE account must never take the entire order down) ──
+	            try:
+	                msg = str(res.get("msg") or "")
+	                status = res.get("status") or "failed"
 
-	            attempts = self._voice_attempts.setdefault(order_id, {})
-	            n_att = attempts.get(aid, 0) + 1
-	            attempts[aid] = n_att
-	            outcome = join_brain.classify_message(msg)
-	            if n_att >= attempt_budget:
-	                # Retry budget exhausted → give up on this account; the
-	                # next wave replaces it with a fresh pool member.
-	                self._voice_banned.setdefault(order_id, set()).add(aid)
-	                logger.warning(
-	                    f"Order {order_id}: account {aid} gave up after {n_att} "
-	                    f"attempt(s) ({msg[:80]}) — replaced from pool"
+	                if status == "deferred":
+	                    # Wave deadline cancelled a still-joining account.  This
+	                    # is a scheduling artifact, NOT an account fault — keep
+	                    # the retry budget and retry soon in the next wave.
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + 5
+	                    logger.info(
+	                        f"Order {order_id}: account {aid} deferred by wave deadline - "
+	                        f"retrying in 5s (budget kept)"
+	                    )
+	                    wave_fail += 1
+	                    continue
+
+	                upper = msg.upper()
+	                if status == "dead" or any(x in upper for x in (
+	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
+	                )):
+	                    # Account itself is dead — mark inactive & replace.
+	                    dead_count += 1
+	                    wave_dead += 1
+	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    try:
+	                        await self._mark_account_dead(aid)
+	                    except Exception:
+	                        pass
+	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                    wave_fail += 1
+	                    continue
+
+	                attempts = self._voice_attempts.setdefault(order_id, {})
+	                n_att = attempts.get(aid, 0) + 1
+	                attempts[aid] = n_att
+	                outcome = join_brain.classify_message(msg)
+	                if n_att >= attempt_budget:
+	                    # Retry budget exhausted → give up on this account; the
+	                    # next wave replaces it with a fresh pool member.
+	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} gave up after {n_att} "
+	                        f"attempt(s) ({msg[:80]}) — replaced from pool"
+	                    )
+	                else:
+	                    delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
+	                    logger.info(
+	                        f"Order {order_id}: account {aid} attempt {n_att} failed "
+	                        f"({msg[:60]}); retry in {delay:.0f}s"
+	                    )
+	                join_brain.report_result(order_id, outcome, msg)
+	                wave_fail += 1
+	            except Exception as _bookkeep_err:
+	                # NEVER let one account's bookkeeping kill the whole order.
+	                logger.error(
+	                    f"Order {order_id}: wave bookkeeping error for account {aid}: "
+	                    f"{_bookkeep_err}",
+	                    exc_info=True,
 	                )
-	            else:
-	                delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
-	                self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
-	                logger.info(
-	                    f"Order {order_id}: account {aid} attempt {n_att} failed "
-	                    f"({msg[:60]}); retry in {delay:.0f}s"
-	                )
-	            join_brain.report_result(order_id, outcome, msg)
-	            wave_fail += 1
+	                wave_fail += 1
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))
