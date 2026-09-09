@@ -10,6 +10,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    environment:
+      # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
+      - TZ=${TZ:-Asia/Tehran}
     env_file:
       - path: .env
         required: false
