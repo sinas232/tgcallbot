@@ -702,12 +702,18 @@ class DatabaseManager:
     
     @staticmethod
     async def mark_order_as_running(order_id: int):
+        """Move the order to `running` WITHOUT starting the billable clock.
+
+        `started_at` stays NULL during the whole join/build phase so the
+        time accounts spend joining is never charged to the customer. The
+        executor stamps `started_at` (via start_order_duration) only after
+        the required accounts are present and the paid duration begins.
+        """
         async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
             await db_session.execute(
                 update(Order)
                 .where(Order.id == order_id)
-                .values(status='running', started_at=now)
+                .values(status='running')
             )
             await db_session.commit()
 
