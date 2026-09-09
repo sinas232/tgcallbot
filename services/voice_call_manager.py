@@ -1,27 +1,32 @@
 """
-VoiceCallManager — STRICT SEQUENTIAL Voice Chat Architecture (v5.0)
+VoiceCallManager — ADAPTIVE BATCH / PARALLEL Voice Chat Architecture (v6.0)
 
 REQUIRED BEHAVIOR (scope: voice_chat only):
-  Accounts join STRICTLY ONE BY ONE for a given order:
-    1 → verify → 2 → verify → 3 → verify → ... → target
-  The next account does NOT start joining until the previous account has
-  successfully joined AND its presence in the Voice Chat has been properly
-  verified.
+  Accounts of one order join in WAVES driven by the Join Brain
+  (services/join_brain.py): up to N accounts join + get verified
+  CONCURRENTLY (N starts at 5-10, adapts between 1 and the configured max
+  from live FloodWait / failure feedback), the next wave is released only
+  after the previous wave resolved, and every account is POSITIVELY
+  verified inside the Voice Chat before it is counted.
 
   KEY DESIGN PRINCIPLES:
-  1. STRICT SEQUENTIAL joins — a PER-ORDER lock serializes every join path
-     (executor join + monitor recovery/rejoin).  No worker pool, no parallel
-     asyncio.create_task join workers for the same order.
+  1. PARALLEL-but-bounded joins — a PER-ORDER ADAPTIVE JOIN GATE
+     (semaphore, capacity = configured max window) bounds every join path
+     (executor waves + monitor recovery/rejoin) for the same order.  The
+     Join Brain decides how many concurrent joins each wave may issue.
   2. PERSISTENT per-order joined state (`joined_accounts_by_order`) is the
      SOURCE OF TRUTH for counting.  It is NEVER decremented on temporary
-     verification failures / unknown / API errors.  Only removed at order end,
-     explicit cancellation, or a CONFIRMED & unrecoverable disconnect.
+     verification failures / unknown / API errors.  Only removed at order
+     end, explicit cancellation, or a CONFIRMED & unrecoverable disconnect
+     (released so the executor can REPLACE the dead slot with a fresh
+     account during the paid duration).
   3. Idempotent registration — an account is counted ONCE per order.  A
      reconnect/rejoin never increments the count again.
   4. ONCE JOINED, STAY INSIDE.  The monitor NEVER removes a healthy account.
      It only recovers a CONFIRMED_DISCONNECTED account by rejoining the SAME
-     account (without re-counting).
-  5. Each order has completely isolated state & its own join lock.
+     account (without re-counting); only after bounded rejoin attempts fail
+     is the slot marked UNRECOVERABLE for executor-side replacement.
+  5. Each order has completely isolated state & its own join gate.
     6. Join audio is open by default; muting remains an explicit configuration option.
   7. ONE PyTgCalls client per account, shared across ALL orders (multi-voice-chat).
   8. Group leave with reference counting — leave only when no orders remain.
@@ -116,15 +121,18 @@ _SILENCE_FRAMES = 48000 * _SILENCE_SECONDS
 
 from config import Config
 
-CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 5)))
-GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 8)))
+CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
+GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
 
-# For voice_chat, concurrency is STRICTLY 1 (one account at a time).
-# The per-order lock is the real guarantee; this semaphore caps total
-# native PyTgCalls join operations issued system-wide at any instant
-# so a large *multi-order* deployment stays bounded.  It never allows two
-# accounts of the SAME order to join in parallel because of the per-order lock.
+# ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
+# For voice_chat, each order owns a JOIN GATE whose capacity is the order's
+# configured MAX window (VOICE_JOIN_MAX_CONCURRENCY).  The Join Brain
+# (services/join_brain.py) decides how many accounts each wave issues; the
+# gate makes sure the sum of (wave joins + monitor recovery joins) for one
+# order NEVER exceeds the hard ceiling.  This semaphore additionally caps
+# total native PyTgCalls join operations issued system-wide at any instant
+# so a large *multi-order* deployment stays bounded.
 JOIN_CALL_SEMAPHORE = asyncio.Semaphore(GLOBAL_JOIN_CONCURRENCY)
 
 # Ultra-short human-like delay between connect attempts for the SAME account
@@ -421,15 +429,23 @@ class VoiceCallManager:
         # (joined_accounts_by_order remains the source of truth for order completion).
         self._presence_reconcilers: Dict[int, PresenceReconciler] = {}
 
-        # ═══ PER-ORDER JOIN LOCK ═══
-        # Guarantees that NO two code paths (executor join + monitor recovery join)
-        # can start a Join operation for the SAME order simultaneously. This is
-        # what enforces STRICT SEQUENTIAL joins (one account at a time).
-        self._order_join_locks: Dict[int, asyncio.Lock] = {}
+        # ═══ PER-ORDER ADAPTIVE JOIN GATE ═══
+        # A semaphore (NOT a plain lock) whose capacity is the order's
+        # configured MAX window.  It bounds every join path (executor waves
+        # + monitor recovery join) for the SAME order so at most `capacity`
+        # accounts of one order join concurrently.  How many of those slots
+        # each wave actually uses is decided adaptively by the Join Brain.
+        self._order_join_locks: Dict[int, asyncio.Semaphore] = {}
 
 # Per-order lifecycle bookkeeping (event/state driven).
         # order_timeline[order_id] = {started_at, end_time, target, expected, ...}
         self._order_timeline: Dict[int, Dict] = {}
+
+        # Per-account rejoin-failure counters inside the monitor: after
+        # VOICE_RECOVERY_MAX_ATTEMPTS failed recovery attempts the slot is
+        # marked UNRECOVERABLE so the executor can REPLACE it (instead of
+        # keeping a ghost that can never be brought back).
+        self._rejoin_failures: Dict[Tuple[int, int], int] = {}
 
         self._chat_refresh_cache: Dict[int, float] = {}
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
@@ -721,15 +737,32 @@ class VoiceCallManager:
         return snapshot
 
     def get_adaptive_limits(self, desired: int) -> Tuple[int, float]:
-        """For voice_chat, concurrency MUST be exactly 1 (strict sequential)."""
-        return 1, 0.0
+        """Report the per-order concurrency ceiling for voice_chat.
 
-# ─── ORDER LOCK helper ───
+        Actual per-wave concurrency is decided adaptively by the Join Brain
+        between VOICE_JOIN_MIN_CONCURRENCY and this ceiling.
+        """
+        return max(
+            1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))
+        ), 0.0
 
-    def _get_order_lock(self, order_id: int) -> asyncio.Lock:
-        if order_id not in self._order_join_locks:
-            self._order_join_locks[order_id] = asyncio.Lock()
-        return self._order_join_locks[order_id]
+# ─── ORDER JOIN GATE helper ───
+
+    def _get_order_gate(self, order_id: int) -> asyncio.Semaphore:
+        """Per-order adaptive join gate (semaphore).
+
+        Capacity = the order's configured MAX window — a HARD Telegram-safety
+        ceiling per order.  The Join Brain decides how many concurrent joins
+        each wave issues *below* that ceiling; recovery/rejoin of a confirmed
+        disconnect shares the same gate so it can never push an order over
+        its ceiling either.
+        """
+        gate = self._order_join_locks.get(order_id)
+        if gate is None:
+            capacity = max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10)))
+            gate = asyncio.Semaphore(capacity)
+            self._order_join_locks[order_id] = gate
+        return gate
 
 # ─── STATE MACHINE + DIAGNOSTICS ───
 
@@ -1650,7 +1683,7 @@ class VoiceCallManager:
             pass
         return False
 
-    # ─── SERIAL JOIN: the core fix ───
+    # ─── PARALLEL JOIN CORE (per-account, verification-driven) ───
 
     async def _join_call(self, pytg: PyTgCalls, app: Client, chat_id: int, account_id: int, order_id: int, target: str) -> Tuple[bool, str]:
         """
@@ -1804,8 +1837,8 @@ class VoiceCallManager:
         - RATE_LIMITED failures are persisted (server-provided wait) and the
           server-directed wait is respected via retry_at — never hammered.
         - PERMANENT / AUTHENTICATION failures return immediately (no retry storm).
-        - A failed Account N never releases Account N+1 (the caller's sequential
-          loop + per-order lock guarantee this).
+        - Each account attempt is independent: other accounts of the same wave
+          keep joining concurrently (bounded by the per-order adaptive gate).
         """
         trace_id = _uuid.uuid4().hex[:12]
         hard_limit = int(getattr(Config, 'VOICE_JOIN_RETRY_HARD_LIMIT', 2))
@@ -1905,32 +1938,39 @@ class VoiceCallManager:
         """
         Recover a CONFIRMED_DISCONNECTED account by rejoining the SAME account.
 
-        All under the per-order lock so it can never run parallel to another
-        join/recovery for the same order. register_join is idempotent → the
+        Every rejoin attempt passes through the per-order ADAPTIVE JOIN GATE
+        (semaphore, bounded by the order's max window) so recovery can never
+        push the order over its concurrency ceiling — and healthy wave joins
+        are never starved by recovery. register_join is idempotent → the
         count is NOT incremented when this account rejoins.
         """
-        async with self._get_order_lock(order_id):
-            if (order_id, account_id) not in self.active_calls \
-               and account_id not in self.joined_accounts_by_order.get(order_id, {}):
+        if (order_id, account_id) not in self.active_calls \
+           and account_id not in self.joined_accounts_by_order.get(order_id, {}):
+            return False
+        for attempt in range(1, MAX_REJOIN_ATTEMPTS + 1):
+            # Slot may have been released while we were waiting (order ended /
+            # cancelled / replaced by the executor).
+            if account_id not in self.joined_accounts_by_order.get(order_id, {}):
                 return False
-            for attempt in range(1, MAX_REJOIN_ATTEMPTS + 1):
-                try:
-                    await self._ensure_membership(app, chat_id, target)
-                except Exception:
-                    pass
-                try:
-                    await self._force_refresh_call(app, chat_id)
+            try:
+                await self._ensure_membership(app, chat_id, target)
+            except Exception:
+                pass
+            try:
+                await self._force_refresh_call(app, chat_id)
+                async with self._get_order_gate(order_id):
                     async with JOIN_CALL_SEMAPHORE:
                         rejoined, _msg = await self._join_call(pytg, app, chat_id, account_id, order_id, target)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    self._vc_event_log(order_id, account_id, "rejoin_failed", {"exc": str(e)[:60]})
-                    rejoined = False
-                if rejoined:
-                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._vc_event_log(order_id, account_id, "rejoin_failed", {"exc": str(e)[:60]})
+                rejoined = False
+            if rejoined:
+                return True
+            if attempt < MAX_REJOIN_ATTEMPTS:
                 await asyncio.sleep(min(REJOIN_BACKOFF_BASE * attempt, 30))
-            return False
+        return False
 
     async def _monitor_loop(self, order_id: int) -> None:
         """
@@ -1944,10 +1984,13 @@ class VoiceCallManager:
              - False                → CHECK_FAILED (increment; only after several
                                       consecutive confirmed absences → genuine)
           5. On CONFIRMED_DISCONNECTED → recover by rejoining the SAME account
-             under the per-order lock (never re-counts, never touches healthy
-             accounts).
+             through the per-order adaptive join gate (never re-counts, never
+             touches healthy accounts); after VOICE_RECOVERY_MAX_ATTEMPTS
+             failed recoveries the slot is marked UNRECOVERABLE so the
+             executor can replace it with a fresh account.
           6. NEVER pops from joined_accounts_by_order on a temporary failure.
-             Only drops if a confirmed disconnect cannot be recovered (rare).
+             Slots are only released for replacement after a confirmed
+             disconnect could NOT be recovered (bounded attempts).
         """
         fail_cycles: Dict[int, int] = {}  # account_id -> consecutive confirmed absences
         try:
@@ -1990,6 +2033,10 @@ class VoiceCallManager:
                         if acc_id not in self.joined_accounts_by_order.get(order_id, {}):
                             continue
                         rec = acc_info.get(acc_id) or {}
+                        # Slot already proven unrecoverable → executor will
+                        # replace it; don't keep retrying it forever.
+                        if rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE":
+                            continue
                         tgt = rec.get("target") or ""
                         cid = int(rec.get("chat_id") or chat_id)
                         app = self.pyrogram_clients.get(acc_id)
@@ -2042,6 +2089,8 @@ class VoiceCallManager:
                             # JOINED — confirmed present.
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
+                            self._rejoin_failures.pop((order_id, acc_id), None)
+                            rec.pop("unrecoverable", None)
                             rec["status"] = "JOINED"
                             rec["last_ok"] = time.time()
                             # Ensure transport bookkeeping still present (idempotent).
@@ -2094,17 +2143,37 @@ class VoiceCallManager:
                         if rejoined:
                             # Same account rejoined — DO NOT increment count.
                             fail_cycles.pop(acc_id, None)
+                            self._rejoin_failures.pop((order_id, acc_id), None)
                             self._vc_event_log(order_id, acc_id, "rejoined_same_account", {"chat_id": cid})
                             rec["status"] = "JOINED"
                         else:
-                            # Unrecoverable confirmed disconnect (rare). We do NOT
-                            # remove it automatically here — the order may still be
-                            # active; the executor's end-of-order cleanup handles it.
-                            # Keeping the durable count intact is preferred over
-                            # churning the set. We lower the fail threshold to avoid
-                            # an infinite loop but do NOT decrement the count.
-                            fail_cycles[acc_id] = max(0, fc - 3)
-                            self._vc_event_log(order_id, acc_id, "rejoin_failed_unrecoverable", {"chat_id": cid})
+                            # Recovery failed. Bounded retries: after
+                            # VOICE_RECOVERY_MAX_ATTEMPTS failed recoveries the
+                            # slot is marked UNRECOVERABLE (still counted) so
+                            # the executor can REPLACE it with a fresh account
+                            # while the order's paid duration is still running.
+                            key = (order_id, acc_id)
+                            rjf = self._rejoin_failures.get(key, 0) + 1
+                            self._rejoin_failures[key] = rjf
+                            recovery_limit = max(1, int(getattr(Config, "VOICE_RECOVERY_MAX_ATTEMPTS", 3)))
+                            if rjf >= recovery_limit:
+                                rec["unrecoverable"] = True
+                                rec["status"] = "UNRECOVERABLE"
+                                self._account_states_by_order.setdefault(order_id, {})[acc_id] = "UNRECOVERABLE"
+                                self._vc_event_log(order_id, acc_id, "slot_unrecoverable", {
+                                    "chat_id": cid,
+                                    "rejoin_attempts": rjf,
+                                    "verdict": "ready_for_replacement",
+                                })
+                                logger.warning(
+                                    f"Order {order_id} acc {acc_id}: slot UNRECOVERABLE after "
+                                    f"{rjf} failed rejoin attempts — executor will replace it"
+                                )
+                            else:
+                                # Lower the fail threshold so the next cycle
+                                # retries without an infinite hot loop.
+                                fail_cycles[acc_id] = max(0, fc - 3)
+                                self._vc_event_log(order_id, acc_id, "rejoin_failed_unrecoverable", {"chat_id": cid})
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -2116,7 +2185,10 @@ class VoiceCallManager:
 
     def is_slot_healthy(self, order_id: int, account_id: int) -> bool:
         rec = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
-        return bool(rec) and rec.get("status") in ("JOINED", "TEMPORARILY_UNKNOWN", "CHECK_FAILED", "CONFIRMED_DISCONNECTED")
+        return bool(rec) and rec.get("status") in (
+            "JOINED", "TEMPORARILY_UNKNOWN", "CHECK_FAILED",
+            "CONFIRMED_DISCONNECTED", "UNRECOVERABLE",
+        )
 
     async def verify_order_presence(self, order_id: int) -> int:
         """Return the persistent joined count (stable source of truth)."""
@@ -2136,47 +2208,73 @@ class VoiceCallManager:
             self._reservations[order_id] = set(account_ids)
 
     async def warmup_clients(self, accounts: List[Dict], limit: int = 0) -> int:
-        """Pre-create clients with minimal delays."""
-        warmed = 0
+        """Pre-create Pyrogram clients CONCURRENTLY (bounded) for a wave.
+
+        Used by the Join Brain to warm the NEXT wave's accounts while the
+        CURRENT wave is still joining — this is what removes the
+        per-account client-start latency from the critical path at
+        100-500-account scale.  Every client creation is guarded by the
+        account lock (no double-start races) and the global
+        CLIENT_CREATE_SEMAPHORE (no startup storm).
+        """
         to_warm = accounts if limit <= 0 else accounts[:limit]
+        candidates: List[Dict] = []
         for acc in to_warm:
             try:
-                session_string = acc.get("session_string")
                 account_id = acc.get("id")
+                session_string = acc.get("session_string")
                 if not session_string or not account_id:
                     continue
                 if account_id in self.pyrogram_clients:
-                    warmed += 1
                     continue
-                decrypted_session = SecurityManager.decrypt_session(session_string)
-                if not decrypted_session:
-                    continue
-                async with CLIENT_CREATE_SEMAPHORE:
-                    helper = TelegramAccountClient("temp", session_string, account_id)
-                    api_id, api_hash = await helper._get_api_credentials()
-                    app = Client(
-                        f"shared_client_{account_id}",
-                        session_string=decrypted_session,
-                        api_id=api_id,
-                        api_hash=api_hash,
-                        # Voice clients must receive raw updates from Telegram.
-                        no_updates=False,
-                        in_memory=True,
-                    )
-                    await asyncio.wait_for(app.start(), timeout=15)
-                    self.pyrogram_clients[account_id] = app
-                    self._session_cache[account_id] = session_string
-                    warmed += 1
+                candidates.append(acc)
+            except Exception:
+                continue
+
+        warmed = 0
+
+        async def _warm_one(acc: Dict) -> None:
+            nonlocal warmed
+            account_id = acc.get("id")
+            session_string = acc.get("session_string")
+            try:
+                async with self._lock(account_id):
+                    # Re-check under the lock (a concurrent join may have
+                    # already created this client).
+                    if account_id in self.pyrogram_clients:
+                        return
+                    decrypted_session = SecurityManager.decrypt_session(session_string)
+                    if not decrypted_session:
+                        return
+                    async with CLIENT_CREATE_SEMAPHORE:
+                        helper = TelegramAccountClient("temp", session_string, account_id)
+                        api_id, api_hash = await helper._get_api_credentials()
+                        app = Client(
+                            f"shared_client_{account_id}",
+                            session_string=decrypted_session,
+                            api_id=api_id,
+                            api_hash=api_hash,
+                            # Voice clients must receive raw updates from Telegram.
+                            no_updates=False,
+                            in_memory=True,
+                        )
+                        await asyncio.wait_for(app.start(), timeout=15)
+                        self.pyrogram_clients[account_id] = app
+                        self._session_cache[account_id] = session_string
+                        warmed += 1
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
-                self._vc_event_log(None, acc.get("id"), "session_revoked_warmup", {})
-                continue
+                self._vc_event_log(None, account_id, "session_revoked_warmup", {})
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self._vc_event_log(None, acc.get("id"), "warmup_error", {"exc": str(e)[:60]})
-                continue
+                self._vc_event_log(None, account_id, "warmup_error", {"exc": str(e)[:60]})
+
+        if candidates:
+            await asyncio.gather(*(_warm_one(acc) for acc in candidates), return_exceptions=True)
         return warmed
 
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
-        """Start a voice call for one account — STRICT SEQUENTIAL (per-order lock)."""
+        """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
         key = (order_id, account_id)
 
         # If already durably joined & counted for this order, return success
@@ -2191,9 +2289,11 @@ class VoiceCallManager:
                 }
             return True, "Already active in this order", cid
 
-        # ═══ STRICT SEQUENTIAL: acquire the PER-ORDER lock ═══
-        # No other account for THIS order can be joining while we hold this lock.
-        async with self._get_order_lock(order_id):
+        # ═══ ADAPTIVE PARALLEL: acquire the PER-ORDER JOIN GATE ═══
+        # The gate is a semaphore sized to the order's MAX window; up to
+        # `window` accounts of THIS order may be inside simultaneously, each
+        # going through its own join+verify lifecycle below.
+        async with self._get_order_gate(order_id):
             # Double-check under the lock (another path may have joined already).
             if account_id in self.joined_accounts_by_order.get(order_id, {}):
                 cid = int((self.joined_accounts_by_order[order_id][account_id]).get("chat_id") or 0)
@@ -2205,19 +2305,16 @@ class VoiceCallManager:
                     }
                 return True, "Already active in this order", cid
 
-# ═══ EVENT/STATE-DRIVEN PROGRESSION (NO FIXED JOIN INTERVAL) ═══
-            # There is NO artificial delay between accounts. This account may
-            # start NOW because it is released by the PREVIOUS account having
-            # reached CONFIRMED_JOINED — guaranteed by the per-order lock and
-            # the sequential executor loop (Account N+1 is not selected until
-            # Account N's join was positively verified). The lazy Pyrogram
-            # client for THIS account is created only now, at its turn.
+# ═══ EVENT/STATE-DRIVEN PROGRESSION (ADAPTIVE WAVES) ═══
+            # This account is one of up-to-`window` accounts joining in the
+            # current wave. Its Pyrogram client may already be warm (the Join
+            # Brain pre-warms the next wave while the current one joins);
+            # otherwise it is created now. The per-account state machine
+            # below tracks each account independently through join + verify.
             self._set_state(order_id, account_id, STARTING, "account selected, starting")
             logger.info(f"[VoiceScheduler] Order {order_id}: starting account {account_id}")
 
-            # LAZY / JUST-IN-TIME Pyrogram initialization.  The client for this
-            # account is created ONLY now, when its turn arrives.  No future
-            # account's client is touched here (no startup storm).
+            # Client init (cached per account, bounded by CLIENT_CREATE_CONCURRENCY).
             logger.info(f"[VoiceScheduler] Order {order_id}: creating Pyrogram client for account {account_id}")
             try:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
@@ -2354,7 +2451,13 @@ class VoiceCallManager:
         # Remove from persistent joined state (order is ending / cancelling).
         removed = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
         if removed is not None:
-            (self._account_states_by_order.pop(order_id, None) or {}).pop(account_id, None)
+            # Remove ONLY this account's state — never wipe the whole order's
+            # state dict (that would drop every other account's machine).
+            acc_states = self._account_states_by_order.get(order_id)
+            if acc_states is not None:
+                acc_states.pop(account_id, None)
+            self._account_meta_by_order.get(order_id, {}).pop(account_id, None)
+            self._rejoin_failures.pop((order_id, account_id), None)
 
         # Cancel keepalive
         ka = self._keepalive_tasks.pop(key, None)
@@ -2432,13 +2535,53 @@ class VoiceCallManager:
         ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._stop_monitor(order_id)
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)
         self.order_chat_ids.pop(order_id, None)
         self.joined_accounts_by_order.pop(order_id, None)
         self._account_states_by_order.pop(order_id, None)
+        self._account_meta_by_order.pop(order_id, None)
+        self._order_timeline.pop(order_id, None)
         self._order_join_locks.pop(order_id, None)
+        for key in [k for k in self._rejoin_failures if k[0] == order_id]:
+            self._rejoin_failures.pop(key, None)
         return len(keys)
+
+    # ─── UNRECOVERABLE-SLOT API (executor-side replacement support) ───
+
+    def get_unrecoverable_account_ids(self, order_id: int) -> Set[int]:
+        """Accounts whose slot was proven unrecoverable by the monitor.
+
+        They are STILL durably counted (so the durable count never drops on
+        its own); the executor decides when to release + replace them.
+        """
+        joined = self.joined_accounts_by_order.get(order_id, {})
+        return {
+            aid for aid, rec in joined.items()
+            if rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE"
+        }
+
+    def get_unrecoverable_slots(self, order_id: int) -> Dict[int, Dict]:
+        joined = self.joined_accounts_by_order.get(order_id, {})
+        return {
+            aid: dict(rec) for aid, rec in joined.items()
+            if rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE"
+        }
+
+    async def release_unrecoverable_slot(self, order_id: int, account_id: int,
+                                         leave_group: bool = False) -> Tuple[bool, str]:
+        """Release an unrecoverable slot so a fresh account can replace it.
+
+        Only a slot the monitor already proved unrecoverable may be released
+        this way — a healthy / temporarily-unknown account is NEVER dropped.
+        """
+        rec = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
+        if not rec or not (rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE"):
+            return False, "Slot is not unrecoverable (kept)"
+        self._vc_event_log(order_id, account_id, "slot_released_for_replacement", {})
+        await self.stop_call(order_id, account_id, leave_group=leave_group, cleanup_client=False)
+        return True, "Slot released for replacement"
 
     async def cleanup_all(self) -> None:
         """Cleanup everything — for shutdown."""

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import time
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -9,6 +10,7 @@ from database import DatabaseManager
 from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
+from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +37,27 @@ def _get_voice_call_manager():
 class OrderExecutor:
 	"""
 	Core executor for Telegram orders (voice chat, group join, etc.).
+
+	Voice-chat orders use the ADAPTIVE BATCH architecture: accounts join in
+	waves of N concurrent verified joins (N decided by the Join Brain from
+	live FloodWait / failure feedback). Failed accounts are replaced from
+	the account pool, disconnected accounts are re-joined by the
+	VoiceCallManager monitor, and slots proven unrecoverable during the
+	paid duration are replaced with fresh accounts.
 	"""
 
 	def __init__(self):
 		self.active_orders: Dict[int, Dict[str, Any]] = {}
-		# Per-order lock: guarantees that two different code paths can NEVER
-		# start a Join operation for the same order simultaneously.  Critical
-		# for STRICT SEQUENTIAL voice-chat joins.
-		self._order_locks: Dict[int, asyncio.Lock] = {}
 		self.app = None
+
+		# ─── Join Brain per-order scratch state (voice_chat) ───
+		# Kept OUTSIDE `active_orders` so it survives across build →
+		# duration-maintenance calls of the same order.
+		self._voice_pool: Dict[int, List[Dict]] = {}          # eligible account pool (merged/refreshed)
+		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
+		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
+		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
+		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 
 	def init_app(self, application):
 		self.app = application
@@ -80,23 +94,24 @@ class OrderExecutor:
 
 	async def _get_voice_settings(self, bot_id: int, desired: int) -> Tuple[int, float]:
 		"""
-		Voice-chat concurrency is STRICTLY 1 (one account at a time).
-		The order_type is resolved by the caller; this helper is only used by
-		the shared executor path and returns the safe sequential default.
+		Return the per-order voice concurrency CEILING (hard Telegram-safety
+		cap). Actual per-wave concurrency is adapted between the configured
+		min and this ceiling by the Join Brain — see _voice_batched_fill.
 		"""
 		vcm = _get_voice_call_manager()
 		if vcm and hasattr(vcm, "get_adaptive_limits"):
 			try:
 				concurrency, join_delay = vcm.get_adaptive_limits(desired)
 				logger.info(
-					f"[VoiceSettings] desired={desired} concurrency={concurrency} "
-					f"delay={join_delay}s (strict sequential active)"
+					f"[VoiceSettings] desired={desired} ceiling={concurrency} "
+					f"(adaptive waves active: min={getattr(Config, 'VOICE_JOIN_MIN_CONCURRENCY', 1)} "
+					f"initial={getattr(Config, 'VOICE_JOIN_INITIAL_CONCURRENCY', 5)})"
 				)
 				return concurrency, join_delay
 			except Exception:
 				pass
-		# fallback: strict sequential (1 at a time)
-		return 1, 0.0
+		# fallback: fixed safe ceiling
+		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
 	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
 		if order_id in self.active_orders:
@@ -121,201 +136,612 @@ class OrderExecutor:
 		self.active_orders[order_id]["task"] = task
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
-		joined_list: List[Dict[str, Any]] = []
-		dead_count = 0
-		try:
-			requested = int(data["accounts_count"])
-			bot_id = data.get("bot_id", 1)
-			target = data["target_link"]
-			duration = int(data.get("duration_minutes") or 0)
-			order_type = data["order_type"]
+	    joined_list: List[Dict[str, Any]] = []
+	    dead_count = 0
+	    build_started_wall = time.time()
+	    try:
+	        requested = int(data["accounts_count"])
+	        bot_id = data.get("bot_id", 1)
+	        target = data["target_link"]
+	        duration = int(data.get("duration_minutes") or 0)
+	        order_type = data["order_type"]
 
-			vcm = _get_voice_call_manager()
-			eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
-			exact = min(requested, eligible_count)
-			logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
+	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
+	        exact = min(requested, eligible_count)
+	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
 
-			if exact <= 0:
-				await self._fail_order(order_id, "No eligible active accounts available.")
-				return
+	        if exact <= 0:
+	            await self._fail_order(order_id, "No eligible active accounts available.")
+	            return
 
-			if order_id in self.active_orders:
-				self.active_orders[order_id]["target_count"] = exact
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["target_count"] = exact
 
-			await self._log_to_channel("started", order_id, data, bot_id=bot_id)
+	        await self._log_to_channel("started", order_id, data, bot_id=bot_id)
 
-			concurrency, join_delay = await self._get_voice_settings(bot_id, exact)
-			if order_type == "voice_chat":
-				# STRICT SEQUENTIAL: voice-chat accounts join ONE BY ONE.
-				concurrency = 1
-				join_delay = 0.0
-			else:
-				concurrency = 8
-				join_delay = 0.5
+	        # ────────────────────────────────────────────────────────────
+	        # BUILD PHASE — join time is NEVER part of the purchased window.
+	        # Voice orders: ADAPTIVE BATCH fill — waves of N accounts join &
+	        # get verified CONCURRENTLY; N adapts to FloodWait/failure rates
+	        # (Join Brain); failed accounts are retried (bounded) and then
+	        # replaced from the pool; next wave starts only after the
+	        # previous one fully resolved.
+	        # ────────────────────────────────────────────────────────────
+	        if order_type == "voice_chat":
+	            joined_list, dead_count = await self._voice_batched_fill(
+	                order_id=order_id,
+	                target=target,
+	                bot_id=bot_id,
+	                target_count=exact,
+	                requested=requested,
+	            )
+	        else:
+	            concurrency = 8
+	            join_delay = 0.5
+	            logger.info(f"Order {order_id}: group/channel fill concurrency={concurrency}, delay={join_delay}s")
+	            joined_list, dead_count = await self._progressive_fill(
+	                order_id=order_id,
+	                order_type=order_type,
+	                target=target,
+	                bot_id=bot_id,
+	                target_count=exact,
+	                requested=requested,
+	                concurrency=concurrency,
+	                join_delay=join_delay,
+	                duration_minutes=duration,
+	            )
 
-			logger.info(f"Order {order_id}: concurrency={concurrency}, delay={join_delay}s")
+	        if not self._is_order_active(order_id):
+	            await self._cleanup_order(order_id, joined_list, data)
+	            await DatabaseManager.update_order_status(order_id, "stopped")
+	            self.active_orders.pop(order_id, None)
+	            return
 
-			joined_list, dead_count = await self._progressive_fill(
-				order_id=order_id,
-				order_type=order_type,
-				target=target,
-				bot_id=bot_id,
-				target_count=exact,
-				requested=requested,
-				concurrency=concurrency,
-				join_delay=join_delay,
-				duration_minutes=duration,
-			)
+	        joined_list = self._prune_joined(order_id, order_type, joined_list)
+	        live = self._live_count(order_id, order_type, joined_list)
 
-			if not self._is_order_active(order_id):
-				await self._cleanup_order(order_id, joined_list, data)
-				await DatabaseManager.update_order_status(order_id, "stopped")
-				self.active_orders.pop(order_id, None)
-				return
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["joined_accounts"] = joined_list
+	            self.active_orders[order_id]["dead_accounts_count"] = dead_count
+	            self.active_orders[order_id]["live_count"] = live
 
-			joined_list = self._prune_joined(order_id, order_type, joined_list)
-			live = self._live_count(order_id, order_type, joined_list)
+	        # Group/channel builds that ended below target get a bounded
+	        # progressive top-up.  Voice builds already swept the ENTIRE pool
+	        # (incl. bounded retries) so no second pass is needed here —
+	        # replacements during the paid phase are handled separately by
+	        # _voice_duration_maintenance.
+	        if order_type != "voice_chat" and live < exact and self._is_order_active(order_id):
+	            logger.warning(f"Order {order_id}: incomplete {live}/{exact} - progressive top-up")
+	            more, d2 = await self._refill_order(
+	                order_id=order_id,
+	                order_type=order_type,
+	                target=target,
+	                bot_id=bot_id,
+	                joined_list=joined_list,
+	                target_count=exact,
+	                concurrency=concurrency,
+	                join_delay=join_delay,
+	                duration_minutes=duration,
+	            )
+	            dead_count += d2
+	            have = {(e.get("acc") or {}).get("id") for e in joined_list}
+	            for e in more:
+	                if (e.get("acc") or {}).get("id") not in have:
+	                    joined_list.append(e)
+	            joined_list = self._prune_joined(order_id, order_type, joined_list)
+	            live = self._live_count(order_id, order_type, joined_list)
 
-			if order_id in self.active_orders:
-				self.active_orders[order_id]["joined_accounts"] = joined_list
-				self.active_orders[order_id]["dead_accounts_count"] = dead_count
-				self.active_orders[order_id]["live_count"] = live
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["live_count"] = live
 
-			# If the build phase did not reach target (e.g. some accounts failed),
-			# top up progressively with fresh accounts. This only happens during
-			# the BUILD phase — NOT during the active duration. Once the order is
-			# in its duration phase, the count is stable and never refilled.
-			if live < exact and self._is_order_active(order_id):
-				logger.warning(f"Order {order_id}: incomplete {live}/{exact} - progressive top-up")
-				more, d2 = await self._refill_order(
-					order_id=order_id,
-					order_type=order_type,
-					target=target,
-					bot_id=bot_id,
-					joined_list=joined_list,
-					target_count=exact,
-					concurrency=concurrency,
-					join_delay=join_delay,
-					duration_minutes=duration,
-				)
-				dead_count += d2
-				have = {(e.get("acc") or {}).get("id") for e in joined_list}
-				for e in more:
-					if (e.get("acc") or {}).get("id") not in have:
-						joined_list.append(e)
-				joined_list = self._prune_joined(order_id, order_type, joined_list)
-				live = self._live_count(order_id, order_type, joined_list)
+	        if live == 0:
+	            await self._fail_order(order_id, "All accounts failed to join.")
+	            return
 
-			if order_id in self.active_orders:
-				self.active_orders[order_id]["live_count"] = live
+	        # ────────────────────────────────────────────────────────────
+	        # DURATION PHASE — the billable timer starts ONLY NOW that the
+	        # required accounts are present (join/build time is free).
+	        # ────────────────────────────────────────────────────────────
+	        if duration > 0:
+	            try:
+	                started_at = await DatabaseManager.start_order_duration(order_id)
+	            except Exception as exc:
+	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
+	                started_at = None
+	            started_at = started_at or datetime.utcnow()
+	            end_time = started_at + timedelta(minutes=duration)
+	            total_secs = duration * 60
+	            logger.info(
+	                f"Order {order_id}: BUILD completed in {time.time() - build_started_wall:.0f}s "
+	                f"(live={live}/{exact}). Billable timer NOW STARTING — "
+	                f"{_format_timer(total_secs)} | deadline={end_time.strftime('%H:%M:%S')} UTC"
+	            )
 
-			if live == 0:
-				await self._fail_order(order_id, "All accounts failed to join.")
-				return
+	            if order_id in self.active_orders:
+	                self.active_orders[order_id]["end_time"] = end_time
+	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
 
-			# Duration phase — monitor timer.
-			if duration > 0:
-				# The paid service window starts when the order starts, not after
-				# the sequential account build finishes.
-				started_at = (await DatabaseManager.get_order(order_id) or {}).get("started_at")
-				started_at = started_at or datetime.utcnow()
-				end_time = started_at + timedelta(minutes=duration)
-				total_secs = duration * 60
-				logger.info(
-					f"Order {order_id}: starting timer {_format_timer(total_secs)} | "
-					f"deadline={end_time.strftime('%H:%M:%S')} UTC | live={live}/{exact}"
-				)
+	            _tick = 0
+	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
+	            _log_interval = 10
 
-				if order_id in self.active_orders:
-					self.active_orders[order_id]["end_time"] = end_time
-					self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
+	            while True:
+	                now_utc = datetime.utcnow()
+	                remaining_now = (end_time - now_utc).total_seconds()
 
-				_tick = 0
-				_check_interval = 15
-				_log_interval = 10
+	                if not self._is_order_active(order_id):
+	                    logger.info(f"Order {order_id}: cancelled - ejecting all accounts NOW")
+	                    await self._cleanup_order(order_id, joined_list, data)
+	                    await DatabaseManager.update_order_status(order_id, "stopped")
+	                    try:
+	                        await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id, reason="User cancelled")
+	                    except Exception:
+	                        pass
+	                    self.active_orders.pop(order_id, None)
+	                    return
 
-				while True:
-					now_utc = datetime.utcnow()
-					remaining_now = (end_time - now_utc).total_seconds()
+	                if remaining_now <= 0:
+	                    break
 
-					if not self._is_order_active(order_id):
-						logger.info(f"Order {order_id}: cancelled - ejecting all accounts NOW")
-						await self._cleanup_order(order_id, joined_list, data)
-						await DatabaseManager.update_order_status(order_id, "stopped")
-						try:
-							await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id, reason="User cancelled")
-						except Exception:
-							pass
-						self.active_orders.pop(order_id, None)
-						return
+	                if order_id in self.active_orders:
+	                    self.active_orders[order_id]["remaining_seconds"] = remaining_now
 
-					if remaining_now <= 0:
-						break
+	                if _tick % _log_interval == 0:
+	                    logger.info(
+	                        f"Order {order_id}: {_format_timer(remaining_now)} "
+	                        f"| live={live}/{exact}"
+	                    )
 
-					if order_id in self.active_orders:
-						self.active_orders[order_id]["remaining_seconds"] = remaining_now
+	                if _tick % _check_interval == 0 and _tick > 0:
+	                    if not self._is_order_active(order_id):
+	                        logger.info(f"Order {order_id}: cancelled — ejecting all accounts")
+	                        await self._cleanup_order(order_id, joined_list, data)
+	                        await DatabaseManager.update_order_status(order_id, "stopped")
+	                        try:
+	                            await self._log_to_channel(
+	                                "cancelled", order_id, data,
+	                            success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id,
+	                            reason="User cancelled",
+	                            )
+	                        except Exception:
+	                            pass
+	                        self.active_orders.pop(order_id, None)
+	                        return
 
-					if _tick % _log_interval == 0:
-						logger.info(
-							f"Order {order_id}: {_format_timer(remaining_now)} "
-							f"| live={live}/{exact}"
-						)
+	                    # Update live count from PERSISTENT per-order state.
+	                    # This NEVER decreases on temporary verification
+	                    # failures.  Disconnects are re-joined by the monitor
+	                    # (SAME account, never re-counted); slots the monitor
+	                    # proved UNRECOVERABLE are REPLACED with fresh
+	                    # accounts so presence stays at target until the real
+	                    # deadline.
+	                    joined_list = self._prune_joined(order_id, order_type, joined_list)
+	                    live = self._live_count(order_id, order_type, joined_list)
+	                    if order_type == "voice_chat":
+	                        try:
+	                            await self._voice_duration_maintenance(order_id, data, end_time)
+	                        except asyncio.CancelledError:
+	                            raise
+	                        except Exception as exc:
+	                            logger.warning(f"Order {order_id}: duration maintenance error: {exc}")
+	                        order_info = self.active_orders.get(order_id)
+	                        if order_info:
+	                            joined_list = order_info.get("joined_accounts") or joined_list
+	                            live = self._live_count(order_id, order_type, joined_list)
+	                    if order_id in self.active_orders:
+	                        self.active_orders[order_id]["live_count"] = live
+	                        self.active_orders[order_id]["joined_accounts"] = joined_list
+	                    logger.info(
+	                        f"Order {order_id}: stable live={live}/{exact} "
+	                        f"(rejoin by monitor; unrecoverable slots replaced)"
+	                    )
 
-					if _tick % _check_interval == 0 and _tick > 0:
-						if not self._is_order_active(order_id):
-							logger.info(f"Order {order_id}: cancelled — ejecting all accounts")
-							await self._cleanup_order(order_id, joined_list, data)
-							await DatabaseManager.update_order_status(order_id, "stopped")
-							try:
-								await self._log_to_channel(
-									"cancelled", order_id, data,
-									success_cnt=len(joined_list), bot_id=bot_id,
-									reason="User cancelled",
-								)
-							except Exception:
-								pass
-							self.active_orders.pop(order_id, None)
-							return
+	                await asyncio.sleep(min(1.0, max(0.0, remaining_now)))
+	                _tick += 1
 
-						# Update live count from PERSISTENT per-order state.
-						# This NEVER decreases on temporary verification failures.
-						# Voice-chat orders do NOT refill/prune during the active
-						# phase — once target is reached, the count stays stable and
-						# all accounts remain inside the Voice Chat until the order
-						# duration ends. Recovery of a genuinely disconnected account
-						# is handled by the voice_call_manager monitor (rejoin SAME
-						# account, never re-counts).
-						joined_list = self._prune_joined(order_id, order_type, joined_list)
-						live = self._live_count(order_id, order_type, joined_list)
-						if order_id in self.active_orders:
-							self.active_orders[order_id]["live_count"] = live
-							self.active_orders[order_id]["joined_accounts"] = joined_list
-						logger.info(
-							f"Order {order_id}: stable live={live}/{exact} "
-							f"(persistent count, no refill during active order)"
-						)
+	            logger.info(
+	                f"Order {order_id}: timer ended after {_format_timer(total_secs)} "
+	                f"— ejecting all accounts"
+	            )
+	            await self._finish_order(order_id, data, joined_list, dead_count)
+	        else:
+	            await self._finish_order(order_id, data, joined_list, dead_count)
 
-					await asyncio.sleep(min(1.0, max(0.0, remaining_now)))
-					_tick += 1
+	    except asyncio.CancelledError:
+	        await self._cleanup_order(order_id, joined_list, data)
+	        await DatabaseManager.update_order_status(order_id, "stopped")
+	        try: await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, data.get("order_type"), joined_list), bot_id=data.get("bot_id", 1))
+	        except: pass
+	        self.active_orders.pop(order_id, None)
+	    except Exception as e:
+	        logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
+	        await self._cleanup_order(order_id, joined_list, data)
+	        await self._fail_order(order_id, f"System Error: {e}")
 
-				logger.info(
-					f"Order {order_id}: timer ended after {_format_timer(total_secs)} "
-					f"— ejecting all accounts"
-				)
-				await self._finish_order(order_id, data, joined_list, dead_count)
-			else:
-				await self._finish_order(order_id, data, joined_list, dead_count)
+	# ═══════════════════════════════════════════════════════════════════
+	# JOIN BRAIN — ADAPTIVE BATCH FILL (voice_chat)
+	# ═══════════════════════════════════════════════════════════════════
 
-		except asyncio.CancelledError:
-			await self._cleanup_order(order_id, joined_list, data)
-			await DatabaseManager.update_order_status(order_id, "stopped")
-			try: await self._log_to_channel("cancelled", order_id, data, success_cnt=len(joined_list), bot_id=data.get("bot_id", 1))
-			except: pass
-			self.active_orders.pop(order_id, None)
-		except Exception as e:
-			logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
-			await self._cleanup_order(order_id, joined_list, data)
-			await self._fail_order(order_id, f"System Error: {e}")
+	def _voice_state(self, order_id: int) -> None:
+	    """Make sure per-order Join-Brain scratch state exists."""
+	    self._voice_pool.setdefault(order_id, [])
+	    self._voice_attempts.setdefault(order_id, {})
+	    self._voice_banned.setdefault(order_id, set())
+	    self._voice_retry_after.setdefault(order_id, {})
+	    self._voice_cursor.setdefault(order_id, 0)
+
+	def _voice_forget_order(self, order_id: int) -> None:
+	    """Release all Join-Brain scratch state for an order (idempotent)."""
+	    try:
+	        join_brain.forget_order(order_id)
+	    except Exception:
+	        pass
+	    self._voice_pool.pop(order_id, None)
+	    self._voice_attempts.pop(order_id, None)
+	    self._voice_banned.pop(order_id, None)
+	    self._voice_retry_after.pop(order_id, None)
+	    self._voice_cursor.pop(order_id, None)
+
+	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
+	    """Load (or refresh) the eligible-account pool for an order.
+
+	    Existing entries keep their order (deterministic per-order shuffle);
+	    newly added accounts are appended at the end.  Refreshing also drops
+	    accounts that were marked inactive meanwhile (dead sessions).
+	    """
+	    current = self._voice_pool.get(order_id, [])
+	    page = max(100, int(getattr(Config, "BATCH_SIZE", 20)))
+	    offset = 0
+	    fetched: List[Dict] = []
+	    while True:
+	        batch = await DatabaseManager.get_active_accounts_batch(
+	            bot_id=bot_id, offset=offset, limit=page,
+	        )
+	        if not batch:
+	            break
+	        fetched.extend(batch)
+	        offset += len(batch)
+	        if len(batch) < page:
+	            break
+	    if not current:
+	        rnd = random.Random(int(order_id))
+	        rnd.shuffle(fetched)
+	        self._voice_pool[order_id] = fetched
+	        return
+	    # Refresh: keep previously-known accounts that are STILL active (same
+	    # relative order), drop ones no longer eligible, append newly added.
+	    fetched_ids = {a.get("id") for a in fetched if a.get("id")}
+	    merged: List[Dict] = []
+	    seen: Set[int] = set()
+	    for acc in current:
+	        aid = acc.get("id")
+	        if aid and aid in fetched_ids and aid not in seen:
+	            merged.append(acc)
+	            seen.add(aid)
+	    for acc in fetched:
+	        aid = acc.get("id")
+	        if not aid or aid in seen:
+	            continue
+	        merged.append(acc)
+	        seen.add(aid)
+	    self._voice_pool[order_id] = merged
+
+	def _voice_candidates(self, order_id: int, window: int, joined_ids: Set[int],
+	                      in_flight: Set[int], now: float) -> List[Dict]:
+	    """Pick up to `window` pool accounts that are ready to try now."""
+	    pool = self._voice_pool.get(order_id) or []
+	    if not pool:
+	        return []
+	    attempts = self._voice_attempts.get(order_id, {})
+	    banned = self._voice_banned.get(order_id, set())
+	    retry_after = self._voice_retry_after.get(order_id, {})
+	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    chosen: List[Dict] = []
+	    cursor = self._voice_cursor.get(order_id, 0)
+	    n = len(pool)
+	    scanned = 0
+	    while len(chosen) < window and scanned < n:
+	        acc = pool[cursor % n]
+	        cursor += 1
+	        scanned += 1
+	        aid = acc.get("id")
+	        if not aid:
+	            continue
+	        if aid in banned or aid in joined_ids or aid in in_flight:
+	            continue
+	        if attempts.get(aid, 0) >= attempt_budget:
+	            continue
+	        if retry_after.get(aid, 0) > now:
+	            continue
+	        chosen.append(acc)
+	    self._voice_cursor[order_id] = cursor % n if n else 0
+	    return chosen
+
+	def _voice_earliest_retry(self, order_id: int, joined_ids: Set[int]) -> Optional[float]:
+	    """Earliest retry timestamp among pool accounts not yet exhausted."""
+	    pool = self._voice_pool.get(order_id) or []
+	    attempts = self._voice_attempts.get(order_id, {})
+	    banned = self._voice_banned.get(order_id, set())
+	    retry_after = self._voice_retry_after.get(order_id, {})
+	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    best: Optional[float] = None
+	    for acc in pool:
+	        aid = acc.get("id")
+	        if not aid or aid in banned or aid in joined_ids:
+	            continue
+	        if attempts.get(aid, 0) >= attempt_budget:
+	            continue
+	        when = retry_after.get(aid, 0.0)
+	        if when <= 0:
+	            return 0.0
+	        best = when if best is None else min(best, when)
+	    return best
+
+	async def _voice_batched_fill(
+	    self,
+	    order_id: int,
+	    target: str,
+	    bot_id: int,
+	    target_count: int,
+	    requested: int,
+	) -> Tuple[List[Dict], int]:
+	    """ADAPTIVE BATCH fill — the parallel voice-join engine.
+
+	    Each wave takes up to `window` fresh candidate accounts and joins
+	    them CONCURRENTLY (every account individually verified by the
+	    VoiceCallManager before it counts).  The window comes from the Join
+	    Brain and adapts: it widens after clean waves and narrows on
+	    FloodWait / retryable failures (never above the configured max).
+	    Failures are retried with bounded exponential backoff and then
+	    REPLACED by fresh pool accounts; dead sessions are marked inactive.
+	    The next wave starts only after the current one fully resolved.
+	    """
+	    joined_list: List[Dict] = []
+	    dead_count = 0
+	    self._voice_state(order_id)
+	    vcm = _get_voice_call_manager()
+	    if not vcm:
+	        logger.error(f"Order {order_id}: voice manager unavailable — cannot join")
+	        return joined_list, dead_count
+	    if not self._is_order_active(order_id):
+	        return joined_list, dead_count
+
+	    await self._voice_load_pool(bot_id, order_id)
+	    adaptive = bool(getattr(Config, "VOICE_JOIN_ADAPTIVE", True))
+	    if adaptive:
+	        join_brain.register_order(order_id)
+	    else:
+	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
+	        join_brain.register_order(order_id, initial=fixed, min_window=fixed, max_window=fixed)
+
+	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+	    wave_no = 0
+	    live = int(vcm.get_active_count(order_id))
+
+	    while self._is_order_active(order_id) and live < target_count:
+	        await join_brain.wait_if_paused(order_id)
+	        if not self._is_order_active(order_id):
+	            break
+
+	        window = join_brain.get_window(order_id)
+	        need = max(0, target_count - live)
+	        window = max(1, min(int(window), int(need)))
+	        now = time.time()
+	        joined_ids = set(vcm.get_active_account_ids(order_id))
+
+	        candidates = self._voice_candidates(order_id, window, joined_ids, set(), now)
+
+	        # Pipeline: warm the NEXT wave's Pyrogram clients while this wave
+	        # is joining (client start is the slowest single step).
+	        warm_task: Optional[asyncio.Task] = None
+	        if candidates:
+	            in_flight_ids = {c["id"] for c in candidates if c.get("id")}
+	            lookahead = self._voice_candidates(
+	                order_id, max(1, window * 2), joined_ids | in_flight_ids, set(), now,
+	            )
+	            if lookahead:
+	                try:
+	                    warm_task = asyncio.create_task(vcm.warmup_clients(lookahead))
+
+	                    def _consume_warm(_t: asyncio.Task) -> None:
+	                        try:
+	                            _t.exception()
+	                        except (asyncio.CancelledError, Exception):
+	                            pass
+
+	                    warm_task.add_done_callback(_consume_warm)
+	                except Exception:
+	                    warm_task = None
+
+	        if not candidates:
+	            # Nothing ready right now — wait for the earliest retry
+	            # backoff, or end the fill if the pool is exhausted.
+	            earliest = self._voice_earliest_retry(order_id, joined_ids)
+	            if earliest is None:
+	                break
+	            wait = max(0.0, min(earliest - now, 30.0))
+	            if wait <= 0:
+	                # Should not happen (a ready account would have been
+	                # selected); avoid any possibility of a hot spin.
+	                break
+	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
+	            await asyncio.sleep(wait)
+	            continue
+
+	        join_brain.start_wave(order_id, len(candidates))
+	        wave_no += 1
+	        wave_started = time.monotonic()
+	        logger.info(
+	            f"Order {order_id}: wave {wave_no} — joining {len(candidates)} accounts "
+	            f"in parallel (window={window}, live={live}/{target_count})"
+	        )
+
+	        wave_tasks = [
+	            asyncio.create_task(
+	                self._join_single_account(order_id, acc, "voice_chat", target, 0)
+	            )
+	            for acc in candidates
+	        ]
+	        results = await asyncio.gather(*wave_tasks, return_exceptions=True)
+
+	        wave_ok = 0
+	        wave_fail = 0
+	        wave_dead = 0
+	        for acc, res in zip(candidates, results):
+	            aid = acc.get("id")
+	            if not aid:
+	                continue
+	            if isinstance(res, Exception):
+	                res = {"success": False, "status": "error", "msg": str(res)}
+	            if res is None:
+	                # Order was cancelled mid-flight — do not count attempts.
+	                continue
+	            if res.get("success"):
+	                if aid not in joined_ids:
+	                    joined_list.append(res)
+	                    joined_ids.add(aid)
+	                wave_ok += 1
+	                join_brain.report_result(order_id, OUTCOME_OK)
+	                continue
+
+	            # ── failure handling ──
+	            msg = str(res.get("msg") or "")
+	            status = res.get("status") or "failed"
+	            upper = msg.upper()
+	            if status == "dead" or any(x in upper for x in (
+	                "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	                "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
+	            )):
+	                # Account itself is dead — mark inactive & replace.
+	                dead_count += 1
+	                wave_dead += 1
+	                self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                self._voice_banned.setdefault(order_id, set()).add(aid)
+	                try:
+	                    await self._mark_account_dead(aid)
+	                except Exception:
+	                    pass
+	                join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                wave_fail += 1
+	                continue
+
+	            attempts = self._voice_attempts.setdefault(order_id, {})
+	            n_att = attempts.get(aid, 0) + 1
+	            attempts[aid] = n_att
+	            outcome = join_brain.classify_message(msg)
+	            if n_att >= attempt_budget:
+	                # Retry budget exhausted → give up on this account; the
+	                # next wave replaces it with a fresh pool member.
+	                self._voice_banned.setdefault(order_id, set()).add(aid)
+	                logger.warning(
+	                    f"Order {order_id}: account {aid} gave up after {n_att} "
+	                    f"attempt(s) ({msg[:80]}) — replaced from pool"
+	                )
+	            else:
+	                delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
+	                self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
+	                logger.info(
+	                    f"Order {order_id}: account {aid} attempt {n_att} failed "
+	                    f"({msg[:60]}); retry in {delay:.0f}s"
+	                )
+	            join_brain.report_result(order_id, outcome, msg)
+	            wave_fail += 1
+
+	        # Wave fully resolved → recompute authoritative live count, adapt.
+	        live = int(vcm.get_active_count(order_id))
+	        wave_duration = time.monotonic() - wave_started
+	        wave_total = wave_ok + wave_fail
+	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0
+	        join_brain.finish_wave(
+	            order_id, joined=wave_ok, failed=wave_fail,
+	            ok_rate=ok_rate, duration_s=wave_duration,
+	        )
+
+	        if order_id in self.active_orders:
+	            info = self.active_orders[order_id]
+	            info["live_count"] = live
+	            # NOTE: dead_count is fill-cumulative, so only add THIS wave's delta.
+	            if wave_dead:
+	                info["dead_accounts_count"] = (info.get("dead_accounts_count") or 0) + wave_dead
+	        logger.info(
+                f"Order {order_id}: wave {wave_no} done (ok={wave_ok} fail={wave_fail} "
+                f"in {wave_duration:.0f}s) | "
+                f"{join_brain.format_progress(order_id, live, target_count)}"
+            )
+
+	    # Return only the accounts this call newly joined; the CALLER owns
+	    # merging them into the order's running joined_accounts list (the
+	    # VoiceCallManager remains the authoritative source for counting).
+	    return joined_list, dead_count
+
+	async def _voice_duration_maintenance(
+	    self, order_id: int, data: Dict[str, Any], end_time: datetime,
+	) -> int:
+	    """Replace monitor-proven-unrecoverable slots during the paid phase.
+
+	    Only slots the monitor flagged UNRECOVERABLE (confirmed disconnect +
+	    bounded rejoin attempts exhausted) are released — a healthy or
+	    temporarily-unknown account is NEVER touched.  Replacement only runs
+	    while enough paid time remains to be worthwhile, so no pointless
+	    joins happen at the very end.
+	    """
+	    vcm = _get_voice_call_manager()
+	    if not vcm:
+	        return 0
+	    if not bool(getattr(Config, "VOICE_DURATION_REPLACEMENT", True)):
+	        return 0
+	    remaining = (end_time - datetime.utcnow()).total_seconds()
+	    grace = max(0, int(getattr(Config, "VOICE_REPLACEMENT_GRACE_SECONDS", 60)))
+	    if remaining < grace:
+	        return 0
+	    if not self._is_order_active(order_id):
+	        return 0
+
+	    slots = vcm.get_unrecoverable_slots(order_id)
+	    if not slots:
+	        return 0
+
+	    released = 0
+	    for aid in list(slots.keys()):
+	        try:
+	            ok, _m = await vcm.release_unrecoverable_slot(order_id, aid, leave_group=False)
+	            if ok:
+	                released += 1
+	        except asyncio.CancelledError:
+	            raise
+	        except Exception as exc:
+	            logger.warning(f"Order {order_id}: failed releasing slot {aid}: {exc}")
+
+	    if released <= 0:
+	        return 0
+
+	    exact = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
+	    if exact <= 0:
+	        return 0
+	    logger.warning(
+	        f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
+	        f"replacing to keep presence until deadline"
+	    )
+	    more, _d2 = await self._voice_batched_fill(
+	        order_id=order_id,
+	        target=str((data or {}).get("target_link") or ""),
+	        bot_id=int((data or {}).get("bot_id", 1)),
+	        target_count=exact,
+	        requested=exact,
+	    )
+	    info = self.active_orders.get(order_id)
+	    if info:
+	        current = info.get("joined_accounts") or []
+	        have = {(e.get("acc") or {}).get("id") for e in current}
+	        for e in more:
+	            acc_id = (e.get("acc") or {}).get("id")
+	            if acc_id and acc_id not in have:
+	                current.append(e)
+	                have.add(acc_id)
+	        info["joined_accounts"] = current
+	        info["live_count"] = self._live_count(order_id, "voice_chat", current)
+	    return released
 
 	async def _progressive_fill(
 		self,
@@ -329,11 +755,12 @@ class OrderExecutor:
 		join_delay: float,
 		duration_minutes: int = 0,
 	) -> Tuple[List[Dict], int]:
-		"""Progressive / batched fill without an artificial order cap.
+		"""Progressive / batched fill for group_join / channel_join orders.
 
 		Fetches small batches of eligible accounts from the database and
-		processes them sequentially (for voice_chat, one account at a time)
-		until active_count reaches target_count or no eligible accounts remain.
+		processes them until active_count reaches target_count or no eligible
+		accounts remain.  NOTE: voice_chat orders no longer use this path —
+		they go through the adaptive parallel engine (_voice_batched_fill).
 		"""
 		joined: List[Dict] = []
 		dead_count = 0
@@ -483,12 +910,12 @@ class OrderExecutor:
 		duration_minutes: int = 0,
 		seen_ids: Optional[Set[int]] = None,
 	) -> Tuple[List[Dict], int]:
-		"""STRICT SEQUENTIAL join engine.
+		"""Sequential join engine (group_join / channel_join path).
 
-		For voice_chat, accounts join ONE BY ONE: each account fully joins
-		AND is verified (inside _join_single_account -> vcm.start_call ->
-		_join_call) before the NEXT account begins. No worker pool, no
-		parallel background task workers for the same order.
+		Each account fully joins AND is verified before the next begins —
+		kept intentionally simple for group/channel orders.  Voice_chat
+		orders use the adaptive parallel engine (_voice_batched_fill) whose
+		waves call the same per-account join (start_call) concurrently.
 
 		dedup scope = per (order + target chat), via `seen_ids`. An account
 		active in ANOTHER order/chat is NOT excluded here (cross-order reuse).
@@ -610,6 +1037,8 @@ class OrderExecutor:
 		self.active_orders.pop(order_id, None)
 
 	async def _cleanup_order(self, order_id, joined_accounts, data):
+		# Release Join Brain scratch state (idempotent).
+		self._voice_forget_order(order_id)
 		try:
 			await self._eject_all_fast(order_id, joined_accounts, data)
 		except Exception as exc:
@@ -674,6 +1103,7 @@ class OrderExecutor:
 		if info: await self._eject_all_fast(order_id, info.get("joined_accounts", []), info.get("data", {}))
 		vcm = _get_voice_call_manager()
 		if vcm: await vcm.stop_all_for_order(order_id, leave_group=True)
+		self._voice_forget_order(order_id)
 		await DatabaseManager.update_order_status(order_id, "failed")
 		self.active_orders.pop(order_id, None)
 

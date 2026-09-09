@@ -68,8 +68,11 @@ class Config:
     # unrestricted and is limited only by eligible accounts, Telegram limits,
     # and server capacity.
     JOIN_CONCURRENCY = int(os.getenv('JOIN_CONCURRENCY', '4'))            # (legacy) other order types
-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '8'))  # global join semaphore across orders
-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '5'))  # parallel Pyrogram client creations
+    # System-wide hard cap on simultaneous native join operations (across ALL
+    # orders). Bumped up so several 100-500-account orders can build in
+    # parallel without starving each other.
+    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
+    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
@@ -78,11 +81,47 @@ class Config:
     OPERATION_TIMEOUT = int(os.getenv('OPERATION_TIMEOUT', '20'))         # per-operation timeout (seconds)
     VOICE_JOIN_PENDING_TIMEOUT = int(os.getenv('VOICE_JOIN_PENDING_TIMEOUT', '60'))  # wait for Telegram propagation
 
+    # ═══════════════════════════════════════════════════════════════════
+    # Adaptive Batch / Parallel voice-join architecture ("Join Brain")
+    # ═══════════════════════════════════════════════════════════════════
+    # Accounts are joined in WAVES: up to N accounts join + get verified
+    # concurrently, the next wave only starts after the current one is
+    # confirmed, and N adapts itself up/down from live join results
+    # (success speed vs. FloodWait / transient failures). Designed for
+    # orders of 100-500 accounts.
+    VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '5'))   # first wave size (5-10 recommended)
+    VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '10'))         # per-order hard ceiling
+    # Consecutive failure-free waves before the brain widens the window by 1.
+    VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
+    # Failure-rate (per wave) above which the window is narrowed.
+    VOICE_JOIN_ERROR_RATE_SHRINK = float(os.getenv('VOICE_JOIN_ERROR_RATE_SHRINK', '0.34'))
+    # How long new waves pause when the window already hit its floor and
+    # Telegram still answers with FloodWait (server-directed waits are always
+    # respected first — this only paces NEW waves).
+    VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
+    # Driver-level attempt budget per account (start_call itself already does
+    # bounded retries + respects FloodWait internally).
+    VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '2'))
+    VOICE_RETRY_BACKOFF_BASE = float(os.getenv('VOICE_RETRY_BACKOFF_BASE', '8'))
+    # Rejoin attempts for a CONFIRMED-disconnected account before the slot is
+    # declared unrecoverable and REPLACED with a fresh account (duration phase).
+    VOICE_RECOVERY_MAX_ATTEMPTS = int(os.getenv('VOICE_RECOVERY_MAX_ATTEMPTS', '3'))
+    # Replace unrecoverable slots during the paid duration phase?
+    VOICE_DURATION_REPLACEMENT = os.getenv('VOICE_DURATION_REPLACEMENT', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Keep at least this many seconds of paid time left before bothering to
+    # replace a lost slot (avoids pointless joins at the very end).
+    VOICE_REPLACEMENT_GRACE_SECONDS = int(os.getenv('VOICE_REPLACEMENT_GRACE_SECONDS', '60'))
+    # Live-count maintenance sweep inside the duration loop.
+    VOICE_DURATION_CHECK_INTERVAL = int(os.getenv('VOICE_DURATION_CHECK_INTERVAL', '20'))
+
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
-    # There is NO fixed per-account join interval. Account N+1 is released
-    # ONLY after Account N has reached CONFIRMED_JOINED (positive verification
-    # inside the Voice Chat). The constants below tune retries, rate-limit
-    # handling and monitoring — never the spacing between new-account joins.
+    # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
+    # Accounts of one order join in waves of N (initial 5-10) concurrent
+    # joins; each wave is fully verified before the next wave is released;
+    # N is adapted by the Join Brain from live FloodWait / failure rates.
+    # The constants below tune retries, rate-limit handling and monitoring.
     VOICE_JOIN_RETRY_HARD_LIMIT = int(os.getenv('VOICE_JOIN_RETRY_HARD_LIMIT', '2'))   # absolute max attempts per join op
     VOICE_VERIFICATION_GRACE_CHECKS = int(os.getenv('VOICE_VERIFICATION_GRACE_CHECKS', '3'))
     VOICE_VERIFICATION_GRACE_INTERVAL = float(os.getenv('VOICE_VERIFICATION_GRACE_INTERVAL', '0.3'))
