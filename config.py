@@ -116,6 +116,40 @@ class Config:
     # Live-count maintenance sweep inside the duration loop.
     VOICE_DURATION_CHECK_INTERVAL = int(os.getenv('VOICE_DURATION_CHECK_INTERVAL', '20'))
 
+    # ─── Voice-call STAY-ALIVE & anti-detection tuning ─────────────────
+    # Silence stream: raw s16le @ 48 kHz STEREO — the exact wire format a real
+    # Telegram Android client encodes to 48 kHz Opus.  The on-disk file is
+    # intentionally SHORT; the infinite duration comes from looping it with
+    # ffmpeg (-stream_loop -1) at play time, so the media transport can never
+    # die of EOF and an order of ANY length stays inside the call.
+    VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
+    VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Max wait for the native media join (pytgcalls play()) to CONFIRM the
+    # account is inside the call.  play() returns only after Telegram accepted
+    # the JoinGroupCall + the WebRTC transport is up, so this works even in
+    # HUGE voice chats where the participant listing cannot be paginated.
+    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '30'))
+    # Shared chat-info cache TTL (peer + access_hash + InputGroupCall): ONE
+    # account resolves the chat and every other account reuses the cached
+    # objects instead of each issuing resolve_peer/GetFullChannel from the same
+    # IP (the #1 cause of PEER_FLOOD / FLOOD_WAIT when 40+ accounts share an IP).
+    VOICE_CHAT_INFO_CACHE_TTL = int(os.getenv('VOICE_CHAT_INFO_CACHE_TTL', '120'))
+    # Android-like device fingerprint (anti-detection): instead of broadcasting
+    # "CPython / Pyrogram" (an instant bot tell), accounts report a plausible
+    # phone model + Telegram app version + Android SDK, deterministic per account.
+    VOICE_ANDROID_FINGERPRINT = os.getenv('VOICE_ANDROID_FINGERPRINT', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Online deep-learning hold-risk net (services/drop_net.py): per-cycle risk
+    # score + WHY (gradient attribution), learned online from real outcomes.
+    VOICE_DL_GUARD = os.getenv('VOICE_DL_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_DL_RISK_THRESHOLD = float(os.getenv('VOICE_DL_RISK_THRESHOLD', '0.8'))
+    # Structured drop ledger (logs/voice_drops.log) + per-cycle DL telemetry
+    # (logs/voice_telemetry.log) so every fall-out has a recorded reason.
+    VOICE_DROP_LEDGER = os.getenv('VOICE_DROP_LEDGER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_TELEMETRY = os.getenv('VOICE_TELEMETRY', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Session guard: if an account's MTProto session silently died, reconnect it
+    # inside the monitor cycle (a dead session kills the call minutes later).
+    VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
     # Accounts of one order join in waves of N (initial 5-10) concurrent
