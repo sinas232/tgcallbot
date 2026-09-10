@@ -121,9 +121,14 @@ def hook():
         try:
             return _OI(*a, **kw)
         except ImportError:
-            name = a[0] if a else kw.get("name", "")
-            if str(name).startswith("pyrogram") and heal(False):
-                return _OI(*a, **kw)
+            name = str(a[0] if a else kw.get("name", ""))
+            if name.startswith("pyrogram") or name.startswith("pytgcalls"):
+                heal(False)
+                heal_module(name, False)
+                try:
+                    return _OI(*a, **kw)
+                except ImportError:
+                    pass
             raise
 
     builtins.__import__ = _imp
@@ -131,6 +136,46 @@ def hook():
 
 
 # ---- cause classification ----
+def _mod_base(mod_name):
+    """Base class for synthesised names: TLObject for raw.*, RPCError otherwise."""
+    try:
+        if mod_name.startswith("pyrogram.raw"):
+            import pyrogram.raw.core as _core
+            return getattr(_core, "TLObject", object)
+        import pyrogram.errors as _errs
+        return getattr(_errs, "RPCError", Exception)
+    except Exception:
+        return object
+
+
+def heal_module(mod_name, verbose=True):
+    """Give any pyrogram sub-module a __getattr__ that synthesises missing names."""
+    try:
+        import importlib
+        mod = importlib.import_module(mod_name)
+    except Exception:
+        return False
+    with _L:
+        if "__getattr__" in vars(mod):
+            return True
+        base = _mod_base(mod_name)
+
+        def _g(n, _m=mod, _b=base, _mn=mod_name):
+            if n.startswith("__"):
+                raise AttributeError(n)
+            t = type(n, (_b,), {"ID": n})
+            setattr(_m, n, t)
+            note("import_missing_name", "%s.%s" % (_mn, n), "synthesised_stub")
+            log.warning("[SelfHeal] missing name %s.%s -> synthesised stub "
+                        "(check package versions)", _mn, n)
+            return t
+
+        mod.__dict__["__getattr__"] = _g
+        if verbose:
+            log.info("[SelfHeal] %s healed (missing-name synthesis on)", mod_name)
+    return True
+
+
 _RULES = (
     ("import_error", ("cannot import name", "no module named", "importerror")),
     ("session_dead", ("session_revoked", "auth_key_invalid", "auth_key_unregistered",
@@ -320,6 +365,12 @@ def install():
     try:
         load()
         heal()
+        for _m in ("pyrogram.raw", "pyrogram.raw.types", "pyrogram.raw.base",
+                   "pyrogram.raw.functions", "pyrogram.raw.core"):
+            try:
+                heal_module(_m, False)
+            except Exception:
+                pass
         hook()
         log.info("[SelfHeal] active | %s", health())
     except Exception:

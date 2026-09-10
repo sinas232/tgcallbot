@@ -17,4 +17,4 @@ python-telegram-bot[job-queue]
 
 pyrogram>=2.0.106
 tgcrypto>=1.2.5
-py-tgcalls>=2.3.3,<3.0.0
+py-tgcalls==2.2.5
