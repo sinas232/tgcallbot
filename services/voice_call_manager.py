@@ -116,10 +116,19 @@ def _patch_pyrogram_channel_id_range() -> None:
 _patch_pyrogram_channel_id_range()
 
 SILENT_AUDIO_PATH = "silence.wav"
-_SILENCE_SECONDS = 600
-_SILENCE_FRAMES = 48000 * _SILENCE_SECONDS
 
 from config import Config
+
+# ─── SILENCE STREAM (stay-alive media) ────────────────────────────────
+# A real Telegram Android client transmits Opus @ 48 kHz stereo.  We feed
+# ntgcalls the exact same wire format (raw s16le 48 kHz stereo) via ffmpeg and
+# LOOP the (short) file infinitely (-stream_loop -1) at play time, so the media
+# transport can never die of EOF — the effective silence duration is unlimited
+# (multi-hour orders stay inside the call).
+_SILENCE_RATE = 48000
+_SILENCE_CHANNELS = 2
+_SILENCE_SECONDS = max(5, int(getattr(Config, "VOICE_SILENCE_SECONDS", 30) or 30))
+_SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
 
 CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
@@ -172,6 +181,52 @@ _JOIN_PENDING_TIMEOUT = max(
 # Telegram can keep a call object valid for a while, but a cached object must
 # not be treated as proof that the call is still active forever.
 ACTIVE_CALL_CACHE_TTL = max(5, int(getattr(Config, 'VOICE_CALL_CACHE_TTL', 30)))
+
+# Max wait for the native media join (pytgcalls play()) to CONFIRM the account
+# inside the call.  play() returns only after Telegram accepted the
+# JoinGroupCall and the WebRTC transport is up (or immediately when the account
+# is already in the call), so this works even in HUGE voice chats where the
+# participant listing cannot be paginated reliably.
+JOIN_MEDIA_CONFIRM_TIMEOUT = max(10, int(getattr(Config, 'VOICE_JOIN_MEDIA_TIMEOUT', 30)))
+
+# Shared chat-info cache TTL: ONE account resolves the chat (peer + access_hash
+# + InputGroupCall) and every other account reuses the cached objects instead of
+# issuing its own resolve_peer / GetFullChannel from the same IP (the #1 cause
+# of PEER_FLOOD / FLOOD_WAIT when 40+ accounts share one IP).
+CHAT_INFO_CACHE_TTL = max(10, int(getattr(Config, 'VOICE_CHAT_INFO_CACHE_TTL', 120)))
+
+# Online deep-learning hold-risk net (services/drop_net.py).  Every monitor
+# cycle scores every account's hold-risk and learns from the resolved outcome;
+# the net's own gradient attribution answers "why is this account at risk".
+try:
+    from services.drop_net import net as _dl_net
+except Exception:  # fully optional — never allowed to break the bot
+    _dl_net = None
+
+# Android-like device fingerprints (anti-detection): by default Pyrogram
+# broadcasts device_model="CPython 3.x" / app_version="2.0.106" — an instant
+# bot tell.  Real Telegram Android clients report a phone model + Telegram app
+# version + Android SDK.  The choice is deterministic per account id, so each
+# account keeps a stable, plausible identity while accounts still differ.
+_ANDROID_DEVICES = (
+    "SM-G991B", "SM-A525F", "SM-M315F", "Redmi Note 11", "POCO X3 Pro",
+    "SM-G970F", "Mi 11 Lite", "SM-A715F", "Redmi Note 10 Pro", "SM-N986B",
+)
+_ANDROID_APP_VERSIONS = ("11.8.3", "11.9.2", "11.10.1", "12.0.0", "12.1.0")
+_ANDROID_SDK = ("SDK 33", "SDK 34", "SDK 35")
+
+
+def _client_device_fingerprint(account_id: int) -> Dict[str, str]:
+    """Android-like device fingerprint (deterministic per account)."""
+    if not bool(getattr(Config, "VOICE_ANDROID_FINGERPRINT", True)):
+        return {}
+    i = int(account_id or 0) % len(_ANDROID_DEVICES)
+    return {
+        "device_model": _ANDROID_DEVICES[i],
+        "app_version": _ANDROID_APP_VERSIONS[i % len(_ANDROID_APP_VERSIONS)],
+        "system_version": _ANDROID_SDK[i % len(_ANDROID_SDK)],
+        "lang_code": "fa",
+    }
 
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
@@ -272,13 +327,36 @@ class JoinAttemptTimeout(asyncio.TimeoutError):
 
 
 def _ensure_silence_file() -> None:
+    """Create/validate the stay-alive silence stream.
+
+    Format = raw s16le @ 48 kHz STEREO — the exact wire format ntgcalls encodes
+    to 48 kHz Opus (identical to a real Telegram Android client), so the ffmpeg
+    stage is a pure pass-through.  The file is intentionally SHORT; the infinite
+    duration comes from `-stream_loop -1` at play time.
+    """
     try:
-        if not os.path.exists(SILENT_AUDIO_PATH):
+        valid = False
+        if os.path.exists(SILENT_AUDIO_PATH):
+            try:
+                with wave.open(SILENT_AUDIO_PATH, "rb") as r:
+                    valid = (
+                        r.getnchannels() == _SILENCE_CHANNELS
+                        and r.getframerate() == _SILENCE_RATE
+                        and r.getsampwidth() == 2
+                    )
+            except Exception:
+                valid = False
+        if not valid:
             with wave.open(SILENT_AUDIO_PATH, "wb") as handle:
-                handle.setnchannels(1)
+                handle.setnchannels(_SILENCE_CHANNELS)
                 handle.setsampwidth(2)
-                handle.setframerate(48000)
-                handle.writeframes(b"\x00\x00" * _SILENCE_FRAMES)
+                handle.setframerate(_SILENCE_RATE)
+                # one frame = one sample per channel (2 bytes each)
+                handle.writeframes(b"\x00\x00" * (_SILENCE_FRAMES * _SILENCE_CHANNELS))
+        logger.info(
+            "silence stream ready: %ds @ %d Hz %dch (%s)",
+            _SILENCE_SECONDS, _SILENCE_RATE, _SILENCE_CHANNELS, SILENT_AUDIO_PATH,
+        )
     except Exception as e:
         logger.warning(f"silence file error: {e}")
 
@@ -460,6 +538,11 @@ class VoiceCallManager:
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
         self._active_call_cache: Dict[int, Tuple[float, object]] = {}
 
+        # Shared chat-info cache (peer + access_hash + InputGroupCall): ONE
+        # account resolves the chat, every other account reuses the cached
+        # objects instead of issuing its own resolve_peer/GetFullChannel flood.
+        self._chat_info_cache: Dict[int, Tuple[float, object, object]] = {}
+
         # Group leave reference count: {(account_id, chat_id): active_order_count}
         self._group_refcount: Dict[Tuple[int, int], int] = {}
 
@@ -491,8 +574,12 @@ class VoiceCallManager:
             self._log_dir = os.path.join(os.getcwd(), "logs")
             os.makedirs(self._log_dir, exist_ok=True)
             self._vc_log_path = os.path.join(self._log_dir, "voice_calls.log")
+            self._drop_log_path = os.path.join(self._log_dir, "voice_drops.log")
+            self._telemetry_log_path = os.path.join(self._log_dir, "voice_telemetry.log")
         except Exception:
             self._vc_log_path = None
+            self._drop_log_path = None
+            self._telemetry_log_path = None
         self._recent_issues = deque()
         self._recent_issues_lock = asyncio.Lock()
 
@@ -613,10 +700,147 @@ class VoiceCallManager:
             self._client_locks[account_id] = asyncio.Lock()
         return self._client_locks[account_id]
 
+    def _record_drop(self, order_id, account_id, chat_id, event, deliberate=False, reason="", extra=None) -> None:
+        """Structured drop ledger → logs/voice_drops.log (JSONL).
+
+        EVERY involuntary (or order-managed) leave from a voice call lands here
+        with dwell time, session state and the reason, so "it fell out after a
+        minute and nothing was logged" is impossible.  Kill switch:
+        VOICE_DROP_LEDGER=0.
+        """
+        try:
+            if not bool(getattr(Config, "VOICE_DROP_LEDGER", True)):
+                return
+        except Exception:
+            pass
+        try:
+            path = getattr(self, "_drop_log_path", None)
+            if not path:
+                path = os.path.join(getattr(self, "_log_dir", ""), "voice_drops.log")
+            joined_at = None
+            try:
+                joined_at = (self.active_calls.get((order_id, account_id)) or {}).get("joined_at")
+                if not joined_at:
+                    joined_at = (
+                        (self.joined_accounts_by_order.get(order_id) or {}).get(account_id) or {}
+                    ).get("joined_at")
+            except Exception:
+                joined_at = None
+            dwell = round(time.time() - float(joined_at), 1) if joined_at else None
+            session_connected = None
+            try:
+                if account_id is not None:
+                    _app = self.pyrogram_clients.get(account_id)
+                    if _app is not None:
+                        session_connected = bool(getattr(_app, "is_connected", None))
+            except Exception:
+                session_connected = None
+            entry = {
+                "ts": int(time.time()),
+                "order_id": order_id,
+                "account_id": account_id,
+                "chat_id": int(chat_id or 0),
+                "event": str(event),
+                "deliberate": bool(deliberate),
+                "dwell_s": dwell,
+                "reason": str(reason or "")[:160],
+                "session_connected": session_connected,
+                "extra": extra or {},
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # Surface every INVOLUNTARY drop on the console too, so
+            # `docker compose logs` alone answers "who fell out and why".
+            if not deliberate:
+                logger.warning(
+                    "[VoiceDrop] order=%s acc=%s chat=%s event=%s dwell=%ss reason=%s",
+                    order_id, account_id, entry["chat_id"], event, dwell, entry["reason"],
+                )
+        except Exception:
+            pass
+
+    def _write_telemetry(self, order_id, account_id, chat_id, feats, risk, label) -> None:
+        """Per-cycle DL telemetry → logs/voice_telemetry.log (JSONL).
+
+        Unlike the drop ledger (departures only), EVERY monitor cycle is on
+        record here with its feature vector, risk score and resolved label, so
+        the full lifecycle of every account is reproducible and diagnosable.
+        """
+        try:
+            if not bool(getattr(Config, "VOICE_TELEMETRY", True)):
+                return
+        except Exception:
+            pass
+        try:
+            path = getattr(self, "_telemetry_log_path", None)
+            if not path:
+                path = os.path.join(getattr(self, "_log_dir", ""), "voice_telemetry.log")
+            row = {
+                "ts": int(time.time()),
+                "order_id": order_id,
+                "account_id": account_id,
+                "chat_id": int(chat_id or 0),
+                "risk": round(float(risk), 4),
+                "label": label,
+                "feats": feats,
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    # ─── SHARED CHAT-INFO CACHE (one account resolves, all reuse) ──────
+    def _chat_info_get(self, chat_id: int) -> Optional[Tuple[object, object]]:
+        """Return cached (peer, input_group_call) for a chat, if still fresh."""
+        cached = self._chat_info_cache.get(int(chat_id))
+        if not cached:
+            return None
+        ts, peer, call = cached
+        if time.time() - ts > CHAT_INFO_CACHE_TTL:
+            self._chat_info_cache.pop(int(chat_id), None)
+            return None
+        return peer, call
+
+    def _chat_info_put(self, chat_id: int, peer: object, call: object) -> None:
+        self._chat_info_cache[int(chat_id)] = (time.time(), peer, call)
+
+    async def _resolve_cached_peer(self, app: Client, chat_id: int) -> object:
+        """Resolve the raw peer ONCE (cached) and reuse it for all accounts.
+
+        ONE account does resolve_peer (a single API call); every other account
+        reuses the cached raw peer object.  A peer's channel id + access_hash
+        are GLOBAL (not per-account), so sharing the object is safe and removes
+        the biggest per-IP API-flood source.
+        """
+        chat_id = int(chat_id)
+        cached = self._chat_info_get(chat_id)
+        if cached and cached[0] is not None:
+            return cached[0]
+        peer = await app.resolve_peer(chat_id)
+        cached = self._chat_info_get(chat_id)
+        self._chat_info_put(chat_id, peer, cached[1] if cached else None)
+        return peer
+
+    async def _get_cached_group_call(self, app: Client, chat_id: int) -> object:
+        """Get the active group-call object for a chat, cached & shared.
+
+        Returns the raw InputGroupCall, or None when there is no active call.
+        """
+        chat_id = int(chat_id)
+        cached = self._chat_info_get(chat_id)
+        if cached and cached[1] is not None:
+            return cached[1]
+        peer = await self._resolve_cached_peer(app, chat_id)
+        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+        call = getattr(full.full_chat, "call", None)
+        self._chat_info_put(chat_id, peer, call)
+        return call
+
     def _clear_chat_cache(self, chat_id: int) -> None:
         self._chat_refresh_cache.pop(chat_id, None)
         self._input_group_call_cache.pop(chat_id, None)
         self._active_call_cache.pop(int(chat_id), None)
+        self._chat_info_cache.pop(int(chat_id), None)
 
     def _account_in_any_order(self, account_id: int) -> bool:
         return any(aid == account_id for (oid, aid) in self.active_calls.keys())
@@ -1216,6 +1440,7 @@ class VoiceCallManager:
                         # the voice transport handshake and participant sync.
                         no_updates=False,
                         in_memory=True,
+                        **_client_device_fingerprint(account_id),
                     )
                     await asyncio.wait_for(app.start(), timeout=20)
                     self.pyrogram_clients[account_id] = app
@@ -1282,6 +1507,19 @@ class VoiceCallManager:
             pass
 
     async def _play_silence(self, pytg: PyTgCalls, chat_id: int) -> None:
+        """Join + play the LOOPING silence stream (stay-alive media).
+
+        ``pytg.play()`` COMPLETING is the authoritative "the account is inside
+        the call" signal: it returns only after Telegram accepted the
+        JoinGroupCall and the WebRTC transport is up (or immediately when the
+        account is already in the call).  The silence is looped forever with
+        ``-stream_loop -1`` so the transport can never die of EOF.
+        """
+        loop_flag = (
+            "-audio -stream_loop -1"
+            if getattr(Config, "VOICE_SILENCE_LOOP", True)
+            else None
+        )
         try:
             await pytg.play(
                 int(chat_id),
@@ -1289,15 +1527,23 @@ class VoiceCallManager:
                     SILENT_AUDIO_PATH,
                     audio_parameters=AudioQuality.HIGH,
                     video_flags=MediaStream.Flags.IGNORE,
+                    ffmpeg_parameters=loop_flag,
                 ),
             )
-            await pytg.mute(int(chat_id))
         except Exception as e:
             s = str(e).lower()
             if "already" in s and ("join" in s or "stream" in s or "call" in s):
                 return
             logger.debug("voice media negotiation failed chat=%s: %s", chat_id, e)
             raise
+        # Mute the local microphone (kept muted by default so the account is
+        # indistinguishable from a listener and never echoes).  Muting is
+        # best-effort: presence does not depend on it.
+        if getattr(Config, "VOICE_JOIN_MUTED", True):
+            try:
+                await pytg.mute(int(chat_id))
+            except Exception as e:
+                logger.debug("mute failed chat=%s (non-fatal): %s", chat_id, e)
 
     async def _mute_call(self, pytg: PyTgCalls, chat_id: int) -> None:
         try:
@@ -1305,19 +1551,33 @@ class VoiceCallManager:
         except Exception:
             pass
 
-    async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> bool:
-        """Check the native PyTgCalls engine state for local transport health."""
+    async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
+        """Authoritative per-chat media transport liveness.
+
+        PyTgCalls has NO global ``is_connected`` — the previous check used
+        ``getattr(pytg, "is_connected", True)`` which ALWAYS returned True, so
+        media health was a silent no-op.  The real signal is whether ntgcalls
+        still has an ACTIVE group call for this chat on this account's binding:
+        that is the ground truth for "the account is still transmitting silence
+        / present in the call".
+
+        Returns True/False, or None when the engine state is unknown.
+        """
         if pytg is None:
             return False
         try:
-            return bool(getattr(pytg, "is_connected", True))
+            group_calls = await pytg.group_calls
         except Exception:
-            return False
+            return None
+        try:
+            return int(chat_id) in group_calls
+        except Exception:
+            return None
 
     async def _protocol_mute(self, app: Client, chat_id: int) -> bool:
         try:
-            # Properly resolve the peer with correct access_hash
-            peer = await app.resolve_peer(int(chat_id))
+            # Properly resolve the peer with correct access_hash (cached/shared)
+            peer = await self._resolve_cached_peer(app, int(chat_id))
             full_chat = await app.invoke(
                 functions.channels.GetFullChannel(channel=peer)
             )
@@ -1460,9 +1720,7 @@ class VoiceCallManager:
     async def _force_refresh_call(self, app: Client, chat_id: int) -> None:
         self._clear_chat_cache(chat_id)
         try:
-            peer = await app.resolve_peer(chat_id)
-            full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-            call = getattr(full.full_chat, "call", None)
+            call = await self._get_cached_group_call(app, int(chat_id))
             if call is not None:
                 self._active_call_cache[int(chat_id)] = (time.time(), call)
         except Exception:
@@ -1489,9 +1747,7 @@ class VoiceCallManager:
             # requests and Telegram's mandatory 9-10 second waits.
             call = cached[1] if cached else None
             if call is None:
-                peer = await app.resolve_peer(chat_id)
-                full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-                call = getattr(full.full_chat, "call", None)
+                call = await self._get_cached_group_call(app, int(chat_id))
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
@@ -1594,9 +1850,7 @@ class VoiceCallManager:
                 cached = None
             call = cached[1] if cached else None
             if call is None:
-                peer = await app.resolve_peer(chat_id)
-                full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-                call = getattr(full.full_chat, "call", None)
+                call = await self._get_cached_group_call(app, int(chat_id))
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
@@ -1648,19 +1902,16 @@ class VoiceCallManager:
         collapsed into ``False`` because that turns a temporary API failure
         into a permanent order failure.
         """
-        cached = self._active_call_cache.get(int(chat_id))
-        if cached and time.time() - cached[0] < ACTIVE_CALL_CACHE_TTL:
+        # Shared chat-info cache: if another account already confirmed the call
+        # is active (cached InputGroupCall), answer instantly — no API call.
+        cached_info = self._chat_info_get(int(chat_id))
+        if cached_info and cached_info[1] is not None:
             return True
-        if cached:
-            self._active_call_cache.pop(int(chat_id), None)
         try:
-            peer = await app.resolve_peer(chat_id)
-            full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-            call = getattr(full.full_chat, "call", None)
+            call = await self._get_cached_group_call(app, int(chat_id))
             if call is not None:
                 self._active_call_cache[int(chat_id)] = (time.time(), call)
                 return True
-            self._active_call_cache.pop(int(chat_id), None)
             return False
         except Exception as exc:
             logger.warning(f"voice-call state check failed chat={chat_id}: {exc}")
@@ -1713,13 +1964,16 @@ class VoiceCallManager:
                 # Ultra-short delay to avoid rate limits
                 await asyncio.sleep(random.uniform(JOIN_DELAY_MIN, JOIN_DELAY_MAX))
 
-                # Start media negotiation once, then verify Telegram presence
-                # concurrently. PyTgCalls can spend the full timeout waiting
-                # for ICE even after Telegram has already registered the user.
-                join_sent = True
+                # ── AUTHORITATIVE JOIN CONFIRMATION ──────────────────────
+                # pytgcalls.play() completes ONLY after Telegram accepted the
+                # JoinGroupCall and the WebRTC transport is up (or immediately
+                # when the account is already in the call).  That is the
+                # ground-truth join signal — it works even in HUGE voice chats
+                # where the participant listing is too big to paginate (the old
+                # listing-based check made most accounts fail to "verify", so
+                # only a handful ever counted).
                 join_key = (account_id, int(chat_id))
                 join_task = self._inflight_joins.get(join_key)
-                transport_warning = join_task is not None and not join_task.done()
                 if join_task is None or join_task.done():
                     join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
                     self._inflight_joins[join_key] = join_task
@@ -1731,22 +1985,37 @@ class VoiceCallManager:
                         pass
 
                 join_task.add_done_callback(_consume_join_task_result)
+
+                media_confirmed = False
                 try:
-                    await asyncio.wait_for(asyncio.shield(join_task), timeout=0.75)
-                except asyncio.TimeoutError:
-                    transport_warning = True
-                    self._vc_event_log(order_id, account_id, "join_in_flight", {"chat_id": chat_id})
+                    await asyncio.wait_for(
+                        asyncio.shield(join_task),
+                        timeout=JOIN_MEDIA_CONFIRM_TIMEOUT,
+                    )
+                    media_confirmed = True
                 except FloodWait as e:
                     wait_s = int(getattr(e, "value", 3) or 3)
                     self._vc_event_log(order_id, account_id, "floodwait", {"wait_s": wait_s})
+                    self._inflight_joins.pop(join_key, None)
                     return False, f"FloodWait:{wait_s}"
                 except GroupCallInvalid:
                     # GroupCallInvalid might be transient — refresh and retry
                     # once before failing. Don't immediately mark as failed.
                     self._vc_event_log(order_id, account_id, "groupcall_invalid_on_join", {"chat_id": chat_id})
+                    self._inflight_joins.pop(join_key, None)
                     await self._force_refresh_call(app, chat_id)
                     # Allow retry by returning False instead of permanent failure
                     return False, "GroupCallInvalid (retrying)"
+                except asyncio.CancelledError:
+                    if not join_task.done():
+                        join_task.cancel()
+                    self._inflight_joins.pop(join_key, None)
+                    raise
+                except asyncio.TimeoutError:
+                    # Media join still propagating → Telegram may have already
+                    # registered the user.  Fall back to the presence listing
+                    # for a bounded grace window, then give up this attempt.
+                    self._vc_event_log(order_id, account_id, "join_in_flight", {"chat_id": chat_id})
                 except Exception as e:
                     err_str = str(e)
                     if not err_str:
@@ -1755,6 +2024,7 @@ class VoiceCallManager:
                         # otherwise the failure is logged as "Join error: "
                         # and misclassified as non-retryable UNKNOWN.
                         err_str = type(e).__name__
+                    self._inflight_joins.pop(join_key, None)
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
                         self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
@@ -1764,19 +2034,20 @@ class VoiceCallManager:
                         return False, f"GroupCall Forbidden (retrying): {err_str[:40]}"
                     if "already" not in err_str.lower() and not _is_transient(e):
                         return False, f"Join error: {err_str[:60]}"
-                    transport_warning = True
+                    # transient → fall through to the presence fallback below
                     self._vc_event_log(order_id, account_id, "transport_uncertain", {
                         "chat_id": int(chat_id), "error": err_str[:120],
                     })
-                except asyncio.CancelledError:
-                    if not join_task.done():
-                        join_task.cancel()
-                    self._inflight_joins.pop(join_key, None)
-                    raise
 
-                if not join_sent:
-                    self._set_state(order_id, account_id, RETRY_PENDING, "join request failed")
-                    return False, "Join request failed"
+                if media_confirmed:
+                    # play() completed → transport up → account IS in the call.
+                    await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True)
+                    self._set_state(order_id, account_id, JOINED, "media transport confirmed", {"voice_chat_id": chat_id})
+                    self._inflight_joins.pop(join_key, None)
+                    self._vc_event_log(order_id, account_id, "joined_media_confirmed", {"chat_id": int(chat_id)})
+                    return True, "Joined"
+
+                transport_warning = True
 
                 # Verify presence via Telegram API (grace period). Telegram
                 # propagation can be slow, so while presence is UNKNOWN (None) or
@@ -2086,6 +2357,25 @@ class VoiceCallManager:
                                 self._account_states_by_order.setdefault(order_id, {})[acc_id] = "TEMPORARILY_UNKNOWN"
                                 continue
 
+                        # ── SESSION GUARD ───────────────────────────────
+                        # A silently-dead MTProto session kills the account's
+                        # voice call minutes later.  Reconnect it immediately
+                        # (and record it) so accounts never die of session loss.
+                        try:
+                            if bool(getattr(Config, "VOICE_SESSION_GUARD", True)) and not bool(getattr(app, "is_connected", True)):
+                                self._record_drop(order_id, acc_id, cid, "session_disconnected",
+                                                  reason="mtproto session down at monitor cycle")
+                                self._vc_event_log(order_id, acc_id, "session_disconnected", {"chat_id": cid})
+                                try:
+                                    await asyncio.wait_for(app.connect(), timeout=10)
+                                    self._vc_event_log(order_id, acc_id, "session_reconnected", {"chat_id": cid})
+                                except Exception as _reconn_exc:
+                                    self._vc_event_log(order_id, acc_id, "session_reconnect_failed", {
+                                        "chat_id": cid, "exc": str(_reconn_exc)[:60],
+                                    })
+                        except Exception:
+                            pass
+
                         # Verify presence via the shared snapshot.
                         try:
                             present = await self._is_in_voice_call(app, cid)
@@ -2095,29 +2385,75 @@ class VoiceCallManager:
                             })
                             present = None  # API hiccup → TEMPORARILY_UNKNOWN
 
-                        # Participant presence alone is not enough: PyTgCalls
-                        # can register the participant before ICE fails. Treat
-                        # a dead media transport as a real disconnect so the
-                        # same account can be recovered before the user sees it
-                        # disappear from the call.
+                        # ── MEDIA TRANSPORT IS THE GROUND TRUTH ──────────
+                        # The participant listing can be incomplete/rate-limited
+                        # in big voice chats (only the first ~200 are returned).
+                        # ntgcalls' own active-call set is authoritative: if the
+                        # native transport is alive, the account IS in the call
+                        # regardless of what the listing says.  This is what
+                        # stops healthy accounts from being mis-detected as gone
+                        # and then force-left around the 1-minute mark.
                         media_alive = None
                         try:
                             media_alive = await self._is_media_call_active(pytg, cid)
                         except Exception:
-                            # Media check failed — assume media is alive to avoid false
-                            # disconnects. Only treat as disconnect if presence check
-                            # also fails.
-                            media_alive = True
-                        
-                        if present is True and not media_alive:
+                            media_alive = None  # unknown → rely on the listing
+
+                        media_known = media_alive is not None
+                        if media_alive is True:
+                            present = True
+                        elif media_alive is False:
                             self._vc_event_log(order_id, acc_id, "media_transport_lost", {
                                 "chat_id": cid,
                                 "verdict": "confirmed_media_disconnect",
                             })
+                            self._record_drop(order_id, acc_id, cid, "media_transport_lost",
+                                              reason="engine media connection missing (ghost)",
+                                              extra={"media_known": media_known})
                             present = False
 
+                        # ── DL HOLD-RISK (online deep-learning model) ───
+                        # Score every cycle, learn from the resolved outcome, and
+                        # keep per-cycle telemetry so WHY an account is at risk
+                        # is always on record.
+                        try:
+                            if _dl_net is not None and bool(getattr(Config, "VOICE_DL_GUARD", True)):
+                                _sess_ok = None
+                                try:
+                                    _sess_ok = bool(app.is_connected)
+                                except Exception:
+                                    _sess_ok = None
+                                _feats = {
+                                    "present_true": 1.0 if present is True else 0.0,
+                                    "present_false": 1.0 if present is False else 0.0,
+                                    "present_unknown": 1.0 if present is None else 0.0,
+                                    "media_alive": 1.0 if media_alive else 0.0,
+                                    "media_known": 1.0 if media_known else 0.0,
+                                    "media_forced": 1.0 if (present is True and media_alive is False) else 0.0,
+                                    "session_ok": (0.5 if _sess_ok is None else (1.0 if _sess_ok else 0.0)),
+                                    "rejoin_failures": min(float(self._rejoin_failures.get((order_id, acc_id), 0)) / 3.0, 1.0),
+                                    "inflight_join": 1.0 if (acc_id, int(cid)) in self._inflight_joins else 0.0,
+                                    "engine_down": 1.0 if pytg is None else 0.0,
+                                    "recent_issues": min(float(len(self._recent_issues)) / 20.0, 1.0),
+                                    "concurrent_joins": min(float(len(self._inflight_joins)) / 24.0, 1.0),
+                                }
+                                _label = None
+                                if media_alive is False:
+                                    _label = 1.0
+                                elif present is True and media_alive is True and _sess_ok is not False:
+                                    _label = 0.0
+                                _risk, _expl = _dl_net.observe(_feats, _label)
+                                self._write_telemetry(order_id, acc_id, cid, _feats, _risk, _label)
+                                _thr = float(getattr(Config, "VOICE_DL_RISK_THRESHOLD", 0.8) or 0.8)
+                                if _risk >= _thr:
+                                    self._vc_event_log(order_id, acc_id, "dl_hold_risk", {
+                                        "risk": round(_risk, 3), "top": _expl[:3],
+                                    })
+                        except Exception:
+                            pass
+
                         if present is True:
-                            # JOINED — confirmed present.
+                            # JOINED — confirmed present (or media transport alive).
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
@@ -2160,6 +2496,9 @@ class VoiceCallManager:
                         self._account_states_by_order.setdefault(order_id, {})[acc_id] = "CONFIRMED_DISCONNECTED"
                         rec["status"] = "CONFIRMED_DISCONNECTED"
                         self._vc_event_log(order_id, acc_id, "confirmed_disconnect", {"chat_id": cid})
+                        self._record_drop(order_id, acc_id, cid, "confirmed_disconnect",
+                                          reason="presence absent %dx in a row" % int(fc),
+                                          extra={"fail_cycle": int(fc)})
 
                         rejoined = False
                         try:
@@ -2176,6 +2515,8 @@ class VoiceCallManager:
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
                             self._vc_event_log(order_id, acc_id, "rejoined_same_account", {"chat_id": cid})
+                            self._record_drop(order_id, acc_id, cid, "recovered",
+                                              reason="same-account rejoin ok", extra={"fail_cycle": int(fc)})
                             rec["status"] = "JOINED"
                         else:
                             # Recovery failed. Bounded retries: after
@@ -2196,6 +2537,9 @@ class VoiceCallManager:
                                     "rejoin_attempts": rjf,
                                     "verdict": "ready_for_replacement",
                                 })
+                                self._record_drop(order_id, acc_id, cid, "slot_unrecoverable",
+                                                  reason="rejoin failed %dx - slot released for replacement" % int(rjf),
+                                                  extra={"rejoin_attempts": int(rjf)})
                                 logger.warning(
                                     f"Order {order_id} acc {acc_id}: slot UNRECOVERABLE after "
                                     f"{rjf} failed rejoin attempts — executor will replace it"
@@ -2288,6 +2632,7 @@ class VoiceCallManager:
                             # Voice clients must receive raw updates from Telegram.
                             no_updates=False,
                             in_memory=True,
+                            **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=15)
                         self.pyrogram_clients[account_id] = app
@@ -2546,6 +2891,8 @@ class VoiceCallManager:
 
         await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
+        self._record_drop(order_id, account_id, chat_id, "stopped",
+                          deliberate=True, reason="order-managed stop")
         return True, "Stopped"
 
     async def stop_call_with_retry(self, order_id: int, account_id: int, max_retries: int = 3, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
