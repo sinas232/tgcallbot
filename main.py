@@ -2,6 +2,13 @@
 main.py
 نسخه نهایی و کامل - اصلاح شده برای فعال‌سازی دکمه خروج همگانی
 """
+# self_healing bootstrap - must be the FIRST import of the app
+try:
+    from services.self_healing import install as _sh_install
+    _sh_install()
+except Exception:
+    pass
+
 import logging
 import os
 import time

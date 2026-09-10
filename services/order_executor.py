@@ -11,6 +11,7 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD
+from services import self_healing
 
 logger = logging.getLogger(__name__)
 
@@ -531,6 +532,10 @@ class OrderExecutor:
 	        joined_ids = set(vcm.get_active_account_ids(order_id))
 
 	        candidates = self._voice_candidates(order_id, window, joined_ids, set(), now)
+	        try:
+	            candidates = self_healing.rank(candidates)
+	        except Exception:
+	            pass
 
 	        # Pipeline: warm the NEXT wave's Pyrogram clients while this wave
 	        # is joining (client start is the slowest single step).
@@ -634,12 +639,20 @@ class OrderExecutor:
 	                    joined_ids.add(aid)
 	                wave_ok += 1
 	                join_brain.report_result(order_id, OUTCOME_OK)
+	                try:
+	                    self_healing.report("", True, key=f"{order_id}:{aid}")
+	                except Exception:
+	                    pass
 	                continue
 
 	            # ── failure handling (whole block guarded: a bookkeeping bug
 	            #    for ONE account must never take the entire order down) ──
 	            try:
 	                msg = str(res.get("msg") or "")
+	                try:
+	                    self_healing.report(msg, False, key=f"{order_id}:{aid}")
+	                except Exception:
+	                    pass
 	                status = res.get("status") or "failed"
 
 	                if status == "deferred":
@@ -686,6 +699,11 @@ class OrderExecutor:
 	                    )
 	                else:
 	                    delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
+	                    try:
+	                        _b, _fac = self_healing.pick(msg, key=f"{order_id}:{aid}")
+	                        delay = min(max(delay * _fac, 1.0), 300.0)
+	                    except Exception:
+	                        pass
 	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
 	                    logger.info(
 	                        f"Order {order_id}: account {aid} attempt {n_att} failed "

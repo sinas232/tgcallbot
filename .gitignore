@@ -4,3 +4,4 @@ __pycache__/
 *.raw
 *.wav
 19.zip
+data/
