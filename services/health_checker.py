@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
+from services.session_ownership import SessionInUseError
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,12 @@ class HealthChecker:
         try:
             client = TelegramAccountClient(account['phone_number'], account['session_string'], account['id'])
             status, result_text = await client.check_spambot()
+        except SessionInUseError as e:
+            # The account is inside an active voice call — opening a second
+            # connection would duplicate the MTProto session and revoke it.
+            # Skip silently this cycle (NOT an error, NOT a dead account).
+            logger.info("⏭ Spam check skipped for acc %s (session in voice call)", account['id'])
+            return
             
             # 🔥 بررسی مرگ اکانت
             if "SESSION_REVOKED" in result_text or "Auth Key Invalid" in result_text or "UserDeactivated" in result_text:

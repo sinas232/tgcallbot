@@ -10,3 +10,4 @@ logs/
 unknown_errors.txt
 sitecustomize.py
 diag_voice.py
+.venv/
