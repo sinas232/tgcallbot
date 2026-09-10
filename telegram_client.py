@@ -23,6 +23,7 @@ from pyrogram.errors import (
 from config import Config
 from security import SecurityManager
 from database import DatabaseManager
+from services.session_ownership import session_ownership, SessionInUseError
 
 logger = logging.getLogger(__name__)
 
@@ -49,22 +50,52 @@ class TelegramAccountClient:
         return Config.TELEGRAM_API_ID, Config.TELEGRAM_API_HASH
 
     async def get_client(self, no_updates=True):
-        """ساخت و بازگرداندن کلاینت Pyrogram"""
-        decrypted_session = SecurityManager.decrypt_session(self.session_string)
-        if not decrypted_session:
-            raise ValueError(f"Invalid Session for account {self.account_id}")
-            
-        api_id, api_hash = await self._get_api_credentials()
-        
-        client = Client(
-            name=f"client_{self.account_id}",
-            api_id=api_id,
-            api_hash=api_hash,
-            session_string=decrypted_session,
-            no_updates=no_updates,  # برای کاهش مصرف منابع
-            in_memory=True
-        )
-        return client
+        """ساخت و بازگرداندن کلاینت Pyrogram
+
+        مهم: وقتی همین سشن در اختیار موتور ویس‌کال است (کلاینت بلندمدت
+        متصل است)، باز کردن یک اتصال موازی با همان session string باعث
+        AUTH_KEY_DUPLICATED و باطل‌شدن سشن (خروج اجباری از ویس) می‌شود؛
+        بنابراین در این حالت SessionInUseError گرفته می‌شود و هیچ اتصال
+        دومی باز نمی‌شود. رزروِ انجام‌شده با stop() کلاینت (پایان
+        context manager) آزاد می‌شود.
+        """
+        # Non-blocking reservation: raises SessionInUseError while the voice
+        # engine (or another ad-hoc op) already holds this session.
+        session_ownership.begin_ad_hoc(self.account_id)
+        try:
+            decrypted_session = SecurityManager.decrypt_session(self.session_string)
+            if not decrypted_session:
+                raise ValueError(f"Invalid Session for account {self.account_id}")
+
+            api_id, api_hash = await self._get_api_credentials()
+
+            client = Client(
+                name=f"client_{self.account_id}",
+                api_id=api_id,
+                api_hash=api_hash,
+                session_string=decrypted_session,
+                no_updates=no_updates,  # برای کاهش مصرف منابع
+                in_memory=True
+            )
+            self._bind_ownership_release(client)
+            return client
+        except Exception:
+            # Construction failed (bad session/credentials) — release the
+            # reservation so the account is not left permanently busy.
+            session_ownership.end_ad_hoc(self.account_id)
+            raise
+
+    def _bind_ownership_release(self, client: Client) -> None:
+        """Release the ad-hoc session reservation when the client stops."""
+        original_stop = client.stop
+
+        async def stop_and_release(*args, **kwargs):
+            try:
+                return await original_stop(*args, **kwargs)
+            finally:
+                session_ownership.end_ad_hoc(self.account_id)
+
+        client.stop = stop_and_release
 
     @staticmethod
     async def preload_all_clients():

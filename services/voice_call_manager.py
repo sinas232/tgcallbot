@@ -56,12 +56,14 @@ from pyrogram.errors import (
     UserAlreadyParticipant,
 )
 from pyrogram.raw import functions, types
-from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioQuality, MediaStream
+from pytgcalls import PyTgCalls, filters as pytgcalls_filters
+from pytgcalls.types import AudioQuality, ChatUpdate, MediaStream, StreamEnded
 
 from database import DatabaseManager
 from security import SecurityManager
 from telegram_client import TelegramAccountClient
+from services.voice_cooldown import voice_cooldown
+from services.session_ownership import session_ownership
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -129,6 +131,29 @@ _SILENCE_RATE = 48000
 _SILENCE_CHANNELS = 2
 _SILENCE_SECONDS = max(5, int(getattr(Config, "VOICE_SILENCE_SECONDS", 30) or 30))
 _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
+
+# pytgcalls 2.x ffmpeg-parameter DSL (see pytgcalls/ffmpeg.py):
+#   ``--audio`` selects the audio section and ``---start`` places the tokens
+#   that follow BEFORE ``-i <path>`` (input options). ``-stream_loop -1``
+#   loops the input file forever. ntgcalls executes this RAW command, so the
+#   silence never reaches EOF and the media transport never tears down.
+#
+# The previous value ``"-audio -stream_loop -1"`` used a SINGLE dash: the
+# parser treated ``-audio`` as an ffmpeg flag, so the runtime command became
+# ``ffmpeg -audio -stream_loop -1 -nostdin -i silence.wav ...`` and ffmpeg
+# exited instantly with "Unrecognized option 'audio'" — ZERO audio bytes
+# flowed, ntgcalls reported stream end and Telegram dropped the participant
+# seconds after joining (this was the primary "joins then immediately gets
+# kicked" bug). The correct section selector is the double-dash form.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -stream_loop -1"
+
+# Server-directed FloodWait at or below this many seconds is slept inside
+# the join attempt (where it survives cancellation as a persisted deadline);
+# longer waits are recorded and the account is deferred by the scheduler so
+# one flooded account cannot freeze an entire wave for hours.
+VOICE_FLOOD_INLINE_WAIT_MAX = max(
+    0, int(getattr(Config, "VOICE_FLOOD_INLINE_WAIT_MAX", 30))
+)
 
 CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
@@ -265,7 +290,7 @@ _NON_RELEASING_STATES = {
 
 # Valid transitions for the state machine (prev -> set of legal next states).
 _VALID_TRANSITIONS = {
-    QUEUED: {STARTING},
+    QUEUED: {STARTING, RATE_LIMITED, FAILED},
     STARTING: {CLIENT_STARTED, FAILED, RATE_LIMITED, RETRY_PENDING},
     CLIENT_STARTED: {JOINING, FAILED, RATE_LIMITED, RETRY_PENDING},
     JOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED, JOINED},
@@ -1417,6 +1442,11 @@ class VoiceCallManager:
                 try:
                     if not app.is_connected:
                         await asyncio.wait_for(app.start(), timeout=15)
+                except FloodWait as e:
+                    wait_s = int(getattr(e, "value", 3) or 3)
+                    voice_cooldown.record(account_id, wait_s,
+                                         operation="client_start", source="pyrogram reconnect")
+                    raise
                 except Exception as e:
                     logger.warning(f"reconnect pyrogram acc={account_id}: {e}")
                     try:
@@ -1426,32 +1456,52 @@ class VoiceCallManager:
                         pass
                     app = None
                     self.pyrogram_clients.pop(account_id, None)
+                    # The session tied to this dead client is gone; release
+                    # the exclusive hold so the fresh client below re-acquires.
+                    session_ownership.release_voice(account_id)
 
             if not app:
                 async with CLIENT_CREATE_SEMAPHORE:
-                    helper = TelegramAccountClient("temp", session_string, account_id)
-                    api_id, api_hash = await helper._get_api_credentials()
-                    app = Client(
-                        f"shared_client_{account_id}",
-                        session_string=decrypted_session,
-                        api_id=api_id,
-                        api_hash=api_hash,
-                        # PyTgCalls needs raw Telegram updates to complete
-                        # the voice transport handshake and participant sync.
-                        no_updates=False,
-                        in_memory=True,
-                        **_client_device_fingerprint(account_id),
-                    )
-                    await asyncio.wait_for(app.start(), timeout=20)
+                    held = await session_ownership.acquire_voice(account_id)
+                    try:
+                        helper = TelegramAccountClient("temp", session_string, account_id)
+                        api_id, api_hash = await helper._get_api_credentials()
+                        app = Client(
+                            f"shared_client_{account_id}",
+                            session_string=decrypted_session,
+                            api_id=api_id,
+                            api_hash=api_hash,
+                            # PyTgCalls needs raw Telegram updates to complete
+                            # the voice transport handshake and participant sync.
+                            no_updates=False,
+                            in_memory=True,
+                            **_client_device_fingerprint(account_id),
+                        )
+                        await asyncio.wait_for(app.start(), timeout=20)
+                    except Exception:
+                        if held:
+                            session_ownership.release_voice(account_id)
+                        raise
                     self.pyrogram_clients[account_id] = app
 
             # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
             pytg = self.clients.get(account_id)
             if pytg:
+                # PyTgCalls 2.x has NO `is_connected` attribute — reading it
+                # raised AttributeError on EVERY reuse, which forced a
+                # stop()+rebuild of a perfectly healthy engine (and kicked the
+                # account's call). Query the binding's call map instead; the
+                # engine is reusable as long as that coroutine answers.
+                healthy = False
                 try:
-                    if not pytg.is_connected:
-                        await asyncio.wait_for(pytg.start(), timeout=15)
-                except Exception:
+                    await pytg.group_calls
+                    healthy = True
+                except Exception as e:
+                    logger.warning(
+                        "pytgcalls engine unhealthy acc=%s (%s) — rebuilding",
+                        account_id, e,
+                    )
+                if not healthy:
                     try:
                         if hasattr(pytg, 'stop'):
                             await pytg.stop()
@@ -1463,6 +1513,7 @@ class VoiceCallManager:
             if not pytg:
                 async with CLIENT_CREATE_SEMAPHORE:
                     pytg = PyTgCalls(app)
+                    self._attach_engine_handlers(pytg, account_id)
                     await asyncio.wait_for(pytg.start(), timeout=15)
                     self.clients[account_id] = pytg
 
@@ -1495,6 +1546,9 @@ class VoiceCallManager:
                     await asyncio.wait_for(app.disconnect(), timeout=5)
                 except Exception:
                     pass
+            # Session is no longer connected by the voice engine — release
+            # the exclusive hold so short-lived clients may use it again.
+            session_ownership.release_voice(account_id)
             self._session_cache.pop(account_id, None)
             self._client_locks.pop(account_id, None)
 
@@ -1506,6 +1560,108 @@ class VoiceCallManager:
         except Exception:
             pass
 
+    # ─── Engine event handlers (stream-end / kicked observability) ───
+    def _order_id_for_account(self, account_id: int, chat_id: int = 0) -> Optional[int]:
+        """Find the order this account is serving right now (if any)."""
+        for (oid, aid), info in self.active_calls.items():
+            if aid == account_id and (
+                not chat_id or int((info or {}).get("chat_id") or 0) == int(chat_id)
+            ):
+                return oid
+        for oid, recs in self.joined_accounts_by_order.items():
+            if account_id in recs:
+                return oid
+        return None
+
+    def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
+        """Register stream-end / kick handlers on a freshly built engine.
+
+        Without these, ffmpeg dying (the old ``-audio`` flag bug) or the
+        account being kicked produced NO log at all — the participant just
+        vanished. The handlers record the event in the drop ledger and make
+        ONE best-effort attempt to restart the silence stream while the
+        account is still expected in the call; the per-order monitor remains
+        the authoritative recovery path if the binding is already gone.
+        """
+        try:
+            @pytg.on_update(pytgcalls_filters.stream_end(StreamEnded.Type.AUDIO))
+            async def _on_audio_ended(_engine, update):  # type: ignore[misc]
+                cid = int(getattr(update, "chat_id", 0) or 0)
+                order_id = self._order_id_for_account(account_id, cid)
+                logger.warning(
+                    "[VoiceStreamEnd] order=%s acc=%s chat=%s audio stream ended",
+                    order_id, account_id, cid,
+                )
+                self._vc_event_log(order_id, account_id, "stream_audio_ended", {"chat_id": cid})
+                self._record_drop(
+                    order_id, account_id, cid, "stream_audio_ended",
+                    reason="ntgcalls reported audio source EOF/failure",
+                )
+                asyncio.create_task(self._restart_silence(account_id, cid))
+
+            @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
+            async def _on_left_call(_engine, update):  # type: ignore[misc]
+                cid = int(getattr(update, "chat_id", 0) or 0)
+                order_id = self._order_id_for_account(account_id, cid)
+                status = getattr(update, "status", "?")
+                logger.warning(
+                    "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
+                    order_id, account_id, cid, status,
+                )
+                self._vc_event_log(
+                    order_id, account_id, "chat_left_update",
+                    {"chat_id": cid, "status": str(status)},
+                )
+                self._record_drop(
+                    order_id, account_id, cid, "chat_left_update",
+                    reason=f"engine chat update: {status}",
+                )
+        except Exception as exc:
+            logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
+
+    async def _restart_silence(self, account_id: int, chat_id: int) -> None:
+        """One best-effort silence restart after a StreamEnded event."""
+        try:
+            await asyncio.sleep(0.5)
+            # NOTE: valid Telegram chat ids are NEGATIVE (e.g. -1001234567890);
+            # only zero/unset means "no call at all".
+            if not chat_id:
+                return
+            # Account is no longer expected in any call → nothing to restart.
+            if not any(aid == account_id for (oid, aid) in self.active_calls):
+                return
+            pytg = self.clients.get(account_id)
+            if pytg is None:
+                return
+            try:
+                calls = await pytg.group_calls
+            except Exception:
+                calls = {}
+            if int(chat_id) not in calls:
+                # Binding is gone; monitor recovery/rejoin owns this now.
+                return
+            await self._play_silence(pytg, int(chat_id))
+            order_id = self._order_id_for_account(account_id, chat_id)
+            self._vc_event_log(order_id, account_id, "silence_restarted", {"chat_id": chat_id})
+            logger.info(
+                "[VoiceStream] silence re-streamed acc=%s chat=%s after end event",
+                account_id, chat_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[VoiceStream] silence restart failed acc=%s chat=%s: %s",
+                account_id, chat_id, exc,
+            )
+
+    def flood_wait_remaining(self, account_id: int) -> float:
+        """Remaining server-directed cooldown for an account (0 if clear)."""
+        try:
+            return float(voice_cooldown.remaining(account_id))
+        except Exception:
+            return 0.0
+
     async def _play_silence(self, pytg: PyTgCalls, chat_id: int) -> None:
         """Join + play the LOOPING silence stream (stay-alive media).
 
@@ -1516,7 +1672,7 @@ class VoiceCallManager:
         ``-stream_loop -1`` so the transport can never die of EOF.
         """
         loop_flag = (
-            "-audio -stream_loop -1"
+            _SILENCE_FFMPEG_LOOP_PARAMS
             if getattr(Config, "VOICE_SILENCE_LOOP", True)
             else None
         )
@@ -1766,12 +1922,16 @@ class VoiceCallManager:
             except Exception:
                 pass
 
-            # 2) Paginate the remainder via GetGroupCallParticipants.
+            # 2) Paginate the remainder via phone.getGroupParticipants.
+            # NOTE: pyrogram 2.0.106 exposes GetGroupParticipants, NOT
+            # GetGroupCallParticipants — the old name raised AttributeError
+            # on every cycle, so the shared snapshot always collapsed to
+            # "unknown" and presence verification silently never worked.
             try:
                 offset = ""
                 for _page in range(50):  # 50 * 500 = 25 000 participants max
                     res = await app.invoke(
-                        functions.phone.GetGroupCallParticipants(
+                        functions.phone.GetGroupParticipants(
                             call=call,
                             ids=[],
                             sources=[],
@@ -1866,12 +2026,12 @@ class VoiceCallManager:
             except Exception:
                 pass
 
-            # 2) Paginate through the remainder.
+            # 2) Paginate through the remainder (phone.getGroupParticipants).
             try:
                 offset = ""
                 for _page in range(50):  # 50 * 500 = 25 000 participants max
                     res = await app.invoke(
-                        functions.phone.GetGroupCallParticipants(
+                        functions.phone.GetGroupParticipants(
                             call=call,
                             ids=[],
                             sources=[],
@@ -1995,6 +2155,12 @@ class VoiceCallManager:
                     media_confirmed = True
                 except FloodWait as e:
                     wait_s = int(getattr(e, "value", 3) or 3)
+                    # Persist the server timer even when this path is used
+                    # directly by monitor recovery (no retry wrapper there).
+                    voice_cooldown.record(
+                        account_id, wait_s,
+                        operation="play_silence", source="JoinGroupCall",
+                    )
                     self._vc_event_log(order_id, account_id, "floodwait", {"wait_s": wait_s})
                     self._inflight_joins.pop(join_key, None)
                     return False, f"FloodWait:{wait_s}"
@@ -2044,6 +2210,9 @@ class VoiceCallManager:
                     await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True)
                     self._set_state(order_id, account_id, JOINED, "media transport confirmed", {"voice_chat_id": chat_id})
                     self._inflight_joins.pop(join_key, None)
+                    # A successful join proves the account action is no
+                    # longer flooded — clear any stale cooldown.
+                    voice_cooldown.clear(account_id)
                     self._vc_event_log(order_id, account_id, "joined_media_confirmed", {"chat_id": int(chat_id)})
                     return True, "Joined"
 
@@ -2137,6 +2306,30 @@ class VoiceCallManager:
         wall_timeout = _JOIN_PENDING_TIMEOUT + 30
         while attempt < hard_limit:
             attempt += 1
+            # Honor a FloodWait cooldown recorded by ANY code path (a prior
+            # wave cancelled mid-sleep, a monitor recovery, a restart ...):
+            # never issue another join for this account while the server
+            # timer is active. Short waits are slept here; long waits are
+            # handed back to the scheduler so one account can't freeze a wave.
+            cooling = voice_cooldown.remaining(account_id)
+            if cooling > VOICE_FLOOD_INLINE_WAIT_MAX:
+                retry_at = time.time() + cooling
+                self._set_state(
+                    order_id, account_id, RATE_LIMITED,
+                    f"persisted FloodWait, {int(cooling)}s left (deferred)",
+                    {"retry_at": retry_at, "failure_class": FAILURE_RATE_LIMITED},
+                )
+                return False, f"FloodWait:{int(cooling)}"
+            if cooling > 0:
+                self._vc_event_log(order_id, account_id, "floodwait_resume_wait",
+                                   {"remaining": int(cooling)})
+                try:
+                    await voice_cooldown.sleep_remaining(account_id)
+                except asyncio.CancelledError:
+                    # The absolute deadline stays recorded — the next wave
+                    # will find the cooldown still active and back off.
+                    raise
+                voice_cooldown.clear(account_id)
             started_at = time.time()
             try:
                 ok, msg = await asyncio.wait_for(
@@ -2168,14 +2361,22 @@ class VoiceCallManager:
             )
 
             if failure == FAILURE_RATE_LIMITED:
-                # Respect server-directed wait; persist and do not hammer.
-                # Extract server wait from the message if present.
+                # Respect the server-directed wait. The ABSOLUTE deadline is
+                # persisted (services/voice_cooldown) BEFORE any sleeping, so
+                # a wave deadline / cancellation / restart can never shorten
+                # it: the next attempt finds the cooldown still active.
                 try:
                     import re as _re
                     m = _re.search(r"(\d+)", msg)
                     wait_s = float(m.group(1)) if m else 3.0
                 except Exception:
                     wait_s = 3.0
+                # Merge with any already-recorded deadline (never shorten).
+                wait_s = max(wait_s, voice_cooldown.remaining(account_id))
+                wait_s = voice_cooldown.record(
+                    account_id, wait_s,
+                    operation="JOIN_VOICE_CHAT", source=msg[:80],
+                )
                 retry_at = time.time() + wait_s
                 await self._persist_rate_limit(
                     order_id=order_id, account_id=account_id,
@@ -2186,7 +2387,18 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, RATE_LIMITED,
                                 f"server-directed wait {int(wait_s)}s",
                                 {"retry_at": retry_at, "failure_class": failure, "attempt": attempt})
-                await asyncio.sleep(wait_s)
+                self._vc_event_log(order_id, account_id, "floodwait",
+                                   {"wait_s": int(wait_s), "attempt": attempt})
+                if wait_s > VOICE_FLOOD_INLINE_WAIT_MAX:
+                    # Hand the long server wait back to the scheduler instead
+                    # of holding a wave slot for minutes/hours.
+                    return False, f"FloodWait:{int(wait_s)}"
+                try:
+                    await voice_cooldown.sleep_remaining(account_id)
+                except asyncio.CancelledError:
+                    # Deadline remains recorded → still enforced later.
+                    raise
+                voice_cooldown.clear(account_id)
                 continue
 
             if not _failure_is_retryable(failure):
@@ -2618,23 +2830,45 @@ class VoiceCallManager:
                     # already created this client).
                     if account_id in self.pyrogram_clients:
                         return
+                    # Never warm an account whose server-directed FloodWait
+                    # timer is still active — warming opens a new connection
+                    # and would extend the wait for the whole IP.
+                    if voice_cooldown.remaining(account_id) > 0:
+                        return
                     decrypted_session = SecurityManager.decrypt_session(session_string)
                     if not decrypted_session:
                         return
                     async with CLIENT_CREATE_SEMAPHORE:
-                        helper = TelegramAccountClient("temp", session_string, account_id)
-                        api_id, api_hash = await helper._get_api_credentials()
-                        app = Client(
-                            f"shared_client_{account_id}",
-                            session_string=decrypted_session,
-                            api_id=api_id,
-                            api_hash=api_hash,
-                            # Voice clients must receive raw updates from Telegram.
-                            no_updates=False,
-                            in_memory=True,
-                            **_client_device_fingerprint(account_id),
-                        )
-                        await asyncio.wait_for(app.start(), timeout=15)
+                        held = await session_ownership.acquire_voice(account_id)
+                        try:
+                            helper = TelegramAccountClient("temp", session_string, account_id)
+                            api_id, api_hash = await helper._get_api_credentials()
+                            app = Client(
+                                f"shared_client_{account_id}",
+                                session_string=decrypted_session,
+                                api_id=api_id,
+                                api_hash=api_hash,
+                                # Voice clients must receive raw updates from Telegram.
+                                no_updates=False,
+                                in_memory=True,
+                                **_client_device_fingerprint(account_id),
+                            )
+                            await asyncio.wait_for(app.start(), timeout=15)
+                        except FloodWait as e:
+                            if held:
+                                session_ownership.release_voice(account_id)
+                            wait_s = int(getattr(e, "value", 3) or 3)
+                            voice_cooldown.record(
+                                account_id, wait_s,
+                                operation="warmup_start", source="client.start",
+                            )
+                            self._vc_event_log(None, account_id, "warmup_floodwait",
+                                               {"wait_s": wait_s})
+                            return
+                        except Exception:
+                            if held:
+                                session_ownership.release_voice(account_id)
+                            raise
                         self.pyrogram_clients[account_id] = app
                         self._session_cache[account_id] = session_string
                         warmed += 1
@@ -2664,6 +2898,25 @@ class VoiceCallManager:
                     "target": chat_link,
                 }
             return True, "Already active in this order", cid
+
+        # ═══ SERVER-DIRECTED FLOODWAIT GATE ═══
+        # If this account is still inside a FloodWait window recorded by any
+        # code path (a wave cancelled mid-sleep, a prior order, a process
+        # restart ...) do NOT open any connection or issue any request yet.
+        # Returning immediately hands the timer to the scheduler without
+        # touching Telegram, so early retries can never extend the wait.
+        cooling = voice_cooldown.remaining(account_id)
+        if cooling > 0:
+            retry_at = time.time() + cooling
+            self._set_state(
+                order_id, account_id, RATE_LIMITED,
+                f"persisted server FloodWait: {int(cooling)}s left",
+                {"retry_at": retry_at, "failure_class": FAILURE_RATE_LIMITED,
+                 "flood_wait_seconds": int(cooling)},
+            )
+            self._vc_event_log(order_id, account_id, "floodwait_gate_skip",
+                               {"remaining": int(cooling)})
+            return False, f"FloodWait:{int(cooling)}", 0
 
         # ═══ ADAPTIVE PARALLEL: acquire the PER-ORDER JOIN GATE ═══
         # The gate is a semaphore sized to the order's MAX window; up to
@@ -2699,6 +2952,8 @@ class VoiceCallManager:
                 return False, f"SESSION_REVOKED: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
+                voice_cooldown.record(account_id, wait_s,
+                                      operation="client_init", source="get_or_create_client")
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
             except Exception as e:
@@ -2800,6 +3055,8 @@ class VoiceCallManager:
 
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
+                voice_cooldown.record(account_id, wait_s,
+                                      operation="start_call", source="join stage")
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
             except Exception as e:

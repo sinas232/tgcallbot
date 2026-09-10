@@ -124,6 +124,17 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # FloodWait at or below this many seconds is slept inside the join task;
+    # longer server waits are persisted (data/voice_flood_cooldown.json, also
+    # surviving restarts/wave cancellation) and the account is deferred by the
+    # scheduler until the timer elapses — never retried early, never replaced.
+    VOICE_FLOOD_INLINE_WAIT_MAX = int(os.getenv('VOICE_FLOOD_INLINE_WAIT_MAX', '30'))
+    # Safety clamp (seconds, default 24h) applied when storing server waits.
+    # Never lowers a wait Telegram asked for below this value.
+    VOICE_FLOOD_WAIT_MAX_SECONDS = int(os.getenv('VOICE_FLOOD_WAIT_MAX_SECONDS', '86400'))
+    # Block duplicate Pyrogram connections on a session that the voice engine
+    # currently holds (prevents AUTH_KEY_DUPLICATED / SESSION_REVOKED kicks).
+    VOICE_SESSION_OWNERSHIP = os.getenv('VOICE_SESSION_OWNERSHIP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # Max wait for the native media join (pytgcalls play()) to CONFIRM the
     # account is inside the call.  play() returns only after Telegram accepted
     # the JoinGroupCall + the WebRTC transport is up, so this works even in

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -10,7 +11,8 @@ from database import DatabaseManager
 from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
-from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD
+from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
+from services.session_ownership import SessionInUseError
 from services import self_healing
 
 logger = logging.getLogger(__name__)
@@ -428,11 +430,12 @@ class OrderExecutor:
 	    self._voice_pool[order_id] = merged
 
 	def _voice_candidates(self, order_id: int, window: int, joined_ids: Set[int],
-	                      in_flight: Set[int], now: float) -> List[Dict]:
+	                    in_flight: Set[int], now: float) -> List[Dict]:
 	    """Pick up to `window` pool accounts that are ready to try now."""
 	    pool = self._voice_pool.get(order_id) or []
 	    if not pool:
 	        return []
+	    vcm = _get_voice_call_manager()
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
@@ -454,6 +457,10 @@ class OrderExecutor:
 	            continue
 	        if retry_after.get(aid, 0) > now:
 	            continue
+	        # Persisted server-directed FloodWait (may survive wave
+	        # cancellation and restarts): never re-issue early.
+	        if vcm is not None and vcm.flood_wait_remaining(aid) > 0:
+	            continue
 	        chosen.append(acc)
 	    self._voice_cursor[order_id] = cursor % n if n else 0
 	    return chosen
@@ -461,6 +468,8 @@ class OrderExecutor:
 	def _voice_earliest_retry(self, order_id: int, joined_ids: Set[int]) -> Optional[float]:
 	    """Earliest retry timestamp among pool accounts not yet exhausted."""
 	    pool = self._voice_pool.get(order_id) or []
+	    vcm = _get_voice_call_manager()
+	    now = time.time()
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
@@ -473,6 +482,12 @@ class OrderExecutor:
 	        if attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        when = retry_after.get(aid, 0.0)
+	        # Mirror the persisted FloodWait timer in scheduling so waves
+	        # wait (polled) instead of hammering a flooded account.
+	        if vcm is not None:
+	            flood_when = now + vcm.flood_wait_remaining(aid)
+	            if flood_when > when:
+	                when = flood_when
 	        if when <= 0:
 	            return 0.0
 	        best = when if best is None else min(best, when)
@@ -685,10 +700,30 @@ class OrderExecutor:
 	                    wave_fail += 1
 	                    continue
 
+	                outcome = join_brain.classify_message(msg)
+	                if outcome == OUTCOME_FLOOD:
+	                    # A server-directed FloodWait is system pressure, NOT a
+	                    # faulty account: do NOT spend its attempt budget and do
+	                    # not replace it (replacement = more joins = even deeper
+	                    # flood). The exact server timer is persisted in vcm and
+	                    # reflected here so candidate selection skips the account
+	                    # until it elapses, whether or not this wave is cancelled.
+	                    fm = re.search(r"FLOODWAIT:(\d+)", msg.upper())
+	                    wait_s = float(fm.group(1)) if fm else float(
+	                        getattr(Config, "VOICE_JOIN_FLOOD_PAUSE_SECONDS", 15)
+	                    )
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + wait_s
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} FloodWait {wait_s:.0f}s — "
+	                        f"budget kept, retry deferred (no replacement)"
+	                    )
+	                    join_brain.report_result(order_id, outcome, msg)
+	                    wave_fail += 1
+	                    continue
+
 	                attempts = self._voice_attempts.setdefault(order_id, {})
 	                n_att = attempts.get(aid, 0) + 1
 	                attempts[aid] = n_att
-	                outcome = join_brain.classify_message(msg)
 	                if n_att >= attempt_budget:
 	                    # Retry budget exhausted → give up on this account; the
 	                    # next wave replaces it with a fresh pool member.
@@ -1073,6 +1108,10 @@ class OrderExecutor:
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}
 			return None
+		except SessionInUseError as e:
+			# Same session is held by the voice engine — opening a duplicate
+			# connection would revoke the auth key. Skip (never mark dead).
+			return {"success": False, "status": "failed", "msg": f"SESSION_IN_USE: {e}"}
 		except Exception as e:
 			return {"success": False, "status": "error", "msg": str(e)}
 
