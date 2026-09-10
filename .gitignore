@@ -6,3 +6,7 @@ __pycache__/
 19.zip
 data/
 data/
+logs/
+unknown_errors.txt
+sitecustomize.py
+diag_voice.py
