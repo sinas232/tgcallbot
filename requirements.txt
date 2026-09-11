@@ -18,6 +18,13 @@ python-telegram-bot[job-queue]
 
 #Engine
 
-pyrogram>=2.0.106
+# Kurigram: fork نگهداری‌شدهٔ Pyrogram که با نام «pyrogram» ایمپورت می‌شود
+# (drop-in replacement). این نسخه Layer جدید تلگرام (>=216) و در نتیجه
+# متد phone.sendGroupCallMessage (پیام/ری‌اکشن درون ویس‌کال) را پشتیبانی می‌کند.
+# چون هم‌نام pyrogram است، py-tgcalls و بقیهٔ کد بدون تغییر کار می‌کنند و
+# سشن‌استرینگ‌های قبلی نیز معتبر می‌مانند.
+# نکته: pyrogram اصلی نباید هم‌زمان نصب باشد (تداخل پکیج). Dockerfile قبل از
+# نصب، pyrogram/pyrofork را حذف می‌کند.
+kurigram>=2.2.25
 tgcrypto>=1.2.5
 py-tgcalls==2.2.5

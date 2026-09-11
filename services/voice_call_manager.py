@@ -980,9 +980,9 @@ class VoiceCallManager:
         """
         if not self._incall_messages_supported():
             return False, (
-                "نسخهٔ فعلی کتابخانهٔ Pyrogram از «پیام/ری‌اکشن درون ویس‌کال» "
-                "پشتیبانی نمی‌کند (نیازمند پشتیبانی Layer 216 تلگرام). برای "
-                "فعال‌سازی باید Pyrogram به نسخه‌ای که این قابلیت را دارد ارتقا یابد."
+                "نسخهٔ فعلی کتابخانهٔ MTProto از «پیام/ری‌اکشن درون ویس‌کال» "
+                "پشتیبانی نمی‌کند (نیازمند Layer ≥216 تلگرام). ایمیج را با "
+                "kurigram دوباره بیلد کنید تا این قابلیت فعال شود."
             )
 
         app = self.pyrogram_clients.get(account_id)
@@ -998,20 +998,28 @@ class VoiceCallManager:
             if not call:
                 return False, "در این چت ویس‌کال فعالی یافت نشد."
 
-            # ساخت متن استایل‌دار طبق اسکیمای Layer 216
-            msg_obj = payload
-            try:
-                # برخی نسخه‌ها TextWithEntities را لازم دارند
-                if hasattr(types, "TextWithEntities"):
-                    msg_obj = types.TextWithEntities(text=payload, entities=[])
-            except Exception:
+            # اسکیمای دقیق (Layer 216+):
+            #   phone.sendGroupCallMessage call:InputGroupCall random_id:long
+            #       message:TextWithEntities ...  = Updates
+            # پس message باید حتماً TextWithEntities باشد.
+            if hasattr(types, "TextWithEntities"):
+                msg_obj = types.TextWithEntities(text=payload, entities=[])
+            else:
                 msg_obj = payload
 
             SendFn = getattr(functions.phone, "SendGroupCallMessage")
-            try:
-                req = SendFn(call=call, message=msg_obj, random_id=self._rand_id())
-            except TypeError:
-                # امضای متد ممکن است اندکی متفاوت باشد
+            req = None
+            for kwargs in (
+                {"call": call, "random_id": self._rand_id(), "message": msg_obj},
+                {"call": call, "message": msg_obj, "random_id": self._rand_id()},
+                {"call": call, "message": msg_obj},
+            ):
+                try:
+                    req = SendFn(**kwargs)
+                    break
+                except TypeError:
+                    continue
+            if req is None:
                 req = SendFn(call=call, message=payload)
 
             await app.invoke(req)

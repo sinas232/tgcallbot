@@ -43,6 +43,17 @@ async def is_incall_feature_enabled(bot_id: int) -> bool:
     return val == "true"
 
 
+def _short_target(link) -> str:
+    """نمایش کوتاه و تمیز مقصد سفارش (بدون https/@ اضافه)."""
+    s = (link or "").strip()
+    if not s:
+        return "—"
+    for p in ("https://", "http://", "t.me/", "@"):
+        if s.startswith(p):
+            s = s[len(p):]
+    return s[:18]
+
+
 def _acc_name(acc: dict) -> str:
     first = (acc.get('first_name') or "").strip()
     last = (acc.get('last_name') or "").strip()
@@ -71,8 +82,8 @@ async def incall_center_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if vcm and not vcm._incall_messages_supported():
         await send_safe(
             context.bot, update.effective_chat.id,
-            "ℹ️ این قابلیت هنوز روی این سرور فعال نشده است (نیازمند بروزرسانی کتابخانه). "
-            "لطفاً بعداً دوباره امتحان کنید.",
+            "ℹ️ این قابلیت روی نسخهٔ فعلی سرور در دسترس نیست (نیازمند کتابخانهٔ "
+            "kurigram و ری‌بیلد ایمیج). لطفاً بعد از بروزرسانی دوباره امتحان کنید.",
             reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
         return ConversationHandler.END
 
@@ -91,6 +102,16 @@ async def incall_center_start(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.HTML)
         return ConversationHandler.END
 
+    # هوشمند: اگر فقط یک سفارش فعال دارد، مستقیم به انتخاب اکانت‌ها برو
+    if len(orders) == 1:
+        oid = orders[0]['id']
+        context.user_data['ic_order_id'] = oid
+        context.user_data.setdefault('ic_selected', set())
+        await send_safe(context.bot, update.effective_chat.id,
+                        "💬 <b>مرکز چت در ویس‌کال</b>", parse_mode=ParseMode.HTML)
+        await _render_account_picker(update, context, oid, edit=False)
+        return ConversationHandler.END
+
     await _render_orders_list(update, context, orders, edit=False)
     return ConversationHandler.END
 
@@ -103,9 +124,10 @@ async def _render_orders_list(update, context, orders, edit=False):
         n_present = 0
         if vcm:
             n_present = len(vcm.get_order_incall_accounts(oid))
-        target = (o.get('target_link') or "")[:25]
-        label = f"🎙 سفارش #{oid} • {n_present} اکانت آنلاین"
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"ic_order_{oid}")])
+        target = _short_target(o.get('target_link'))
+        dot = "🟢" if n_present else "⚪️"
+        label = f"{dot} #{oid} • {target} • {n_present} آنلاین"
+        rows.append([InlineKeyboardButton(label[:64], callback_data=f"ic_order_{oid}")])
     rows.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="ic_orders_refresh")])
     rows.append([InlineKeyboardButton("❌ بستن", callback_data="ic_close")])
     kb = InlineKeyboardMarkup(rows)
@@ -308,7 +330,19 @@ async def incall_back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _render_compose_panel(update, context, edit=True, note=""):
     selected = context.user_data.get('ic_selected', set())
     oid = context.user_data.get('ic_order_id')
+
+    # هوشمند: انتخاب‌ها را با اکانت‌هایی که هنوز آنلاین‌اند هم‌گام کن
+    vcm = _get_vcm()
+    online_ids = {a['account_id'] for a in vcm.get_order_incall_accounts(oid)} if (vcm and oid) else set()
+    selected = {s for s in selected if s in online_ids}
+    context.user_data['ic_selected'] = selected
     n = len(selected)
+    n_online = len(online_ids)
+
+    # اگر هیچ‌کدام از اکانت‌های انتخاب‌شده آنلاین نماند، به انتخاب اکانت برگرد
+    if n == 0:
+        await _render_account_picker(update, context, oid, edit=edit)
+        return
 
     rows = []
     row = []
@@ -327,7 +361,7 @@ async def _render_compose_panel(update, context, edit=True, note=""):
     kb = InlineKeyboardMarkup(rows)
 
     txt = (f"💬 <b>ارسال در ویس‌کال</b> — سفارش <code>#{oid}</code>\n"
-           f"👥 اکانت‌های انتخاب‌شده: <b>{n}</b>\n\n"
+           f"👥 اکانت‌های انتخاب‌شده: <b>{n}</b> از {n_online} آنلاین\n\n"
            "روی یک اموجی بزنید تا فوراً ری‌اکشن ارسال شود، یا «نوشتن پیام متنی» را انتخاب کنید.\n"
            "می‌توانید بارها و بارها ارسال کنید؛ منو باز می‌ماند.")
     if note:
