@@ -35,6 +35,7 @@ services:
     extra_hosts:
       - "db:172.28.0.2"
       - "redis:172.28.0.3"
+      - "payproxy:172.28.0.5"
     # پورت وب‌سرور ربات (کال‌بک پرداخت) از اینجا منتشر می‌شود، چون bot در
     # فضای شبکهٔ همین کانتینر اجرا می‌شود و پورت مستقل ندارد.
     ports:
@@ -78,13 +79,6 @@ services:
     # سازگاری با اجرای غیر-swarm قدیمی‌تر (docker-compose v1) در صورت وجود:
     mem_limit: 1536m
     cpus: 2.0
-    depends_on:
-      warp:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}
@@ -95,6 +89,18 @@ services:
       - USE_PROXY=${USE_PROXY:-true}
       - SOCKS5_HOST=${SOCKS5_HOST:-127.0.0.1}
       - SOCKS5_PORT=${SOCKS5_PORT:-1080}
+      # پروکسی درخواست‌های درگاه پرداخت (بدون WARP، از IP ایرانی هاست).
+      # اگر خالی شود، درخواست‌های پرداخت مستقیم (از WARP) می‌روند.
+      - PAYMENT_HTTP_PROXY=${PAYMENT_HTTP_PROXY:-http://payproxy:8888}
+    depends_on:
+      warp:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      payproxy:
+        condition: service_started
     env_file:
       - path: .env
         required: false
@@ -139,6 +145,31 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────
+  # پروکسی درگاه پرداخت (بدون WARP)
+  # ─────────────────────────────────────────────────────────────────────
+  # درگاه‌های پرداخت ایرانی (زرین‌پال/آقای پرداخت) اتصال از IP خارجیِ WARP را
+  # نمی‌پذیرند. چون ربات با network_mode: service:warp اجرا می‌شود، کل ترافیکش
+  # (از جمله ساخت لینک پرداخت) از IP خارجی می‌رود و timeout می‌خورد.
+  # این کانتینر روی شبکهٔ عادیِ داکر است، پس ترافیکش از IP ایرانیِ هاست خارج
+  # می‌شود. ربات فقط درخواست‌های پرداخت را از این پروکسی رد می‌کند
+  # (PAYMENT_HTTP_PROXY=http://172.28.0.5:8888)، و تماس‌های صوتی همچنان WARP.
+  payproxy:
+    build: ./proxy
+    container_name: payment_proxy_container
+    restart: always
+    networks:
+      default:
+        ipv4_address: 172.28.0.5
+    healthcheck:
+      # صرفاً بررسی می‌کند پروسهٔ tinyproxy در حال اجراست (چون bot با
+      # service_started به آن وابسته است، این چک فقط برای نمایش در docker ps است).
+      test: ["CMD-SHELL", "pgrep tinyproxy >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   default:

@@ -270,6 +270,12 @@ class Config:
     SERVER_URL = os.getenv('SERVER_URL', 'http://localhost:8080').rstrip('/')
     PORT = int(os.getenv('PORT', '8080'))
 
+    # پروکسی HTTP برای درخواست‌های درگاه پرداخت (زرین‌پال/آقای پرداخت).
+    # چون ربات با WARP اجرا می‌شود و درگاه‌های ایرانی اتصال از IP خارجی را
+    # نمی‌پذیرند، این درخواست‌ها از یک پروکسیِ بدون WARP (کانتینر payproxy روی
+    # IP ایرانیِ هاست) عبور می‌کنند. اگر خالی باشد، مستقیم (از WARP) می‌روند.
+    PAYMENT_HTTP_PROXY = os.getenv('PAYMENT_HTTP_PROXY', '').strip() or None
+
     # --- Payment Configuration (Corrected Names) ---
 
     # 1. Aqaye Pardakht

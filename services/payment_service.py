@@ -13,6 +13,15 @@ from constants import GATEWAY_SLUG_AGHAYE_PARDAKHT, GATEWAY_SLUG_ZARINPAL
 
 logger = logging.getLogger(__name__)
 
+
+def _payment_proxy() -> Optional[str]:
+    """آدرس پروکسی HTTP برای درخواست‌های درگاه پرداخت (بدون WARP).
+
+    درگاه‌های ایرانی اتصال از IP خارجیِ WARP را نمی‌پذیرند؛ این پروکسی از IP
+    ایرانیِ هاست عبور می‌کند. None یعنی بدون پروکسی (مستقیم).
+    """
+    return getattr(Config, "PAYMENT_HTTP_PROXY", None)
+
 class BasePaymentGateway(ABC):
     def __init__(self, slug: str, name: str):
         self.slug = slug
@@ -55,7 +64,7 @@ class AghayePardakhtGateway(BasePaymentGateway):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.API_URL_REQUEST, json=payload, timeout=15) as response:
+                async with session.post(self.API_URL_REQUEST, json=payload, timeout=15, proxy=_payment_proxy()) as response:
                     data = await response.json()
                     if response.status == 200 and data.get('status') == 'success':
                         trans_id = data.get('transid') 
@@ -78,7 +87,7 @@ class AghayePardakhtGateway(BasePaymentGateway):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.API_URL_VERIFY, json=payload, timeout=15) as response:
+                async with session.post(self.API_URL_VERIFY, json=payload, timeout=15, proxy=_payment_proxy()) as response:
                     data = await response.json()
                     if response.status == 200 and str(data.get('code')) == '1':
                         # آقای پرداخت معمولا کارت را برمی‌گرداند اگر بانک ساپورت کند
@@ -107,7 +116,10 @@ class ZarinPalGateway(BasePaymentGateway):
         
         full_callback = f"{callback_url}?user_id={user_id}"
         # لاگِ آدرس بازگشت تا در صورت مشکلِ «بازنگشتن به ربات» به‌راحتی قابل بررسی باشد.
-        logger.info(f"ZarinPal create: amount={amount} تومان ({amount_rial} ریال), callback_url={full_callback}")
+        logger.info(
+            f"ZarinPal create: amount={amount} تومان ({amount_rial} ریال), "
+            f"callback_url={full_callback}, proxy={_payment_proxy() or 'direct'}"
+        )
         if "localhost" in full_callback.lower() or "127.0.0.1" in full_callback.lower():
             logger.warning(
                 "⚠️ callback_url زرین‌پال روی localhost است؛ کاربر پس از پرداخت به "
@@ -129,7 +141,7 @@ class ZarinPalGateway(BasePaymentGateway):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.API_URL_REQUEST, json=payload, timeout=15) as response:
+                async with session.post(self.API_URL_REQUEST, json=payload, timeout=15, proxy=_payment_proxy()) as response:
                     data = await response.json()
                     if response.status == 200 and data.get('data', {}).get('code') == 100:
                         authority = data['data']['authority']
@@ -157,7 +169,7 @@ class ZarinPalGateway(BasePaymentGateway):
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.API_URL_VERIFY, json=payload, timeout=15) as response:
+                async with session.post(self.API_URL_VERIFY, json=payload, timeout=15, proxy=_payment_proxy()) as response:
                     data = await response.json()
                     
                     # بررسی موفقیت آمیز بودن تراکنش
