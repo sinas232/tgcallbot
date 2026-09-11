@@ -230,6 +230,15 @@ docker compose up -d --build
 
 ## عیب‌یابی سریع
 
+- **در حالت WARP خطای `Database not ready ... Name or service not known`:**
+  کانتینر warp، DNSِ داخلی داکر (`127.0.0.11`) را می‌شکند و نام‌های `db`/`redis`
+  resolve نمی‌شوند. این در فایل `docker-compose.warp.yml` با دادن **IP ثابت** به
+  db/redis و ثبتشان در `/etc/hosts` کانتینر warp حل شده است (نسخهٔ به‌روز مخزن).
+  فقط کافی است `git pull` کنید و دوباره با override اجرا کنید. **توجه:** اگر
+  `tools/check_udp.py` روی حالت bridge خروجی `UDP egress OK` داد، احتمالاً اصلاً
+  به WARP نیاز ندارید و می‌توانید با حالت عادی (بند ۵-الف) کار کنید.
+
+
 - **کانتینر warp بالا نمی‌آید / healthy نمی‌شود:**
   `docker logs warp_container` — معمولاً نبود ماژول `tun` یا خطای `src_valid_mark`.
   ماژول را با `modprobe tun` فعال و در صورت لزوم روی هاست

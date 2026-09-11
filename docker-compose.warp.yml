@@ -13,14 +13,17 @@
 # توقف:
 #   docker compose -f docker-compose.yml -f docker-compose.warp.yml down
 #
-# ⚠️ در این حالت ربات پورت شبکهٔ مستقلی ندارد؛ در فضای شبکهٔ سرویس warp زندگی
-#    می‌کند. به همین دلیل:
-#      • پورت 8080 (کال‌بک پرداخت) روی سرویس warp منتشر می‌شود، نه روی bot.
-#      • نام‌های db و redis همچنان از طریق DNS داخلی داکر resolve می‌شوند،
-#        چون سرویس warp هم روی همان شبکهٔ compose قرار دارد. پس در .env
-#        مقادیر را روی db / redis نگه دارید (نیازی به 127.0.0.1 نیست).
-#      • ترافیک شبکهٔ خصوصی داکر (به db/redis) به‌خاطر مسیرِ مستقیمِ
-#        subnet داکر تونل نمی‌شود؛ فقط ترافیک اینترنت عمومی از WARP رد می‌شود.
+# ⚠️ نکتهٔ مهم دربارهٔ DNS:
+#   وقتی کانتینر warp تونل را بالا می‌آورد، DNS داخلی داکر (127.0.0.11) را
+#   دور می‌زند؛ در نتیجه نام‌های سرویسی مثل db و redis دیگر resolve نمی‌شوند
+#   (خطای «Name or service not known»). برای رفع قطعی، به db و redis IP ثابت
+#   می‌دهیم و همان‌ها را در /etc/hosts کانتینر warp ثبت می‌کنیم. چون bot در
+#   فضای شبکهٔ warp اجرا می‌شود، از همین /etc/hosts استفاده می‌کند و اتصال به
+#   دیتابیس/ردیس مستقل از DNS برقرار می‌ماند. پس در .env مقادیر را روی
+#   db / redis نگه دارید (نیازی به تغییر نیست).
+#
+#   همچنین پورت 8080 (کال‌بک پرداخت) روی سرویس warp منتشر می‌شود، چون bot
+#   پورت شبکهٔ مستقل ندارد و در namespace شبکهٔ warp زندگی می‌کند.
 # ═══════════════════════════════════════════════════════════════════════
 services:
   warp:
@@ -41,12 +44,20 @@ services:
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
+    # نام db و redis را مستقیم به IP ثابتشان می‌بندیم تا مستقل از DNSِ
+    # شکستهٔ warp کار کنند. bot از همین /etc/hosts استفاده می‌کند.
+    extra_hosts:
+      - "db:172.28.0.2"
+      - "redis:172.28.0.3"
     # پورت وب‌سرور ربات (کال‌بک پرداخت) از اینجا منتشر می‌شود، چون bot در
     # فضای شبکهٔ همین کانتینر اجرا می‌شود.
     ports:
       - "8080:8080"
     volumes:
       - warp_data:/var/lib/cloudflare-warp
+    networks:
+      default:
+        ipv4_address: 172.28.0.4
     healthcheck:
       # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
       test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
@@ -67,6 +78,23 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # IP ثابت برای db و redis تا در /etc/hosts کانتینر warp قابل ثبت باشند.
+  db:
+    networks:
+      default:
+        ipv4_address: 172.28.0.2
+
+  redis:
+    networks:
+      default:
+        ipv4_address: 172.28.0.3
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 volumes:
   warp_data:
