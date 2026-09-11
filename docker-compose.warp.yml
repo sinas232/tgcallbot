@@ -1,0 +1,72 @@
+# ═══════════════════════════════════════════════════════════════════════
+# اجرای ربات با Cloudflare WARP به‌صورت «ایزوله در داکر» (روش امن و توصیه‌شده)
+# ═══════════════════════════════════════════════════════════════════════
+# چرا این روش؟
+#   WARP فقط داخل کانتینر خودش (سرویس warp) اجرا می‌شود و کل ترافیک اینترنتِ
+#   ربات (شامل سیگنالینگ تلگرام و مدیای UDP/WebRTC ویس‌کال) از داخل آن عبور
+#   می‌کند. سیستم‌عاملِ سرور، جدول مسیریابی هاست و مهم‌تر از همه دسترسی SSH
+#   شما هرگز دستکاری نمی‌شود. (هرگز روی خود هاست `warp-cli connect` نزنید.)
+#
+# نحوهٔ اجرا (کنار docker-compose.yml اصلی):
+#   docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
+#
+# توقف:
+#   docker compose -f docker-compose.yml -f docker-compose.warp.yml down
+#
+# ⚠️ در این حالت ربات پورت شبکهٔ مستقلی ندارد؛ در فضای شبکهٔ سرویس warp زندگی
+#    می‌کند. به همین دلیل:
+#      • پورت 8080 (کال‌بک پرداخت) روی سرویس warp منتشر می‌شود، نه روی bot.
+#      • نام‌های db و redis همچنان از طریق DNS داخلی داکر resolve می‌شوند،
+#        چون سرویس warp هم روی همان شبکهٔ compose قرار دارد. پس در .env
+#        مقادیر را روی db / redis نگه دارید (نیازی به 127.0.0.1 نیست).
+#      • ترافیک شبکهٔ خصوصی داکر (به db/redis) به‌خاطر مسیرِ مستقیمِ
+#        subnet داکر تونل نمی‌شود؛ فقط ترافیک اینترنت عمومی از WARP رد می‌شود.
+# ═══════════════════════════════════════════════════════════════════════
+services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp_container
+    restart: always
+    # این cgroup rule پس از تغییرات runc برای ساخت دستگاه TUN لازم است.
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    environment:
+      - WARP_SLEEP=2
+      # برای WARP+ کلید را اینجا بگذارید (اختیاری):
+      # - WARP_LICENSE_KEY=${WARP_LICENSE_KEY:-}
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    # پورت وب‌سرور ربات (کال‌بک پرداخت) از اینجا منتشر می‌شود، چون bot در
+    # فضای شبکهٔ همین کانتینر اجرا می‌شود.
+    ports:
+      - "8080:8080"
+    volumes:
+      - warp_data:/var/lib/cloudflare-warp
+    healthcheck:
+      # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
+      test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    # ربات فضای شبکهٔ سرویس warp را به اشتراک می‌گذارد ⇒ کل ترافیکش از WARP رد می‌شود.
+    network_mode: "service:warp"
+    # پورت‌های تعریف‌شده در فایل پایه اینجا باید ریست شوند (با network_mode مجاز نیستند).
+    ports: !reset []
+    depends_on:
+      warp:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  warp_data:
