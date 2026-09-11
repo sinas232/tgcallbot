@@ -1686,7 +1686,13 @@ async def service_toggle_callback(update, context):
     srv = data.replace("toggle_srv_", "")
     bot_id = context.bot_data.get('bot_id', 1)
     curr = await DatabaseManager.get_setting(f"service_{srv}", "true", bot_id=bot_id) == "true"
-    await DatabaseManager.set_setting(f"service_{srv}", "false" if curr else "true", bot_id=bot_id)
+    new_val = "false" if curr else "true"
+    await DatabaseManager.set_setting(f"service_{srv}", new_val, bot_id=bot_id)
+    # بازخورد صریح به ادمین
+    try:
+        await query.answer("✅ فعال شد." if new_val == "true" else "❌ غیرفعال شد.", show_alert=False)
+    except Exception:
+        pass
     return await services_management_menu(update, context)
 
 # ===================== BACKUP & RESTORE (پشتیبان‌گیری و بازیابی) =====================

@@ -56,7 +56,21 @@ async def show_plans_for_category(update: Update, context: ContextTypes.DEFAULT_
     category = type_map[text]
     context.user_data['order_category'] = category
     bot_id = context.bot_data.get('bot_id', 1)
-    
+
+    # بررسی فعال بودن سرویس (توسط ادمین از «مدیریت سرویس‌ها» غیرفعال‌شدنی است).
+    if not await DatabaseManager.is_service_active(category, bot_id=bot_id):
+        service_names = {
+            "voice_chat": "🎙 ویس‌کال",
+            "group_join": "👥 عضویت گروه",
+            "channel_join": "📢 عضویت کانال",
+        }
+        await update.message.reply_text(
+            f"⛔️ سرویس «{service_names.get(category, text)}» در حال حاضر غیرفعال است.\n"
+            "لطفاً بعداً تلاش کنید یا سرویس دیگری را انتخاب نمایید.",
+            reply_markup=ReplyKeyboardMarkup(PLAN_TYPES_MENU, resize_keyboard=True),
+        )
+        return AWAITING_SELECT_PLAN
+
     plans = await DatabaseManager.get_plans(service_type=category, active_only=True, bot_id=bot_id)
     
     if not plans:
@@ -92,7 +106,13 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not plan:
         await query.edit_message_text("❌ پلن یافت نشد.")
         return AWAITING_SELECT_PLAN
-        
+
+    # بررسی مجدد فعال بودن سرویس (جلوگیری از دور زدن با لیست پلنِ قدیمی).
+    bot_id = context.bot_data.get('bot_id', 1)
+    if not await DatabaseManager.is_service_active(plan['service_type'], bot_id=bot_id):
+        await query.edit_message_text("⛔️ این سرویس در حال حاضر غیرفعال است.")
+        return AWAITING_SELECT_PLAN
+
     context.user_data['selected_plan'] = plan
     
     await query.delete_message()
