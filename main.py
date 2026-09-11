@@ -809,11 +809,13 @@ def register_handlers(application: Application) -> None:
     prof_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل و استوری$"), profile_settings_start),
-            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start)
+            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start),
+            # ورود مستقیم به ویرایش اکانت از دکمهٔ شیشه‌ای لیست اکانت‌ها
+            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_")
         ],
         states={
             AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account)],
-            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_profile_menu_action)],
+            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)],
             AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler)],
             AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler)],
             AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler)],
@@ -821,8 +823,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler)],
             AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)],
             AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish)],
-            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, privacy_menu_handler)],
-            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, set_privacy_level)],
+            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)],
+            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
             AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
         },
         fallbacks=STANDARD_FALLBACKS,

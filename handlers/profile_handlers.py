@@ -6,6 +6,7 @@ import logging
 import os
 import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
@@ -29,9 +30,7 @@ async def profile_settings_start(update: Update, context: ContextTypes.DEFAULT_T
     for acc in accounts:
         phone = html.escape(str(acc.get('phone_number') or 'No Phone'))
         status = html.escape(str(acc.get('account_status', 'unknown')).title())
-        name = html.escape(
-            str(acc.get('name') or acc.get('username') or acc.get('first_name') or acc.get('last_name') or 'Unnamed')
-        )
+        name = html.escape(_display_name(acc))
         spam_info = ''
         if acc.get('spam_status') and acc.get('spam_status') != 'unknown':
             spam_info = f" | ⛔️ {html.escape(str(acc['spam_status']))}"
@@ -42,6 +41,63 @@ async def profile_settings_start(update: Update, context: ContextTypes.DEFAULT_T
         
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(BACK_KB, resize_keyboard=True))
     return AWAITING_SELECT_ACCOUNT_FOR_PROFILE
+
+async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ورود مستقیم به منوی ویرایش یک اکانت از طریق دکمهٔ شیشه‌ای «✏️ ویرایش» در لیست اکانت‌ها."""
+    query = update.callback_query
+    await query.answer()
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        aid = int(query.data.split("_")[2])  # acc_edit_<id>
+    except Exception:
+        await send_safe(context.bot, update.effective_chat.id, "❌ شناسهٔ اکانت نامعتبر است.")
+        return ConversationHandler.END
+
+    acc = await DatabaseManager.get_account_by_id(aid)
+    if not acc or acc.get('bot_id', 1) != bot_id:
+        await send_safe(context.bot, update.effective_chat.id, "❌ اکانت یافت نشد یا متعلق به این ربات نیست.")
+        return ConversationHandler.END
+
+    context.user_data['selected_acc_id'] = aid
+
+    # اگر نام اکانت در دیتابیس کش نشده (اکانت‌های قدیمی)، یک‌بار به‌صورت زنده واکشی و ذخیره می‌کنیم
+    if not (acc.get('first_name') or acc.get('last_name') or acc.get('username')):
+        try:
+            cl = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
+            me = await cl.fetch_me()
+            if me:
+                await DatabaseManager.update_account_profile_cache(
+                    aid, first_name=me.get('first_name'),
+                    last_name=me.get('last_name'), username=me.get('username'))
+                acc.update({k: v for k, v in me.items() if v is not None})
+        except Exception as e:
+            logger.warning(f"Backfill profile cache failed for acc {aid}: {e}")
+
+    name = html.escape(_display_name(acc))
+    phone = html.escape(str(acc.get('phone_number') or 'بدون شماره'))
+    txt = (
+        f"✏️ <b>ویرایش اکانت</b>\n\n"
+        f"👤 نام: <b>{name}</b>\n"
+        f"📱 شماره: <code>{phone}</code>\n"
+        f"🆔 شناسه: <code>{aid}</code>\n\n"
+        f"یکی از گزینه‌های زیر را برای تغییر انتخاب کنید:"
+    )
+    await send_safe(context.bot, update.effective_chat.id, txt,
+                    reply_markup=ReplyKeyboardMarkup(PROFILE_MENU, resize_keyboard=True),
+                    parse_mode=ParseMode.HTML)
+    return AWAITING_PROFILE_ACTION
+
+
+def _display_name(acc: dict) -> str:
+    first = (acc.get('first_name') or "").strip()
+    last = (acc.get('last_name') or "").strip()
+    full = (first + " " + last).strip()
+    if full:
+        return full
+    if acc.get('username'):
+        return "@" + str(acc.get('username')).lstrip('@')
+    return "بدون نام"
+
 
 async def select_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
@@ -67,8 +123,9 @@ async def select_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_profile_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = update.message.text
     
-    if "بازگشت" in choice: 
-        return await profile_settings_start(update, context)
+    if "بازگشت" in choice:
+        from handlers.menu_handlers import account_management_handler
+        return await account_management_handler(update, context)
     
     if "تغییر نام" in choice and "خانوادگی" not in choice:
         await send_safe(context.bot, update.effective_chat.id, "📝 **نام جدید (First Name):**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
@@ -113,14 +170,22 @@ async def get_client(context):
 async def set_name_handler(update, context):
     if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
     cl = await get_client(context)
-    res = await cl.update_profile(first_name=update.message.text)
+    new_val = update.message.text
+    res = await cl.update_profile(first_name=new_val)
+    if isinstance(res, str) and res.startswith("✅"):
+        await DatabaseManager.update_account_profile_cache(
+            context.user_data.get('selected_acc_id'), first_name=new_val)
     await send_result(update, context, res)
     return AWAITING_PROFILE_ACTION
 
 async def set_last_name_handler(update, context):
     if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
     cl = await get_client(context)
-    res = await cl.update_profile(last_name=update.message.text)
+    new_val = update.message.text
+    res = await cl.update_profile(last_name=new_val)
+    if isinstance(res, str) and res.startswith("✅"):
+        await DatabaseManager.update_account_profile_cache(
+            context.user_data.get('selected_acc_id'), last_name=new_val)
     await send_result(update, context, res)
     return AWAITING_PROFILE_ACTION
 
@@ -134,7 +199,11 @@ async def set_bio_handler(update, context):
 async def set_username_handler(update, context):
     if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
     cl = await get_client(context)
-    res, msg = await cl.set_username(update.message.text)
+    new_val = update.message.text.lstrip('@').strip()
+    res, msg = await cl.set_username(new_val)
+    if res:
+        await DatabaseManager.update_account_profile_cache(
+            context.user_data.get('selected_acc_id'), username=new_val)
     await send_result(update, context, res, msg)
     return AWAITING_PROFILE_ACTION
 
@@ -172,8 +241,83 @@ async def post_story_finish(update, context):
     await send_result(update, context, res, msg)
     return AWAITING_PROFILE_ACTION
 
-async def privacy_menu_handler(update, context): return AWAITING_PRIVACY_VALUE
-async def set_privacy_level(update, context): return AWAITING_PRIVACY_VALUE
+# نگاشت دکمه‌های منوی حریم خصوصی به کلیدهای Raw API
+_PRIVACY_KEYS = {
+    "عکس پروفایل": "profile_photo",
+    "آخرین بازدید": "last_seen",
+    "تماس صوتی": "phone_call",
+    "فوروارد پیام": "forwards",
+}
+_PRIVACY_LEVELS = {
+    "همه": "everyone",
+    "مخاطبین": "contacts",
+    "هیچکس": "nobody",
+}
+
+
+async def privacy_menu_handler(update, context):
+    """انتخاب نوع حریم خصوصی (عکس، آخرین بازدید، تماس، فوروارد)."""
+    choice = update.message.text or ""
+    if "بازگشت" in choice:
+        return await back_to_menu(update, context)
+
+    selected = None
+    for label, key in _PRIVACY_KEYS.items():
+        if label in choice:
+            selected = key
+            break
+
+    if not selected:
+        await send_safe(context.bot, update.effective_chat.id,
+                        "❌ گزینه نامعتبر است. یکی از موارد منو را انتخاب کنید.",
+                        reply_markup=ReplyKeyboardMarkup(PRIVACY_MENU, resize_keyboard=True))
+        return AWAITING_PRIVACY_CHOICE
+
+    context.user_data['privacy_key'] = selected
+    await send_safe(context.bot, update.effective_chat.id,
+                    "🔒 <b>چه کسانی به این مورد دسترسی داشته باشند؟</b>",
+                    reply_markup=ReplyKeyboardMarkup(PRIVACY_LEVEL_MENU, resize_keyboard=True),
+                    parse_mode=ParseMode.HTML)
+    return AWAITING_PRIVACY_VALUE
+
+
+async def set_privacy_level(update, context):
+    """اعمال سطح دسترسی انتخاب‌شده روی اکانت."""
+    choice = update.message.text or ""
+    if "بازگشت" in choice:
+        await send_safe(context.bot, update.effective_chat.id, "🔒 تنظیمات حریم خصوصی:",
+                        reply_markup=ReplyKeyboardMarkup(PRIVACY_MENU, resize_keyboard=True))
+        return AWAITING_PRIVACY_CHOICE
+
+    level = None
+    for label, val in _PRIVACY_LEVELS.items():
+        if label in choice:
+            level = val
+            break
+
+    if not level:
+        await send_safe(context.bot, update.effective_chat.id,
+                        "❌ سطح دسترسی نامعتبر است.",
+                        reply_markup=ReplyKeyboardMarkup(PRIVACY_LEVEL_MENU, resize_keyboard=True))
+        return AWAITING_PRIVACY_VALUE
+
+    key = context.user_data.get('privacy_key')
+    if not key:
+        await send_safe(context.bot, update.effective_chat.id,
+                        "❌ ابتدا نوع حریم خصوصی را انتخاب کنید.",
+                        reply_markup=ReplyKeyboardMarkup(PRIVACY_MENU, resize_keyboard=True))
+        return AWAITING_PRIVACY_CHOICE
+
+    msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال اعمال تنظیمات...")
+    cl = await get_client(context)
+    ok, result = await cl.set_privacy(key, level)
+    try:
+        await context.bot.delete_message(update.effective_chat.id, msg.message_id)
+    except Exception:
+        pass
+    await send_safe(context.bot, update.effective_chat.id, result,
+                    reply_markup=ReplyKeyboardMarkup(PRIVACY_MENU, resize_keyboard=True))
+    return AWAITING_PRIVACY_CHOICE
 
 async def back_to_menu(update, context):
     await send_safe(context.bot, update.effective_chat.id, "بازگشت.", reply_markup=ReplyKeyboardMarkup(PROFILE_MENU, resize_keyboard=True))

@@ -316,3 +316,53 @@ class TelegramAccountClient:
                 return await app.download_media(file_id, file_name=path)
         except:
             return None
+
+    async def fetch_me(self):
+        """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""
+        try:
+            async with await self.get_client() as app:
+                me = await app.get_me()
+                return {
+                    'first_name': getattr(me, 'first_name', None),
+                    'last_name': getattr(me, 'last_name', None),
+                    'username': getattr(me, 'username', None),
+                }
+        except Exception as e:
+            logger.warning(f"fetch_me failed for acc {self.account_id}: {e}")
+            return None
+
+    async def set_privacy(self, key_name, level):
+        """
+        تنظیم حریم خصوصی اکانت با استفاده از Raw API پایروگرام.
+        key_name: یکی از profile_photo / last_seen / phone_call / forwards
+        level: یکی از everyone / contacts / nobody
+        """
+        try:
+            from pyrogram.raw import functions, types as raw_types
+
+            key_map = {
+                "profile_photo": raw_types.InputPrivacyKeyProfilePhoto,
+                "last_seen": raw_types.InputPrivacyKeyStatusTimestamp,
+                "phone_call": raw_types.InputPrivacyKeyPhoneCall,
+                "forwards": raw_types.InputPrivacyKeyForwards,
+            }
+            if key_name not in key_map:
+                return False, "کلید حریم خصوصی نامعتبر است."
+
+            if level == "everyone":
+                rules = [raw_types.InputPrivacyValueAllowAll()]
+            elif level == "contacts":
+                rules = [raw_types.InputPrivacyValueAllowContacts()]
+            elif level == "nobody":
+                rules = [raw_types.InputPrivacyValueDisallowAll()]
+            else:
+                return False, "سطح دسترسی نامعتبر است."
+
+            async with await self.get_client() as app:
+                await app.invoke(functions.account.SetPrivacy(
+                    key=key_map[key_name](),
+                    rules=rules
+                ))
+            return True, "✅ تنظیمات حریم خصوصی اعمال شد."
+        except Exception as e:
+            return False, f"❌ خطا: {e}"

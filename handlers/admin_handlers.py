@@ -1517,7 +1517,7 @@ async def handle_reseller_action(update, context):
                 return AWAITING_SETTINGS_ACTION
             count = 0
             for acc in main_accounts:
-                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'))
+                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'), first_name=acc.get('first_name'), last_name=acc.get('last_name'), username=acc.get('username'))
                 if res: count += 1
             await query.edit_message_text(f"✅ {count} اکانت کپی شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]))
         except: pass

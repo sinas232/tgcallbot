@@ -114,6 +114,10 @@ class TelegramAccount(Base):
     session_string = Column(Text, nullable=False)
     api_id = Column(Integer, nullable=True)
     api_hash = Column(String(100), nullable=True)
+    # 🔥 اطلاعات کش‌شدهٔ پروفایل اکانت (برای نمایش در لیست بدون نیاز به اتصال زنده)
+    first_name = Column(String(255), nullable=True)
+    last_name = Column(String(255), nullable=True)
+    username = Column(String(255), nullable=True)
     account_status = Column(String(20), default="active")
     health_score = Column(Integer, default=100)
     last_health_check = Column(DateTime, nullable=True)
@@ -298,6 +302,10 @@ class DatabaseManager:
             "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP WITHOUT TIME ZONE;",
             "ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255);",
             "ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS file_id VARCHAR(255);",
+            # اطلاعات کش‌شدهٔ پروفایل اکانت‌های تلگرام (نام/نام‌خانوادگی/یوزرنیم)
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS username VARCHAR(255);",
         ]
         async with engine.connect() as conn:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -855,7 +863,8 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None):
+    async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None,
+                                   first_name=None, last_name=None, username=None):
         async with AsyncSessionLocal() as db_session:
             try:
                 existing = await db_session.execute(select(TelegramAccount).filter(TelegramAccount.phone_number == phone, TelegramAccount.bot_id == bot_id))
@@ -866,12 +875,16 @@ class DatabaseManager:
                     acc.account_status = 'active'
                     if api_id: acc.api_id = api_id
                     if api_hash: acc.api_hash = api_hash
+                    if first_name is not None: acc.first_name = first_name
+                    if last_name is not None: acc.last_name = last_name
+                    if username is not None: acc.username = username
                     status = "updated"
                 else:
                     acc = TelegramAccount(
                         bot_id=bot_id, user_id=user_id, phone_number=phone, 
                         session_string=session_str, is_verified=True, 
-                        account_status='active', api_id=api_id, api_hash=api_hash
+                        account_status='active', api_id=api_id, api_hash=api_hash,
+                        first_name=first_name, last_name=last_name, username=username
                     )
                     db_session.add(acc)
                 await db_session.commit()
@@ -879,6 +892,23 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"❌ Add account db error: {e}")
                 return False, "error"
+
+    @staticmethod
+    async def update_account_profile_cache(aid, first_name=None, last_name=None, username=None):
+        """بروزرسانی اطلاعات کش‌شدهٔ پروفایل یک اکانت (فقط فیلدهای ارسال‌شده)."""
+        async with AsyncSessionLocal() as db_session:
+            try:
+                acc = await db_session.get(TelegramAccount, aid)
+                if not acc:
+                    return False
+                if first_name is not None: acc.first_name = first_name
+                if last_name is not None: acc.last_name = last_name
+                if username is not None: acc.username = username
+                await db_session.commit()
+                return True
+            except Exception as e:
+                logger.error(f"❌ update_account_profile_cache error: {e}")
+                return False
 
     @staticmethod
     async def get_accounts_paginated(limit=10, offset=0, active_only=False, bot_id=1):

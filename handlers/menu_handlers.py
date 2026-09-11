@@ -14,7 +14,25 @@ from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
 
+try:
+    from utils.helpers import format_jalali_datetime
+except Exception:
+    def format_jalali_datetime(dt_obj):
+        return str(dt_obj) if dt_obj else "---"
+
 logger = logging.getLogger(__name__)
+
+
+def account_display_name(acc: dict) -> str:
+    """ساخت نام نمایشی اکانت از اطلاعات کش‌شده در دیتابیس."""
+    first = (acc.get('first_name') or "").strip()
+    last = (acc.get('last_name') or "").strip()
+    full = (first + " " + last).strip()
+    if full:
+        return full
+    if acc.get('username'):
+        return "@" + str(acc.get('username')).lstrip('@')
+    return "بدون نام"
 
 @require_admin
 async def account_management_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -90,55 +108,82 @@ async def show_accounts_page(update, context, page=1, is_edit=False):
     else:
         astats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
         inactive = max(0, astats.get("total", total_count) - astats.get("active", 0))
-        total_pages_hdr = (total_count + limit - 1) // limit
-        text = f"📋 <b>لیست اکانت‌های ربات</b> (صفحه {page}/{total_pages_hdr})\n"
-        text += f"📊 کل: <code>{astats.get('total', total_count)}</code> | "
-        text += f"✅ فعال: <code>{astats.get('active', 0)}</code> | "
-        text += f"❌ غیرفعال: <code>{inactive}</code> | "
-        text += f"⛔️ محدود: <code>{astats.get('limited', 0)}</code>\n➖➖➖➖➖➖\n"
-        
+        total_pages = (total_count + limit - 1) // limit
+
+        # ===== سربرگ آماری =====
+        text = f"📋 <b>لیست اکانت‌های ربات</b> — صفحه <code>{page}/{total_pages}</code>\n"
+        text += "➖➖➖➖➖➖➖➖➖➖\n"
+        text += f"📊 کل: <code>{astats.get('total', total_count)}</code>   "
+        text += f"✅ فعال: <code>{astats.get('active', 0)}</code>\n"
+        text += f"❌ غیرفعال: <code>{inactive}</code>   "
+        text += f"⛔️ محدود: <code>{astats.get('limited', 0)}</code>\n"
+        text += "➖➖➖➖➖➖➖➖➖➖\n\n"
+
         start_index = offset + 1
         page_map = {}
-        
+        kb_buttons = []
+
         for i, acc in enumerate(accounts):
             row_number = start_index + i
             page_map[row_number] = acc['id']
-            
-            name = html.escape(
-                str(acc.get('name') or acc.get('username') or acc.get('first_name') or acc.get('last_name') or 'Unnamed')
-            )
-            status_icon = "✅"
-            if acc.get('account_status') != 'active':
-                status_icon = "❌ غیرفعال"
-            
-            spam_info = ""
-            if acc.get('spam_status') == 'limited':
-                spam_info = " | ⛔️ محدود"
-            
-            phone = html.escape(str(acc.get('phone_number') or "No Phone"))
-            
-            text += f"<b>{row_number}.</b> {name} | 📱 <code>{phone}</code>\n"
-            text += f"   🆔 DB_ID: <code>{acc['id']}</code>\n"
-            text += f"   وضعیت: {status_icon}{spam_info}\n"
-            text += "➖➖➖\n"
-            
+
+            name = html.escape(account_display_name(acc))
+            phone = html.escape(str(acc.get('phone_number') or "بدون شماره"))
+
+            # وضعیت اکانت
+            raw_status = str(acc.get('account_status') or "unknown").lower()
+            if raw_status == 'active':
+                status_line = "✅ فعال"
+            elif raw_status in ('dead', 'banned', 'deleted'):
+                status_line = "💀 مسدود/حذف‌شده"
+            else:
+                status_line = f"❌ غیرفعال ({html.escape(raw_status)})"
+
+            # وضعیت اسپم/محدودیت
+            spam_status = str(acc.get('spam_status') or "unknown").lower()
+            if spam_status == 'limited':
+                spam_line = "⛔️ محدود شده (اسپم‌بلاک)"
+            elif spam_status in ('free', 'ok', 'clean'):
+                spam_line = "🟢 بدون محدودیت"
+            else:
+                spam_line = "❔ نامشخص"
+
+            health = acc.get('health_score')
+            health_line = f"{health}٪" if health is not None else "---"
+
+            username = acc.get('username')
+            username_line = ("@" + str(username).lstrip('@')) if username else "—"
+
+            created = format_jalali_datetime(acc.get('created_at'))
+
+            text += f"<b>{row_number}. {name}</b>\n"
+            text += f"   🆔 شناسه دیتابیس: <code>{acc['id']}</code>\n"
+            text += f"   📱 شماره: <code>{phone}</code>\n"
+            text += f"   🔗 یوزرنیم: {html.escape(username_line)}\n"
+            text += f"   📶 وضعیت: {status_line}\n"
+            text += f"   🛡 اسپم: {spam_line}\n"
+            text += f"   ❤️ سلامت: <code>{health_line}</code>\n"
+            text += f"   🗓 افزوده شده: {html.escape(str(created))}\n"
+            text += "➖➖➖➖➖➖➖➖➖➖\n"
+
+            # دکمه ویرایش مخصوص هر اکانت
+            kb_buttons.append([
+                InlineKeyboardButton(f"✏️ ویرایش «{account_display_name(acc)[:20]}»",
+                                     callback_data=f"acc_edit_{acc['id']}")
+            ])
+
         context.user_data['list_page_map'] = page_map
-            
-        kb_buttons = []
-        total_pages = (total_count + limit - 1) // limit
-        
+
+        # ردیف ناوبری صفحات
         nav_row = []
         if page > 1:
             nav_row.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"acc_page_{page-1}"))
-        
         nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
-        
         if page < total_pages:
             nav_row.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"acc_page_{page+1}"))
-            
         if nav_row:
             kb_buttons.append(nav_row)
-            
+
         kb = InlineKeyboardMarkup(kb_buttons)
 
     if is_edit and update.callback_query:

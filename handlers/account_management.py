@@ -189,8 +189,13 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
         await client.start()
         me = await client.get_me()
         phone = f"+{me.phone_number}" if me.phone_number else "Unknown"
+        profile_info = {
+            'first_name': getattr(me, 'first_name', None),
+            'last_name': getattr(me, 'last_name', None),
+            'username': getattr(me, 'username', None),
+        }
         await client.stop()
-        return await finalize_import(update, context, phone, sess_str)
+        return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
     except Exception as e:
         logger.error(f"Import Session Error: {e}")
         try: await client.stop() 
@@ -198,12 +203,13 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
         await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{e}")
         return AWAITING_SESSION_STRING
 
-async def finalize_import(update, context, phone, session_string):
+async def finalize_import(update, context, phone, session_string, profile_info=None):
     try:
         enc_sess = SecurityManager.encrypt_session(session_string)
         bot_id = context.bot_data.get('bot_id', 1)
         api_id = context.user_data.get('import_api_id')
         api_hash = context.user_data.get('import_api_hash')
+        profile_info = profile_info or {}
         tg_user = update.effective_user
         db_user = await DatabaseManager.create_or_update_user({
             'id': tg_user.id,
@@ -213,7 +219,10 @@ async def finalize_import(update, context, phone, session_string):
         }, bot_id=bot_id)
         
         success, status = await DatabaseManager.add_telegram_account(
-            db_user['id'], phone, enc_sess, bot_id=bot_id, api_id=api_id, api_hash=api_hash
+            db_user['id'], phone, enc_sess, bot_id=bot_id, api_id=api_id, api_hash=api_hash,
+            first_name=profile_info.get('first_name'),
+            last_name=profile_info.get('last_name'),
+            username=profile_info.get('username')
         )
         if success:
              await send_safe(context.bot, update.effective_chat.id, f"✅ **اکانت {phone} با موفقیت ایمپورت شد!**", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
@@ -247,7 +256,10 @@ async def finalize_session(update, context, client):
 
         success, status = await DatabaseManager.add_telegram_account(
             db_user['id'], phone, enc_sess,
-            bot_id=bot_id, api_id=api_id, api_hash=api_hash
+            bot_id=bot_id, api_id=api_id, api_hash=api_hash,
+            first_name=getattr(me, 'first_name', None),
+            last_name=getattr(me, 'last_name', None),
+            username=getattr(me, 'username', None)
         )
         safe_name = html.escape(me.first_name or "Unknown")
         if success:
