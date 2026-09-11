@@ -229,6 +229,34 @@ aqayepardakht_callback=https://bot.liontm.ir/payment/callback/aqayepardakht
 - **پارامترهای بازگشت:** زرین‌پال با متد **GET** برمی‌گردد و
   `Authority` + `Status` (`OK`/`NOK`) را در query می‌گذارد.
 
+### درگاه آقای پرداخت (API V2)
+
+این درگاه با مستندات رسمی `panel.aqayepardakht.ir/api/v2` هماهنگ شده است:
+
+- **واحد مبلغ = تومان.** آقای پرداخت مبلغ را به **تومان** می‌گیرد (بین ۱٬۰۰۰ تا
+  ۴۰۰٬۰۰۰٬۰۰۰). چون مبلغ داخلیِ ما هم تومان است، **هیچ تبدیلی** انجام نمی‌شود
+  (برخلاف زرین‌پال که `× ۱۰` به ریال می‌شود). ضرب اشتباهِ قبلی در ۱۰ حذف شد.
+- **پارامترهای create:** `pin` (کد پین درگاه — نه `key`)، `amount` (تومان)،
+  `callback` (نه `callback_url`)، `callback_method=GET`، به‌همراه
+  `invoice_id`/`mobile`/`email`/`description`. با `Content-Type: form` (POST body)
+  ارسال می‌شود.
+- **لینک پرداخت:** پاسخِ create فقط `transid` می‌دهد؛ لینک را خودمان می‌سازیم:
+  - واقعی: `https://panel.aqayepardakht.ir/startpay/{transid}`
+  - سندباکس (وقتی `pin=sandbox`): `https://panel.aqayepardakht.ir/startpay/sandbox/{transid}`
+- **بازگشت (callback):** چون `callback_method=GET` است، آقای پرداخت با متد **GET**
+  برمی‌گردد و `transid`, `status` (۱=موفق/۰=ناموفق), `cardnumber`,
+  `tracking_number`, `bank`, `invoice_id` را می‌فرستد. هندلر هم GET و هم POST را
+  می‌پذیرد.
+- **verify:** پارامترهای `pin` + `transid` + `amount` (تومان). کد `1` = موفق و
+  کد `2` = «قبلاً وریفای و پرداخت شده» — **هر دو موفق** تلقی می‌شوند (کد ۲ دیگر
+  به‌اشتباه ناموفق ثبت نمی‌شود). شمارهٔ کارت و شمارهٔ پیگیری از خودِ callback به
+  گزارش منتقل می‌شوند.
+- **تنظیم PIN:** در پنل ادمین ربات، بخش درگاه‌ها، «تنظیم PIN» را با کد پین درگاهتان
+  پر کنید. برای تست، مقدار `sandbox` را بگذارید.
+- **الزام هم‌دامنه بودن:** آدرس `callback` باید با دامنهٔ درگاهِ تاییدشده در آقای
+  پرداخت روی **یک دامنه** باشد؛ در غیر این‌صورت خطای `-15` می‌گیرید. صفحهٔ میانیِ
+  `/pay/{trans_id}` این تطابق Referrer را تضمین می‌کند.
+
 ---
 
 ## ۷) (توصیه‌شده) HTTPS با nginx

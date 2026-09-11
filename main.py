@@ -233,12 +233,24 @@ def get_html_response(title, message, color="#4CAF50", icon="✅"):
     """
 
 async def ap_callback_handler(request):
-    """کالبک آقای پرداخت"""
+    """کالبک آقای پرداخت (API V2).
+
+    چون هنگام ایجاد تراکنش callback_method=GET فرستاده می‌شود، بازگشت با متد
+    GET انجام می‌شود؛ اما برای اطمینان هر دو حالت GET و POST را می‌خوانیم.
+    پارامترها طبق مستندات: transid, status (۱ موفق/۰ ناموفق), cardnumber,
+    tracking_number, invoice_id, bank.
+    """
     try:
-        data = await request.post()
+        if request.method == 'POST':
+            data = await request.post()
+        else:
+            data = request.query
+
         trans_id = data.get('transid')
         status = data.get('status')
-        
+        card_pan = data.get('cardnumber') or data.get('card_number') or '---'
+        tracking_number = data.get('tracking_number')
+
         if not trans_id: 
             return web.Response(text="Missing transid", status=400)
         
@@ -253,7 +265,10 @@ async def ap_callback_handler(request):
         app = bot_manager.active_bots.get(bot_id)
 
         if str(status) == '1':
-            success, result_data = await payment_service.verify_payment(trans_id, int(transaction['amount']), "aqayepardakht", bot_id=bot_id)
+            success, result_data = await payment_service.verify_payment(
+                trans_id, int(transaction['amount']), "aqayepardakht", bot_id=bot_id,
+                extra={"card_pan": card_pan, "tracking_number": tracking_number},
+            )
             if success:
                 await DatabaseManager.update_payment_status(trans_id, 'paid')
                 await DatabaseManager.update_user_credit(transaction['user_id'], int(float(transaction['amount'])), "online_charge", f"شارژ آنلاین (کد: {trans_id})", bot_id=bot_id)
@@ -408,6 +423,7 @@ async def start_web_server():
     app.router.add_get('/health', health_handler)
     app.router.add_get('/pay/{trans_id}', pay_redirect_handler)
     app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
+    app.router.add_get('/payment/callback/aqayepardakht', ap_callback_handler)
     app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
     
     runner = web.AppRunner(app)
