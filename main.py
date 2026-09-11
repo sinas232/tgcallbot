@@ -114,6 +114,10 @@ for _handler in logging.getLogger().handlers:
     _handler.addFilter(_PyTgCallsNoiseFilter())
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("pytgcalls").setLevel(logging.WARNING)
+# asyncio/ntgcalls emit per-task and per-frame chatter that burns CPU on the
+# console handler under many concurrent voice streams; keep only real problems.
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("ntgcalls").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 

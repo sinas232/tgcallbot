@@ -147,7 +147,16 @@ _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
 # flowed, ntgcalls reported stream end and Telegram dropped the participant
 # seconds after joining (this was the primary "joins then immediately gets
 # kicked" bug). The correct section selector is the double-dash form.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -stream_loop -1"
+#
+# CPU: ``---start -threads 1`` is placed as an INPUT option (before ``-i``) so
+# each ffmpeg helper decodes the silence on a SINGLE thread. With dozens of
+# accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
+# per core multiplies context-switching and pins every CPU core; pinning to 1
+# thread keeps the (trivial) silence decode cheap and bounded.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+
+# Same single-thread cap for the non-looping fallback (short file, plays once).
+_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -1994,10 +2003,13 @@ class VoiceCallManager:
         account is already in the call).  The silence is looped forever with
         ``-stream_loop -1`` so the transport can never die of EOF.
         """
+        # Always cap ffmpeg at a single decode thread (CPU). When looping is on
+        # we also add ``-stream_loop -1``; otherwise fall back to the
+        # threads-only input options so the non-loop path is still bounded.
         loop_flag = (
             _SILENCE_FFMPEG_LOOP_PARAMS
             if getattr(Config, "VOICE_SILENCE_LOOP", True)
-            else None
+            else _SILENCE_FFMPEG_THREADS_PARAMS
         )
         try:
             await pytg.play(
