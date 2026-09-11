@@ -128,13 +128,15 @@ ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 # ── (اختیاری) کاهش مصرف CPU و لاگ ──
 # لاگِ پرتکرارِ [VoiceDiag] در حالت عادی خاموش است؛ فقط برای دیباگ عمیق روشن کنید:
 # ENABLE_VERBOSE_DIAG=false
-# فاصلهٔ ورود اکانت‌ها (ثانیه) — برای فرار از FloodWait بزرگ‌تر کنید:
-# VOICE_JOIN_START_STAGGER_MIN=6.0
-# VOICE_JOIN_START_STAGGER_MAX=10.0
+# فاصلهٔ ورود اکانت‌ها (ثانیه). پیش‌فرض حالا 0.5–1.0s است (کم‌ترین اسپایک CPU).
+# ⚠️ اگر تلگرام هنگام رمپ‌آپ بزرگ FloodWait داد، این‌ها را به 3–6s برگردانید:
+# VOICE_JOIN_START_STAGGER_MIN=0.5
+# VOICE_JOIN_START_STAGGER_MAX=1.0
 # VOICE_JOIN_MAX_CONCURRENCY=2
-# فرمت صدای «حضور» — MONO فشار انکود Opus را ~۵۰٪ کم می‌کند (پیش‌فرض بهینه):
+# فرمت صدای «حضور» — MONO + سمپل‌ریت پایین فشار انکود Opus را کم می‌کند.
+# پیش‌فرض 24kHz mono (کم‌ترین بار پردازشی برای keepalive سکوت):
 # VOICE_AUDIO_CHANNELS=1
-# VOICE_AUDIO_SAMPLE_RATE=48000
+# VOICE_AUDIO_SAMPLE_RATE=24000
 ```
 
 > نکته: مقادیر `DATABASE_URL`/`REDIS_URL` را روی `db` / `redis` نگه دارید
@@ -257,9 +259,11 @@ docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
   مهم (خطا/FloodWait) را می‌نویسد. برای فایربالِ کامل `ENABLE_VERBOSE_DIAG=true`.
   همچنین لاگ کتابخانه‌های `asyncio` (ERROR) و `ntgcalls`/`pyrogram`/`pytgcalls`
   (WARNING) خفه شده تا فشار per-frame روی پردازنده حذف شود.
-- **صدای MONO تک‌کاناله:** استریمِ «حضور» (silence) از استریو به **MONO @ ۴۸kHz**
-  تغییر کرد؛ انکود Opus تک‌کاناله ~۵۰٪ CPU کمتر از استریو مصرف می‌کند. با
-  `VOICE_AUDIO_CHANNELS` قابل تنظیم است.
+- **صدای MONO با سمپل‌ریت پایین:** استریمِ «حضور» (silence) به **MONO @ ۲۴kHz**
+  رسید؛ انکود Opus تک‌کاناله با سمپل‌ریت پایین کم‌ترین بار پردازشی را دارد (این
+  فقط سکوتِ keepalive است، پس کیفیت اهمیتی ندارد). فایل wav، آرگومان‌های ffmpeg و
+  AudioParameters همه از یک مقدار مشتق می‌شوند تا هرگز resample رخ ندهد. با
+  `VOICE_AUDIO_CHANNELS` و `VOICE_AUDIO_SAMPLE_RATE` قابل تنظیم است.
 - **ffmpeg تک‌ریسمانی:** هر پروسهٔ ffmpeg با `-threads 1` اجرا می‌شود تا ده‌ها
   helper به ازای هر اکانت، هسته‌های CPU را تسخیر نکنند.
 - **سقف منابع کانتینر:** در `docker-compose.yml` روی سرویس bot محدودیت
@@ -269,8 +273,16 @@ docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
 > **نکته دربارهٔ «pipe مشترک ffmpeg»:** در معماری PyTgCalls هر اتصال WebRTC
 > (هر اکانت) ntgcalls خودش را دارد و نمی‌توان یک pipe صوتی را بین چند اتصال
 > مجزا به اشتراک گذاشت؛ بنابراین حذفِ کاملِ پروسه‌های ffmpeg ممکن نیست، اما با
-> MONO + `-threads 1` + فایل از پیش‌ساختهٔ ۴۸kHz، هر پروسه به حداقلِ مصرف رسیده
+> MONO + `-threads 1` + فایل از پیش‌ساختهٔ ۲۴kHz، هر پروسه به حداقلِ مصرف رسیده
 > (pass-through بدون re-encode/downmix).
+
+> **چرا `no_updates=True` روی کلاینت‌های ویس فعال نیست:** PyTgCalls رویدادهای
+> ویس‌کال (اتمام هندشیک WebRTC، sync شرکت‌کننده‌ها، kick/leave) را از طریق
+> `@app.on_raw_update` روی همان کلاینت Pyrogram می‌گیرد. اگر `no_updates=True`
+> باشد، Pyrogram اصلاً `handler_worker` را استارت نمی‌کند و این هندلر هرگز اجرا
+> نمی‌شود ⇒ اتصال ویس ناقص می‌ماند و اکانت بیرون انداخته می‌شود. به همین دلیل
+> کلاینت‌های ویس عمداً با `no_updates=False` ساخته می‌شوند. (بار پردازشیِ این
+> آپدیت‌ها با `no_updates` حذف نمی‌شود، بلکه با خفه‌کردن لاگ‌ها و uvloop مهار شده.)
 
 بعد از هر تغییرِ `requirements.txt` (مثل افزودن uvloop) حتماً با `--build` بسازید:
 

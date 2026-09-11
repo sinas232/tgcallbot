@@ -130,24 +130,24 @@ from config import Config
 # LOOP the (short) file infinitely (-stream_loop -1) at play time, so the media
 # transport can never die of EOF — the effective silence duration is unlimited
 # (multi-hour orders stay inside the call).
-_SILENCE_RATE = 48000
-# MONO (1 channel): a mono silence stream halves the Opus encoding pressure vs
-# stereo (a real listener account never needs stereo), and keeps the whole
-# path mono end-to-end so ntgcalls never has to downmix. Kept in sync with
-# _SILENCE_AUDIO_CHANNELS (defined below) so the .wav file and the
-# AudioParameters handed to ntgcalls always agree (pure pass-through).
+#
+# Audio format (CPU): the whole path is kept identical end-to-end so ffmpeg is a
+# pure pass-through (no resample, no downmix). In pytgcalls 2.x
+# AudioParameters(bitrate=<sample_rate>, channels=<n>) — the first field is the
+# SAMPLE RATE (AudioQuality.HIGH == (48000, 2), LOW == (24000, 1)). Because this
+# is pure SILENCE that only keeps a muted listener's WebRTC transport alive, we
+# default to 24 kHz MONO: the lowest-cost Opus frame that Telegram still accepts.
+# The .wav file, the ffmpeg -ar/-ac, and the ntgcalls AudioParameters ALL derive
+# from these two values, so they can never drift out of sync.
 _SILENCE_CHANNELS = 1 if int(getattr(Config, "VOICE_AUDIO_CHANNELS", 1) or 1) <= 1 else 2
+_SILENCE_RATE = max(8000, int(getattr(Config, "VOICE_AUDIO_SAMPLE_RATE", 24000) or 24000))
 _SILENCE_SECONDS = max(5, int(getattr(Config, "VOICE_SILENCE_SECONDS", 30) or 30))
 _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
 
-# Audio parameters handed to ntgcalls for the stay-alive silence.  In
-# pytgcalls 2.x AudioParameters(bitrate=<sample_rate>, channels=<n>) — the first
-# field is the SAMPLE RATE (AudioQuality.HIGH == (48000, 2), LOW == (24000, 1)).
-# We keep 48 kHz to match a real client's wire format but force MONO (channels=1)
-# so Opus encodes a single channel (~50% less CPU than the previous stereo HIGH
-# preset).  Both are overridable via env for tuning.
-_SILENCE_AUDIO_RATE = max(8000, int(getattr(Config, "VOICE_AUDIO_SAMPLE_RATE", 48000) or 48000))
-_SILENCE_AUDIO_CHANNELS = 1 if int(getattr(Config, "VOICE_AUDIO_CHANNELS", 1) or 1) <= 1 else 2
+# Audio parameters handed to ntgcalls for the stay-alive silence — same rate and
+# channel count as the generated .wav above (pure pass-through).
+_SILENCE_AUDIO_RATE = _SILENCE_RATE
+_SILENCE_AUDIO_CHANNELS = _SILENCE_CHANNELS
 _SILENCE_AUDIO_PARAMS = AudioParameters(
     bitrate=_SILENCE_AUDIO_RATE,
     channels=_SILENCE_AUDIO_CHANNELS,

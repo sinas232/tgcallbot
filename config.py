@@ -124,13 +124,19 @@ class Config:
     # second" bursts (FloodWait loops) and no ffmpeg/CPU spike.
     # The wave itself still overlaps: a single join takes 30-45s, so the
     # build speed is nearly unchanged; only the *starts* are paced.
-    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '6.0'))
-    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '10.0'))
+    # Default gap 0.5-1.0s between account starts (user-requested pacing to
+    # avoid a one-shot CPU spike while still throttling the RPC cadence).
+    # NOTE: this is much tighter than the earlier 6-10s FloodWait-safe pacing —
+    # if Telegram starts issuing FloodWait during big ramp-ups, raise these two
+    # env vars back toward 3-6s.
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '0.5'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '1.0'))
     # Extra small human-like jitter (seconds) added on top of the base
     # start-gap between two account client starts, to avoid a perfectly
-    # periodic RPC cadence that automated anti-spam can fingerprint.
-    VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.5'))
-    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '1.5'))
+    # periodic RPC cadence that automated anti-spam can fingerprint. Kept at 0
+    # by default so the total gap stays within the requested 0.5-1.0s window.
+    VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.0'))
+    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '0.0'))
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -164,10 +170,13 @@ class Config:
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # ── Stay-alive audio format (CPU) ────────────────────────────────────
     # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
-    # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo; 48 kHz
-    # keeps the real-client wire format so ffmpeg stays a pass-through. A
-    # listener account never needs stereo, so MONO is the default.
-    VOICE_AUDIO_SAMPLE_RATE = int(os.getenv('VOICE_AUDIO_SAMPLE_RATE', '48000'))
+    # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo, and a
+    # LOWER sample rate (24 kHz) further cuts the per-frame Opus work.  Since
+    # this is pure silence keeping a muted listener's WebRTC transport alive,
+    # 24 kHz mono is inaudibly sufficient and the cheapest to encode.  The
+    # generated silence.wav is built at the SAME rate so ffmpeg never resamples
+    # (pure pass-through).  Both are overridable via env.
+    VOICE_AUDIO_SAMPLE_RATE = int(os.getenv('VOICE_AUDIO_SAMPLE_RATE', '24000'))
     VOICE_AUDIO_CHANNELS = int(os.getenv('VOICE_AUDIO_CHANNELS', '1'))
     # FloodWait at or below this many seconds is slept inside the join task;
     # longer server waits are persisted (data/voice_flood_cooldown.json, also
