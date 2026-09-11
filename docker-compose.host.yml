@@ -18,6 +18,9 @@ services:
   bot:
     network_mode: "host"
     ports: !reset []
+    extra_hosts:
+      - "db:127.0.0.1"
+      - "redis:127.0.0.1"
     ulimits:
       nofile:
         soft: 65535
