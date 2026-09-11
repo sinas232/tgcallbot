@@ -319,6 +319,74 @@ async def zp_callback_handler(request):
         logger.error(f"ZP Callback Error: {e}")
         return web.Response(text="Internal Error", status=500)
 
+async def pay_redirect_handler(request):
+    """صفحهٔ میانیِ فاکتور/هدایت به درگاه (روی دامنهٔ اصلیِ خودمان).
+
+    الزام شاپرک: پرداخت از بات نباید مستقیم به درگاه هدایت شود؛ باید ابتدا
+    از یک صفحهٔ وب روی «دامنهٔ اصلی» آغاز شود تا نشانی ارجاع‌دهنده (Referrer)
+    با دامنهٔ رسمیِ درگاه و صفحهٔ نتیجهٔ پرداخت (callback) تطابق داشته باشد.
+    این صفحه لینک واقعی درگاه را از دیتابیس می‌خواند و کاربر را (پس از یک
+    ریدایرکت کوتاه که Referrer را روی دامنهٔ ما ثبت می‌کند) به درگاه می‌برد.
+    """
+    trans_id = request.match_info.get('trans_id', '')
+    if not trans_id:
+        return web.Response(text="Bad Request", status=400)
+
+    transaction = await DatabaseManager.get_payment_transaction(trans_id)
+    if not transaction:
+        return web.Response(
+            text=get_html_response("تراکنش یافت نشد", "لینک پرداخت نامعتبر است.",
+                                   color="#F44336", icon="❌"),
+            content_type='text/html', status=404,
+        )
+
+    if transaction.get('status') == 'paid':
+        return web.Response(
+            text=get_html_response("پرداخت‌شده", "این تراکنش قبلاً پرداخت شده است."),
+            content_type='text/html',
+        )
+
+    pay_url = transaction.get('pay_url')
+    if not pay_url:
+        return web.Response(
+            text=get_html_response("خطا", "آدرس درگاه برای این تراکنش ثبت نشده است.",
+                                   color="#F44336", icon="❌"),
+            content_type='text/html', status=500,
+        )
+
+    amount = int(float(transaction.get('amount', 0)))
+    # صفحهٔ فاکتور با هدایت خودکار (meta refresh + JS) به درگاه. چون این صفحه
+    # روی دامنهٔ اصلی ما بارگذاری می‌شود، مرورگر هنگام رفتن به درگاه، همین دامنه
+    # را به‌عنوان Referrer ارسال می‌کند و الزام تطابق دامنه رعایت می‌شود.
+    html = f"""<!DOCTYPE html>
+<html lang="fa">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="1;url={pay_url}">
+    <title>در حال انتقال به درگاه پرداخت</title>
+    <style>
+        body {{ font-family: Tahoma, Arial, sans-serif; text-align: center; padding: 50px; direction: rtl; background:#f4f4f9; }}
+        .card {{ background:#fff; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,.1); display:inline-block; max-width:400px; width:100%; }}
+        h1 {{ color:#0088cc; }}
+        .amount {{ font-size:22px; font-weight:bold; color:#333; margin:14px 0; }}
+        .btn {{ display:inline-block; margin-top:24px; padding:12px 26px; background:#0088cc; color:#fff; text-decoration:none; border-radius:8px; font-weight:bold; }}
+        .muted {{ color:#888; font-size:13px; margin-top:16px; }}
+    </style>
+    <script>setTimeout(function(){{ window.location.href = "{pay_url}"; }}, 900);</script>
+</head>
+<body>
+    <div class="card">
+        <h1>در حال انتقال به درگاه پرداخت…</h1>
+        <div class="amount">مبلغ: {amount:,} تومان</div>
+        <p>لطفاً چند لحظه صبر کنید. اگر به‌صورت خودکار منتقل نشدید، روی دکمهٔ زیر بزنید:</p>
+        <a class="btn" href="{pay_url}">ورود به درگاه پرداخت</a>
+        <div class="muted">شناسهٔ تراکنش: {trans_id}</div>
+    </div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type='text/html')
+
 async def health_handler(request):
     """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
     اگر این آدرس را در مرورگر باز کردید و 'ok' دیدید، یعنی دامنه/پورت شما
@@ -338,6 +406,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
+    app.router.add_get('/pay/{trans_id}', pay_redirect_handler)
     app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
     app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
     

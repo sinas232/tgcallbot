@@ -213,6 +213,10 @@ class PaymentTransaction(Base):
     trans_id = Column(String(100), unique=True, nullable=False)
     status = Column(String(20), default="pending")
     gateway_slug = Column(String(50))
+    # لینک واقعی درگاه (StartPay). صفحهٔ میانیِ /pay/{trans_id} روی دامنهٔ خودمان
+    # کاربر را به این آدرس هدایت می‌کند تا Referrer با دامنهٔ اصلی تطابق داشته باشد
+    # (الزام شاپرک برای بات‌ها).
+    pay_url = Column(String(500))
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Ticket(Base):
@@ -248,6 +252,8 @@ class DatabaseManager:
     async def _run_safe_migrations():
         commands = [
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_id INTEGER DEFAULT 1;",
+            # لینک واقعی درگاه برای صفحهٔ میانیِ Referrer-safe (الزام شاپرک برای بات‌ها)
+            "ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS pay_url VARCHAR(500);",
             # جدول کارت بانکی
             """
             CREATE TABLE IF NOT EXISTS bank_cards (
@@ -1071,9 +1077,9 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             await db_session.commit()
 
     @staticmethod
-    async def create_payment_transaction(user_id: int, amount: float, trans_id: str, gateway: str, bot_id=1):
+    async def create_payment_transaction(user_id: int, amount: float, trans_id: str, gateway: str, bot_id=1, pay_url: str = None):
         async with AsyncSessionLocal() as db_session:
-            pt = PaymentTransaction(bot_id=bot_id, user_id=user_id, amount=amount, trans_id=trans_id, gateway_slug=gateway)
+            pt = PaymentTransaction(bot_id=bot_id, user_id=user_id, amount=amount, trans_id=trans_id, gateway_slug=gateway, pay_url=pay_url)
             db_session.add(pt)
             await db_session.commit()
 

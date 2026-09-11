@@ -208,8 +208,15 @@ class PaymentService:
         success, link, trans_id = await gateway.create_payment_link(user_id, amount, mobile, email, config)
         
         if success and trans_id:
-            await DatabaseManager.create_payment_transaction(user_id, amount, trans_id, slug, bot_id=bot_id)
-            return True, link
+            # لینک واقعی درگاه (link) را ذخیره می‌کنیم و به‌جای آن، آدرس صفحهٔ
+            # میانیِ خودمان را به کاربر می‌دهیم. این صفحه (روی دامنهٔ اصلی) کاربر
+            # را به درگاه هدایت می‌کند تا Referrer با دامنهٔ اصلی تطابق داشته باشد
+            # (الزام شاپرک برای پرداخت از طریق بات‌ها).
+            await DatabaseManager.create_payment_transaction(
+                user_id, amount, trans_id, slug, bot_id=bot_id, pay_url=link
+            )
+            intermediate_url = f"{Config.SERVER_URL}/pay/{trans_id}"
+            return True, intermediate_url
         elif success and not trans_id:
             return False, "خطای داخلی: شناسه تراکنش دریافت نشد."
             
