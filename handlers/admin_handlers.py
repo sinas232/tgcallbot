@@ -1184,7 +1184,14 @@ async def handle_gateway_action(update, context):
         await DatabaseManager.update_gateway_config(slug, new_status, config, bot_id=bot_id)
         await update.message.reply_text(f"✅ وضعیت تغییر کرد.")
         return await handle_gateway_selection(update, context, gateway_name=gw['name'])
-    if "تنظیم PIN" in text or "تنظیم merchant_id" in text:
+    if "🔑 تنظیم Access Token" in text:
+        context.user_data['config_mode'] = "access_token"
+        await update.message.reply_text("✏️ لطفاً **Access Token** جدید را ارسال کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+        return AWAITING_GATEWAY_CONFIG_INPUT
+    # نام دکمهٔ تنظیم شناسه مطابق slug ساخته می‌شود («تنظیم pin» یا «تنظیم merchant_id»).
+    # چک را حساس‌به‌بزرگی/کوچکی نمی‌کنیم تا هم PIN و هم pin مطابقت کنند.
+    lowered = text.lower()
+    if "تنظیم pin" in lowered or "تنظیم merchant_id" in lowered:
         context.user_data['config_mode'] = "main_id"
         param_name = "PIN" if slug == 'aqayepardakht' else "Merchant ID"
         await update.message.reply_text(f"✏️ لطفاً **{param_name}** جدید را ارسال کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
