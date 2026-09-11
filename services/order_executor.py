@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import math
 import random
 import re
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -129,6 +131,7 @@ class OrderExecutor:
 			"target_count": int(order_data.get("accounts_count") or 0),
 			"live_count": 0,
 			"pool_ids": set(),
+			"swapped_accounts": 0,
 		}
 		try:
 			await DatabaseManager.mark_order_as_running(order_id)
@@ -841,6 +844,13 @@ class OrderExecutor:
 	    if released <= 0:
 	        return 0
 
+	    # Track how many slots were hot-swapped over the order's lifetime so the
+	    # completion/cancellation report can show {swapped_accounts}. Counted at
+	    # the moment unrecoverable slots are released for replacement.
+	    _info = self.active_orders.get(order_id)
+	    if _info is not None:
+	        _info["swapped_accounts"] = int(_info.get("swapped_accounts") or 0) + released
+
 	    exact = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
 	    if exact <= 0:
 	        return 0
@@ -1246,70 +1256,276 @@ class OrderExecutor:
 			name = f"@{user.get('username')}" if user.get("username") else "Unknown"
 		return name, user.get("telegram_id", "---")
 
-	def _build_report(self, kind, order_id, data, order_rec, user, success_cnt=0, reason=None):
+	@staticmethod
+	def compute_prorated_settlement(total_price, duration_minutes, started_at):
+		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
+
+		خروجی: (used_cost, refund_amount, elapsed_seconds)
+		  Rs = total_price / (duration_minutes*60)         نرخ ثانیه‌ای
+		  C_used = RoundUp(Δt × Rs)  ← سقف = total_price، کف = 0
+		  refund = total_price − C_used
+		اگر started_at موجود نباشد یا مدت ۰ باشد، هیچ زمان قابل‌محاسبه‌ای
+		مصرف نشده و کل مبلغ عودت می‌شود.
+		"""
+		try:
+			total_price = float(total_price or 0)
+		except Exception:
+			total_price = 0.0
+		duration_minutes = int(duration_minutes or 0)
+		if duration_minutes <= 0 or not started_at:
+			return 0.0, total_price, 0.0
+		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
+		total_seconds = duration_minutes * 60
+		if elapsed_seconds >= total_seconds:
+			used = total_price
+		else:
+			rate_per_second = total_price / total_seconds
+			used = min(float(math.ceil(elapsed_seconds * rate_per_second)), total_price)
+		refund = max(0.0, total_price - used)
+		return used, refund, elapsed_seconds
+
+	async def settle_and_refund_order(
+		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
+		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+	):
+		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
+
+		استفادهٔ مشترک کاربر و ادمین. اگر do_refund=False فقط لغو می‌شود
+		(بدون عودت وجه) ولی گزارش مالی با مبلغ عودت ۰ ثبت می‌گردد.
+
+		خروجی: dict شامل total_cost/used_cost/refund_amount/refund_tx_id/
+		        user_wallet_balance برای نمایش به تماس‌گیرنده.
+		"""
+		order = await DatabaseManager.get_order(order_id) or {}
+		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
+		total_price = float(order.get("price_paid") or 0)
+		duration_minutes = int(order.get("duration_minutes") or 0)
+		started_at = order.get("started_at")
+
+		used_cost, refund_amount, _elapsed = self.compute_prorated_settlement(
+			total_price, duration_minutes, started_at
+		)
+		if not do_refund:
+			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
+			used_cost = total_price
+			refund_amount = 0.0
+
+		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
+		new_balance = None
+		if do_refund and refund_amount > 0 and user:
+			ok, new_balance = await DatabaseManager.update_user_credit(
+				user["id"], refund_amount, "order_refund",
+				f"عودت لغو سفارش {order_id} | {refund_tx_id}", bot_id=bot_id,
+			)
+		if new_balance is None and user:
+			fresh = await DatabaseManager.get_user_by_id(user["id"])
+			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+
+		# توقف واقعی سفارش/اکانت‌ها
+		try:
+			await self.stop_active_order(order_id, is_expired=False, reason=cancellation_reason)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: stop during settlement failed: {exc}")
+
+		if not canceled_by_name:
+			canceled_by_name = self._user_display(user)[0] if user else "—"
+
+		try:
+			await self._log_to_channel(
+				"cancelled", order_id, order, user=user, bot_id=bot_id,
+				reason=cancellation_reason,
+				extra={
+					"canceled_by_role": canceled_by_role,
+					"canceled_by_name": canceled_by_name,
+					"cancellation_reason": cancellation_reason,
+					"total_cost": total_price,
+					"used_cost": used_cost,
+					"refund_amount": refund_amount,
+					"user_wallet_balance": new_balance,
+					"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else "—",
+				},
+			)
+		except Exception:
+			pass
+
+		return {
+			"total_cost": total_price,
+			"used_cost": used_cost,
+			"refund_amount": refund_amount,
+			"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else None,
+			"user_wallet_balance": new_balance,
+		}
+
+	# نگاشت نوع سرویس به فارسی برای گزارش‌ها ({order_type_fa})
+	_ORDER_TYPE_FA = {
+		"voice_chat": "ویس‌چت (Voice Chat)",
+		"group_join": "عضویت گروه (Group Join)",
+		"channel_join": "عضویت کانال (Channel Join)",
+	}
+
+	@staticmethod
+	def _fmt_duration_fa(total_seconds) -> str:
+		"""مدت کارکرد واقعی را به «X دقیقه و Y ثانیه» تبدیل می‌کند."""
+		try:
+			total_seconds = max(0, int(round(total_seconds)))
+		except Exception:
+			total_seconds = 0
+		h = total_seconds // 3600
+		m = (total_seconds % 3600) // 60
+		s = total_seconds % 60
+		parts = []
+		if h > 0:
+			parts.append(f"{h} ساعت")
+		if m > 0 or h > 0:
+			parts.append(f"{m} دقیقه")
+		parts.append(f"{s} ثانیه")
+		return " و ".join(parts)
+
+	def _stability_rate(self, target_count, success_cnt, swapped) -> str:
+		"""درصد پایداری سیستم = نسبت اکانت‌های زندهٔ نهایی به تعداد درخواستی."""
+		try:
+			target = int(target_count or 0)
+			if target <= 0:
+				return "100%"
+			live = max(0, min(int(success_cnt or 0), target))
+			rate = (live / target) * 100.0
+			# نمایش یک رقم اعشار، بدون صفر اضافی
+			txt = f"{rate:.1f}".rstrip("0").rstrip(".")
+			return f"{txt}%"
+		except Exception:
+			return "—"
+
+	def _build_report(self, kind, order_id, data, order_rec, user, success_cnt=0, reason=None, extra=None):
+		"""ساخت گزارش‌های پرمیوم فارسی برای کانال لاگ سفارش‌ها.
+
+		extra (dict اختیاری) برای گزارش لغو مالی:
+		  total_cost, used_cost, refund_amount, wallet_balance, refund_tx_id,
+		  canceled_by_role, canceled_by_name
+		"""
 		order_rec = order_rec or {}
+		data = data or {}
+		extra = extra or {}
 		name, tg_id = self._user_display(user)
 		order_type = data.get("order_type") or order_rec.get("order_type") or "---"
+		order_type_fa = self._ORDER_TYPE_FA.get(order_type, order_type)
 		link = data.get("target_link") or order_rec.get("target_link") or "---"
-		count = data.get("accounts_count") or order_rec.get("accounts_count") or 0
+		count = int(data.get("accounts_count") or order_rec.get("accounts_count") or 0)
 		plan_minutes = int(data.get("duration_minutes") or order_rec.get("duration_minutes") or 0)
 
 		created_at = order_rec.get("created_at")
 		started_at = order_rec.get("started_at") or created_at or datetime.utcnow()
 		ended_at = order_rec.get("completed_at") or datetime.utcnow()
 
-		headers = {
-			"started": "started",
-			"completed": "completed",
-			"cancelled": "cancelled",
-			"failed": "failed",
-			"scheduled": "scheduled",
-		}
+		# متغیرهای کارنامهٔ عملکرد (swap / stability)
+		info = self.active_orders.get(order_id) or {}
+		swapped = int(extra.get("swapped_accounts", info.get("swapped_accounts", 0)) or 0)
+		stability = self._stability_rate(count, success_cnt, swapped)
+
+		sep = "───────────────────────"
+
+		# ── گزارش شروع سفارش ──
+		if kind in ("started", "scheduled"):
+			head = "🟢 **سفارش جدید فعال شد**" if kind == "started" else "🗓️ **سفارش زمان‌بندی‌شده ثبت شد**"
+			lines = [
+				f"┌ {head}",
+				"│",
+				f"├ 👤 **سفارش‌دهنده:** {name}",
+				f"├ 🆔 **آیدی کاربر:** `{tg_id}`",
+				f"├ 🔖 **کد پیگیری:** `{order_id}`",
+				f"├ 📦 **نوع سرویس:** {order_type_fa}",
+				f"├ 🔗 **لینک مقصد:** `{link}`",
+				"│",
+				f"├ 🔢 **تعداد اکانت:** `{count}` عدد",
+				f"├ ⏳ **مدت پلن:** `{plan_minutes}` دقیقه",
+				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
+				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(started_at)}`",
+				sep,
+				"🛡️ *سیستم مانیتورینگ لحظه‌ای و خودکار فعال است.*",
+			]
+			return "\n".join(lines)
+
+		# مدت کارکرد واقعی (ثانیه‌ای دقیق)
+		try:
+			real_seconds = max(0, (ended_at - started_at).total_seconds()) if (started_at and ended_at) else 0
+		except Exception:
+			real_seconds = 0
+		actual_duration_formatted = self._fmt_duration_fa(real_seconds)
+
+		# ── گزارش لغو سفارش و تسویه مالی ──
+		if kind == "cancelled":
+			canceled_by_role = extra.get("canceled_by_role") or "کاربر"
+			canceled_by_name = extra.get("canceled_by_name") or name
+			cancellation_reason = extra.get("cancellation_reason") or reason or "لغو دستی"
+			total_cost = extra.get("total_cost", order_rec.get("price_paid") or 0)
+			used_cost = extra.get("used_cost")
+			refund_amount = extra.get("refund_amount")
+			wallet_balance = extra.get("user_wallet_balance")
+			refund_tx_id = extra.get("refund_tx_id") or "—"
+
+			def _p(v):
+				try:
+					return f"{int(round(float(v))):,}"
+				except Exception:
+					return "—"
+
+			lines = [
+				"┌ ⛔ **گزارش لغو سفارش و تسویه حساب**",
+				"│",
+				f"├ 👤 **سفارش‌دهنده:** {name} (`{tg_id}`)",
+				f"├ 🔖 **کد سفارش:** `{order_id}`",
+				f"├ 📦 **نوع سرویس:** {order_type_fa}",
+				f"├ 🔗 **لینک مقصد:** `{link}`",
+				"│",
+				f"├ 🚫 **لغو شده توسط:** `{canceled_by_role}` ({canceled_by_name})",
+				f"├ 📝 **علت لغو:** `{cancellation_reason}`",
+				f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+				f"├ ⏱️ **زمان کارکرد واقعی:** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
+				"│",
+				"├ 💳 **جزئیات مالی و عودت وجه:**",
+				f"│  ├ 💰 **هزینه کل پلن:** `{_p(total_cost)}` تومان",
+				f"│  ├ 📉 **هزینه مدت کارکرد:** `{_p(used_cost)}` تومان",
+				f"│  └ 🔄 **مبلغ عودت‌شده:** `{_p(refund_amount)}` تومان",
+				"│",
+				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
+				f"└ 👛 **موجودی فعلی کیف‌پول:** `{_p(wallet_balance)}` تومان",
+				sep,
+				"⚡ *مبلغ باقی‌مانده بلافاصله و بدون کسر کارمزد به کیف پول حساب شما اضافه شد.*",
+			]
+			return "\n".join(lines)
+
+		# ── گزارش پایان موفق سفارش (completed) و همچنین failed ──
+		if kind == "failed":
+			head = "⚠️ **پایان سفارش با خطا**"
+			footer = "❗ *سفارش به‌طور کامل اجرا نشد؛ در صورت نیاز با پشتیبانی تماس بگیرید.*"
+		else:
+			head = "🏁 **پایان موفقیت‌آمیز سفارش**"
+			footer = "✨ *با تشکر از اعتماد شما | سفارش با موفقیت خاتمه یافت.*"
 
 		lines = [
-			headers.get(kind, "status"),
-			"",
-			f"User: {name} (ID: `{tg_id}`)",
-			"",
-			f"Order: `{order_id}`",
-			"",
-			f"Type: {order_type}",
-			"",
-			f"Link: `{link}`",
-			"",
-			f"Count: `{count}`",
-			"",
-			f"Plan minutes: `{plan_minutes}`",
-			"",
-			f"Created: `{format_jalali_datetime(created_at)}`",
-			"",
-			f"Started: `{format_jalali_datetime(started_at)}`",
+			f"┌ {head}",
+			"│",
+			f"├ 👤 **سفارش‌دهنده:** {name} (`{tg_id}`)",
+			f"├ 🔖 **کد سفارش:** `{order_id}`",
+			f"├ 📦 **نوع سرویس:** {order_type_fa}",
+			f"├ 🔗 **لینک مقصد:** `{link}`",
+			"│",
+			f"├ ⏳ **پلن درخواستی:** `{plan_minutes}` دقیقه",
+			f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+			f"├ 🏁 **زمان پایان:** `{format_jalali_datetime(ended_at)}`",
+			f"├ ⏱️ **مدت اجرای واقعی:** `{actual_duration_formatted}`",
+			"│",
+			"└ 📊 **کارنامه عملکرد سیستم:**",
+			f"   ├ ✅ **اکانت‌های آنلاین:** `{success_cnt}` از `{count}`",
+			f"   ├ 🔄 **جایگزینی هوشمند:** `{swapped}` اکانت",
+			f"   └ 📈 **نرخ پایداری اتصال:** `{stability}`",
+			sep,
+			footer,
 		]
-
-		if kind in ("completed", "cancelled", "failed"):
-			real_minutes = 0
-			try:
-				if started_at and ended_at:
-					real_minutes = int(round((ended_at - started_at).total_seconds() / 60))
-			except Exception:
-				real_minutes = 0
-			lines += [
-				"",
-				f"Ended: `{format_jalali_datetime(ended_at)}`",
-				"",
-				f"Actual runtime: `{real_minutes}` minutes",
-				"",
-				"Result:",
-				"",
-				f"Success: `{success_cnt}` accounts",
-			]
-
 		if reason:
-			lines += ["", f"Reason: {reason}"]
-
+			lines += [f"📝 دلیل: {reason}"]
 		return "\n".join(lines)
 
-	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1):
+	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
 		from services.bot_manager import bot_manager
 		app = bot_manager.active_bots.get(bot_id)
 		if not app:
@@ -1323,10 +1539,15 @@ class OrderExecutor:
 				user = await DatabaseManager.get_user_by_id(order_rec["user_id"])
 			if not user:
 				user = {"first_name": "Unknown", "telegram_id": data.get("user_id", "Unknown")}
-			txt = self._build_report(type, order_id, data, order_rec, user, success_cnt=success_cnt, reason=reason)
-			# User-controlled names/links can contain Markdown characters. Send the
-			# structured report as plain text so logging never fails on formatting.
-			await app.bot.send_message(channel_id, txt)
+			txt = self._build_report(type, order_id, data, order_rec, user, success_cnt=success_cnt, reason=reason, extra=extra)
+			# The premium templates use Markdown (**bold**, `code`). Try Markdown
+			# first so the report renders nicely; user-controlled names/links can
+			# contain characters that break Markdown, so on ANY formatting error
+			# fall back to a plain-text send (logging must never be lost).
+			try:
+				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
+			except Exception:
+				await app.bot.send_message(channel_id, txt)
 		except Exception as exc:
 			logger.warning(f"Order {order_id}: report send failed: {exc}")
 

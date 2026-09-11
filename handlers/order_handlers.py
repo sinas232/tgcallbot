@@ -7,7 +7,9 @@ handlers/order_handlers.py
 3. رفع مشکل عدم واکنش دکمه‌های تقویم
 """
 import logging
+import math
 import re
+import uuid
 from datetime import datetime, timedelta
 import jdatetime
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -391,18 +393,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
         refund_amount = total_price
         msg_prefix = "✅ سفارش زمان‌بندی شده با موفقیت لغو شد."
-
-        # ثبت لاگ لغو
-        try:
-            await order_executor._log_to_channel(
-                "cancelled",
-                order_id,
-                order,
-                bot_id=bot_id,
-                reason="User cancelled scheduled order before start"
-            )
-        except Exception:
-            pass
+        # گزارش لغو در انتهای تابع (به‌همراه جزئیات مالی) یک‌بار ارسال می‌شود.
     else:
         # سفارش در حال اجرا → محاسبه مدت مصرف‌شده
         duration_minutes = int(order.get('duration_minutes') or 0)
@@ -410,6 +401,10 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         started_at = order.get('started_at')
 
         if duration_minutes > 0 and started_at:
+            # تسویه ثانیه‌ای دقیق (Precision Pro-Rated Billing):
+            #   Δt = ثانیهٔ کارکرد واقعی
+            #   Rs = هزینه کل ÷ کل ثانیه‌های پلن  (نرخ ثانیه‌ای)
+            #   C_used = RoundUp(Δt × Rs)  ← به نفع مجموعه، سقف = هزینه کل
             now_utc = datetime.utcnow()
             elapsed_seconds = max(0, (now_utc - started_at).total_seconds())
             total_seconds = duration_minutes * 60
@@ -417,7 +412,9 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if elapsed_seconds >= total_seconds:
                 spent_amount = total_price
             else:
-                spent_amount = total_price * (elapsed_seconds / total_seconds)
+                rate_per_second = total_price / total_seconds
+                spent_amount = math.ceil(elapsed_seconds * rate_per_second)
+                spent_amount = min(float(spent_amount), total_price)
         else:
             # No duration start means no billable service time was consumed.
             spent_amount = 0.0
@@ -436,15 +433,24 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         msg_prefix = "✅ سفارش فعال با موفقیت لغو شد."
 
-    # عودت وجه به کیف پول کاربر
+    # شناسهٔ یکتای تراکنش عودت (refund_tx_id) — برای درج در دیتابیس و گزارش
+    refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
+
+    # عودت وجه به کیف پول کاربر (تراکنش اتمیک: اعتبار + رکورد تراکنش در یک commit)
+    new_balance = None
     if refund_amount > 0:
-        await DatabaseManager.update_user_credit(
+        ok, new_balance = await DatabaseManager.update_user_credit(
             user['id'],
             refund_amount,
             "order_refund",
-            f"لغو سفارش {order_id}",
+            f"عودت لغو سفارش {order_id} | {refund_tx_id}",
             bot_id=bot_id
         )
+
+    # موجودی فعلی کیف پول برای نمایش (اگر عودتی نبود، از رکورد کاربر بخوان)
+    if new_balance is None:
+        fresh_user = await DatabaseManager.get_user_by_id(user['id'])
+        new_balance = (fresh_user or {}).get('credit', user.get('credit', 0))
 
     spent_amount = max(0.0, total_price - refund_amount)
 
@@ -452,10 +458,37 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"{msg_prefix}\n\n"
         f"💰 مبلغ کل پلن: {format_price(total_price)} تومان\n"
         f"⏱ مبلغ مصرف‌شده تا لحظه لغو: {format_price(spent_amount)} تومان\n"
-        f"💵 مبلغ عودت داده شده به کیف پول: {format_price(refund_amount)} تومان"
+        f"💵 مبلغ عودت داده شده به کیف پول: {format_price(refund_amount)} تومان\n"
+        f"🧾 کد پیگیری عودت: {refund_tx_id}\n"
+        f"👛 موجودی فعلی کیف‌پول: {format_price(new_balance)} تومان"
     )
 
     await query.edit_message_text(txt)
+
+    # گزارش شکیل لغو + تسویهٔ مالی به کانال لاگ (نقش لغوکننده = کاربر)
+    try:
+        cancel_name, _ = order_executor._user_display(user)
+        await order_executor._log_to_channel(
+            "cancelled",
+            order_id,
+            order,
+            user=user,
+            bot_id=bot_id,
+            reason="لغو دستی توسط کاربر",
+            extra={
+                "canceled_by_role": "کاربر",
+                "canceled_by_name": cancel_name,
+                "cancellation_reason": "لغو دستی توسط کاربر",
+                "total_cost": total_price,
+                "used_cost": spent_amount,
+                "refund_amount": refund_amount,
+                "user_wallet_balance": new_balance,
+                "refund_tx_id": refund_tx_id,
+            },
+        )
+    except Exception:
+        pass
+
     return ConversationHandler.END
 
 # -------------------- تاریخچه سفارشات --------------------

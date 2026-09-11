@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 from database import DatabaseManager
 from helpers.message_utils import send_safe
 from constants import *
-from utils.helpers import clean_number, format_jalali_datetime
+from utils.helpers import clean_number, format_jalali_datetime, format_price
 from config import Config
 from services.order_executor import order_executor
 from services.bot_manager import bot_manager
@@ -626,15 +626,43 @@ async def stop_order_execute(update, context):
         return AWAITING_STOP_ORDER_INDEX
         
     if order['status'] == 'scheduled':
-        await DatabaseManager.update_order_status(oid, 'stopped')
-        msg = "✅ سفارش زمان‌بندی شده لغو شد."
+        # سفارش زمان‌بندی‌شده هنوز شروع نشده → عودت کامل بدون محاسبهٔ ثانیه‌ای
+        await order_executor.settle_and_refund_order(
+            oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
+            canceled_by_name=update.effective_user.first_name,
+            cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
+            bot_id=context.bot_data.get('bot_id', 1),
+        )
+        msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     else:
-        await order_executor.stop_active_order(oid)
-        msg = "✅ سفارش فعال متوقف شد."
-        
-    await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
-    
-    # 🔙 بازگشت هوشمند پس از لغو
+        # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
+        total_price = float(order.get('price_paid') or 0)
+        used_cost, refund_amount, _elapsed = order_executor.compute_prorated_settlement(
+            total_price, order.get('duration_minutes'), order.get('started_at')
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
+                callback_data=f"admincancel_refund_{oid}")],
+            [InlineKeyboardButton(
+                "🚫 لغو بدون عودت وجه",
+                callback_data=f"admincancel_norefund_{oid}")],
+            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
+        ])
+        txt = (
+            f"🛑 **لغو سفارش فعال #{oid}**\n\n"
+            f"💰 هزینه کل پلن: {format_price(total_price)} تومان\n"
+            f"📉 هزینه مصرف‌شده تا الان: {format_price(used_cost)} تومان\n"
+            f"💵 مبلغ قابل عودت: {format_price(refund_amount)} تومان\n\n"
+            f"لطفاً نوع لغو را انتخاب کنید:"
+        )
+        await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb)
+        # منوی اصلی را هم برگردان تا کیبورد پایین گیر نکند
+        await send_safe(context.bot, update.effective_chat.id, "👇", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
+        return AWAITING_SETTINGS_ACTION
+
+    # 🔙 بازگشت هوشمند پس از لغو (فقط برای مسیر scheduled)
     return_to = context.user_data.get('stop_order_return_to')
     if return_to == 'profile':
         uid = context.user_data.get('target_uid')
@@ -643,6 +671,52 @@ async def stop_order_execute(update, context):
     else: await manage_orders_start(update, context)
     
     return AWAITING_SETTINGS_ACTION
+
+
+async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        _, mode, oid_str = data.split("_", 2)
+        oid = int(oid_str)
+    except Exception:
+        return
+
+    if mode == "abort":
+        await query.edit_message_text("↩️ لغو منصرف شد. سفارش دست‌نخورده باقی ماند.")
+        return
+
+    order = await DatabaseManager.get_order(oid)
+    if not order:
+        await query.edit_message_text("❌ سفارش یافت نشد یا قبلاً بسته شده است.")
+        return
+
+    do_refund = (mode == "refund")
+    result = await order_executor.settle_and_refund_order(
+        oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
+        canceled_by_name=update.effective_user.first_name,
+        cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
+        bot_id=bot_id,
+    )
+
+    if do_refund:
+        txt = (
+            f"✅ سفارش #{oid} لغو شد و مبلغ عودت داده شد.\n\n"
+            f"💰 هزینه کل: {format_price(result['total_cost'])} تومان\n"
+            f"📉 مصرف‌شده: {format_price(result['used_cost'])} تومان\n"
+            f"💵 عودت‌شده: {format_price(result['refund_amount'])} تومان\n"
+            f"🧾 کد عودت: {result.get('refund_tx_id') or '—'}\n"
+            f"👛 موجودی جدید کاربر: {format_price(result.get('user_wallet_balance'))} تومان"
+        )
+    else:
+        txt = (
+            f"✅ سفارش #{oid} بدون عودت وجه لغو شد.\n\n"
+            f"💰 کل مبلغ ({format_price(result['total_cost'])} تومان) به‌عنوان مصرف‌شده در نظر گرفته شد."
+        )
+    await query.edit_message_text(txt)
 
 # ===================== USER & ADMIN MANAGEMENT =====================
 

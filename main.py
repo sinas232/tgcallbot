@@ -533,6 +533,7 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
                 CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
                 CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+                CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
                 MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
                 
                 # اکشن‌های کاربر
