@@ -90,9 +90,23 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '5'))   # first wave size (5-10 recommended)
+    # First wave size. 3 is the safe default: combined with the staggered
+    # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs land
+    # ~1-2s apart, which is well inside Telegram's per-IP rate budget. The
+    # Join Brain may still widen this later when waves are clean.
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '3'))   # first wave size (start small; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
     VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '10'))         # per-order hard ceiling
+    # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
+    # Accounts of one wave do NOT fire their joins in the same millisecond:
+    # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
+    # after the previous one. This spreads the phone.JoinGroupCall RPCs over
+    # several seconds so Telegram never sees "N joins in one second" (the
+    # classic burst that triggers the 3s FloodWait loop). The wave itself
+    # still overlaps — each join takes 30-45s, so throughput is nearly
+    # unchanged; only the *starts* are paced (~1 join/second, human-like).
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '1.0'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '2.0'))
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -139,7 +153,14 @@ class Config:
     # account is inside the call.  play() returns only after Telegram accepted
     # the JoinGroupCall + the WebRTC transport is up, so this works even in
     # HUGE voice chats where the participant listing cannot be paginated.
-    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '30'))
+    # 40s gives the (now staggered, non-flooded) join full head-room before
+    # the code falls back to the participant-listing verification.
+    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '40'))
+    # Min seconds between two silence re-stream attempts for the SAME account
+    # when the engine media binding vanished but the account is still listed
+    # inside the call (ghost-media-only). Paced so the re-stream can never
+    # become a new JoinGroupCall burst.
+    VOICE_MEDIA_RESTORE_INTERVAL = int(os.getenv('VOICE_MEDIA_RESTORE_INTERVAL', '25'))
     # Shared chat-info cache TTL (peer + access_hash + InputGroupCall): ONE
     # account resolves the chat and every other account reuses the cached
     # objects instead of each issuing resolve_peer/GetFullChannel from the same

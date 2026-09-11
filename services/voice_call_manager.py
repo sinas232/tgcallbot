@@ -577,6 +577,19 @@ class VoiceCallManager:
         # second JoinGroupCall for the same account and chat.
         self._inflight_joins: Dict[Tuple[int, int], asyncio.Task] = {}
 
+        # ── GHOST-MEDIA RESTORE BOOKKEEPING ─────────────────────────────
+        # When the engine media binding vanishes (chat not in pytg.group_calls)
+        # while the participant listing STILL shows the account inside the
+        # call, the old code treated the account as dropped and re-joined it;
+        # the rejoin found "Already in call" WITHOUT re-establishing the media
+        # → ghost again → infinite join/leave churn (the "dwell=6-31s
+        # media_transport_lost" storm).  Now we keep the account counted and
+        # pace a bounded silence re-stream instead.  These two structures
+        # make that re-stream at most ONCE per account per
+        # VOICE_MEDIA_RESTORE_INTERVAL seconds and never two in flight.
+        self._media_restore_inflight: Set[Tuple[int, int]] = set()   # (order_id, account_id)
+        self._media_restore_last: Dict[Tuple[int, int], float] = {}  # (order_id, account_id) -> ts
+
         # Shared per-order monitor tasks
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
 
@@ -1655,6 +1668,58 @@ class VoiceCallManager:
                 account_id, chat_id, exc,
             )
 
+    async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
+        """Re-establish the silent media transport for a GHOST-MEDIA-ONLY slot.
+
+        The participant listing says the account is STILL inside the call,
+        but the engine lost its media binding (``chat_id not in
+        pytg.group_calls``).  Presence — what the order sells — is intact, so
+        the account is kept counted; only the silence stream is re-attached.
+
+        Paced and non-stacking:
+          * at most one restore in flight per (order, account)
+          * at most one restore per account per VOICE_MEDIA_RESTORE_INTERVAL
+            seconds (so a broken media path can never turn into a new
+            JoinGroupCall burst)
+          * a small random pre-delay so N ghosted accounts do not re-stream
+            in the same instant
+        """
+        key = (order_id, account_id)
+        now = time.time()
+        if key in self._media_restore_inflight:
+            return
+        interval = max(5, int(getattr(Config, "VOICE_MEDIA_RESTORE_INTERVAL", 25)))
+        if now - self._media_restore_last.get(key, 0.0) < interval:
+            return
+        pytg = self.clients.get(account_id)
+        if pytg is None:
+            return
+        self._media_restore_inflight.add(key)
+        self._media_restore_last[key] = now
+        try:
+            await asyncio.sleep(random.uniform(0.5, 3.0))
+            # Slot may have been released while we waited.
+            if (order_id, account_id) not in self.active_calls:
+                return
+            await self._play_silence(pytg, int(chat_id))
+            self._vc_event_log(order_id, account_id, "media_restored", {"chat_id": int(chat_id)})
+            logger.info(
+                "[VoiceMedia] silence re-streamed acc=%s chat=%s — media transport back",
+                account_id, chat_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._vc_event_log(order_id, account_id, "media_restore_failed", {
+                "chat_id": int(chat_id), "exc": str(exc)[:80],
+            })
+            logger.warning(
+                "[VoiceMedia] media restore failed acc=%s chat=%s: %s",
+                account_id, chat_id, str(exc)[:80],
+            )
+        finally:
+            self._media_restore_inflight.discard(key)
+
     def flood_wait_remaining(self, account_id: int) -> float:
         """Remaining server-directed cooldown for an account (0 if clear)."""
         try:
@@ -2119,6 +2184,22 @@ class VoiceCallManager:
                 presence = await self._is_in_voice_call(app, chat_id)
                 if presence is True:
                     if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True):
+                        # The account is inside the call.  If the engine has
+                        # NO media binding for this chat (a rejoin after the
+                        # transport died), attach the silence stream through
+                        # the PACED restore path — without this, the account
+                        # would stay a "ghost" (present but no media) and the
+                        # monitor would keep flagging it.  _schedule_media_restore
+                        # is rate-limited and non-stacking, so this can never
+                        # create a JoinGroupCall burst.
+                        try:
+                            group_calls = await pytg.group_calls
+                            if int(chat_id) not in group_calls:
+                                asyncio.create_task(
+                                    self._schedule_media_restore(order_id, account_id, int(chat_id))
+                                )
+                        except Exception:
+                            pass
                         return True, "Already in call"
 
                 # Ultra-short delay to avoid rate limits
@@ -2615,14 +2696,49 @@ class VoiceCallManager:
                         if media_alive is True:
                             present = True
                         elif media_alive is False:
-                            self._vc_event_log(order_id, acc_id, "media_transport_lost", {
-                                "chat_id": cid,
-                                "verdict": "confirmed_media_disconnect",
-                            })
-                            self._record_drop(order_id, acc_id, cid, "media_transport_lost",
-                                              reason="engine media connection missing (ghost)",
-                                              extra={"media_known": media_known})
-                            present = False
+                            if present is True:
+                                # ── GHOST-MEDIA-ONLY (presence intact) ──────────
+                                # The participant listing says the account is
+                                # STILL inside the call — only the engine's
+                                # media binding vanished.  Presence is what the
+                                # order sells, so the account STAYS COUNTED and
+                                # no fail-cycle/rejoin is triggered (the old
+                                # code forced present=False here, which spun the
+                                # join → ghost → rejoin → ghost loop forever and
+                                # is what made accounts visibly bounce out).
+                                # Instead: pace ONE bounded silence re-stream
+                                # per VOICE_MEDIA_RESTORE_INTERVAL seconds.
+                                # If the media path is genuinely broken the
+                                # account simply stays inside the call until
+                                # Telegram itself evicts it (then the normal
+                                # confirmed-disconnect recovery/replacement
+                                # path below takes over).
+                                self._vc_event_log(order_id, acc_id, "media_lost_presence_ok", {
+                                    "chat_id": cid,
+                                    "verdict": "ghost_media_only",
+                                })
+                                self._record_drop(order_id, acc_id, cid, "media_transport_lost",
+                                                  reason="engine media connection missing but presence confirmed (ghost media only)",
+                                                  extra={"media_known": media_known,
+                                                         "verdict": "media_only_presence_intact"})
+                                try:
+                                    asyncio.create_task(
+                                        self._schedule_media_restore(order_id, acc_id, cid)
+                                    )
+                                except RuntimeError:
+                                    pass
+                            else:
+                                # Media binding gone AND the listing does not
+                                # confirm presence → treat as a real loss
+                                # (existing fail-cycle / recovery logic below).
+                                self._vc_event_log(order_id, acc_id, "media_transport_lost", {
+                                    "chat_id": cid,
+                                    "verdict": "confirmed_media_disconnect",
+                                })
+                                self._record_drop(order_id, acc_id, cid, "media_transport_lost",
+                                                  reason="engine media connection missing (ghost)",
+                                                  extra={"media_known": media_known})
+                                present = False
 
                         # ── DL HOLD-RISK (online deep-learning model) ───
                         # Score every cycle, learn from the resolved outcome, and

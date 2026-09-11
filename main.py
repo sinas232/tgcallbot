@@ -9,6 +9,20 @@ try:
 except Exception:
     pass
 
+# ── Suppress the PTBUserWarning spam from ConversationHandler ────────────
+# Our conversations deliberately use per_message=False (button-driven
+# conversations: each callback is handled regardless of which message it
+# came from — the documented safe pattern, see the PTB FAQ on per_*
+# settings).  PTB 20+ warns once per ConversationHandler that contains a
+# CallbackQueryHandler; with 7 conversations that floods the startup log.
+# NOTE: this warning is raised on the per_message VALUE, so even passing
+# per_message=False explicitly cannot silence it — the filter below is the
+# only way without changing conversation behavior.  Must be set BEFORE the
+# handlers are constructed further down in this module.
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
+
 import logging
 import os
 import time
@@ -449,7 +463,10 @@ def register_handlers(application: Application) -> None:
             AWAITING_TICKET_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message)]
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="support_ticket", persistent=True
+        name="support_ticket", persistent=True,
+        # Explicit per_* settings (documented, safe pattern for
+        # button-driven conversations — see the PTBUserWarning note above).
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(support_conv)
 
@@ -464,7 +481,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_KYC_VIDEO: [MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="kyc", persistent=True
+        name="kyc", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(kyc_conv)
 
@@ -599,7 +617,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_RESELLER_EDIT_VALUE: [MessageHandler(STD_TEXT, receive_reseller_edit_value)], 
         },
         fallbacks=admin_fallbacks,
-        name="admin", persistent=True
+        name="admin", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(admin_conv)
     
@@ -614,7 +633,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_CHARGE_AMOUNT: [MessageHandler(STD_TEXT, handle_charge_amount)],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="wallet", persistent=True
+        name="wallet", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(wallet_conv)
     
@@ -643,7 +663,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="acc", persistent=True
+        name="acc", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(acc_conv)
 
@@ -668,7 +689,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="prof", persistent=True
+        name="prof", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(prof_conv)
 
@@ -688,7 +710,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation)]
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="buy", persistent=True
+        name="buy", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(buy_conv)
 

@@ -592,17 +592,29 @@ class OrderExecutor:
 	        join_brain.start_wave(order_id, len(candidates))
 	        wave_no += 1
 	        wave_started = time.monotonic()
+	        # ── STAGGERED WAVE STARTS (managed pacing) ─────────────────
+	        # NEVER fire the whole wave in the same millisecond. Each account's
+	        # join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds after the
+	        # previous one, so the phone.JoinGroupCall RPCs spread over several
+	        # seconds (~1 join/second — clearly a bot, but far below the burst
+	        # threshold that makes Telegram answer with FloodWait 3s loops).
+	        # The wave still overlaps: a single join takes 30-45s, so with a
+	        # window of 3-10 the build speed is nearly unchanged.
+	        stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 1.0)))
+	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 2.0)))
 	        logger.info(
 	            f"Order {order_id}: wave {wave_no} — joining {len(candidates)} accounts "
-	            f"in parallel (window={window}, live={live}/{target_count})"
+	            f"staggered (window={window}, start-gap={stagger_min:.1f}-{stagger_max:.1f}s, "
+	            f"live={live}/{target_count})"
 	        )
 
-	        wave_tasks = [
-	            asyncio.create_task(
+	        wave_tasks: List[asyncio.Task] = []
+	        for _i, acc in enumerate(candidates):
+	            if _i > 0:
+	                await asyncio.sleep(random.uniform(stagger_min, stagger_max))
+	            wave_tasks.append(asyncio.create_task(
 	                self._join_single_account(order_id, acc, "voice_chat", target, 0)
-	            )
-	            for acc in candidates
-	        ]
+	            ))
 	        # Hard wave deadline: ONE stuck account must never freeze the whole
 	        # build.  Stragglers are cancelled and deferred to a later wave —
 	        # the deferral itself does NOT consume their attempt budget.
