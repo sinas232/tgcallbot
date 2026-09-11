@@ -2,6 +2,7 @@ FROM python:3.11-slim-bookworm
 
 ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Tehran
 
 # 1. نصب پیش‌نیازهای اولیه (شامل curl، git و ffmpeg که برای تماس صوتی حیاتی هستند)

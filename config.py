@@ -162,6 +162,13 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── Stay-alive audio format (CPU) ────────────────────────────────────
+    # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
+    # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo; 48 kHz
+    # keeps the real-client wire format so ffmpeg stays a pass-through. A
+    # listener account never needs stereo, so MONO is the default.
+    VOICE_AUDIO_SAMPLE_RATE = int(os.getenv('VOICE_AUDIO_SAMPLE_RATE', '48000'))
+    VOICE_AUDIO_CHANNELS = int(os.getenv('VOICE_AUDIO_CHANNELS', '1'))
     # FloodWait at or below this many seconds is slept inside the join task;
     # longer server waits are persisted (data/voice_flood_cooldown.json, also
     # surviving restarts/wave cancellation) and the account is deferred by the

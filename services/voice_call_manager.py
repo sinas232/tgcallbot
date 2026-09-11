@@ -60,6 +60,7 @@ from pyrogram.errors import (
 from pyrogram.raw import functions, types
 from pytgcalls import PyTgCalls, filters as pytgcalls_filters
 from pytgcalls.types import AudioQuality, ChatUpdate, MediaStream, StreamEnded
+from pytgcalls.types.raw import AudioParameters
 
 from database import DatabaseManager
 from security import SecurityManager
@@ -130,9 +131,27 @@ from config import Config
 # transport can never die of EOF — the effective silence duration is unlimited
 # (multi-hour orders stay inside the call).
 _SILENCE_RATE = 48000
-_SILENCE_CHANNELS = 2
+# MONO (1 channel): a mono silence stream halves the Opus encoding pressure vs
+# stereo (a real listener account never needs stereo), and keeps the whole
+# path mono end-to-end so ntgcalls never has to downmix. Kept in sync with
+# _SILENCE_AUDIO_CHANNELS (defined below) so the .wav file and the
+# AudioParameters handed to ntgcalls always agree (pure pass-through).
+_SILENCE_CHANNELS = 1 if int(getattr(Config, "VOICE_AUDIO_CHANNELS", 1) or 1) <= 1 else 2
 _SILENCE_SECONDS = max(5, int(getattr(Config, "VOICE_SILENCE_SECONDS", 30) or 30))
 _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
+
+# Audio parameters handed to ntgcalls for the stay-alive silence.  In
+# pytgcalls 2.x AudioParameters(bitrate=<sample_rate>, channels=<n>) — the first
+# field is the SAMPLE RATE (AudioQuality.HIGH == (48000, 2), LOW == (24000, 1)).
+# We keep 48 kHz to match a real client's wire format but force MONO (channels=1)
+# so Opus encodes a single channel (~50% less CPU than the previous stereo HIGH
+# preset).  Both are overridable via env for tuning.
+_SILENCE_AUDIO_RATE = max(8000, int(getattr(Config, "VOICE_AUDIO_SAMPLE_RATE", 48000) or 48000))
+_SILENCE_AUDIO_CHANNELS = 1 if int(getattr(Config, "VOICE_AUDIO_CHANNELS", 1) or 1) <= 1 else 2
+_SILENCE_AUDIO_PARAMS = AudioParameters(
+    bitrate=_SILENCE_AUDIO_RATE,
+    channels=_SILENCE_AUDIO_CHANNELS,
+)
 
 # pytgcalls 2.x ffmpeg-parameter DSL (see pytgcalls/ffmpeg.py):
 #   ``--audio`` selects the audio section and ``---start`` places the tokens
@@ -400,10 +419,11 @@ class JoinAttemptTimeout(asyncio.TimeoutError):
 def _ensure_silence_file() -> None:
     """Create/validate the stay-alive silence stream.
 
-    Format = raw s16le @ 48 kHz STEREO — the exact wire format ntgcalls encodes
-    to 48 kHz Opus (identical to a real Telegram Android client), so the ffmpeg
-    stage is a pure pass-through.  The file is intentionally SHORT; the infinite
-    duration comes from `-stream_loop -1` at play time.
+    Format = raw s16le @ 48 kHz MONO — matches the AudioParameters(channels=1)
+    handed to ntgcalls, so the ffmpeg stage is a pure pass-through with no
+    downmix and Opus encodes a single channel (~50% less encode work than
+    stereo).  The file is intentionally SHORT; the infinite duration comes from
+    `-stream_loop -1` at play time.
     """
     try:
         valid = False
@@ -2016,7 +2036,7 @@ class VoiceCallManager:
                 int(chat_id),
                 MediaStream(
                     SILENT_AUDIO_PATH,
-                    audio_parameters=AudioQuality.HIGH,
+                    audio_parameters=_SILENCE_AUDIO_PARAMS,
                     video_flags=MediaStream.Flags.IGNORE,
                     ffmpeg_parameters=loop_flag,
                 ),

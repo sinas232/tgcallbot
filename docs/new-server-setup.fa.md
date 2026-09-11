@@ -132,6 +132,9 @@ ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 # VOICE_JOIN_START_STAGGER_MIN=6.0
 # VOICE_JOIN_START_STAGGER_MAX=10.0
 # VOICE_JOIN_MAX_CONCURRENCY=2
+# فرمت صدای «حضور» — MONO فشار انکود Opus را ~۵۰٪ کم می‌کند (پیش‌فرض بهینه):
+# VOICE_AUDIO_CHANNELS=1
+# VOICE_AUDIO_SAMPLE_RATE=48000
 ```
 
 > نکته: مقادیر `DATABASE_URL`/`REDIS_URL` را روی `db` / `redis` نگه دارید
@@ -243,7 +246,7 @@ docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
 این تغییرات برای رفع مصرف بالای CPU (تا ~۹۴٪) و خطاهای FloodWait تلگرام اعمال شده:
 
 - **حلقهٔ رویداد سریع‌تر (uvloop):** روی لینوکس به‌طور خودکار فعال می‌شود؛ در لاگِ
-  بوت خط `uvloop installed as the asyncio event loop policy` را می‌بینید.
+  بوت خط `uvloop active as the asyncio event loop (libuv backend)` را می‌بینید.
 - **ورود پلکانی محتاطانه‌تر:** فاصلهٔ شروع هر اکانت به **۶ تا ۱۰ ثانیه** + یک
   jitter تصادفی (۰٫۵–۱٫۵ ثانیه) افزایش یافت و سقف هم‌زمانی هر سفارش به **۲** و
   موج اول به **۱** کاهش یافت — یعنی هرگز چند JoinGroupCall در یک لحظه شلیک
@@ -252,7 +255,22 @@ docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
   کول‌داونِ ماندگار می‌رود و بقیهٔ اکانت‌ها بدون توقف ادامه می‌دهند.
 - **کاهش I/O لاگ:** استریمِ پرتکرارِ `[VoiceDiag]` به‌صورت پیش‌فرض فقط رویدادهای
   مهم (خطا/FloodWait) را می‌نویسد. برای فایربالِ کامل `ENABLE_VERBOSE_DIAG=true`.
+  همچنین لاگ کتابخانه‌های `asyncio` (ERROR) و `ntgcalls`/`pyrogram`/`pytgcalls`
+  (WARNING) خفه شده تا فشار per-frame روی پردازنده حذف شود.
+- **صدای MONO تک‌کاناله:** استریمِ «حضور» (silence) از استریو به **MONO @ ۴۸kHz**
+  تغییر کرد؛ انکود Opus تک‌کاناله ~۵۰٪ CPU کمتر از استریو مصرف می‌کند. با
+  `VOICE_AUDIO_CHANNELS` قابل تنظیم است.
+- **ffmpeg تک‌ریسمانی:** هر پروسهٔ ffmpeg با `-threads 1` اجرا می‌شود تا ده‌ها
+  helper به ازای هر اکانت، هسته‌های CPU را تسخیر نکنند.
+- **سقف منابع کانتینر:** در `docker-compose.yml` روی سرویس bot محدودیت
+  `cpus: 2.0` و `memory: 1536M` ست شده تا هاست همیشه فضای تنفس داشته باشد.
 - **پروکسی اختیاری SOCKS5:** با `USE_PROXY=true` کلاینت‌های ویس از پروکسی رد می‌شوند.
+
+> **نکته دربارهٔ «pipe مشترک ffmpeg»:** در معماری PyTgCalls هر اتصال WebRTC
+> (هر اکانت) ntgcalls خودش را دارد و نمی‌توان یک pipe صوتی را بین چند اتصال
+> مجزا به اشتراک گذاشت؛ بنابراین حذفِ کاملِ پروسه‌های ffmpeg ممکن نیست، اما با
+> MONO + `-threads 1` + فایل از پیش‌ساختهٔ ۴۸kHz، هر پروسه به حداقلِ مصرف رسیده
+> (pass-through بدون re-encode/downmix).
 
 بعد از هر تغییرِ `requirements.txt` (مثل افزودن uvloop) حتماً با `--build` بسازید:
 
