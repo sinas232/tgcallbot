@@ -98,6 +98,11 @@ AWAITING_RESELLER_EDIT_VALUE = 166
 # 🔥 وضعیت‌های تیکت
 AWAITING_TICKET_MESSAGE = 200
 AWAITING_ADMIN_TICKET_REPLY = 201
+AWAITING_TICKET_SUBJECT = 202   # انتخاب/نوشتن موضوع تیکت جدید
+AWAITING_TICKET_BODY = 203      # نوشتن متن تیکت پس از موضوع
+
+# مدت زمان بی‌فعالیتی برای بستن خودکار تیکت (ساعت)
+TICKET_AUTOCLOSE_HOURS = 48
 
 # 💾 وضعیت‌های پشتیبان‌گیری و بازیابی
 AWAITING_RESTORE_FILE = 210

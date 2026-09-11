@@ -79,9 +79,13 @@ from handlers.kyc_handlers import *
 from handlers.ticket_handlers import (
     start_ticket_support, 
     handle_user_ticket_message, 
+    handle_ticket_subject,
+    handle_ticket_body,
+    user_ticket_callback,
     admin_tickets_list, 
     admin_ticket_actions, 
-    handle_admin_reply_message
+    handle_admin_reply_message,
+    auto_close_idle_tickets,
 )
 from constants import *
 from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
@@ -587,7 +591,12 @@ def register_handlers(application: Application) -> None:
     support_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
         states={
-            AWAITING_TICKET_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message)]
+            AWAITING_TICKET_MESSAGE: [
+                CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
+                MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message),
+            ],
+            AWAITING_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_subject)],
+            AWAITING_TICKET_BODY: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_ticket_body)],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="support_ticket", persistent=True,
@@ -926,6 +935,11 @@ async def main_loop():
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
+        # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
+        main_app.job_queue.run_repeating(
+            lambda ctx: auto_close_idle_tickets(ctx, bot_manager=bot_manager),
+            interval=3600, first=180,
+        )
 
     # زنده نگه داشتن برنامه
     stop_event = asyncio.Event()
