@@ -38,8 +38,10 @@ import asyncio
 import logging
 import os
 import random
+import sys
 import time
 import json
+import traceback
 import wave
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
@@ -1733,6 +1735,20 @@ class VoiceCallManager:
         # fresh PyTgCalls(app) because self.clients no longer has one.
         return await self._get_or_create_client(order_id, account_id, session_string)
 
+    # Unrecoverable PyTgCalls/ntgcalls engine states that no per-chat
+    # stop/leave can fix — a FRESH PyTgCalls instance is required.
+    _ENGINE_STATE_MARKERS = (
+        "initialized more than once",
+        "connection cannot",
+        "connection not initialized",
+        "no active group call",
+    )
+
+    @classmethod
+    def _is_engine_state_error(cls, msg: str) -> bool:
+        s = (msg or "").lower()
+        return any(m in s for m in cls._ENGINE_STATE_MARKERS)
+
     async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
         """Re-establish the silent media transport for a GHOST-MEDIA-ONLY slot.
 
@@ -1742,23 +1758,30 @@ class VoiceCallManager:
         the account is kept counted; only the silence stream is re-attached.
 
         Recovery ladder (fastest fix first, full rebuild last):
-          L1: play() again — if the engine still holds the binding it just
-              re-attaches the stream (set_stream_sources, no re-init).
-          L2: engine-level stop() of the dead chat + play() — clears
-              half-dead call state in the binding.
-          L3: FRESH PyTgCalls instance (new NTgCalls binding) + play() —
-              required for 'Connection cannot be initialized more than once',
-              which no per-chat stop can clear.
-        Paced and non-stacking:
-          * at most one restore in flight per (order, account)
-          * at most one per VOICE_MEDIA_RESTORE_INTERVAL seconds
+          L1: play() — if the engine still holds the binding it just
+              re-attaches the stream (set_stream_sources, no re-init, and no
+              LeaveGroupCall sent).
+          L2: EXPLICIT ``leave_call(chat_id)`` cleanup of the existing WebRTC
+              session (engine stop + LeaveGroupCall + local cache cleanup)
+              followed by a fresh play().  When the engine has no call entry
+              for the chat (the usual ghost-media-only case) leave_call raises
+              NotInCallError BEFORE sending LeaveGroupCall — harmless, caught.
+          L3: on an unrecoverable engine state ('Connection cannot be
+              initialized more than once' & similar) — tear down the
+              PyTgCalls instance and build a FRESH PyTgCalls(client) on the
+              same pyrogram session, then re-join.
+
+        Diagnostics & loop protection:
+          * every failure logs the FULL traceback (logger + JSONL event)
+          * if the client instance itself is invalid (rebuild failed), the
+            account state is set to TEMPORARILY_UNKNOWN so nothing keeps
+            assuming a healthy engine; the monitor rebuilds the client next
+            cycle and re-verifies presence
+          * paced: one restore per VOICE_MEDIA_RESTORE_INTERVAL seconds,
+            non-stacking, under the per-(account, chat) join lock
           * after VOICE_MEDIA_RESTORE_MAX_FAILS consecutive failures the slot
-            is paused (VOICE_MEDIA_RESTORE_PAUSE_SECONDS) so a broken media
-            path is never hammered with new JoinGroupCalls
-          * a small random pre-delay so N ghosted accounts do not re-stream
-            in the same instant
-          * runs under the per-(account, chat) join lock so a restore can
-            never rebuild the engine under an in-flight join/rejoin
+            is paused (VOICE_MEDIA_RESTORE_PAUSE_SECONDS) — no infinite retry
+            loops on invalid client instances
         """
         key = (order_id, account_id)
         if not self._media_restore_due(key):
@@ -1771,6 +1794,7 @@ class VoiceCallManager:
         self._media_restore_last[key] = time.time()
         lock_key = (account_id, cid)
         result = "failed"
+        last_tb = ""
         try:
             await asyncio.sleep(random.uniform(0.5, 3.0))
             # Slot may have been released while we waited.
@@ -1779,45 +1803,65 @@ class VoiceCallManager:
                 return
             async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
                 try:
-                    # ── L1: straightforward re-stream ────────────────────
+                    # ── L1: fast path — re-stream on the existing engine ──
                     await self._play_silence(pytg, cid)
                     result = "restored"
-                except Exception as e1:
-                    msg1 = str(e1) or type(e1).__name__
-                    if "initialized more than once" not in msg1.lower():
-                        result = f"play_failed:{msg1[:70]}"
-                    else:
-                        # ── L2: engine-level teardown of the dead chat ──
-                        try:
-                            await asyncio.wait_for(pytg._binding.stop(cid), timeout=5)
-                        except Exception:
-                            pass
-                        try:
-                            await self._play_silence(pytg, cid)
-                            result = "restored_after_teardown"
-                        except Exception as e2:
-                            msg2 = str(e2) or type(e2).__name__
-                            if "initialized more than once" not in msg2.lower():
-                                result = f"play_failed:{msg2[:70]}"
-                            else:
-                                # ── L3: full engine rebuild ────────────
-                                logger.warning(
-                                    "[VoiceEngine] poisoned engine acc=%s chat=%s — "
-                                    "building fresh PyTgCalls instance",
-                                    account_id, cid,
-                                )
-                                self._vc_event_log(order_id, account_id, "engine_rebuild", {
-                                    "chat_id": cid, "reason": "connection cannot be re-initialized",
-                                })
-                                try:
-                                    fresh = await self._rebuild_engine_for_account(order_id, account_id)
-                                    if fresh is None:
-                                        result = "rebuild_failed:no_client"
-                                    else:
-                                        await self._play_silence(fresh, cid)
-                                        result = "restored_after_engine_rebuild"
-                                except Exception as e3:
-                                    result = f"rebuild_failed:{(str(e3) or type(e3).__name__)[:70]}"
+                except Exception:
+                    _e1 = sys.exc_info()[1]
+                    msg1 = str(_e1) or type(_e1).__name__
+                    last_tb = traceback.format_exc(limit=8)
+                    logger.warning(
+                        "[VoiceMedia] restore L1 play failed acc=%s chat=%s: %s",
+                        account_id, cid, msg1[:120],
+                    )
+                    # ── L2: explicit WebRTC session cleanup, then rejoin ──
+                    # leave_call() inside try/except as required: it stops the
+                    # engine's connection for this chat and (if the engine
+                    # still lists it) sends LeaveGroupCall, so the NEXT play()
+                    # starts from a fully clean session.
+                    try:
+                        await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
+                    except Exception as e_leave:
+                        logger.debug(
+                            "[VoiceMedia] leave_call cleanup skipped acc=%s chat=%s: %s",
+                            account_id, cid,
+                            str(e_leave)[:80] or type(e_leave).__name__,
+                        )
+                    try:
+                        await self._play_silence(pytg, cid)
+                        result = "restored_after_leave"
+                    except Exception:
+                        _e2 = sys.exc_info()[1]
+                        msg2 = str(_e2) or type(_e2).__name__
+                        last_tb = traceback.format_exc(limit=8)
+                        if not self._is_engine_state_error(msg2):
+                            result = f"play_failed:{msg2[:70]}"
+                        else:
+                            # ── L3: unrecoverable engine state — REBUILD ──
+                            # No per-chat stop/leave can clear a half-dead
+                            # WebRTC peer connection; only a fresh PyTgCalls
+                            # instance (fresh NTgCalls binding) can.
+                            logger.warning(
+                                "[VoiceEngine] unrecoverable engine state acc=%s chat=%s (%s) — "
+                                "tearing down and building fresh PyTgCalls instance",
+                                account_id, cid, msg2[:80],
+                            )
+                            self._vc_event_log(order_id, account_id, "engine_rebuild", {
+                                "chat_id": cid, "reason": msg2[:120],
+                            })
+                            try:
+                                fresh = await self._rebuild_engine_for_account(order_id, account_id)
+                                if fresh is None:
+                                    result = "rebuild_failed:no_client"
+                                else:
+                                    await self._play_silence(fresh, cid)
+                                    result = "restored_after_engine_rebuild"
+                            except Exception:
+                                _e3 = sys.exc_info()[1]
+                                result = f"rebuild_failed:{(str(_e3) or type(_e3).__name__)[:70]}"
+                                last_tb = traceback.format_exc(limit=8)
+
+            # ── result handling ─────────────────────────────────────────
             if result.startswith("restored"):
                 self._media_restore_failures[key] = 0
                 self._media_restore_paused_until.pop(key, None)
@@ -1831,32 +1875,46 @@ class VoiceCallManager:
             else:
                 fails = self._media_restore_failures.get(key, 0) + 1
                 self._media_restore_failures[key] = fails
+                # Invalid client instance (rebuild failed / engine gone):
+                # update the presence status so NO code path keeps assuming a
+                # healthy engine for this account.  The monitor's next cycle
+                # rebuilds the client (its missing-client branch) and
+                # re-verifies presence; the pause gate below stops infinite
+                # restore loops in the meantime.
+                if result.startswith("rebuild_failed"):
+                    self._account_states_by_order.setdefault(order_id, {})[account_id] = "TEMPORARILY_UNKNOWN"
+                    rec = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
+                    if rec is not None:
+                        rec["status"] = "TEMPORARILY_UNKNOWN"
                 max_fails = max(1, int(getattr(Config, "VOICE_MEDIA_RESTORE_MAX_FAILS", 3)))
                 if fails >= max_fails:
                     pause_s = max(60, int(getattr(Config, "VOICE_MEDIA_RESTORE_PAUSE_SECONDS", 600)))
                     self._media_restore_paused_until[key] = time.time() + pause_s
                     self._vc_event_log(order_id, account_id, "media_restore_paused", {
-                        "chat_id": cid, "fails": fails, "pause_s": pause_s, "reason": result,
+                        "chat_id": cid, "fails": fails, "pause_s": pause_s,
+                        "reason": result[:120], "traceback": last_tb[-2500:],
                     })
                     logger.warning(
-                        "[VoiceMedia] media restore paused for acc=%s chat=%s %ds after %d fails (%s) — "
-                        "account stays counted inside the call",
-                        account_id, cid, pause_s, fails, result[:60],
+                        "[VoiceMedia] media restore PAUSED for acc=%s chat=%s %ds after %d fails (%s) — "
+                        "account stays counted inside the call\n%s",
+                        account_id, cid, pause_s, fails, result[:60], last_tb[-2500:],
                     )
                 else:
                     self._vc_event_log(order_id, account_id, "media_restore_failed", {
-                        "chat_id": cid, "fails": fails, "reason": result[:120],
+                        "chat_id": cid, "fails": fails,
+                        "reason": result[:120], "traceback": last_tb[-2500:],
                     })
                     logger.warning(
-                        "[VoiceMedia] media restore failed acc=%s chat=%s (%s) — attempt %d/%d",
-                        account_id, cid, result[:80], fails, max_fails,
+                        "[VoiceMedia] media restore failed acc=%s chat=%s (%s) — attempt %d/%d\n%s",
+                        account_id, cid, result[:80], fails, max_fails, last_tb[-2500:],
                     )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception:
+            last_tb = traceback.format_exc(limit=8)
             logger.warning(
-                "[VoiceMedia] media restore error acc=%s chat=%s: %s",
-                account_id, cid, str(exc)[:80],
+                "[VoiceMedia] media restore error acc=%s chat=%s\n%s",
+                account_id, cid, last_tb[-2500:],
             )
         finally:
             self._media_restore_inflight.discard(key)

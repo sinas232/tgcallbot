@@ -18,6 +18,10 @@ services:
   bot:
     network_mode: "host"
     ports: !reset []
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
   redis:
     ports:
       - "6379:6379"
