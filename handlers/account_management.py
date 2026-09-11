@@ -29,9 +29,16 @@ async def _cleanup_client(context):
 
 
 def _format_account_display(acc):
-    name = html.escape(
-        str(acc.get('name') or acc.get('username') or acc.get('first_name') or acc.get('last_name') or 'Unnamed')
-    )
+    first = (acc.get('first_name') or "").strip()
+    last = (acc.get('last_name') or "").strip()
+    full = (first + " " + last).strip()
+    if full:
+        display = full
+    elif acc.get('username'):
+        display = "@" + str(acc.get('username')).lstrip('@')
+    else:
+        display = "بدون نام"
+    name = html.escape(display)
     phone = html.escape(str(acc.get('phone_number') or 'No Phone'))
     status = html.escape(str(acc.get('account_status', 'active')).title())
     spam_info = ''

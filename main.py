@@ -867,6 +867,10 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(handle_order_history_callback, pattern="^history_"), group=0)
     application.add_handler(CallbackQueryHandler(handle_back_to_history_menu, pattern="^back_to_history_menu"), group=0)
 
+    # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
+    application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|del|delyes|sync)_\d+$"), group=0)
+
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
     await DatabaseManager.init_db()

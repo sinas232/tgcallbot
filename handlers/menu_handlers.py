@@ -13,6 +13,7 @@ from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHA
 from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
+from telegram_client import TelegramAccountClient
 
 try:
     from utils.helpers import format_jalali_datetime
@@ -76,6 +77,7 @@ async def account_management_handler(update: Update, context: ContextTypes.DEFAU
 async def list_accounts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """نمایش لیست اکانت‌ها با صفحه‌بندی (صفحه اول)"""
     logger.info("Requesting account list.")
+    context.user_data['acc_list_page'] = 1
     await show_accounts_page(update, context, page=1)
 
 async def account_pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -89,90 +91,69 @@ async def account_pagination_callback(update: Update, context: ContextTypes.DEFA
     except:
         page = 1
     
+    context.user_data['acc_list_page'] = page
     await show_accounts_page(update, context, page=page, is_edit=True)
 
+def _status_icon(acc):
+    raw_status = str(acc.get('account_status') or "unknown").lower()
+    if raw_status == 'active':
+        return "✅"
+    elif raw_status in ('dead', 'banned', 'deleted'):
+        return "💀"
+    return "❌"
+
+
+def _spam_icon(acc):
+    spam_status = str(acc.get('spam_status') or "unknown").lower()
+    if spam_status == 'limited':
+        return "⛔️"
+    elif spam_status in ('free', 'ok', 'clean'):
+        return "🟢"
+    return ""
+
+
 async def show_accounts_page(update, context, page=1, is_edit=False):
-    """نمایش لیست اکانت‌ها مختص همان ربات"""
-    limit = 10
+    """نمایش لیست اکانت‌ها به‌صورت دکمه‌های شیشه‌ای (هر اکانت = یک دکمه)."""
+    limit = 8
     offset = (page - 1) * limit
-    bot_id = context.bot_data.get('bot_id', 1) # ✅ دریافت bot_id
-    
-    # دریافت اکانت‌ها + تعداد کل فقط برای این ربات
+    bot_id = context.bot_data.get('bot_id', 1)
+
     accounts, total_count = await DatabaseManager.get_accounts_paginated(limit=limit, offset=offset, active_only=False, bot_id=bot_id)
-    
+
     if not accounts:
         text = f"📭 <b>هیچ اکانتی در صفحه {page} یافت نشد.</b>\n(کل اکانت‌ها: {total_count})"
         kb = None
         if page > 1:
-             kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ صفحه قبل", callback_data=f"acc_page_{page-1}")]])
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ صفحه قبل", callback_data=f"acc_page_{page-1}")]])
     else:
         astats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
         inactive = max(0, astats.get("total", total_count) - astats.get("active", 0))
         total_pages = (total_count + limit - 1) // limit
 
         # ===== سربرگ آماری =====
-        text = f"📋 <b>لیست اکانت‌های ربات</b> — صفحه <code>{page}/{total_pages}</code>\n"
+        text = "📋 <b>لیست اکانت‌های ربات</b>\n"
         text += "➖➖➖➖➖➖➖➖➖➖\n"
         text += f"📊 کل: <code>{astats.get('total', total_count)}</code>   "
         text += f"✅ فعال: <code>{astats.get('active', 0)}</code>\n"
         text += f"❌ غیرفعال: <code>{inactive}</code>   "
         text += f"⛔️ محدود: <code>{astats.get('limited', 0)}</code>\n"
-        text += "➖➖➖➖➖➖➖➖➖➖\n\n"
+        text += "➖➖➖➖➖➖➖➖➖➖\n"
+        text += "👇 برای مشاهده و ویرایش، روی اکانت موردنظر بزنید:"
 
-        start_index = offset + 1
-        page_map = {}
         kb_buttons = []
-
-        for i, acc in enumerate(accounts):
-            row_number = start_index + i
-            page_map[row_number] = acc['id']
-
-            name = html.escape(account_display_name(acc))
-            phone = html.escape(str(acc.get('phone_number') or "بدون شماره"))
-
-            # وضعیت اکانت
-            raw_status = str(acc.get('account_status') or "unknown").lower()
-            if raw_status == 'active':
-                status_line = "✅ فعال"
-            elif raw_status in ('dead', 'banned', 'deleted'):
-                status_line = "💀 مسدود/حذف‌شده"
-            else:
-                status_line = f"❌ غیرفعال ({html.escape(raw_status)})"
-
-            # وضعیت اسپم/محدودیت
-            spam_status = str(acc.get('spam_status') or "unknown").lower()
-            if spam_status == 'limited':
-                spam_line = "⛔️ محدود شده (اسپم‌بلاک)"
-            elif spam_status in ('free', 'ok', 'clean'):
-                spam_line = "🟢 بدون محدودیت"
-            else:
-                spam_line = "❔ نامشخص"
-
-            health = acc.get('health_score')
-            health_line = f"{health}٪" if health is not None else "---"
-
-            username = acc.get('username')
-            username_line = ("@" + str(username).lstrip('@')) if username else "—"
-
-            created = format_jalali_datetime(acc.get('created_at'))
-
-            text += f"<b>{row_number}. {name}</b>\n"
-            text += f"   🆔 شناسه دیتابیس: <code>{acc['id']}</code>\n"
-            text += f"   📱 شماره: <code>{phone}</code>\n"
-            text += f"   🔗 یوزرنیم: {html.escape(username_line)}\n"
-            text += f"   📶 وضعیت: {status_line}\n"
-            text += f"   🛡 اسپم: {spam_line}\n"
-            text += f"   ❤️ سلامت: <code>{health_line}</code>\n"
-            text += f"   🗓 افزوده شده: {html.escape(str(created))}\n"
-            text += "➖➖➖➖➖➖➖➖➖➖\n"
-
-            # دکمه ویرایش مخصوص هر اکانت
+        for acc in accounts:
+            name = account_display_name(acc)
+            phone = str(acc.get('phone_number') or "بدون شماره")
+            label = f"{_status_icon(acc)}{_spam_icon(acc)} {name} • {phone}"
             kb_buttons.append([
-                InlineKeyboardButton(f"✏️ ویرایش «{account_display_name(acc)[:20]}»",
-                                     callback_data=f"acc_edit_{acc['id']}")
+                InlineKeyboardButton(label[:60], callback_data=f"acc_view_{acc['id']}")
             ])
 
-        context.user_data['list_page_map'] = page_map
+        # ابزار: همگام‌سازی نام همهٔ اکانت‌ها + رفرش
+        kb_buttons.append([
+            InlineKeyboardButton("🔄 همگام‌سازی نام‌ها", callback_data=f"acc_sync_{page}"),
+            InlineKeyboardButton("♻️ بروزرسانی", callback_data=f"acc_page_{page}")
+        ])
 
         # ردیف ناوبری صفحات
         nav_row = []
@@ -187,9 +168,212 @@ async def show_accounts_page(update, context, page=1, is_edit=False):
         kb = InlineKeyboardMarkup(kb_buttons)
 
     if is_edit and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@require_admin
+async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش کارت جزئیات یک اکانت با دکمه‌های عملیاتی (شیشه‌ای)."""
+    query = update.callback_query
+    await query.answer()
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        aid = int(query.data.split("_")[2])  # acc_view_<id>
+    except Exception:
+        return
+
+    acc = await DatabaseManager.get_account_by_id(aid)
+    if not acc or acc.get('bot_id', 1) != bot_id:
+        await query.answer("❌ اکانت یافت نشد.", show_alert=True)
+        return
+
+    # صفحه‌ای که از آن آمده‌ایم را برای دکمهٔ بازگشت نگه می‌داریم
+    back_page = context.user_data.get('acc_list_page', 1)
+
+    name = html.escape(account_display_name(acc))
+    phone = html.escape(str(acc.get('phone_number') or "بدون شماره"))
+
+    raw_status = str(acc.get('account_status') or "unknown").lower()
+    if raw_status == 'active':
+        status_line = "✅ فعال"
+    elif raw_status in ('dead', 'banned', 'deleted'):
+        status_line = "💀 مسدود/حذف‌شده"
+    else:
+        status_line = f"❌ غیرفعال ({html.escape(raw_status)})"
+
+    spam_status = str(acc.get('spam_status') or "unknown").lower()
+    if spam_status == 'limited':
+        spam_line = "⛔️ محدود شده (اسپم‌بلاک)"
+    elif spam_status in ('free', 'ok', 'clean'):
+        spam_line = "🟢 بدون محدودیت"
+    else:
+        spam_line = "❔ نامشخص"
+
+    health = acc.get('health_score')
+    health_line = f"{health}٪" if health is not None else "---"
+    username = acc.get('username')
+    username_line = ("@" + str(username).lstrip('@')) if username else "—"
+    created = format_jalali_datetime(acc.get('created_at'))
+
+    text = (
+        f"👤 <b>{name}</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🆔 شناسه دیتابیس: <code>{acc['id']}</code>\n"
+        f"📱 شماره: <code>{phone}</code>\n"
+        f"🔗 یوزرنیم: {html.escape(username_line)}\n"
+        f"📶 وضعیت: {status_line}\n"
+        f"🛡 اسپم: {spam_line}\n"
+        f"❤️ سلامت: <code>{health_line}</code>\n"
+        f"🗓 افزوده شده: {html.escape(str(created))}"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data=f"acc_edit_{acc['id']}")],
+        [
+            InlineKeyboardButton("📩 دریافت کد ورود", callback_data=f"acc_getcode_{acc['id']}"),
+            InlineKeyboardButton("🛡 بررسی اسپم", callback_data=f"acc_spam_{acc['id']}")
+        ],
+        [
+            InlineKeyboardButton("🔄 بروزرسانی اطلاعات", callback_data=f"acc_refresh_{acc['id']}"),
+            InlineKeyboardButton("🗑 حذف اکانت", callback_data=f"acc_del_{acc['id']}")
+        ],
+        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")]
+    ])
+
+    try:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@require_admin
+async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندل عملیات کارت اکانت: کد ورود، بررسی اسپم، رفرش اطلاعات، حذف، همگام‌سازی نام‌ها."""
+    query = update.callback_query
+    data = query.data
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    # همگام‌سازی نام همهٔ اکانت‌های صفحهٔ جاری
+    if data.startswith("acc_sync_"):
+        await query.answer("در حال همگام‌سازی نام‌ها... این کار ممکن است کمی طول بکشد.", show_alert=False)
+        try:
+            page = int(data.split("_")[2])
+        except Exception:
+            page = 1
+        updated = await _sync_account_names(bot_id, page=page, limit=8)
+        await query.answer(f"✅ {updated} اکانت به‌روزرسانی شد.", show_alert=True)
+        await show_accounts_page(update, context, page=page, is_edit=True)
+        return
+
+    # عملیات تک‌اکانتی
+    try:
+        parts = data.split("_")
+        action = parts[1]
+        aid = int(parts[2])
+    except Exception:
+        await query.answer()
+        return
+
+    acc = await DatabaseManager.get_account_by_id(aid)
+    if not acc or acc.get('bot_id', 1) != bot_id:
+        await query.answer("❌ اکانت یافت نشد.", show_alert=True)
+        return
+
+    client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
+
+    if action == "getcode":
+        await query.answer("⏳ در حال دریافت کد...")
+        try:
+            code_text = await client.get_latest_code()
+        except Exception as e:
+            code_text = f"❌ خطا: {e}"
+        await send_safe(context.bot, update.effective_chat.id,
+                        f"📩 <b>آخرین کد/پیام ورود ({html.escape(str(acc['phone_number']))}):</b>\n\n{html.escape(str(code_text))}",
+                        parse_mode=ParseMode.HTML)
+        return
+
+    if action == "spam":
+        await query.answer("⏳ در حال بررسی وضعیت اسپم...")
+        try:
+            status, msg = await client.check_spambot()
+            await DatabaseManager.update_account_spam_status(aid, status, msg)
+        except Exception as e:
+            status, msg = "error", str(e)
+        await send_safe(context.bot, update.effective_chat.id,
+                        f"🛡 <b>نتیجه بررسی اسپم:</b>\nوضعیت: <code>{html.escape(str(status))}</code>\n{html.escape(str(msg))}",
+                        parse_mode=ParseMode.HTML)
+        return
+
+    if action == "refresh":
+        await query.answer("⏳ در حال دریافت اطلاعات زنده...")
+        me = await client.fetch_me()
+        if me:
+            await DatabaseManager.update_account_profile_cache(
+                aid, first_name=me.get('first_name'),
+                last_name=me.get('last_name'), username=me.get('username'))
+            await query.answer("✅ اطلاعات به‌روزرسانی شد.", show_alert=False)
+        else:
+            await query.answer("⚠️ امکان اتصال به اکانت نبود (شاید سشن در حال استفاده است).", show_alert=True)
+        # نمایش مجدد کارت
+        query.data = f"acc_view_{aid}"
+        await account_view_callback(update, context)
+        return
+
+    if action == "del":
+        # تایید حذف
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"acc_delyes_{aid}"),
+                InlineKeyboardButton("❌ انصراف", callback_data=f"acc_view_{aid}")
+            ]
+        ])
+        await query.answer()
+        await query.edit_message_text(
+            f"⚠️ <b>حذف اکانت</b>\n\nآیا از حذف اکانت <code>{html.escape(str(acc['phone_number']))}</code> مطمئن هستید؟\nاین عمل غیرقابل بازگشت است.",
+            reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    if action == "delyes":
+        await query.answer("در حال حذف...")
+        try:
+            await DatabaseManager.delete_account(aid, acc.get('user_id'))
+        except Exception as e:
+            logger.error(f"delete account error: {e}")
+        await query.edit_message_text(
+            f"🗑 اکانت <code>{html.escape(str(acc['phone_number']))}</code> حذف شد.",
+            parse_mode=ParseMode.HTML)
+        back_page = context.user_data.get('acc_list_page', 1)
+        await show_accounts_page(update, context, page=back_page, is_edit=False)
+        return
+
+    await query.answer()
+
+
+async def _sync_account_names(bot_id, page=1, limit=8):
+    """واکشی زندهٔ نام اکانت‌های یک صفحه و ذخیره در دیتابیس. تعداد به‌روزشده را برمی‌گرداند."""
+    offset = (page - 1) * limit
+    accounts, _ = await DatabaseManager.get_accounts_paginated(limit=limit, offset=offset, active_only=False, bot_id=bot_id)
+    updated = 0
+    for acc in accounts:
+        # فقط اکانت‌هایی که نام کش‌شده ندارند
+        if acc.get('first_name') or acc.get('last_name') or acc.get('username'):
+            continue
+        try:
+            client = TelegramAccountClient(acc['phone_number'], acc['session_string'], acc['id'])
+            me = await client.fetch_me()
+            if me and (me.get('first_name') or me.get('last_name') or me.get('username')):
+                await DatabaseManager.update_account_profile_cache(
+                    acc['id'], first_name=me.get('first_name'),
+                    last_name=me.get('last_name'), username=me.get('username'))
+                updated += 1
+        except Exception as e:
+            logger.warning(f"sync name failed acc {acc.get('id')}: {e}")
+    return updated
 
 @require_admin
 async def reporting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
