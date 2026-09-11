@@ -1042,6 +1042,73 @@ class VoiceCallManager:
                 })
         return out
 
+    def get_order_incall_accounts(self, order_id: int) -> List[Dict]:
+        """اکانت‌هایی از یک سفارش که هم‌اکنون داخل ویس‌کال حاضر و متصل‌اند.
+
+        از دو منبع استفاده می‌کند: active_calls (کلید order,acc) و
+        joined_accounts_by_order (منبع پایدار). فقط اکانت‌هایی برگردانده
+        می‌شوند که کلاینت متصل دارند تا ارسال پیام سریع و بدون اتصال مجدد باشد.
+
+        هر آیتم: {account_id, chat_id}
+        """
+        order_id = int(order_id)
+        seen: Dict[int, int] = {}  # account_id -> chat_id
+
+        for (oid, account_id), rec in self.active_calls.items():
+            if int(oid) == order_id and rec.get("chat_id") is not None:
+                seen[account_id] = int(rec["chat_id"])
+
+        for account_id, rec in (self.joined_accounts_by_order.get(order_id) or {}).items():
+            cid = rec.get("chat_id")
+            if cid is not None:
+                seen.setdefault(account_id, int(cid))
+
+        # اگر chat_id از order_chat_ids در دسترس است، برای اکانت‌های بدون chat پرش می‌کنیم
+        fallback_chat = self.order_chat_ids.get(order_id)
+
+        out = []
+        for account_id, chat_id in seen.items():
+            if account_id not in self.pyrogram_clients:
+                continue  # فقط اکانت‌های متصل (ارسال آنی)
+            out.append({
+                "account_id": account_id,
+                "chat_id": chat_id or fallback_chat,
+            })
+        return out
+
+    async def broadcast_incall_message(self, account_ids: List[int], order_id: int,
+                                       text: str = "", reaction_emoji: str = "") -> Dict:
+        """ارسال هم‌زمان یک پیام/ری‌اکشن از چند اکانت در ویس‌کال همان سفارش.
+
+        خروجی: {sent, failed, total, errors:[...]}
+        """
+        order_id = int(order_id)
+        # نگاشت account_id → chat_id از وضعیت فعلی سفارش
+        chat_map = {a["account_id"]: a["chat_id"] for a in self.get_order_incall_accounts(order_id)}
+
+        async def _one(aid):
+            cid = chat_map.get(aid)
+            if cid is None:
+                return aid, False, "اکانت در تماس فعال نیست"
+            ok, msg = await self.send_incall_message(aid, cid, text=text, reaction_emoji=reaction_emoji)
+            return aid, ok, msg
+
+        results = await asyncio.gather(*[_one(a) for a in account_ids], return_exceptions=True)
+
+        sent, failed, errors = 0, 0, []
+        for r in results:
+            if isinstance(r, Exception):
+                failed += 1
+                errors.append(str(r)[:80])
+                continue
+            aid, ok, msg = r
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+                errors.append(f"#{aid}: {msg}")
+        return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
+
     def _account_in_any_order(self, account_id: int) -> bool:
         return any(aid == account_id for (oid, aid) in self.active_calls.keys())
 

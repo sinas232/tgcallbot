@@ -75,9 +75,11 @@ from handlers.account_management import *
 from handlers.wallet_handlers import *
 from handlers.profile_handlers import *
 from handlers.incall_handlers import (
-    incall_start, incall_pick_callback, incall_react_callback,
-    incall_text_callback, incall_receive_text, incall_backlist_callback,
-    incall_close_callback,
+    incall_center_start, incall_orders_refresh, incall_order_selected,
+    incall_toggle_account, incall_select_all, incall_select_none,
+    incall_accs_refresh, incall_back_orders, incall_compose,
+    incall_edit_accounts, incall_react, incall_write, incall_receive_text,
+    incall_close,
 )
 from handlers.kyc_handlers import *
 # ایمپورت هندلرهای تیکتینگ
@@ -876,15 +878,18 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(prof_conv)
 
-    # --- 6.5 پیام/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام) ---
-    # گفتگو فقط برای مرحلهٔ دریافت متن پیام است؛ انتخاب اکانت و ری‌اکشن‌ها
-    # بدون‌حالت (stateless) و از طریق کالبک‌های سراسری انجام می‌شوند.
+    # --- 6.5 مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
+    # فقط مرحلهٔ دریافت متن پیام حالت‌دار است؛ انتخاب سفارش/اکانت‌ها و ری‌اکشن‌ها
+    # بدون‌حالت و از طریق کالبک‌های سراسری انجام می‌شوند تا سریع و مکرر باشند.
     incall_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(incall_text_callback, pattern=r"^incall_text$"),
+            CallbackQueryHandler(incall_write, pattern=r"^ic_write$"),
         ],
         states={
-            AWAITING_INCALL_TEXT: [MessageHandler(STD_TEXT, incall_receive_text)],
+            AWAITING_INCALL_TEXT: [
+                MessageHandler(FILTER_BACK, incall_receive_text),
+                MessageHandler(STD_TEXT, incall_receive_text),
+            ],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="incall", persistent=True,
@@ -892,12 +897,19 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(incall_conv)
 
-    # ورود به بخش (دکمهٔ منو) + کالبک‌های بدون‌حالت پیام/ری‌اکشن درون ویس‌کال
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INCALL_MSG}$"), incall_start), group=0)
-    application.add_handler(CallbackQueryHandler(incall_pick_callback, pattern=r"^incall_pick_\d+_-?\d+$"), group=0)
-    application.add_handler(CallbackQueryHandler(incall_react_callback, pattern=r"^incall_react_"), group=0)
-    application.add_handler(CallbackQueryHandler(incall_backlist_callback, pattern=r"^incall_backlist$"), group=0)
-    application.add_handler(CallbackQueryHandler(incall_close_callback, pattern=r"^incall_close$"), group=0)
+    # ورود به مرکز (دکمهٔ منو) + کالبک‌های بدون‌حالت
+    application.add_handler(MessageHandler(filters.Regex(r"^💬 چت در ویس‌کال$"), incall_center_start), group=0)
+    application.add_handler(CallbackQueryHandler(incall_orders_refresh, pattern=r"^ic_orders_refresh$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_order_selected, pattern=r"^ic_order_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_toggle_account, pattern=r"^ic_toggle_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_select_all, pattern=r"^ic_all$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_select_none, pattern=r"^ic_none$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_accs_refresh, pattern=r"^ic_accs_refresh_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_back_orders, pattern=r"^ic_back_orders$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_compose, pattern=r"^ic_compose$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_edit_accounts, pattern=r"^ic_editaccs$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_react, pattern=r"^ic_react_"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_close, pattern=r"^ic_close$"), group=0)
 
     # --- 7. خرید سرویس ---
     buy_conv = ConversationHandler(

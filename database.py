@@ -716,6 +716,23 @@ class DatabaseManager:
             return to_dict(order)
 
     @staticmethod
+    async def get_user_running_voice_orders(user_id: int, bot_id: int = 1):
+        """سفارش‌های ویس‌کالِ در حال اجرای یک کاربر (برای مرکز پیام درون‌تماس)."""
+        async with AsyncSessionLocal() as db_session:
+            q = (
+                select(Order)
+                .filter(
+                    Order.user_id == user_id,
+                    Order.bot_id == bot_id,
+                    Order.status == 'running',
+                    Order.order_type.ilike('%voice%'),
+                )
+                .order_by(desc(Order.created_at))
+            )
+            res = await db_session.execute(q)
+            return [to_dict(o) for o in res.scalars().all()]
+
+    @staticmethod
     async def get_orders_history(user_id=None, limit=20, offset=0):
         async with AsyncSessionLocal() as db_session:
             q = select(Order).order_by(desc(Order.created_at)).limit(limit).offset(offset)

@@ -1667,10 +1667,19 @@ async def services_management_menu(update, context):
     v_status = await DatabaseManager.get_setting("service_voice_chat", "true", bot_id=bot_id) == "true"
     g_status = await DatabaseManager.get_setting("service_group_join", "true", bot_id=bot_id) == "true"
     c_status = await DatabaseManager.get_setting("service_channel_join", "true", bot_id=bot_id) == "true"
+    # قابلیت چت درون ویس‌کال (پیش‌فرض خاموش)
+    ic_status = await DatabaseManager.get_setting("service_incall_chat", "false", bot_id=bot_id) == "true"
     v_txt = "✅ فعال" if v_status else "❌ غیرفعال"
     g_txt = "✅ فعال" if g_status else "❌ غیرفعال"
     c_txt = "✅ فعال" if c_status else "❌ غیرفعال"
-    kb = [[InlineKeyboardButton(f"ویس‌کال: {v_txt}", callback_data="toggle_srv_voice_chat")], [InlineKeyboardButton(f"گروه: {g_txt}", callback_data="toggle_srv_group_join")], [InlineKeyboardButton(f"کانال: {c_txt}", callback_data="toggle_srv_channel_join")], [InlineKeyboardButton("🔙", callback_data="back_to_settings")]]
+    ic_txt = "✅ فعال" if ic_status else "❌ غیرفعال"
+    kb = [
+        [InlineKeyboardButton(f"ویس‌کال: {v_txt}", callback_data="toggle_srv_voice_chat")],
+        [InlineKeyboardButton(f"گروه: {g_txt}", callback_data="toggle_srv_group_join")],
+        [InlineKeyboardButton(f"کانال: {c_txt}", callback_data="toggle_srv_channel_join")],
+        [InlineKeyboardButton(f"💬 چت در ویس‌کال: {ic_txt}", callback_data="toggle_srv_incall_chat")],
+        [InlineKeyboardButton("🔙", callback_data="back_to_settings")],
+    ]
     txt = "🛠 **مدیریت سرویس‌ها**\nروی دکمه بزنید تا وضعیت تغییر کند."
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
