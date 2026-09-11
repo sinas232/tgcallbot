@@ -21,6 +21,11 @@ services:
       - 'c 10:200 rwm'
     environment:
       - WARP_SLEEP=2
+      # رفع مشکل مسیر برگشت (asymmetric routing) برای ترافیکِ ورودی از شبکهٔ
+      # داکر. بدون این، warp زیرشبکهٔ داکر را هم به تونل می‌فرستد و پاسخِ
+      # درخواست‌هایی که از nginx/هاست به وب‌سرور 8080 می‌آیند گم می‌شود (502).
+      # این متغیر زیرشبکه را از تونل مستثنی می‌کند. (قابلیت رسمی warp-docker)
+      - BETA_FIX_HOST_CONNECTIVITY=1
       # برای WARP+ کلید را در .env بگذارید (اختیاری):
       # - WARP_LICENSE_KEY=${WARP_LICENSE_KEY:-}
     cap_add:
@@ -49,13 +54,12 @@ services:
     networks:
       default:
         ipv4_address: 172.28.0.4
-    healthcheck:
-      # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
-      test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
+    # ⚠️ مهم: healthcheck را اینجا override نمی‌کنیم. healthcheckِ داخلیِ image
+    # هم warp=on را بررسی می‌کند و هم (به‌خاطر BETA_FIX_HOST_CONNECTIVITY=1)
+    # مشکل مسیر برگشت شبکهٔ داکر را به‌صورت خودکار اصلاح می‌کند. اگر اینجا
+    # healthcheck سفارشی بگذاریم، آن اصلاحِ خودکار اجرا نمی‌شود و 502 می‌گیریم.
+    # depends_on: warp: service_healthy همچنان تضمین می‌کند ربات قبل از برقراری
+    # تونل بالا نیاید (چون healthcheck داخلی هم warp=on را چک می‌کند).
 
   bot:
     build: .
