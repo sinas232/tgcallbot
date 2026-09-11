@@ -2,9 +2,10 @@
 # ═══════════════════════════════════════════════════════════════════════
 # استقرار ربات «همیشه با WARP» (WARP ایزوله در داکر)
 # ═══════════════════════════════════════════════════════════════════════
-# این اسکریپت همیشه هر دو فایل compose را با هم اجرا می‌کند تا ربات هرگز
-# بدون WARP بالا نیاید. کل ترافیک اینترنتِ ربات (سیگنالینگ تلگرام + مدیای
-# UDP/WebRTC ویس) از داخل کانتینر warp عبور می‌کند؛ شبکهٔ هاست و SSH لمس نمی‌شود.
+# WARP داخل docker-compose.yml ادغام شده؛ پس یک دستور ساده کافی است و ربات
+# هرگز بدون WARP بالا نمی‌آید. کل ترافیک اینترنتِ ربات (سیگنالینگ تلگرام +
+# مدیای UDP/WebRTC ویس) از داخل کانتینر warp عبور می‌کند؛ شبکهٔ هاست و SSH
+# لمس نمی‌شود.
 #
 # استفاده:
 #   cd ~/callmanager
@@ -15,24 +16,24 @@
 set -e
 cd "$(dirname "$0")"
 
-FILES="-f docker-compose.yml -f docker-compose.warp.yml"
-
 case "$1" in
   logs)
-    exec docker compose $FILES logs -f bot
+    exec docker compose logs -f bot
     ;;
   down)
-    docker compose $FILES down
+    docker compose down --remove-orphans
     exit 0
     ;;
 esac
 
+echo "🧹 Cleaning up any old/orphan containers (frees port 8080 etc.)…"
+docker compose down --remove-orphans 2>/dev/null || true
+
 echo "🏗️  Building & starting (always with WARP)…"
-docker compose $FILES up -d --build
+docker compose up -d --build --remove-orphans
 
 echo ""
 echo "⏳ Waiting for WARP tunnel to become healthy…"
-# صبر تا کانتینر warp سالم شود (تونل واقعاً برقرار شود)
 for i in $(seq 1 20); do
   status=$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null || echo "starting")
   echo "   warp health: $status"
@@ -43,8 +44,8 @@ done
 echo ""
 echo "🌍 Verifying bot traffic egresses through WARP (expect warp=on + a Cloudflare IP):"
 docker exec warp_container sh -c "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -E 'warp=|ip='" || \
-  echo "   ⚠️  couldn't reach the trace endpoint yet — check: docker compose $FILES logs warp"
+  echo "   ⚠️  couldn't reach the trace endpoint yet — check: docker compose logs warp"
 
 echo ""
 echo "📜 Bot logs (Ctrl+C to stop tailing; the bot keeps running):"
-exec docker compose $FILES logs -f bot
+exec docker compose logs -f bot

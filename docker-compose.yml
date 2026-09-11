@@ -1,10 +1,64 @@
+# ═══════════════════════════════════════════════════════════════════════
+# استقرار «همیشه با WARP» — WARP به‌صورت ایزوله داخل داکر
+# ═══════════════════════════════════════════════════════════════════════
+# کل ترافیک اینترنتِ ربات (سیگنالینگ تلگرام + مدیای UDP/WebRTC ویس‌کال) از
+# داخل کانتینر warp عبور می‌کند. شبکهٔ هاست و دسترسی SSH هرگز لمس نمی‌شود.
+# با یک دستور ساده اجرا می‌شود و هیچ‌وقت بدون WARP بالا نمی‌آید:
+#     docker compose up -d --build
+#
+# نکتهٔ DNS: وقتی warp تونل را بالا می‌آورد DNSِ داخلی داکر (127.0.0.11) را
+# دور می‌زند؛ برای همین به db و redis IP ثابت می‌دهیم و نامشان را در
+# /etc/hosts کانتینر warp ثبت می‌کنیم. چون bot در فضای شبکهٔ warp اجرا می‌شود
+# همان /etc/hosts را می‌بیند و بدون DNS به دیتابیس/ردیس وصل می‌شود.
+# ═══════════════════════════════════════════════════════════════════════
 services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp_container
+    restart: always
+    # این cgroup rule پس از تغییرات runc برای ساخت دستگاه TUN لازم است.
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    environment:
+      - WARP_SLEEP=2
+      # برای WARP+ کلید را در .env بگذارید (اختیاری):
+      # - WARP_LICENSE_KEY=${WARP_LICENSE_KEY:-}
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    # نام db و redis را مستقیم به IP ثابتشان می‌بندیم تا مستقل از DNSِ
+    # شکستهٔ warp کار کنند. bot از همین /etc/hosts استفاده می‌کند.
+    extra_hosts:
+      - "db:172.28.0.2"
+      - "redis:172.28.0.3"
+    # پورت وب‌سرور ربات (کال‌بک پرداخت) از اینجا منتشر می‌شود، چون bot در
+    # فضای شبکهٔ همین کانتینر اجرا می‌شود و پورت مستقل ندارد.
+    ports:
+      - "8080:8080"
+    volumes:
+      - warp_data:/var/lib/cloudflare-warp
+    networks:
+      default:
+        ipv4_address: 172.28.0.4
+    healthcheck:
+      # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
+      test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
   bot:
     build: .
     container_name: telegram_bot_container
-    ports:
-      - "8080:8080"
     restart: always
+    # ربات فضای شبکهٔ سرویس warp را به اشتراک می‌گذارد ⇒ کل ترافیکش از WARP رد می‌شود.
+    # (به همین دلیل bot خودش ports/networks/extra_hosts ندارد؛ همه از warp می‌آید.)
+    network_mode: "service:warp"
     # هر اتصال WebRTC ده‌ها socket/FD باز می‌کند؛ با ده‌ها اکانت همزمان
     # سقف پیش‌فرض (~1024) زود تمام می‌شود و اتصالات جدید Drop می‌شوند.
     ulimits:
@@ -12,6 +66,8 @@ services:
         soft: 65535
         hard: 65535
     depends_on:
+      warp:
+        condition: service_healthy
       db:
         condition: service_healthy
       redis:
@@ -39,6 +95,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    networks:
+      default:
+        ipv4_address: 172.28.0.2
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 5s
@@ -52,12 +111,22 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    networks:
+      default:
+        ipv4_address: 172.28.0.3
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
 volumes:
   postgres_data:
   redis_data:
+  warp_data:

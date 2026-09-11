@@ -160,47 +160,19 @@ lsmod | grep -i tun || modprobe tun && echo "tun ok"
 
 ---
 
-## گام ۵ — اجرا
+## گام ۵ — اجرا (همیشه با WARP)
 
-### گام ۵-الف) اجرای عادی بدون WARP (اگر UDP سالم بود)
-
-```bash
-cd /opt/tgcallbot
-docker compose up -d --build
-docker compose ps
-docker compose logs -f bot
-```
-
-### گام ۵-ب) اجرا با WARP ایزوله در داکر (روش امن — توصیه‌شده وقتی UDP نیاز به WARP دارد)
-
-```bash
-cd /opt/tgcallbot
-docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
-
-# صبر کنید تا کانتینر warp سالم (healthy) شود؛ ربات خودش منتظر می‌ماند.
-docker compose -f docker-compose.yml -f docker-compose.warp.yml ps
-```
-
-#### حالت «همیشه با WARP» (توصیه‌شده — تا هیچ‌وقت اشتباهی بدون WARP بالا نیاید)
-
-اگر می‌خواهید ربات **همیشه** با WARP اجرا شود و مجبور نباشید هر بار `-f` ها را
-دستی بزنید، در فایل `.env` این خط را اضافه کنید:
-
-```env
-COMPOSE_FILE=docker-compose.yml:docker-compose.warp.yml
-```
-
-از آن پس همهٔ دستورهای سادهٔ `docker compose` خودکار هر دو فایل را با هم اجرا می‌کنند:
+WARP مستقیم داخل `docker-compose.yml` ادغام شده است؛ پس با یک دستور ساده اجرا
+می‌شود و ربات **هرگز بدون WARP بالا نمی‌آید**:
 
 ```bash
 cd ~/callmanager
-docker compose up -d --build      # خودکار = bridge + warp
+docker compose up -d --build
 docker compose ps
-docker compose logs -f bot
-docker compose down
 ```
 
-یا ساده‌تر، از اسکریپت آماده استفاده کنید (همیشه با WARP + بررسی سلامت تونل + تأیید warp=on):
+یا ساده‌تر، از اسکریپت آماده استفاده کنید (پاک‌سازی orphanها + بیلد + بررسی سلامت
+تونل + تأیید warp=on + لاگ):
 
 ```bash
 cd ~/callmanager
@@ -227,47 +199,35 @@ docker exec telegram_bot_container sh -c "apt-get -qq install -y curl >/dev/null
 ## گام ۶ — بررسی سلامت و لاگ‌ها
 
 ```bash
-# با WARP:
-docker compose -f docker-compose.yml -f docker-compose.warp.yml logs -f bot \
+cd ~/callmanager
+docker compose logs -f bot \
   | grep -E "staggered|media restore|media_restore|VoiceEngine|VoiceMedia|VoicePresence|silence stream ready"
 ```
 
-نشانهٔ بوت سالم: خط `silence stream ready: ...` و نبود کرش پشت‌سرهم.
+نشانهٔ بوت سالم: خط `✅ Database is ready!` و سپس `silence stream ready: ...` و
+نبود کرش پشت‌سرهم.
 
 ---
 
-## توقف / برگشت به حالت عادی
+## توقف / راه‌اندازی دوباره
 
 ```bash
-# توقف حالت WARP
-cd /opt/tgcallbot
-docker compose -f docker-compose.yml -f docker-compose.warp.yml down
-
-# اجرای دوبارهٔ عادی (bridge)
-docker compose up -d --build
+cd ~/callmanager
+docker compose down            # توقف کامل
+docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
 ```
-
----
-
-## سه حالت اجرا — جمع‌بندی
-
-| حالت | فایل‌ها | کِی؟ |
-|---|---|---|
-| عادی (bridge) | `docker-compose.yml` | UDP سالم است، ساده‌ترین حالت |
-| **WARP ایزوله** | `docker-compose.yml` + `docker-compose.warp.yml` | UDP ویس نیاز به عبور از کلودفلیر دارد (روش امن، SSH محفوظ) |
-| host networking | `docker-compose.yml` + `docker-compose.host.yml` | فقط عیب‌یابی پیشرفتهٔ مسیر UDP (نیازمند تغییر `.env` به `127.0.0.1`) |
 
 ---
 
 ## عیب‌یابی سریع
 
-- **در حالت WARP خطای `Database not ready ... Name or service not known`:**
-  کانتینر warp، DNSِ داخلی داکر (`127.0.0.11`) را می‌شکند و نام‌های `db`/`redis`
-  resolve نمی‌شوند. این در فایل `docker-compose.warp.yml` با دادن **IP ثابت** به
-  db/redis و ثبتشان در `/etc/hosts` کانتینر warp حل شده است (نسخهٔ به‌روز مخزن).
-  فقط کافی است `git pull` کنید و دوباره با override اجرا کنید. **توجه:** اگر
-  `tools/check_udp.py` روی حالت bridge خروجی `UDP egress OK` داد، احتمالاً اصلاً
-  به WARP نیاز ندارید و می‌توانید با حالت عادی (بند ۵-الف) کار کنید.
+- **خطای `port is already allocated` روی 8080:** یک کانتینر warp قدیمی/orphan
+  هنوز پورت را گرفته. با `docker compose down --remove-orphans` پاکش کنید و دوباره
+  بالا بیاورید (اسکریپت `deploy-warp.sh` این کار را خودکار انجام می‌دهد).
+- **خطای `Database not ready ... Name or service not known`:** یعنی ربات بدون
+  WARP یا با DNSِ شکسته بالا آمده. مطمئن شوید آخرین نسخهٔ مخزن را `git pull`
+  کرده‌اید (WARP و IP ثابت db/redis داخل `docker-compose.yml` ادغام شده‌اند) و
+  خطوط دستی `COMPOSE_FILE` را از `.env` **حذف** کنید (دیگر لازم نیست).
 
 
 - **کانتینر warp بالا نمی‌آید / healthy نمی‌شود:**
