@@ -1206,6 +1206,14 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             return to_dict(gws[0])
 
     @staticmethod
+    async def get_active_gateways(bot_id=1):
+        """همهٔ درگاه‌های فعال (نه فقط یکی) را برمی‌گرداند تا بتوان چند درگاه را
+        هم‌زمان فعال داشت و به کاربر امکان انتخاب داد."""
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(select(PaymentGateway).filter(PaymentGateway.bot_id == bot_id, PaymentGateway.is_active == True))
+            return [to_dict(g) for g in res.scalars().all()]
+
+    @staticmethod
     async def get_all_users_list(bot_id=1):
         async with AsyncSessionLocal() as db_session:
             result = await db_session.execute(select(User.telegram_id).filter(User.bot_id == bot_id))

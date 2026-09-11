@@ -256,8 +256,15 @@ class PaymentService:
             GATEWAY_SLUG_ZARINPAL: ZarinPalGateway(),
         }
 
-    async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str] = None, bot_id: int = 1) -> Tuple[bool, str]:
-        active_gw_db = await DatabaseManager.get_active_gateway(bot_id=bot_id)
+    async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str] = None, bot_id: int = 1, gateway_slug: Optional[str] = None) -> Tuple[bool, str]:
+        # اگر درگاه مشخص انتخاب شده باشد از همان استفاده می‌کنیم (باید فعال باشد)؛
+        # در غیر این‌صورت اولین درگاه فعال انتخاب می‌شود (سازگاری با رفتار قبلی).
+        if gateway_slug:
+            active_gw_db = await DatabaseManager.get_gateway(gateway_slug, bot_id=bot_id)
+            if not active_gw_db or not active_gw_db.get('is_active'):
+                return False, "درگاه انتخاب‌شده فعال نیست."
+        else:
+            active_gw_db = await DatabaseManager.get_active_gateway(bot_id=bot_id)
         if not active_gw_db:
             return False, "درگاه پرداخت برای این ربات فعال نیست."
             

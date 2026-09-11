@@ -63,8 +63,14 @@ async def wallet_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     else: 
         stats = {'total_paid': 0, 'orders_count': 0}
     
-    active_gateway = await DatabaseManager.get_active_gateway(bot_id=bot_id)
-    gateway_name = active_gateway.get('name', 'درگاه آنلاین') if active_gateway else "غیرفعال"
+    active_gateways = await DatabaseManager.get_active_gateways(bot_id=bot_id)
+    if not active_gateways:
+        gateway_name = "غیرفعال"
+    elif len(active_gateways) == 1:
+        gateway_name = active_gateways[0].get('name', 'درگاه آنلاین')
+    else:
+        # چند درگاه فعال است؛ کاربر هنگام شارژ بین آن‌ها انتخاب می‌کند.
+        gateway_name = "انتخاب درگاه"
     
     wallet_text = (
         f"💰 **کیف پول شخصی شما**\n➖➖➖➖➖➖➖➖\n\n"
@@ -129,8 +135,9 @@ async def start_charge_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             msg_add += f"✅ `{c['card_number']}`\n"
         msg_add += "\n⚠️ پرداخت فقط با کارت‌های بالا معتبر است."
 
-    gw_instance = await DatabaseManager.get_active_gateway(bot_id=bot_id)
-    if not gw_instance:
+    # درگاه‌های فعال (ممکن است چند درگاه هم‌زمان فعال باشند).
+    active_gateways = await DatabaseManager.get_active_gateways(bot_id=bot_id)
+    if not active_gateways:
         warn = "⛔️ درگاه پرداخت غیرفعال است. لطفاً بعداً تلاش کنید یا از «کارت به کارت» استفاده کنید."
         if query:
             await query.answer("⛔️ درگاه پرداخت غیرفعال است.", show_alert=True)
@@ -138,7 +145,39 @@ async def start_charge_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await send_safe(context.bot, update.effective_chat.id, warn)
         return AWAITING_WALLET_ACTION
 
-    # پیام شیشه‌ای قبلی (منوی کیف پول) را پاک می‌کنیم تا صفحه تمیز بماند.
+    # وضعیت کارت را برای مرحلهٔ بعد نگه می‌داریم تا در _prompt_charge_amount استفاده شود.
+    context.user_data['charge_msg_add'] = msg_add
+    context.user_data['charge_card_status'] = status
+
+    # اگر بیش از یک درگاه فعال است، منوی انتخاب درگاه نشان بده.
+    if len(active_gateways) > 1:
+        # پیام شیشه‌ای قبلی (منوی کیف پول) را پاک می‌کنیم تا صفحه تمیز بماند.
+        if query:
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+        kb = [[InlineKeyboardButton(f"💳 {gw['name']}", callback_data=f"chg_gw_{gw['slug']}")] for gw in active_gateways]
+        kb.append([InlineKeyboardButton(BTN_BACK_MAIN, callback_data="back_to_wallet")])
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "💰 **افزایش موجودی حساب**\n\n👇 لطفاً درگاه پرداخت مورد نظر را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        # کیبورد پایین برای امکان بازگشت
+        await send_safe(context.bot, update.effective_chat.id, "برای انصراف از دکمهٔ زیر استفاده کنید:", reply_markup=ReplyKeyboardMarkup([[BTN_BACK_MAIN]], resize_keyboard=True))
+        return AWAITING_WALLET_ACTION
+
+    # فقط یک درگاه فعال است → مستقیماً به مرحلهٔ مبلغ برو.
+    return await _prompt_charge_amount(update, context, bot_id, active_gateways[0], status, msg_add, query)
+
+
+async def _prompt_charge_amount(update, context, bot_id, gw_instance, status, msg_add, query=None):
+    """نمایش مرحلهٔ ورود مبلغ برای درگاه انتخاب‌شده."""
+    # درگاه انتخاب‌شده را برای مرحلهٔ ساخت لینک نگه می‌داریم.
+    context.user_data['charge_gateway_slug'] = gw_instance['slug']
+
+    # اگر از منوی انتخاب درگاه (کلیک اینلاین) آمده‌ایم، پیام قبلی را پاک کن.
     if query:
         try:
             await query.delete_message()
@@ -201,6 +240,17 @@ async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data == "charge_online":
             return await start_charge_flow(update, context, bot_id)
 
+        elif data.startswith("chg_gw_"):
+            # کاربر یک درگاه را از منوی انتخاب درگاه برگزید.
+            slug = data[len("chg_gw_"):]
+            gw_instance = await DatabaseManager.get_gateway(slug, bot_id=bot_id)
+            if not gw_instance or not gw_instance.get('is_active'):
+                await query.answer("⛔️ این درگاه در دسترس نیست.", show_alert=True)
+                return await start_charge_flow(update, context, bot_id)
+            status = context.user_data.get('charge_card_status', 'exempt')
+            msg_add = context.user_data.get('charge_msg_add', '')
+            return await _prompt_charge_amount(update, context, bot_id, gw_instance, status, msg_add, query)
+
         elif data == "wallet_add_new_card":
             # هدایت به پروسه KYC کامل برای کارت جدید
             # نکته: ایمپورت داخل تابع برای جلوگیری از چرخه ایمپورت
@@ -240,10 +290,17 @@ async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYP
         tg_user = update.effective_user
         user = await DatabaseManager.create_or_update_user({'id': tg_user.id, 'username': tg_user.username, 'first_name': tg_user.first_name, 'last_name': tg_user.last_name}, bot_id=bot_id)
         
+        # درگاهی که کاربر انتخاب کرده (اگر چند درگاه فعال بود)؛ در غیر این‌صورت None
+        # و سرویس اولین درگاه فعال را برمی‌دارد.
+        selected_slug = context.user_data.get('charge_gateway_slug')
+
         wait_msg = await update.message.reply_text("⏳ در حال اتصال به درگاه بانکی...")
-        success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id)
+        success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id, gateway_slug=selected_slug)
         
         if success:
+            # پاک‌سازی وضعیت انتخاب درگاه پس از موفقیت.
+            for k in ('charge_gateway_slug', 'charge_card_status', 'charge_msg_add'):
+                context.user_data.pop(k, None)
             kb = [[InlineKeyboardButton("🔗 ورود به درگاه پرداخت", url=result)]]
             msg_text = (f"✅ **لینک پرداخت ایجاد شد.**\n\n💰 مبلغ: `{amount:,}` تومان\n👤 کاربر: {user.get('first_name', 'کاربر')}\n\n👇 برای تکمیل پرداخت روی دکمه زیر کلیک کنید:")
             await wait_msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
