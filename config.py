@@ -39,6 +39,17 @@ class Config:
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH', '')
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
+    # ── Outbound SOCKS5 proxy for the voice Pyrogram/PyTgCalls clients ──
+    # When USE_PROXY is truthy, every voice account's Pyrogram Client (and the
+    # PyTgCalls engine that rides on it) connects through this SOCKS5 proxy —
+    # e.g. a local Cloudflare WARP proxy on 127.0.0.1:4000. Leaving it off
+    # (default) keeps the direct connection behaviour unchanged.
+    USE_PROXY = os.getenv('USE_PROXY', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    SOCKS5_HOST = os.getenv('SOCKS5_HOST', '127.0.0.1')
+    SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', '4000') or 4000)
+    SOCKS5_USERNAME = os.getenv('SOCKS5_USERNAME', '') or None
+    SOCKS5_PASSWORD = os.getenv('SOCKS5_PASSWORD', '') or None
+
     # Database
     DATABASE_URL = _safe_encode_db_url(os.getenv('DATABASE_URL', ''))
     REDIS_URL = _safe_encode_db_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
@@ -95,12 +106,13 @@ class Config:
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
     # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
     # voice handshake. The Join Brain may still widen this (up to the max).
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '2'))   # first wave size (start small; the brain widens on clean waves)
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
     # Per-order ceiling kept LOW on purpose: every simultaneous voice
     # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~3 concurrent media setups is where transports start dying.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '3'))         # per-order hard ceiling
+    # than ~2 concurrent media setups is where transports start dying AND
+    # where Telegram's per-IP burst budget starts answering with FloodWait.
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -109,8 +121,13 @@ class Config:
     # second" bursts (FloodWait loops) and no ffmpeg/CPU spike.
     # The wave itself still overlaps: a single join takes 30-45s, so the
     # build speed is nearly unchanged; only the *starts* are paced.
-    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '2.5'))
-    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '4.5'))
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '6.0'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '10.0'))
+    # Extra small human-like jitter (seconds) added on top of the base
+    # start-gap between two account client starts, to avoid a perfectly
+    # periodic RPC cadence that automated anti-spam can fingerprint.
+    VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.5'))
+    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '1.5'))
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -189,6 +206,13 @@ class Config:
     # (logs/voice_telemetry.log) so every fall-out has a recorded reason.
     VOICE_DROP_LEDGER = os.getenv('VOICE_DROP_LEDGER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     VOICE_TELEMETRY = os.getenv('VOICE_TELEMETRY', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Verbose [VoiceDiag] JSON stream: emit one INFO log line for EVERY routine
+    # state transition (STARTING / CLIENT_STARTED / JOINING / JOINED …). With
+    # many accounts this is a high-frequency disk-I/O + CPU hot path. Off by
+    # default in production: routine transitions drop to DEBUG (suppressed at
+    # the default INFO log level) while warnings/errors/rate-limits are ALWAYS
+    # emitted. Set ENABLE_VERBOSE_DIAG=true to restore the full firehose.
+    ENABLE_VERBOSE_DIAG = os.getenv('ENABLE_VERBOSE_DIAG', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
     # Session guard: if an account's MTProto session silently died, reconnect it
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')

@@ -8,6 +8,9 @@ asyncpg
 redis
 aiohttp
 jdatetime
+# Faster asyncio event loop (Linux/macOS only; skipped on Windows).
+# Cuts event-loop overhead which lowers CPU under many concurrent voice tasks.
+uvloop; sys_platform != "win32"
 
 #Bot
 

@@ -44,7 +44,7 @@ import json
 import traceback
 import wave
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import deque
 
 from pyrogram import Client
@@ -255,12 +255,47 @@ def _client_device_fingerprint(account_id: int) -> Dict[str, str]:
         "lang_code": "fa",
     }
 
+
+def _voice_proxy_config() -> Optional[Dict[str, Any]]:
+    """SOCKS5 proxy dict for Pyrogram Client, or None when USE_PROXY is off.
+
+    When enabled, the account's Pyrogram Client — and the PyTgCalls engine
+    that rides on the same MTProto connection — connect through the configured
+    SOCKS5 proxy (e.g. a local Cloudflare WARP proxy on 127.0.0.1:4000).
+    Returning None preserves the original direct-connection behaviour.
+    """
+    if not bool(getattr(Config, "USE_PROXY", False)):
+        return None
+    proxy: Dict[str, Any] = {
+        "scheme": "socks5",
+        "hostname": str(getattr(Config, "SOCKS5_HOST", "127.0.0.1")),
+        "port": int(getattr(Config, "SOCKS5_PORT", 4000)),
+    }
+    user = getattr(Config, "SOCKS5_USERNAME", None)
+    pwd = getattr(Config, "SOCKS5_PASSWORD", None)
+    if user:
+        proxy["username"] = user
+    if pwd:
+        proxy["password"] = pwd
+    return proxy
+
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
     _JOIN_PENDING_TIMEOUT,
     ACTIVE_CALL_CACHE_TTL,
     os.path.abspath(__file__),
 )
+if bool(getattr(Config, "USE_PROXY", False)):
+    logger.info(
+        "VoiceCallManager SOCKS5 proxy ENABLED for voice clients -> %s:%s",
+        getattr(Config, "SOCKS5_HOST", "127.0.0.1"),
+        getattr(Config, "SOCKS5_PORT", 4000),
+    )
+if not bool(getattr(Config, "ENABLE_VERBOSE_DIAG", False)):
+    logger.info(
+        "VoiceCallManager [VoiceDiag] verbose stream OFF (routine transitions at DEBUG); "
+        "set ENABLE_VERBOSE_DIAG=true to restore the full firehose"
+    )
 
 # ─── ACCOUNT STATE MACHINE ────────────────────────────────────────────────
 # The next account is released ONLY after the current account reaches a
@@ -1136,10 +1171,33 @@ class VoiceCallManager:
                     "flood_wait_seconds", "retry_at",
                 }},
             }
-            logger.info(
-                f"[VoiceDiag] {json.dumps(entry, ensure_ascii=False)}"
+            # ── Log-level throttling (CPU / disk-I/O reduction) ──────────
+            # Routine state-transition spam (STARTING / CLIENT_STARTED /
+            # JOINING / JOINED with no error) is the high-frequency hot path.
+            # In production (ENABLE_VERBOSE_DIAG=false) those drop to DEBUG —
+            # suppressed at the default INFO level and NOT written to disk —
+            # while anything carrying an error / telegram-code / flood-wait, or
+            # a non-routine terminal state, is ALWAYS emitted (WARNING) and
+            # persisted so failures are never lost.
+            verbose = bool(getattr(Config, "ENABLE_VERBOSE_DIAG", False))
+            state_after = entry.get("state_after")
+            is_important = bool(
+                entry.get("exception_type")
+                or entry.get("exception_message")
+                or entry.get("telegram_error_code")
+                or entry.get("flood_wait_seconds")
+                or (state_after in {"FAILED", "RATE_LIMITED", "TEMPORARILY_UNKNOWN"})
             )
-            if self._vc_log_path:
+            line = f"[VoiceDiag] {json.dumps(entry, ensure_ascii=False)}"
+            if is_important:
+                logger.warning(line)
+            elif verbose:
+                logger.info(line)
+            else:
+                logger.debug(line)
+            # Persist to the JSONL trace only when the event matters or the
+            # operator explicitly asked for the full firehose.
+            if self._vc_log_path and (verbose or is_important):
                 with open(self._vc_log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
@@ -1495,6 +1553,7 @@ class VoiceCallManager:
                             # the voice transport handshake and participant sync.
                             no_updates=False,
                             in_memory=True,
+                            proxy=_voice_proxy_config(),
                             **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
@@ -3166,6 +3225,7 @@ class VoiceCallManager:
                                 # Voice clients must receive raw updates from Telegram.
                                 no_updates=False,
                                 in_memory=True,
+                                proxy=_voice_proxy_config(),
                                 **_client_device_fingerprint(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)

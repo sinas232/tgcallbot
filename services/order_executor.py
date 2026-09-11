@@ -600,18 +600,24 @@ class OrderExecutor:
 	        # threshold that makes Telegram answer with FloodWait 3s loops).
 	        # The wave still overlaps: a single join takes 30-45s, so with a
 	        # window of 3-10 the build speed is nearly unchanged.
-	        stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 1.0)))
-	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 2.0)))
+	        stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 6.0)))
+	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 10.0)))
+	        # Subtle human-like jitter added on top of the base gap so the RPC
+	        # cadence is never perfectly periodic (harder for anti-spam to flag).
+	        jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_JITTER_MIN", 0.5)))
+	        jitter_max = max(jitter_min, float(getattr(Config, "VOICE_JOIN_START_JITTER_MAX", 1.5)))
 	        logger.info(
 	            f"Order {order_id}: wave {wave_no} — joining {len(candidates)} accounts "
-	            f"staggered (window={window}, start-gap={stagger_min:.1f}-{stagger_max:.1f}s, "
+	            f"staggered (window={window}, start-gap={stagger_min:.1f}-{stagger_max:.1f}s"
+	            f"+jitter {jitter_min:.1f}-{jitter_max:.1f}s, "
 	            f"live={live}/{target_count})"
 	        )
 
 	        wave_tasks: List[asyncio.Task] = []
 	        for _i, acc in enumerate(candidates):
 	            if _i > 0:
-	                await asyncio.sleep(random.uniform(stagger_min, stagger_max))
+	                gap = random.uniform(stagger_min, stagger_max) + random.uniform(jitter_min, jitter_max)
+	                await asyncio.sleep(gap)
 	            wave_tasks.append(asyncio.create_task(
 	                self._join_single_account(order_id, acc, "voice_chat", target, 0)
 	            ))

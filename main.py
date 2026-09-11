@@ -27,6 +27,23 @@ import logging
 import os
 import time
 import asyncio
+
+# ── uvloop: drop-in, much faster asyncio loop (Linux/macOS) ──────────────
+# Installing it BEFORE any event loop is created makes every asyncio.*
+# primitive (and PTB / Pyrogram / PyTgCalls, which all sit on asyncio) run
+# on the libuv loop. This meaningfully lowers event-loop CPU overhead under
+# many concurrent voice-join tasks. It is a no-op / unavailable on Windows,
+# so we guard on os.name and import failure.
+if os.name != "nt":
+    try:
+        import uvloop
+        uvloop.install()
+        logging.getLogger(__name__).info("uvloop installed as the asyncio event loop policy")
+    except Exception as _uvloop_exc:  # pragma: no cover - platform dependent
+        logging.getLogger(__name__).info(
+            "uvloop not active (falling back to default asyncio loop): %s", _uvloop_exc
+        )
+
 import html
 import json
 from datetime import datetime, timedelta

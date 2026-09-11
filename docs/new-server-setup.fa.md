@@ -113,6 +113,22 @@ ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 # ── (اختیاری) کلید WARP+ اگر دارید ──
 # WARP_LICENSE_KEY=your_warp_plus_key
+
+# ── (اختیاری) پروکسی SOCKS5 برای کلاینت‌های ویس (مثلاً WARP در حالت proxy) ──
+# اگر می‌خواهید ترافیک Pyrogram/PyTgCalls از یک پروکسی SOCKS5 رد شود:
+# USE_PROXY=true
+# SOCKS5_HOST=127.0.0.1
+# SOCKS5_PORT=4000
+# SOCKS5_USERNAME=          # در صورت نیاز
+# SOCKS5_PASSWORD=          # در صورت نیاز
+
+# ── (اختیاری) کاهش مصرف CPU و لاگ ──
+# لاگِ پرتکرارِ [VoiceDiag] در حالت عادی خاموش است؛ فقط برای دیباگ عمیق روشن کنید:
+# ENABLE_VERBOSE_DIAG=false
+# فاصلهٔ ورود اکانت‌ها (ثانیه) — برای فرار از FloodWait بزرگ‌تر کنید:
+# VOICE_JOIN_START_STAGGER_MIN=6.0
+# VOICE_JOIN_START_STAGGER_MAX=10.0
+# VOICE_JOIN_MAX_CONCURRENCY=2
 ```
 
 > نکته: مقادیر `DATABASE_URL`/`REDIS_URL` را روی `db` / `redis` نگه دارید
@@ -215,6 +231,32 @@ docker compose logs -f bot \
 cd ~/callmanager
 docker compose down            # توقف کامل
 docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
+```
+
+---
+
+## کاهش مصرف CPU و جلوگیری از FloodWait (نسخهٔ بهینه)
+
+این تغییرات برای رفع مصرف بالای CPU (تا ~۹۴٪) و خطاهای FloodWait تلگرام اعمال شده:
+
+- **حلقهٔ رویداد سریع‌تر (uvloop):** روی لینوکس به‌طور خودکار فعال می‌شود؛ در لاگِ
+  بوت خط `uvloop installed as the asyncio event loop policy` را می‌بینید.
+- **ورود پلکانی محتاطانه‌تر:** فاصلهٔ شروع هر اکانت به **۶ تا ۱۰ ثانیه** + یک
+  jitter تصادفی (۰٫۵–۱٫۵ ثانیه) افزایش یافت و سقف هم‌زمانی هر سفارش به **۲** و
+  موج اول به **۱** کاهش یافت — یعنی هرگز چند JoinGroupCall در یک لحظه شلیک
+  نمی‌شود (ریشهٔ حلقه‌های FloodWait).
+- **مدیریت FloodWait بدون کرش:** وقتی تلگرام FloodWait می‌دهد، همان اکانت روی
+  کول‌داونِ ماندگار می‌رود و بقیهٔ اکانت‌ها بدون توقف ادامه می‌دهند.
+- **کاهش I/O لاگ:** استریمِ پرتکرارِ `[VoiceDiag]` به‌صورت پیش‌فرض فقط رویدادهای
+  مهم (خطا/FloodWait) را می‌نویسد. برای فایربالِ کامل `ENABLE_VERBOSE_DIAG=true`.
+- **پروکسی اختیاری SOCKS5:** با `USE_PROXY=true` کلاینت‌های ویس از پروکسی رد می‌شوند.
+
+بعد از هر تغییرِ `requirements.txt` (مثل افزودن uvloop) حتماً با `--build` بسازید:
+
+```bash
+cd ~/callmanager
+docker compose up -d --build
+docker compose logs bot | grep -E "uvloop|VoiceDiag|SOCKS5"
 ```
 
 ---
