@@ -29,19 +29,21 @@ import time
 import asyncio
 
 # ── uvloop: drop-in, much faster asyncio loop (Linux/macOS) ──────────────
-# Installing it BEFORE any event loop is created makes every asyncio.*
-# primitive (and PTB / Pyrogram / PyTgCalls, which all sit on asyncio) run
-# on the libuv loop. This meaningfully lowers event-loop CPU overhead under
-# many concurrent voice-join tasks. It is a no-op / unavailable on Windows,
-# so we guard on os.name and import failure.
+# We do NOT call uvloop.install() here. Combined with the deprecated
+# asyncio.get_event_loop() used in the __main__ block below, install() routes
+# get_event_loop() through uvloop's policy, which on some uvloop builds
+# recurses infinitely ("get_event_loop" over and over) and crashes the bot at
+# boot. Instead we detect availability now and build an explicit uvloop loop in
+# __main__ (uvloop.new_event_loop()), which is the recommended, recursion-free
+# way to run on libuv. It is a no-op / unavailable on Windows.
+_UVLOOP = None
 if os.name != "nt":
     try:
-        import uvloop
-        uvloop.install()
-        logging.getLogger(__name__).info("uvloop installed as the asyncio event loop policy")
+        import uvloop as _UVLOOP
     except Exception as _uvloop_exc:  # pragma: no cover - platform dependent
+        _UVLOOP = None
         logging.getLogger(__name__).info(
-            "uvloop not active (falling back to default asyncio loop): %s", _uvloop_exc
+            "uvloop not available (falling back to default asyncio loop): %s", _uvloop_exc
         )
 
 import html
@@ -821,9 +823,15 @@ async def main_loop():
     await stop_event.wait()
 
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+    # Build the event loop explicitly. Prefer an EXPLICIT uvloop loop (fast
+    # libuv backend, lower CPU under many concurrent voice tasks) when uvloop
+    # is available; this avoids the deprecated get_event_loop() path that can
+    # recurse under uvloop's policy. Fall back to the stock asyncio loop.
+    if _UVLOOP is not None:
+        loop = _UVLOOP.new_event_loop()
+        logger.info("uvloop active as the asyncio event loop (libuv backend)")
+    else:
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        logger.info("using the default asyncio event loop (uvloop unavailable)")
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(main_loop())
