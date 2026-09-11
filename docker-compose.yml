@@ -36,10 +36,14 @@ services:
       - "db:172.28.0.2"
       - "redis:172.28.0.3"
       - "payproxy:172.28.0.5"
-    # پورت وب‌سرور ربات (کال‌بک پرداخت) از اینجا منتشر می‌شود، چون bot در
-    # فضای شبکهٔ همین کانتینر اجرا می‌شود و پورت مستقل ندارد.
-    ports:
-      - "8080:8080"
+    # پورت 8080 دیگر مستقیم منتشر نمی‌شود؛ چون bot در فضای شبکهٔ warp است،
+    # انتشار مستقیم دچار مشکل مسیر برگشت (asymmetric routing) از تونل WARP
+    # می‌شود و از اینترنت جواب نمی‌دهد. به‌جایش کانتینر nginx (خارج از WARP)
+    # درخواست‌های ورودی را می‌گیرد و داخلی به 172.28.0.4:8080 پاس می‌دهد.
+    # وب‌سرور همچنان داخل همین netns روی 8080 گوش می‌دهد و از شبکهٔ داخلی داکر
+    # (توسط nginx) در دسترس است.
+    expose:
+      - "8080"
     volumes:
       - warp_data:/var/lib/cloudflare-warp
     networks:
@@ -166,6 +170,35 @@ services:
       # صرفاً بررسی می‌کند پروسهٔ tinyproxy در حال اجراست (چون bot با
       # service_started به آن وابسته است، این چک فقط برای نمایش در docker ps است).
       test: ["CMD-SHELL", "pgrep tinyproxy >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # nginx — reverse proxy برای وب‌سرور callback (خارج از WARP)
+  # ─────────────────────────────────────────────────────────────────────
+  # چون bot با network_mode: service:warp اجرا می‌شود، انتشار مستقیم پورت 8080
+  # دچار مشکل مسیر برگشت (asymmetric routing) از تونل WARP می‌شود و از اینترنت
+  # جواب نمی‌دهد. این nginx در شبکهٔ عادیِ داکر است (نه WARP)، پس پاسخش از مسیر
+  # درستِ هاست به کاربر برمی‌گردد. پورت 80 عمومی را می‌گیرد و داخلی به
+  # 172.28.0.4:8080 (وب‌سرور داخل netns warp) پاس می‌دهد.
+  webproxy:
+    image: nginx:1.27-alpine
+    container_name: web_proxy_container
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      default:
+        ipv4_address: 172.28.0.6
+    depends_on:
+      warp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
