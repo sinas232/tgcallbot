@@ -21,11 +21,6 @@ services:
       - 'c 10:200 rwm'
     environment:
       - WARP_SLEEP=2
-      # رفع مشکل مسیر برگشت (asymmetric routing) برای ترافیکِ ورودی از شبکهٔ
-      # داکر. بدون این، warp زیرشبکهٔ داکر را هم به تونل می‌فرستد و پاسخِ
-      # درخواست‌هایی که از nginx/هاست به وب‌سرور 8080 می‌آیند گم می‌شود (502).
-      # این متغیر زیرشبکه را از تونل مستثنی می‌کند. (قابلیت رسمی warp-docker)
-      - BETA_FIX_HOST_CONNECTIVITY=1
       # برای WARP+ کلید را در .env بگذارید (اختیاری):
       # - WARP_LICENSE_KEY=${WARP_LICENSE_KEY:-}
     cap_add:
@@ -54,12 +49,46 @@ services:
     networks:
       default:
         ipv4_address: 172.28.0.4
-    # ⚠️ مهم: healthcheck را اینجا override نمی‌کنیم. healthcheckِ داخلیِ image
-    # هم warp=on را بررسی می‌کند و هم (به‌خاطر BETA_FIX_HOST_CONNECTIVITY=1)
-    # مشکل مسیر برگشت شبکهٔ داکر را به‌صورت خودکار اصلاح می‌کند. اگر اینجا
-    # healthcheck سفارشی بگذاریم، آن اصلاحِ خودکار اجرا نمی‌شود و 502 می‌گیریم.
-    # depends_on: warp: service_healthy همچنان تضمین می‌کند ربات قبل از برقراری
-    # تونل بالا نیاید (چون healthcheck داخلی هم warp=on را چک می‌کند).
+    healthcheck:
+      # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
+      test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # اصلاح مسیر برگشت (asymmetric routing) برای ترافیک ورودیِ callback
+  # ─────────────────────────────────────────────────────────────────────
+  # WARP یک default route از طریق TUN می‌سازد، پس پاسخِ درخواست‌هایی که از
+  # nginx (172.28.0.6) به وب‌سرور 8080 داخل netns warp می‌آیند، به‌جای برگشت
+  # از اینترفیس eth0، از تونل WARP می‌رود و گم می‌شود (502/Connection refused).
+  # این کانتینر کمکی در همان netns warp اجرا می‌شود و با یک «ip rule» ترافیکِ
+  # مقصدـِ زیرشبکهٔ داکر را مجبور می‌کند از جدول مسیریابیِ main (نه TUN) برگردد.
+  # یک‌بار اجرا می‌شود، سپس زنده می‌ماند؛ warp را ری‌استارت نمی‌کند (پایدار).
+  routefix:
+    image: alpine:3.19
+    container_name: warp_routefix_container
+    restart: always
+    network_mode: "service:warp"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      warp:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache iproute2 >/dev/null 2>&1 || true
+        # ترافیک با مقصدِ زیرشبکهٔ داکر باید از جدول main مسیر بگیرد نه TUN.
+        # priority پایین‌تر از قانون TUNِ warp تا زودتر ارزیابی شود.
+        ip rule add to 172.28.0.0/16 lookup main priority 100 2>/dev/null || true
+        echo "[routefix] ip rule for 172.28.0.0/16 -> main installed"
+        ip rule show || true
+        # زنده ماندن تا کانتینر بالا بماند (بدون مصرف CPU).
+        while true; do sleep 3600; done
 
   bot:
     build: .
