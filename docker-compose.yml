@@ -5,6 +5,12 @@ services:
     ports:
       - "8080:8080"
     restart: always
+    # هر اتصال WebRTC ده‌ها socket/FD باز می‌کند؛ با ده‌ها اکانت همزمان
+    # سقف پیش‌فرض (~1024) زود تمام می‌شود و اتصالات جدید Drop می‌شوند.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       db:
         condition: service_healthy

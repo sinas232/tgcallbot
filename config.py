@@ -90,23 +90,27 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
-    # First wave size. 3 is the safe default: combined with the staggered
-    # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs land
-    # ~1-2s apart, which is well inside Telegram's per-IP rate budget. The
-    # Join Brain may still widen this later when waves are clean.
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '3'))   # first wave size (start small; the brain widens on clean waves)
+    # First wave size. 2 is the safe default: combined with the staggered
+    # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
+    # WebRTC handshakes land several seconds apart, which keeps Telegram's
+    # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
+    # voice handshake. The Join Brain may still widen this (up to the max).
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '2'))   # first wave size (start small; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '10'))         # per-order hard ceiling
+    # Per-order ceiling kept LOW on purpose: every simultaneous voice
+    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
+    # than ~3 concurrent media setups is where transports start dying.
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '3'))         # per-order hard ceiling
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
-    # after the previous one. This spreads the phone.JoinGroupCall RPCs over
-    # several seconds so Telegram never sees "N joins in one second" (the
-    # classic burst that triggers the 3s FloodWait loop). The wave itself
-    # still overlaps — each join takes 30-45s, so throughput is nearly
-    # unchanged; only the *starts* are paced (~1 join/second, human-like).
-    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '1.0'))
-    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '2.0'))
+    # after the previous one. This spreads the phone.JoinGroupCall RPCs AND
+    # the WebRTC media handshakes over several seconds — no "N joins in one
+    # second" bursts (FloodWait loops) and no ffmpeg/CPU spike.
+    # The wave itself still overlaps: a single join takes 30-45s, so the
+    # build speed is nearly unchanged; only the *starts* are paced.
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '3.0'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '5.0'))
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -161,6 +165,13 @@ class Config:
     # inside the call (ghost-media-only). Paced so the re-stream can never
     # become a new JoinGroupCall burst.
     VOICE_MEDIA_RESTORE_INTERVAL = int(os.getenv('VOICE_MEDIA_RESTORE_INTERVAL', '25'))
+    # After this many CONSECUTIVE failed restores for one slot, pause media
+    # restore attempts for VOICE_MEDIA_RESTORE_PAUSE_SECONDS (the account
+    # stays counted inside the call; we stop hammering a broken media path
+    # with new JoinGroupCalls). One probe is allowed again after the pause
+    # so a recovered network heals automatically.
+    VOICE_MEDIA_RESTORE_MAX_FAILS = int(os.getenv('VOICE_MEDIA_RESTORE_MAX_FAILS', '3'))
+    VOICE_MEDIA_RESTORE_PAUSE_SECONDS = int(os.getenv('VOICE_MEDIA_RESTORE_PAUSE_SECONDS', '600'))
     # Shared chat-info cache TTL (peer + access_hash + InputGroupCall): ONE
     # account resolves the chat and every other account reuses the cached
     # objects instead of each issuing resolve_peer/GetFullChannel from the same

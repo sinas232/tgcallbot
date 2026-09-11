@@ -1,0 +1,23 @@
+# ═══════════════════════════════════════════════════════════════════════
+# اختیاری — فقط اگر tools/check_udp.py در شبکه bridge خطا بدهد
+# ═══════════════════════════════════════════════════════════════════════
+# اجرای معمولی (bridge — پیش‌فرض و توصیه‌شده):
+#   docker compose up -d --build
+# اجرای حالت host (فقط برای عیب‌یابی مسیر UDP):
+#   docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build
+#
+# ⚠️  در حالت host، نام‌های کانتینر (db / redis) دیگر resolve نمی‌شوند؛
+#     قبل از اجرا این سه مقدار را در .env روی 127.0.0.1 بگذار:
+#       POSTGRES_HOST=127.0.0.1
+#       DATABASE_URL=postgresql://USER:PASS@127.0.0.1:5432/DB
+#       REDIS_URL=redis://127.0.0.1:6379/0
+#     (db پورت 5432 را از قبل expose می‌کند؛ redis را این override اضافه
+#     می‌کند. برای برگشت: مقدارهای قبلی .env را برگردان و
+#     docker compose up -d --build بدون override.)
+services:
+  bot:
+    network_mode: "host"
+    ports: !reset []
+  redis:
+    ports:
+      - "6379:6379"
