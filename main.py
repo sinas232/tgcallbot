@@ -288,11 +288,14 @@ async def zp_callback_handler(request):
         app = bot_manager.active_bots.get(bot_id)
 
         if status == 'OK':
-            # طبق مستندات رسمی زرین‌پال، مبلغ برای اعتبارسنجی باید به ریال باشد
-            # مبلغ در دیتابیس شما به تومان ذخیره شده است، پس باید در 10 ضرب شود
-            amount_in_rials = int(float(transaction['amount'])) * 10
+            # مبلغ تراکنش به تومان در دیتابیس ذخیره شده است. آن را «به تومان»
+            # به لایهٔ سرویس پاس می‌دهیم؛ خودِ ZarinPalGateway.verify_payment
+            # تبدیل تومان→ریال (× ۱۰) را انجام می‌دهد (دقیقاً مثل مسیر آقای پرداخت).
+            # نکتهٔ مهم: اینجا نباید در ۱۰ ضرب شود، وگرنه مبلغ دوبار ضرب شده و
+            # ۱۰۰ برابر به زرین‌پال می‌رود و verify با خطای «مغایرت مبلغ» شکست می‌خورد.
+            amount_toman = int(float(transaction['amount']))
             
-            success, result_data = await payment_service.verify_payment(authority, amount_in_rials, "zarinpal", bot_id=bot_id)
+            success, result_data = await payment_service.verify_payment(authority, amount_toman, "zarinpal", bot_id=bot_id)
             
             if success:
                 await DatabaseManager.update_payment_status(authority, 'paid')

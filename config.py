@@ -261,6 +261,12 @@ class Config:
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
     # Web Server & Payment
+    # ⚠️ SERVER_URL باید آدرس عمومیِ قابل‌دسترس از اینترنت باشد (دامنه یا IP
+    # عمومی سرور + پورت منتشرشده)، چون درگاه پرداخت پس از پرداخت، کاربر را با
+    # همین آدرس (callback_url) ریدایرکت می‌کند. اگر روی مقدار پیش‌فرض
+    # localhost بماند، مرورگر کاربر به localhostِ خودش برمی‌گردد و کال‌بک هرگز
+    # به سرور نمی‌رسد → verify اجرا نمی‌شود و کیف پول شارژ نمی‌شود.
+    # نمونهٔ درست: https://your-domain.com  یا  http://SERVER_PUBLIC_IP:8080
     SERVER_URL = os.getenv('SERVER_URL', 'http://localhost:8080').rstrip('/')
     PORT = int(os.getenv('PORT', '8080'))
 
@@ -300,4 +306,21 @@ class Config:
 
         if errors:
             raise ValueError(f"خطای تنظیمات:\n" + "\n".join(f"- {e}" for e in errors))
+
+        # هشدار (نه خطای بلاک‌کننده) دربارهٔ SERVER_URL نامعتبر برای درگاه پرداخت.
+        # اگر روی localhost/127.0.0.1 مانده باشد، کال‌بک درگاه پرداخت هرگز به
+        # سرور نمی‌رسد و شارژ کیف پول انجام نمی‌شود.
+        try:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            _url = (cls.SERVER_URL or "").lower()
+            if ("localhost" in _url) or ("127.0.0.1" in _url) or (not _url):
+                _log.warning(
+                    "⚠️ SERVER_URL روی '%s' تنظیم شده است. برای کارکرد کال‌بک "
+                    "درگاه پرداخت (زرین‌پال/آقای پرداخت) باید آدرس عمومیِ سرور "
+                    "باشد؛ در غیر این صورت پس از پرداخت، کاربر به سرور بازنمی‌گردد "
+                    "و کیف پول شارژ نمی‌شود.", cls.SERVER_URL,
+                )
+        except Exception:
+            pass
         return True

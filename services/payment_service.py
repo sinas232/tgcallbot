@@ -105,6 +105,15 @@ class ZarinPalGateway(BasePaymentGateway):
         callback_url = Config.ZARINPAL_CALLBACK_URL
         amount_rial = amount * 10 
         
+        full_callback = f"{callback_url}?user_id={user_id}"
+        # لاگِ آدرس بازگشت تا در صورت مشکلِ «بازنگشتن به ربات» به‌راحتی قابل بررسی باشد.
+        logger.info(f"ZarinPal create: amount={amount} تومان ({amount_rial} ریال), callback_url={full_callback}")
+        if "localhost" in full_callback.lower() or "127.0.0.1" in full_callback.lower():
+            logger.warning(
+                "⚠️ callback_url زرین‌پال روی localhost است؛ کاربر پس از پرداخت به "
+                "سرور بازنمی‌گردد. متغیر محیطی SERVER_URL را به آدرس عمومی سرور تنظیم کنید."
+            )
+
         metadata = {}
         if mobile: metadata["mobile"] = mobile
         if email: metadata["email"] = email
@@ -114,7 +123,7 @@ class ZarinPalGateway(BasePaymentGateway):
             "amount": amount_rial,
             "currency": "IRR", 
             "description": f"شارژ کیف پول کاربر {user_id}",
-            "callback_url": f"{callback_url}?user_id={user_id}",
+            "callback_url": full_callback,
             "metadata": metadata
         }
         

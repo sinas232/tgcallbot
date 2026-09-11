@@ -110,6 +110,13 @@ TZ=Asia/Tehran
 
 # ── درگاه پرداخت (در صورت استفاده) ──
 ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+# ⚠️ آدرس عمومیِ سرور برای بازگشت کاربر از درگاه پرداخت (callback).
+# باید از اینترنت قابل‌دسترس باشد (دامنه یا IP عمومی + پورت منتشرشدهٔ 8080).
+# اگر تنظیم نشود، پیش‌فرض روی http://localhost:8080 می‌ماند و کاربر پس از
+# پرداخت به سرور بازنمی‌گردد و کیف پول شارژ نمی‌شود.
+# نمونه با دامنه (توصیه‌شده، همراه HTTPS):  SERVER_URL=https://your-domain.com
+# نمونه با IP عمومی:                        SERVER_URL=http://SERVER_PUBLIC_IP:8080
+SERVER_URL=https://your-domain.com
 
 # ── (اختیاری) کلید WARP+ اگر دارید ──
 # WARP_LICENSE_KEY=your_warp_plus_key
