@@ -29,8 +29,11 @@
 └────────────────────────────────────────────────────────────────┘
 ```
 
-ترافیک به `db` و `redis` چون روی subnet داخلی داکر است تونل نمی‌شود (مسیر
-مستقیم و اختصاصی‌تر است) و فقط ترافیک اینترنت عمومی از WARP عبور می‌کند.
+کل ترافیک اینترنتِ ربات از WARP عبور می‌کند. برای `db` و `redis` (که روی شبکهٔ
+داخلی داکر هستند) چون کانتینر warp، DNSِ داخلی داکر را دور می‌زند، به آن‌ها
+**IP ثابت** می‌دهیم و نامشان را در `/etc/hosts` کانتینر warp ثبت می‌کنیم؛ ربات
+که در فضای شبکهٔ warp اجرا می‌شود همان `/etc/hosts` را می‌بیند و بدون نیاز به
+DNS به دیتابیس/ردیس وصل می‌شود.
 
 ---
 
@@ -112,9 +115,9 @@ ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 # WARP_LICENSE_KEY=your_warp_plus_key
 ```
 
-> نکته: چون در روش WARP، سرویس `warp` هم روی همان شبکهٔ compose است، ربات
-> همچنان نام‌های `db` و `redis` را از طریق DNS داخلی داکر resolve می‌کند؛
-> پس مقادیر بالا را روی `db` / `redis` نگه دارید (نه `127.0.0.1`).
+> نکته: مقادیر `DATABASE_URL`/`REDIS_URL` را روی `db` / `redis` نگه دارید
+> (نه `127.0.0.1`). در روش WARP، این نام‌ها از طریق `/etc/hosts` کانتینر warp
+> (که به IP ثابت db/redis اشاره می‌کند) resolve می‌شوند.
 
 کلید رمزنگاری سشن را همین‌جا بسازید:
 
@@ -176,6 +179,34 @@ docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
 
 # صبر کنید تا کانتینر warp سالم (healthy) شود؛ ربات خودش منتظر می‌ماند.
 docker compose -f docker-compose.yml -f docker-compose.warp.yml ps
+```
+
+#### حالت «همیشه با WARP» (توصیه‌شده — تا هیچ‌وقت اشتباهی بدون WARP بالا نیاید)
+
+اگر می‌خواهید ربات **همیشه** با WARP اجرا شود و مجبور نباشید هر بار `-f` ها را
+دستی بزنید، در فایل `.env` این خط را اضافه کنید:
+
+```env
+COMPOSE_FILE=docker-compose.yml:docker-compose.warp.yml
+```
+
+از آن پس همهٔ دستورهای سادهٔ `docker compose` خودکار هر دو فایل را با هم اجرا می‌کنند:
+
+```bash
+cd ~/callmanager
+docker compose up -d --build      # خودکار = bridge + warp
+docker compose ps
+docker compose logs -f bot
+docker compose down
+```
+
+یا ساده‌تر، از اسکریپت آماده استفاده کنید (همیشه با WARP + بررسی سلامت تونل + تأیید warp=on):
+
+```bash
+cd ~/callmanager
+bash deploy-warp.sh          # بیلد + اجرا + تأیید عبور از WARP + لاگ
+bash deploy-warp.sh logs     # فقط دیدن لاگ
+bash deploy-warp.sh down     # توقف
 ```
 
 بررسی این‌که ترافیک واقعاً از WARP رد می‌شود:
