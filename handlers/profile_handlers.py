@@ -16,31 +16,21 @@ from handlers.admin_handlers import admin_panel_start
 
 logger = logging.getLogger(__name__)
 
-# 1. انتخاب اکانت (محدود به ربات فعلی)
+# 1. انتخاب اکانت (محدود به ربات فعلی) — لیست شیشه‌ای
 async def profile_settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from handlers.menu_handlers import build_account_picker
     bot_id = context.bot_data.get('bot_id', 1)
-    # ✅ دریافت اکانت‌های فعال همین ربات
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
-    
+
     if not accounts:
-        await send_safe(context.bot, update.effective_chat.id, "❌ **اکانتی موجود نیست.**")
+        await send_safe(context.bot, update.effective_chat.id, "❌ <b>اکانت فعالی موجود نیست.</b>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
-    
-    txt = "**🔧 تنظیمات پروفایل و استوری**\n\nلطفاً **ID اکانت** مورد نظر را وارد کنید:\n\n"
-    for acc in accounts:
-        phone = html.escape(str(acc.get('phone_number') or 'No Phone'))
-        status = html.escape(str(acc.get('account_status', 'unknown')).title())
-        name = html.escape(_display_name(acc))
-        spam_info = ''
-        if acc.get('spam_status') and acc.get('spam_status') != 'unknown':
-            spam_info = f" | ⛔️ {html.escape(str(acc['spam_status']))}"
-        txt += (
-            f"🆔 `{acc['id']}` | {name} | 📱 `{phone}`\n"
-            f"   وضعیت: <b>{status}</b>{spam_info} | bot_id: `{acc.get('bot_id',1)}`\n"
-        )
-        
-    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(BACK_KB, resize_keyboard=True))
-    return AWAITING_SELECT_ACCOUNT_FOR_PROFILE
+
+    txt = "🔧 <b>تنظیمات پروفایل و استوری</b>\n\n👇 اکانت موردنظر را برای ویرایش انتخاب کنید:"
+    kb = build_account_picker(accounts, pick_prefix="acc_edit_", page_prefix="profpage_", page=1, back_cb="acc_pickclose")
+    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    # کلیک روی هر دکمه، خودش از طریق entry point کالبک (acc_edit_) وارد گفتگو می‌شود
+    return ConversationHandler.END
 
 async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """ورود مستقیم به منوی ویرایش یک اکانت از طریق دکمهٔ شیشه‌ای «✏️ ویرایش» در لیست اکانت‌ها."""

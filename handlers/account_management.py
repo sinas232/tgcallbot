@@ -46,29 +46,20 @@ def _format_account_display(acc):
         spam_info = f" | ⛔️ {html.escape(str(acc['spam_status']))}"
     return name, phone, status, spam_info
 
-# --- دریافت کد ورود ---
+# --- دریافت کد ورود (لیست شیشه‌ای) ---
 async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from handlers.menu_handlers import build_account_picker
     bot_id = context.bot_data.get('bot_id', 1)
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
     if not accounts:
         await send_safe(context.bot, update.effective_chat.id, "❌ <b>هیچ اکانت فعالی در این ربات وجود ندارد.</b>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
-        
-    list_text = "📋 <b>لیست اکانت‌های موجود (جهت دریافت کد):</b>\n\n"
-    account_map = {}
-    for i, acc in enumerate(accounts):
-        row_num = i + 1
-        account_map[row_num] = acc['id']
-        name, phone, status, spam_info = _format_account_display(acc)
-        list_text += (
-            f"<b>{row_num}.</b> {name} | 📱 <code>{phone}</code> | وضعیت: <b>{status}</b>{spam_info} "
-            f"(ID: <code>{acc['id']}</code>)\n"
-        )
-    
-    context.user_data['account_map_code'] = account_map
-    await send_safe(context.bot, update.effective_chat.id, list_text, parse_mode=ParseMode.HTML)
-    await send_safe(context.bot, update.effective_chat.id, "📲 <b>شماره ردیف</b> یا <b>ID اکانت</b> مورد نظر را وارد کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True), parse_mode=ParseMode.HTML)
-    return AWAITING_GET_CODE_ACCOUNT
+
+    txt = "📩 <b>دریافت کد ورود</b>\n\n👇 اکانت موردنظر را انتخاب کنید تا آخرین کد/پیام ورود ارسال شود:"
+    kb = build_account_picker(accounts, pick_prefix="acc_getcode_", page_prefix="codepage_", page=1, back_cb="acc_pickclose")
+    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    # انتخاب از طریق کالبک acc_getcode_ انجام می‌شود (هندلر سراسری)
+    return ConversationHandler.END
 
 async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text

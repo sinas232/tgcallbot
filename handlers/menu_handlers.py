@@ -112,6 +112,36 @@ def _spam_icon(acc):
     return ""
 
 
+def build_account_picker(accounts, pick_prefix, page_prefix, page=1, per_page=8, back_cb=None):
+    """ساخت کیبورد شیشه‌ای انتخاب اکانت (با صفحه‌بندی) برای استفادهٔ مشترک در بخش‌های مختلف."""
+    total = len(accounts)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    chunk = accounts[start:start + per_page]
+
+    rows = []
+    for acc in chunk:
+        name = account_display_name(acc)
+        phone = str(acc.get('phone_number') or "")
+        label = f"{_status_icon(acc)}{_spam_icon(acc)} {name} • {phone}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"{pick_prefix}{acc['id']}")])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"{page_prefix}{page-1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"{page_prefix}{page+1}"))
+    if len(nav) > 1:
+        rows.append(nav)
+
+    if back_cb:
+        rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data=back_cb)])
+
+    return InlineKeyboardMarkup(rows)
+
+
 async def show_accounts_page(update, context, page=1, is_edit=False):
     """نمایش لیست اکانت‌ها به‌صورت دکمه‌های شیشه‌ای (هر اکانت = یک دکمه)."""
     limit = 8
@@ -174,6 +204,68 @@ async def show_accounts_page(update, context, page=1, is_edit=False):
             await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@require_admin
+async def profile_picker_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صفحه‌بندی لیست شیشه‌ای انتخاب اکانت در بخش تنظیمات پروفایل."""
+    query = update.callback_query
+    await query.answer()
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        page = int(query.data.split("_")[1])  # profpage_X
+    except Exception:
+        page = 1
+    accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
+    if not accounts:
+        try:
+            await query.edit_message_text("❌ اکانت فعالی موجود نیست.")
+        except Exception:
+            pass
+        return
+    kb = build_account_picker(accounts, pick_prefix="acc_edit_", page_prefix="profpage_", page=page, back_cb="acc_pickclose")
+    try:
+        await query.edit_message_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
+@require_admin
+async def getcode_picker_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """صفحه‌بندی لیست شیشه‌ای انتخاب اکانت در بخش دریافت کد ورود."""
+    query = update.callback_query
+    await query.answer()
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        page = int(query.data.split("_")[1])  # codepage_X
+    except Exception:
+        page = 1
+    accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
+    if not accounts:
+        try:
+            await query.edit_message_text("❌ اکانت فعالی موجود نیست.")
+        except Exception:
+            pass
+        return
+    kb = build_account_picker(accounts, pick_prefix="acc_getcode_", page_prefix="codepage_", page=page, back_cb="acc_pickclose")
+    try:
+        await query.edit_message_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
+@require_admin
+async def account_picker_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بستن لیست شیشه‌ای انتخاب اکانت."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.delete_message()
+    except Exception:
+        try:
+            await query.edit_message_text("✅ بسته شد.")
+        except Exception:
+            pass
 
 
 @require_admin
