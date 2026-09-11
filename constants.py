@@ -63,6 +63,7 @@ AWAITING_ACCOUNT_ID_DELETE = 71
 AWAITING_GET_CODE_ACCOUNT = 72
 AWAITING_LEAVE_ALL_CONFIRM = 73  # وضعیت جدید برای تایید خروج همگانی
 AWAITING_ACCOUNT_MENU = 74  # منوی اصلی مدیریت اکانت‌ها
+AWAITING_INCALL_TEXT = 79   # دریافت متن پیام درون ویس‌کال
 
 AWAITING_PRIVACY_CHOICE = 80
 AWAITING_PRIVACY_VALUE = 81
@@ -169,10 +170,13 @@ PLAN_MANAGEMENT_MENU = [
 PLAN_TYPES_MENU = [["🎙 ویس‌کال", "👥 عضویت گروه"], ["📢 عضویت کانال", BTN_CANCEL]]
 USER_MANAGEMENT_MENU = [["🔎 جستجوی کاربر (پیشرفته)", "➕ افزودن ادمین جدید"], ["➖ حذف ادمین", "📋 لیست ادمین‌ها"], [BTN_BACK]]
 
+BTN_INCALL_MSG = "💬 پیام/ری‌اکشن در ویس‌کال"
+
 ACCOUNT_MENU = [
     ["➕ افزودن اکانت (شماره)", "📥 افزودن با سشن (String)"], 
     ["📋 لیست اکانت‌ها", "📩 دریافت کد ورود"], 
     ["🔧 تنظیمات پروفایل", "❌ حذف اکانت"],
+    [BTN_INCALL_MSG],  # پیام/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام)
     [BTN_LEAVE_ALL_CHATS], # دکمه خروج همگانی
     [BTN_BACK]
 ]

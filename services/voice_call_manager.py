@@ -951,6 +951,97 @@ class VoiceCallManager:
         self._active_call_cache.pop(int(chat_id), None)
         self._chat_info_cache.pop(int(chat_id), None)
 
+    # ─── IN-CALL MESSAGES & REACTIONS (Telegram Layer 216+) ─────────────
+    #
+    # قابلیت جدید تلگرام (اکتبر ۲۰۲۵): شرکت‌کنندگان ویس‌کال می‌توانند در محیط
+    # خود تماس پیام یا ری‌اکشن اموجی بفرستند. متد MTProto مربوطه
+    # `phone.sendGroupCallMessage` است که از Layer 216 اضافه شده.
+    #
+    # نکتهٔ سازگاری: اگر نسخهٔ نصب‌شدهٔ Pyrogram این متد را در اسکیمای raw
+    # نداشته باشد (نسخه‌های قدیمی‌تر از پشتیبانی Layer 216)، این تابع بدون
+    # کرش، پیام خطای واضح برمی‌گرداند تا لایهٔ بالاتر به ادمین اطلاع دهد.
+
+    @staticmethod
+    def _incall_messages_supported() -> bool:
+        """آیا نسخهٔ نصب‌شدهٔ Pyrogram از پیام درون‌تماس پشتیبانی می‌کند؟"""
+        return hasattr(functions.phone, "SendGroupCallMessage")
+
+    async def send_incall_message(self, account_id: int, chat_id: int,
+                                  text: str = "", reaction_emoji: str = "") -> Tuple[bool, str]:
+        """ارسال پیام یا ری‌اکشن اموجی در محیط ویس‌کال با استفاده از اکانتی که
+        هم‌اکنون در همان تماس حاضر است.
+
+        - text: متن پیام درون‌تماس (اگر reaction_emoji خالی باشد).
+        - reaction_emoji: یک اموجی استاندارد؛ اگر پر باشد به‌صورت ری‌اکشن
+          انیمیشنی ارسال می‌شود (طبق مستندات تلگرام، پیامی که فقط شامل یک
+          اموجی ری‌اکشن است، به‌صورت افکت انیمیشنی نمایش داده می‌شود).
+
+        خروجی: (موفقیت, پیام وضعیت)
+        """
+        if not self._incall_messages_supported():
+            return False, (
+                "نسخهٔ فعلی کتابخانهٔ Pyrogram از «پیام/ری‌اکشن درون ویس‌کال» "
+                "پشتیبانی نمی‌کند (نیازمند پشتیبانی Layer 216 تلگرام). برای "
+                "فعال‌سازی باید Pyrogram به نسخه‌ای که این قابلیت را دارد ارتقا یابد."
+            )
+
+        app = self.pyrogram_clients.get(account_id)
+        if not app:
+            return False, "اکانت انتخاب‌شده هم‌اکنون در هیچ ویس‌کالی حاضر و متصل نیست."
+
+        payload = (reaction_emoji or text or "").strip()
+        if not payload:
+            return False, "متن یا اموجی خالی است."
+
+        try:
+            call = await self._get_cached_group_call(app, int(chat_id))
+            if not call:
+                return False, "در این چت ویس‌کال فعالی یافت نشد."
+
+            # ساخت متن استایل‌دار طبق اسکیمای Layer 216
+            msg_obj = payload
+            try:
+                # برخی نسخه‌ها TextWithEntities را لازم دارند
+                if hasattr(types, "TextWithEntities"):
+                    msg_obj = types.TextWithEntities(text=payload, entities=[])
+            except Exception:
+                msg_obj = payload
+
+            SendFn = getattr(functions.phone, "SendGroupCallMessage")
+            try:
+                req = SendFn(call=call, message=msg_obj, random_id=self._rand_id())
+            except TypeError:
+                # امضای متد ممکن است اندکی متفاوت باشد
+                req = SendFn(call=call, message=payload)
+
+            await app.invoke(req)
+            kind = "ری‌اکشن" if reaction_emoji else "پیام"
+            return True, f"✅ {kind} با موفقیت در ویس‌کال ارسال شد."
+        except Exception as e:
+            logger.warning("send_incall_message failed acc=%s chat=%s: %s", account_id, chat_id, e)
+            return False, f"❌ خطا در ارسال: {e}"
+
+    @staticmethod
+    def _rand_id() -> int:
+        import random
+        return random.randint(-(2**31), 2**31 - 1)
+
+    def get_active_call_accounts(self) -> List[Dict]:
+        """فهرست اکانت‌هایی که هم‌اکنون در ویس‌کال حاضر و متصل‌اند
+        (برای استفاده در منوی ارسال پیام/ری‌اکشن درون‌تماس).
+
+        هر آیتم: {account_id, chat_id, order_id}
+        """
+        out = []
+        for (order_id, account_id), rec in self.active_calls.items():
+            if account_id in self.pyrogram_clients:
+                out.append({
+                    "account_id": account_id,
+                    "chat_id": rec.get("chat_id"),
+                    "order_id": order_id,
+                })
+        return out
+
     def _account_in_any_order(self, account_id: int) -> bool:
         return any(aid == account_id for (oid, aid) in self.active_calls.keys())
 

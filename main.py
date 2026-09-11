@@ -74,6 +74,11 @@ from handlers.menu_handlers import *
 from handlers.account_management import *
 from handlers.wallet_handlers import *
 from handlers.profile_handlers import *
+from handlers.incall_handlers import (
+    incall_start, incall_pick_callback, incall_react_callback,
+    incall_text_callback, incall_receive_text, incall_backlist_callback,
+    incall_close_callback,
+)
 from handlers.kyc_handlers import *
 # ایمپورت هندلرهای تیکتینگ
 from handlers.ticket_handlers import (
@@ -580,6 +585,42 @@ def register_handlers(application: Application) -> None:
         await start_command(update, context)
         return ConversationHandler.END
 
+    async def global_back_safety_net(update, context):
+        """شبکه ایمنی سراسری برای دکمه‌های بازگشت.
+
+        وقتی کاربر در منویی است که هیچ مکالمه‌ای فعال نیست (مثلاً منوی
+        «مدیریت اکانت‌های ربات» که بعد از پایان مکالمهٔ ادمین نمایش داده
+        می‌شود) و دکمهٔ بازگشت را می‌زند، این هندلر آن را می‌گیرد و به منوی
+        مناسب برمی‌گرداند. چون در گروه ۰ و پس از تمام مکالمه‌ها ثبت می‌شود،
+        فقط زمانی اجرا می‌شود که هیچ مکالمهٔ فعالی این آپدیت را مصرف نکرده
+        باشد (مکالمه‌های فعال، بازگشت را از طریق fallback خودشان می‌گیرند).
+        """
+        text = (update.message.text if update.message else "") or ""
+        context.user_data.clear()
+        user = update.effective_user
+        if not user:
+            return
+        bot_id = context.bot_data.get('bot_id', 1)
+
+        # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
+        if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
+            return await start_command(update, context)
+
+        # تشخیص ادمین بودن
+        is_admin = user.id in Config.ADMIN_IDS
+        if not is_admin:
+            try:
+                db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+                is_admin = bool(db_user and db_user.get('is_admin'))
+            except Exception:
+                is_admin = False
+
+        # منوهای دارای دکمهٔ بازگشتِ بی‌مکالمه، همگی متعلق به بخش ادمین‌اند
+        if is_admin:
+            from handlers.admin_handlers import admin_panel_start
+            return await admin_panel_start(update, context)
+        return await start_command(update, context)
+
     STANDARD_FALLBACKS = [
         CommandHandler("start", start_command),
         CommandHandler("cancel", start_command),
@@ -695,6 +736,8 @@ def register_handlers(application: Application) -> None:
                 # آمار
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
+                # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
             ],
             
@@ -833,6 +876,29 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(prof_conv)
 
+    # --- 6.5 پیام/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام) ---
+    # گفتگو فقط برای مرحلهٔ دریافت متن پیام است؛ انتخاب اکانت و ری‌اکشن‌ها
+    # بدون‌حالت (stateless) و از طریق کالبک‌های سراسری انجام می‌شوند.
+    incall_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(incall_text_callback, pattern=r"^incall_text$"),
+        ],
+        states={
+            AWAITING_INCALL_TEXT: [MessageHandler(STD_TEXT, incall_receive_text)],
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="incall", persistent=True,
+        per_chat=True, per_user=True, per_message=False
+    )
+    application.add_handler(incall_conv)
+
+    # ورود به بخش (دکمهٔ منو) + کالبک‌های بدون‌حالت پیام/ری‌اکشن درون ویس‌کال
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_INCALL_MSG}$"), incall_start), group=0)
+    application.add_handler(CallbackQueryHandler(incall_pick_callback, pattern=r"^incall_pick_\d+_-?\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_react_callback, pattern=r"^incall_react_"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_backlist_callback, pattern=r"^incall_backlist$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_close_callback, pattern=r"^incall_close$"), group=0)
+
     # --- 7. خرید سرویس ---
     buy_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start)],
@@ -866,6 +932,16 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"), group=0)
     application.add_handler(CallbackQueryHandler(handle_order_history_callback, pattern="^history_"), group=0)
     application.add_handler(CallbackQueryHandler(handle_back_to_history_menu, pattern="^back_to_history_menu"), group=0)
+
+    # 🔙 شبکهٔ ایمنی سراسری دکمه‌های بازگشت.
+    # در گروه ۰ و پس از همهٔ ConversationHandlerها ثبت می‌شود؛ چون در هر گروه
+    # فقط اولین هندلرِ منطبق اجرا می‌شود، مکالمه‌های فعال (که زودتر ثبت شده‌اند)
+    # اولویت دارند و این هندلر فقط زمانی اجرا می‌شود که هیچ مکالمه‌ای این
+    # آپدیت را مصرف نکرده باشد (یعنی دکمهٔ بازگشتِ منویِ بی‌مکالمه).
+    application.add_handler(
+        MessageHandler(FILTER_BACK | filters.Regex(REGEX_MAIN_MENU) | filters.Regex(f"^{BTN_EXIT_ADMIN}$"), global_back_safety_net),
+        group=0,
+    )
 
     # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
     application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
