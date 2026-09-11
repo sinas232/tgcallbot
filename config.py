@@ -321,6 +321,15 @@ class Config:
                     "باشد؛ در غیر این صورت پس از پرداخت، کاربر به سرور بازنمی‌گردد "
                     "و کیف پول شارژ نمی‌شود.", cls.SERVER_URL,
                 )
+            # هشدار merchant_id خالی/پیش‌فرض زرین‌پال (بدون آن، درخواست پرداخت
+            # ساخته نمی‌شود). merchant_id واقعی از پنل زرین‌پال گرفته می‌شود.
+            _mid = (cls.ZARINPAL_MERCHANT or "").strip()
+            if (not _mid) or _mid.startswith("xxxx"):
+                _log.warning(
+                    "⚠️ ZARINPAL_MERCHANT تنظیم نشده است (مقدار فعلی: '%s'). "
+                    "بدون شناسهٔ پذیرندهٔ معتبر (merchant_id)، درگاه زرین‌پال "
+                    "لینک پرداخت نمی‌سازد.", cls.ZARINPAL_MERCHANT,
+                )
         except Exception:
             pass
         return True

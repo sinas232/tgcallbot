@@ -319,9 +319,25 @@ async def zp_callback_handler(request):
         logger.error(f"ZP Callback Error: {e}")
         return web.Response(text="Internal Error", status=500)
 
+async def health_handler(request):
+    """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
+    اگر این آدرس را در مرورگر باز کردید و 'ok' دیدید، یعنی دامنه/پورت شما
+    درست به این سرور اشاره می‌کند و کال‌بک درگاه پرداخت هم به سرور خواهد رسید."""
+    return web.Response(
+        text=(
+            "ok - callback server is reachable\n"
+            f"SERVER_URL={Config.SERVER_URL}\n"
+            f"zarinpal_callback={Config.ZARINPAL_CALLBACK_URL}\n"
+            f"aqayepardakht_callback={Config.AGHAYE_PARDAKHT_CALLBACK_URL}\n"
+        ),
+        content_type='text/plain',
+    )
+
 async def start_web_server():
     """راه‌اندازی وب‌سرور aiohttp"""
     app = web.Application()
+    app.router.add_get('/', health_handler)
+    app.router.add_get('/health', health_handler)
     app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
     app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
     
