@@ -41,12 +41,15 @@ class Config:
 
     # ── Outbound SOCKS5 proxy for the voice Pyrogram/PyTgCalls clients ──
     # When USE_PROXY is truthy, every voice account's Pyrogram Client (and the
-    # PyTgCalls engine that rides on it) connects through this SOCKS5 proxy —
-    # e.g. a local Cloudflare WARP proxy on 127.0.0.1:4000. Leaving it off
-    # (default) keeps the direct connection behaviour unchanged.
+    # PyTgCalls engine that rides on it) connects through this SOCKS5 proxy.
+    # In the always-WARP compose the bot runs with network_mode: service:warp,
+    # so it SHARES the warp container's network namespace — the warp SOCKS5
+    # proxy is therefore reachable on 127.0.0.1:1080 (NOT the container name,
+    # which does not resolve inside a shared netns; and port 1080 is what the
+    # caomingjun/warp image listens on, not 4000).
     USE_PROXY = os.getenv('USE_PROXY', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
     SOCKS5_HOST = os.getenv('SOCKS5_HOST', '127.0.0.1')
-    SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', '4000') or 4000)
+    SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', '1080') or 1080)
     SOCKS5_USERNAME = os.getenv('SOCKS5_USERNAME', '') or None
     SOCKS5_PASSWORD = os.getenv('SOCKS5_PASSWORD', '') or None
 

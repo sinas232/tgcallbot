@@ -75,6 +75,13 @@ services:
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}
+      # کلاینت‌های ویس از پروکسی SOCKS5 کانتینر warp رد می‌شوند. چون bot با
+      # network_mode: service:warp اجرا می‌شود، پروکسی warp روی 127.0.0.1:1080
+      # در دسترس است (نه با نام کانتینر، که در namespace مشترک resolve نمی‌شود).
+      # مقادیر .env در صورت وجود این‌ها را override می‌کنند.
+      - USE_PROXY=${USE_PROXY:-true}
+      - SOCKS5_HOST=${SOCKS5_HOST:-127.0.0.1}
+      - SOCKS5_PORT=${SOCKS5_PORT:-1080}
     env_file:
       - path: .env
         required: false

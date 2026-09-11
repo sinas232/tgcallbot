@@ -114,11 +114,14 @@ ZARINPAL_MERCHANT=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 # ── (اختیاری) کلید WARP+ اگر دارید ──
 # WARP_LICENSE_KEY=your_warp_plus_key
 
-# ── (اختیاری) پروکسی SOCKS5 برای کلاینت‌های ویس (مثلاً WARP در حالت proxy) ──
-# اگر می‌خواهید ترافیک Pyrogram/PyTgCalls از یک پروکسی SOCKS5 رد شود:
+# ── پروکسی SOCKS5 برای کلاینت‌های ویس (از کانتینر warp) ──
+# در حالت همیشه-با-WARP، ربات با network_mode: service:warp اجرا می‌شود و
+# پروکسی SOCKS5 کانتینر warp روی 127.0.0.1:1080 در دسترس است (نه با نام
+# کانتینر، و پورت 1080 است نه 4000). این مقادیر در docker-compose.yml هم
+# پیش‌فرض ست شده‌اند؛ فقط اگر خواستید override کنید اینجا بگذارید:
 # USE_PROXY=true
 # SOCKS5_HOST=127.0.0.1
-# SOCKS5_PORT=4000
+# SOCKS5_PORT=1080
 # SOCKS5_USERNAME=          # در صورت نیاز
 # SOCKS5_PASSWORD=          # در صورت نیاز
 
