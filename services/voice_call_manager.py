@@ -930,15 +930,18 @@ class VoiceCallManager:
         self._chat_info_put(chat_id, peer, cached[1] if cached else None)
         return peer
 
-    async def _get_cached_group_call(self, app: Client, chat_id: int) -> object:
+    async def _get_cached_group_call(self, app: Client, chat_id: int, force_refresh: bool = False) -> object:
         """Get the active group-call object for a chat, cached & shared.
 
         Returns the raw InputGroupCall, or None when there is no active call.
+        با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
+        گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
         """
         chat_id = int(chat_id)
-        cached = self._chat_info_get(chat_id)
-        if cached and cached[1] is not None:
-            return cached[1]
+        if not force_refresh:
+            cached = self._chat_info_get(chat_id)
+            if cached and cached[1] is not None:
+                return cached[1]
         peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
@@ -993,41 +996,64 @@ class VoiceCallManager:
         if not payload:
             return False, "متن یا اموجی خالی است."
 
-        try:
-            call = await self._get_cached_group_call(app, int(chat_id))
-            if not call:
-                return False, "در این چت ویس‌کال فعالی یافت نشد."
+        # اسکیمای دقیق (Layer 216+):
+        #   phone.sendGroupCallMessage call:InputGroupCall random_id:long
+        #       message:TextWithEntities ...  = Updates
+        # پس message باید حتماً TextWithEntities باشد.
+        if hasattr(types, "TextWithEntities"):
+            msg_obj = types.TextWithEntities(text=payload, entities=[])
+        else:
+            msg_obj = payload
 
-            # اسکیمای دقیق (Layer 216+):
-            #   phone.sendGroupCallMessage call:InputGroupCall random_id:long
-            #       message:TextWithEntities ...  = Updates
-            # پس message باید حتماً TextWithEntities باشد.
-            if hasattr(types, "TextWithEntities"):
-                msg_obj = types.TextWithEntities(text=payload, entities=[])
-            else:
-                msg_obj = payload
+        SendFn = getattr(functions.phone, "SendGroupCallMessage")
 
-            SendFn = getattr(functions.phone, "SendGroupCallMessage")
-            req = None
+        def _build_req(call_obj):
             for kwargs in (
-                {"call": call, "random_id": self._rand_id(), "message": msg_obj},
-                {"call": call, "message": msg_obj, "random_id": self._rand_id()},
-                {"call": call, "message": msg_obj},
+                {"call": call_obj, "random_id": self._rand_id(), "message": msg_obj},
+                {"call": call_obj, "message": msg_obj, "random_id": self._rand_id()},
+                {"call": call_obj, "message": msg_obj},
             ):
                 try:
-                    req = SendFn(**kwargs)
-                    break
+                    return SendFn(**kwargs)
                 except TypeError:
                     continue
-            if req is None:
-                req = SendFn(call=call, message=payload)
+            return SendFn(call=call_obj, message=payload)
 
-            await app.invoke(req)
-            kind = "ری‌اکشن" if reaction_emoji else "پیام"
-            return True, f"✅ {kind} با موفقیت در ویس‌کال ارسال شد."
-        except Exception as e:
-            logger.warning("send_incall_message failed acc=%s chat=%s: %s", account_id, chat_id, e)
-            return False, f"❌ خطا در ارسال: {e}"
+        kind = "ری‌اکشن" if reaction_emoji else "پیام"
+
+        # تلاش اول با مرجع کش‌شده؛ در صورت خطای GROUPCALL_INVALID/کهنه بودن
+        # مرجع، کش را پاک کرده و یک بار با مرجعِ تازه دوباره تلاش می‌کنیم.
+        last_err = None
+        for attempt in range(2):
+            force = attempt == 1
+            try:
+                call = await self._get_cached_group_call(app, int(chat_id), force_refresh=force)
+                if not call:
+                    if attempt == 0:
+                        self._clear_chat_cache(int(chat_id))
+                        continue
+                    return False, "در این چت ویس‌کال فعالی یافت نشد (تماس بسته شده است)."
+                await app.invoke(_build_req(call))
+                return True, f"✅ {kind} با موفقیت در ویس‌کال ارسال شد."
+            except Exception as e:
+                last_err = e
+                msg = str(e).upper()
+                stale = ("GROUPCALL_INVALID" in msg or "GROUPCALL_FORBIDDEN" in msg
+                         or "GROUPCALL_JOIN_MISSING" in msg)
+                if attempt == 0 and stale:
+                    # مرجع تماس کهنه است → کش را پاک کن و با مرجع تازه دوباره امتحان کن
+                    self._clear_chat_cache(int(chat_id))
+                    continue
+                break
+
+        e = last_err
+        logger.warning("send_incall_message failed acc=%s chat=%s: %s", account_id, chat_id, e)
+        emsg = str(e)
+        if "GROUPCALL_JOIN_MISSING" in emsg.upper():
+            return False, "❌ این اکانت هنوز به‌طور کامل به تماس نپیوسته است."
+        if "GROUPCALL_INVALID" in emsg.upper():
+            return False, "❌ ویس‌کال معتبر نیست یا بازنشانی شده؛ چند لحظه بعد دوباره امتحان کنید."
+        return False, f"❌ خطا در ارسال: {emsg}"
 
     @staticmethod
     def _rand_id() -> int:
