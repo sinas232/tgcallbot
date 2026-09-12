@@ -306,6 +306,45 @@ class Config:
     ZARINPAL_MERCHANT_ID = ZARINPAL_MERCHANT
     ZARINPAL_CALLBACK_URL = f"{SERVER_URL}/payment/callback/zarinpal"
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  ایموجی پریمیوم (Custom Emoji) — Bot API 9.4 (۹ فوریهٔ ۲۰۲۶)
+    # ═══════════════════════════════════════════════════════════════════
+    # اگر اکانتِ «مالکِ ربات» (همان اکانتی که ربات را در BotFather ساخته)
+    # اشتراک Telegram Premium داشته باشد، ربات می‌تواند ایموجی سفارشی/پریمیوم
+    # را در متن پیام‌ها و به‌عنوان آیکونِ دکمه‌ها استفاده کند.
+    #
+    # این لایه کاملاً «خودکار و بی‌خطر» است:
+    #   * شناسه‌ها در استارت با getCustomEmojiStickers اعتبارسنجی می‌شوند و
+    #     شناسهٔ نامعتبر خودکار حذف می‌شود (ایموجی یونیکد جایگزین می‌شود).
+    #   * اگر تلگرام پیامِ ارتقایافته را نپذیرد (مثلاً در کانال)، همان پیام
+    #     بلافاصله بدون ایموجی پریمیوم ارسال می‌شود (fallback خودکار).
+    # راهنمای کامل: docs/premium-emoji.fa.md
+    PREMIUM_EMOJI_ENABLED = os.getenv('PREMIUM_EMOJI_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ارتقای ایموجی‌های داخل متن پیام‌ها (HTML → <tg-emoji>، متن ساده → entity)
+    PREMIUM_EMOJI_TEXT = os.getenv('PREMIUM_EMOJI_TEXT', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # آیکون پریمیوم روی دکمه‌های inline (icon_custom_emoji_id)
+    PREMIUM_EMOJI_BUTTONS = os.getenv('PREMIUM_EMOJI_BUTTONS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # آیکون پریمیوم روی دکمه‌های کیبورد اصلی (reply keyboard). چون متنِ این
+    # دکمه‌ها همان چیزی است که کاربر می‌فرستد، برچسبِ حذف‌شده در یک لایهٔ
+    # بازگردانی (alias) ذخیره می‌شود تا filters.Regex های موجود نشکنند.
+    PREMIUM_EMOJI_REPLY_BUTTONS = os.getenv('PREMIUM_EMOJI_REPLY_BUTTONS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ایموجیِ چسبیده به انتهای متن دکمه (مثل «عضو شدم ✅») هم به آیکون تبدیل شود؟
+    PREMIUM_EMOJI_TRAILING_ICONS = os.getenv('PREMIUM_EMOJI_TRAILING_ICONS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # پیام‌های Markdown قدیمی به HTML تبدیل شوند تا ایموجی پریمیوم بگیرند؟
+    PREMIUM_EMOJI_MARKDOWN_TO_HTML = os.getenv('PREMIUM_EMOJI_MARKDOWN_TO_HTML', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # اعتبارسنجی شناسه‌ها در زمان استارت (یک فراخوانی API به ازای هر ۲۰۰ شناسه)
+    PREMIUM_EMOJI_VALIDATE = os.getenv('PREMIUM_EMOJI_VALIDATE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # کانال‌ها ایموجی سفارشی را نمی‌پذیرند؛ بدون تلاش، رد می‌شوند.
+    PREMIUM_EMOJI_SKIP_CHANNELS = os.getenv('PREMIUM_EMOJI_SKIP_CHANNELS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # سقف ایموجی در هر پیام (تلگرام حداکثر ۱۰۰ entity می‌پذیرد)
+    PREMIUM_EMOJI_MAX_PER_MESSAGE = int(os.getenv('PREMIUM_EMOJI_MAX_PER_MESSAGE', '90'))
+    # اگر true باشد شناسه‌ای که ایموجی واقعی‌اش با انتظار بسته نمی‌خواند هم حذف می‌شود
+    PREMIUM_EMOJI_STRICT_MATCH = os.getenv('PREMIUM_EMOJI_STRICT_MATCH', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    # جایگزینی/افزودن شناسه‌ها، با JSON یا فرمت ساده:
+    #   PREMIUM_EMOJI_OVERRIDES={"rocket":"5389102131527556772","🚀":"5389102131527556772"}
+    #   PREMIUM_EMOJI_OVERRIDES=rocket=5389102131527556772,🚀=5389102131527556772
+    PREMIUM_EMOJI_OVERRIDES = os.getenv('PREMIUM_EMOJI_OVERRIDES', '')
+
     @classmethod
     def get_normalized_database_url(cls) -> str:
         return cls.DATABASE_URL or ""

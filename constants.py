@@ -3,6 +3,9 @@ constants.py
 شامل تمامی وضعیت‌های ConversationHandler و متن دکمه‌ها
 """
 
+# نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
+BOT_VERSION = "2.1.0"
+
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
 
@@ -110,6 +113,9 @@ AWAITING_RESTORE_FILE = 210
 AWAITING_BACKUP_CHANNEL = 211
 AWAITING_BACKUP_INTERVAL = 212
 
+# 💎 وضعیت‌های ایموجی پریمیوم (جایگزینی شناسهٔ ایموجی توسط ادمین)
+AWAITING_PREMIUM_EMOJI_OVERRIDE = 220
+
 # ===================== BUTTONS =====================
 
 BTN_BACK = "🔙 بازگشت"
@@ -118,6 +124,7 @@ BTN_BACK_MAIN = "بازگشت به منوی اصلی"
 BTN_EXIT_ADMIN = "🔙 خروج از پنل ادمین"
 BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضافه شد
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
+BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
 
 REGEX_BACK = r".*بازگشت.*" 
 REGEX_CANCEL = r".*انصراف.*"
@@ -151,7 +158,8 @@ ADMIN_SETTINGS_MENU = [
     ["📝 تنظیم متن پشتیبانی", "📝 تنظیم متن استارت"],
     ["🆔 تنظیم کانال‌های لاگ", "🆔 متن احراز هویت"],
     ["🤖 مدیریت نمایندگی‌ها", "🩺 تنظیمات بررسی سلامت"],
-    ["📊 گزارش کلی", BTN_BACK]
+    [BTN_PREMIUM_EMOJI, "📊 گزارش کلی"],
+    [BTN_BACK]
 ]
 
 SECURITY_SETTINGS_MENU = [
