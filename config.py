@@ -153,6 +153,21 @@ class Config:
     # bounds concurrency so we never dump the whole batch on Telegram at once.
     INCALL_SEND_MAX_CONCURRENCY = int(os.getenv('INCALL_SEND_MAX_CONCURRENCY', '3'))
 
+    # ── ORDER END / CANCEL LEAVE PACING (anti-burst mass-exit) ────────────
+    # When an order finishes or is cancelled, accounts MUST NOT all leave the
+    # voice chat / group in the same millisecond — that looks like a bot dump
+    # and can trip FloodWait / account limits.  Each leave starts
+    # VOICE_LEAVE_STAGGER_MIN..MAX seconds after the previous one, with a hard
+    # ceiling on concurrent leave RPCs (LeaveGroupCall + leave_chat).
+    # Defaults ~0.8–1.5s gap and max 2 concurrent leaves — finishes a 50-acc
+    # order in ~40–75s without a burst.  Raise the gap if Telegram floods.
+    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '0.8'))
+    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '1.5'))
+    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '2'))
+    # Extra human-like jitter on top of the base leave gap (seconds).
+    VOICE_LEAVE_JITTER_MIN = float(os.getenv('VOICE_LEAVE_JITTER_MIN', '0.0'))
+    VOICE_LEAVE_JITTER_MAX = float(os.getenv('VOICE_LEAVE_JITTER_MAX', '0.4'))
+
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -340,6 +355,8 @@ class Config:
     PREMIUM_EMOJI_MAX_PER_MESSAGE = int(os.getenv('PREMIUM_EMOJI_MAX_PER_MESSAGE', '90'))
     # اگر true باشد شناسه‌ای که ایموجی واقعی‌اش با انتظار بسته نمی‌خواند هم حذف می‌شود
     PREMIUM_EMOJI_STRICT_MATCH = os.getenv('PREMIUM_EMOJI_STRICT_MATCH', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    # رنگ‌آمیزی خودکار دکمه‌ها (سبز=تایید، قرمز=حذف/انصراف، آبی=اصلی) — Bot API 9.4
+    PREMIUM_EMOJI_COLORED_BUTTONS = os.getenv('PREMIUM_EMOJI_COLORED_BUTTONS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # جایگزینی/افزودن شناسه‌ها، با JSON یا فرمت ساده:
     #   PREMIUM_EMOJI_OVERRIDES={"rocket":"5389102131527556772","🚀":"5389102131527556772"}
     #   PREMIUM_EMOJI_OVERRIDES=rocket=5389102131527556772,🚀=5389102131527556772

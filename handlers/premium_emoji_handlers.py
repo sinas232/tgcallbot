@@ -55,7 +55,13 @@ _CB = "premoji_"
 def _toggle_button(label: str, enabled: bool, action: str) -> InlineKeyboardButton:
     icon = "✅" if enabled else "⛔"
     state = "روشن" if enabled else "خاموش"
-    return InlineKeyboardButton(f"{icon} {label}: {state}", callback_data=f"{_CB}{action}")
+    # سبز وقتی روشن، قرمز وقتی خاموش — تشخیص بصری فوری
+    style = "success" if enabled else "danger"
+    return InlineKeyboardButton(
+        f"{icon} {label}: {state}",
+        callback_data=f"{_CB}{action}",
+        style=style,
+    )
 
 
 def _menu_keyboard() -> InlineKeyboardMarkup:
@@ -69,28 +75,34 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
             _toggle_button("کل قابلیت", premium_emoji.enabled, "toggle_master"),
         ],
         [
-            InlineKeyboardButton("🧪 پیام تست", callback_data=f"{_CB}test"),
-            InlineKeyboardButton("📋 پیش‌نمایش بسته", callback_data=f"{_CB}preview"),
+            InlineKeyboardButton("🧪 پیام تست", callback_data=f"{_CB}test", style="primary"),
+            InlineKeyboardButton("📋 پیش‌نمایش بسته", callback_data=f"{_CB}preview", style="primary"),
         ],
         [
-            InlineKeyboardButton("🔄 اعتبارسنجی شناسه‌ها", callback_data=f"{_CB}validate"),
+            InlineKeyboardButton("🔄 اعتبارسنجی شناسه‌ها", callback_data=f"{_CB}validate", style="primary"),
             InlineKeyboardButton("🔧 جایگزینی شناسه", callback_data=f"{_CB}override"),
         ],
-        [InlineKeyboardButton("🛜 کشف از اکانت (MTProto)", callback_data=f"{_CB}sync")],
+        [InlineKeyboardButton("🛜 کشف از اکانت (MTProto)", callback_data=f"{_CB}sync", style="primary")],
+        [InlineKeyboardButton("♻️ بازنشانی چت‌های مسدود", callback_data=f"{_CB}reset_chats")],
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data=f"{_CB}back")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
 def _header() -> str:
+    from utils.premium_emoji import blockquote, divider
+
+    tip = (
+        "شرط لازم: اکانتِ <b>مالک ربات</b> در BotFather باید "
+        "<b>Telegram Premium</b> داشته باشد. دکمه‌های رنگی (سبز/قرمز/آبی) "
+        "و آیکون پریمیوم روی همهٔ منوها خودکار اعمال می‌شود."
+    )
     return (
-        f"{pe('gem')} <b>ایموجی پریمیوم تلگرام</b> <code>v{BOT_VERSION}</code>\n\n"
-        "از Bot API 9.4 اگر <b>اکانتِ مالکِ ربات</b> اشتراک Telegram Premium\n"
-        "داشته باشد، ربات می‌تواند در متن پیام‌ها ایموجی سفارشی بفرستد و روی\n"
-        "دکمه‌ها آیکون پریمیوم بگذارد.\n\n"
-        "این لایه روی <b>همهٔ</b> خروجی‌های ربات فعال است: منوها، گزارش‌ها،\n"
-        "پاسخ تیکت، پیام همگانی و پیام خصوصی — و اگر کاربری خودش ایموجی\n"
-        "پریمیوم بفرستد، ربات همان را سالم بازنشر می‌کند.\n"
+        f"{pe('gem')} <b>ایموجی پریمیوم و UI رنگی</b> <code>v{BOT_VERSION}</code>\n"
+        f"{divider()}\n"
+        f"{blockquote(tip)}\n\n"
+        f"{pe('stars')} لایه روی <b>همه</b> خروجی‌هاست: "
+        "منو · گزارش · تیکت · پیام همگانی · دکمه‌های شیشه‌ای\n"
     )
 
 
@@ -194,6 +206,20 @@ async def premium_emoji_callback(update: Update, context: ContextTypes.DEFAULT_T
     # ── پیش‌نمایش بسته ──
     if action == "preview":
         await _send_preview(context, chat_id)
+        return AWAITING_SETTINGS_ACTION
+
+    # ── بازنشانی چت‌های مسدود (رفع باگ قبلی mark_unsupported) ──
+    if action == "reset_chats":
+        cleared = sum(len(v) for v in premium_emoji.unsupported_chats.values())
+        premium_emoji.unsupported_chats.clear()
+        await context.bot.send_message(
+            chat_id,
+            f"{pe('refresh')} فهرست چت‌های مسدود پاک شد "
+            f"(<code>{cleared}</code> مورد).\n"
+            "از این به بعد دوباره ایموجی پریمیوم ارسال می‌شود.",
+            parse_mode=ParseMode.HTML,
+        )
+        await _refresh_panel(context, chat_id, query)
         return AWAITING_SETTINGS_ACTION
 
     # ── اعتبارسنجی ──
@@ -344,29 +370,36 @@ async def _refresh_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int, query
 
 
 async def _send_test_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """ارسال یک پیام نمونه با ایموجی پریمیوم در متن و دکمه‌ها."""
+    """ارسال یک پیام نمونه با ایموجی پریمیوم + دکمه‌های رنگی."""
+    from utils.premium_emoji import blockquote, divider
+
+    tip = (
+        "اگر ایموجی‌ها <b>متحرک/سفارشی</b> و دکمه‌ها <b>رنگی</b> "
+        "(سبز/قرمز/آبی) دیده می‌شوند، همه‌چیز درست است. "
+        "در غیر این صورت: مالک ربات باید Premium داشته باشد و "
+        "«اعتبارسنجی شناسه‌ها» را یک‌بار بزنید."
+    )
     text = (
-        f"{pe('gem')} <b>پیام تستِ ایموجی پریمیوم</b>\n\n"
-        f"{pe('check')} عملیات با موفقیت انجام شد\n"
-        f"{pe('cross')} عملیات ناموفق بود\n"
-        f"{pe('warn')} هشدار: موجودی کم است\n"
+        f"{pe('gem')} <b>پیام تست — پریمیوم + UI رنگی</b>\n"
+        f"{divider()}\n"
+        f"{pe('check')} عملیات موفق\n"
+        f"{pe('cross')} عملیات ناموفق\n"
+        f"{pe('warn')} هشدار موجودی\n"
         f"{pe('wallet')} کیف پول: <code>120,000</code> تومان\n"
-        f"{pe('mic')} سفارش ویس‌کال {pe('rocket')} شروع آنی\n"
-        f"{pe('ticket')} تیکت جدید {pe('chat')} پاسخ پشتیبانی\n"
-        f"{pe('stats')} آمار {pe('chart_up')} رشد {pe('chart_down')} افت\n"
-        f"{pe('users')} کاربران {pe('shield')} ادمین {pe('bot')} ربات\n"
-        f"{pe('settings')} تنظیمات {pe('tools')} ابزار {pe('search')} جستجو\n"
-        f"{pe('calendar')} زمان‌بندی {pe('clock')} ساعت {pe('bell')} اعلان\n"
+        f"{pe('mic')} ویس‌کال {pe('rocket')} شروع آنی\n"
+        f"{pe('ticket')} تیکت {pe('chat')} پشتیبانی\n"
+        f"{pe('stats')} آمار {pe('chart_up')} {pe('chart_down')}\n"
         f"{pe('heart')} {pe('like')} {pe('fire')} {pe('star')} {pe('zap')}\n\n"
-        "اگر ایموجی‌های بالا <b>متحرک/سفارشی</b> دیده می‌شوند، قابلیت روی\n"
-        "اکانت شما فعال است. اگر ایموجی معمولی می‌بینید، یا اکانتِ مالکِ ربات\n"
-        "پریمیوم ندارد یا شناسه‌ها نامعتبرند (اعتبارسنجی را اجرا کنید)."
+        f"{blockquote(tip)}"
     )
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ تایید", callback_data="premoji_demo_ok"),
-                InlineKeyboardButton("❌ رد", callback_data="premoji_demo_no"),
+                InlineKeyboardButton("✅ تایید", callback_data="premoji_demo_ok", style="success"),
+                InlineKeyboardButton("❌ رد", callback_data="premoji_demo_no", style="danger"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ تنظیمات", callback_data=f"{_CB}back", style="primary"),
             ],
             [InlineKeyboardButton("🔙 بازگشت", callback_data=f"{_CB}back")],
         ]
@@ -392,8 +425,27 @@ async def _send_test_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -
 
 
 async def _send_preview(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """پیش‌نمایش بستهٔ ایموجی (کلید → ایموجی پریمیوم)."""
-    lines = [f"{pe('list')} <b>بستهٔ ایموجی پریمیوم ربات</b>", ""]
+    """پیش‌نمایش بستهٔ ایموجی (کلید → ایموجی پریمیوم).
+
+    پیام‌ها به‌صورت چندتکهٔ امن فرستاده می‌شوند تا:
+      * تگ ``<tg-emoji>`` وسط برش نخورد (باگ قبلی: unclosed end tag)
+      * سقف ۱۰۰ entity تلگرام رعایت شود
+    """
+    from utils.premium_emoji import safe_html_truncate
+
+    header = f"{pe('list')} <b>بستهٔ ایموجی پریمیوم ربات</b>\n"
+    chunk_lines: list = [header]
+    chunk_count = 0
+    # هر پیام حداکثر ~۲۵ ایموجی پریمیوم تا entityها و طول امن بمانند
+    per_chunk = 25
+
+    async def _flush(lines: list) -> None:
+        if not lines:
+            return
+        text = "\n".join(lines)
+        text = safe_html_truncate(text, 3900)
+        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
     for key, (emoji_id, _uni) in PREMIUM_EMOJI_PACK.items():
         if premium_emoji.validated and emoji_id not in premium_emoji.valid_ids:
             mark = "⛔"
@@ -401,8 +453,13 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
             mark = "⛔"
         else:
             mark = "✅"
-        lines.append(f"{premium_emoji.html(key)} <code>{key}</code> {KEY_TO_FALLBACK.get(key, '')} {mark}")
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3990] + "\n…"
-    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        line = f"{premium_emoji.html(key)} <code>{key}</code> {KEY_TO_FALLBACK.get(key, '')} {mark}"
+        chunk_lines.append(line)
+        chunk_count += 1
+        if chunk_count >= per_chunk:
+            await _flush(chunk_lines)
+            chunk_lines = [f"{pe('list')} <b>ادامهٔ بسته…</b>\n"]
+            chunk_count = 0
+
+    if chunk_count or len(chunk_lines) > 1:
+        await _flush(chunk_lines)

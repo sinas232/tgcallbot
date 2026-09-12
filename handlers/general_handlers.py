@@ -5,6 +5,7 @@ handlers/general_handlers.py
 """
 import logging
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
 from config import Config
@@ -66,31 +67,48 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         menu.append(["🔐 پنل مدیریت (ادمین)"])
     
     # 4. دریافت متن استارت از تنظیمات
+    # قالب پیش‌فرض HTML تمیز و مینیمال — لایهٔ پریمیوم ایموجی‌ها را ارتقا می‌دهد
+    safe_name = (user.first_name or "کاربر").replace("<", "").replace(">", "")
     default_text = (
-        f"سلام {user.first_name} عزیز! 👋\n\n"
-        "به ربات خدمات مجازی خوش آمدید.\n"
-        "💎 **خدمات ما:** خرید ممبر، سین، فالوور و ...\n\n"
-        "👇 لطفاً از منوی زیر استفاده کنید:"
+        f"👋 سلام <b>{safe_name}</b> عزیز\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"💎 به ربات خدمات مجازی خوش آمدید.\n\n"
+        f"✨ <b>خدمات:</b> ویس‌کال · عضویت · شارژ\n"
+        f"💰 موجودی شما: <code>{{credit}}</code> تومان\n\n"
+        f"👇 از منوی زیر انتخاب کنید"
     )
     start_text = await DatabaseManager.get_setting("start_text", default_text, bot_id=bot_id)
-    
+
     # جایگذاری متغیرها در متن
+    credit_val = int(db_user.get("credit", 0) or 0)
+    credit_fmt = f"{credit_val:,}"
     try:
         final_text = start_text.format(
-            name=user.first_name,
+            name=safe_name,
             id=user.id,
             username=user.username or "None",
-            credit=int(db_user.get('credit', 0))
+            credit=credit_fmt,
         )
-    except:
-        final_text = start_text.replace("{name}", user.first_name).replace("{credit}", str(int(db_user.get('credit', 0))))
+    except Exception:
+        final_text = (
+            start_text.replace("{name}", safe_name)
+            .replace("{credit}", credit_fmt)
+            .replace("{id}", str(user.id))
+            .replace("{username}", user.username or "None")
+        )
 
-    # ارسال پیام با منوی کیبورد
+    # اگر متن سفارشی ادمین Markdown قدیمی باشد، لایهٔ پریمیوم تبدیلش می‌کند؛
+    # برای قالب پیش‌فرض HTML می‌فرستیم تا ظاهر رنگی/تمیز بماند.
+    parse_mode = ParseMode.HTML
+    if "**" in final_text or (final_text.count("*") >= 2 and "<b>" not in final_text):
+        parse_mode = ParseMode.MARKDOWN
+
     await send_safe(
-        context.bot, 
-        update.effective_chat.id, 
-        final_text, 
-        reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True)
+        context.bot,
+        update.effective_chat.id,
+        final_text,
+        reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True, is_persistent=True),
+        parse_mode=parse_mode,
     )
     
     return -1 # پایان هر کانتکست قبلی (ConversationHandler.END)

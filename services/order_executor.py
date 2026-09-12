@@ -1192,20 +1192,24 @@ class OrderExecutor:
 	async def _cleanup_order(self, order_id, joined_accounts, data):
 		# Release Join Brain scratch state (idempotent).
 		self._voice_forget_order(order_id)
-		try:
-			await self._eject_all_fast(order_id, joined_accounts, data)
-		except Exception as exc:
-			logger.exception(f"Order {order_id}: cleanup failed: {exc}")
 		order_type = (data or {}).get("order_type")
+		# Voice: ONE paced leave path via VCM (covers active + durable state).
+		# Do NOT also call _eject_all_fast for voice — that would double-leave
+		# every account (stop_call again) and defeat the anti-burst pacing.
+		# Group/channel: paced eject via _eject_all_fast.
 		if order_type == "voice_chat":
-			# Also clear any persistent per-order joined state (accounts that were
-			# recovered by the monitor but not present in the executor list).
 			vcm = _get_voice_call_manager()
 			if vcm:
 				try:
-					await vcm.stop_all_for_order(order_id, leave_group=True)
+					n = await vcm.stop_all_for_order(order_id, leave_group=True)
+					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
 				except Exception as exc:
 					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
+		else:
+			try:
+				await self._eject_all_fast(order_id, joined_accounts, data)
+			except Exception as exc:
+				logger.exception(f"Order {order_id}: cleanup failed: {exc}")
 
 	async def _leave_single(self, entry, order_id, order_type, target, sem):
 		async with sem:
@@ -1251,16 +1255,69 @@ class OrderExecutor:
 		return False, "Not found."
 
 	async def _eject_all_fast(self, order_id, accounts_list, data):
-		if not accounts_list: return
-		sem = asyncio.Semaphore(4)
-		tasks = [self._leave_single(e, order_id, data.get("order_type"), data.get("target_link"), sem) for e in accounts_list]
-		await asyncio.gather(*tasks, return_exceptions=True)
+		"""Pace mass-exit so N accounts never leave in the same millisecond.
+
+		Voice_chat leaves are owned exclusively by
+		``vcm.stop_all_for_order`` (paced) — this method is a no-op for
+		voice to avoid a second LeaveGroupCall burst.  Group/channel
+		orders get the same stagger + concurrency limits here.
+		"""
+		if not accounts_list:
+			return
+		order_type = (data or {}).get("order_type")
+		if order_type == "voice_chat":
+			# Voice leaves are handled only by VCM.stop_all_for_order.
+			return
+		gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+		gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+		jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+		jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+		max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+		sem = asyncio.Semaphore(max_conc)
+		entries = list(accounts_list)
+		random.shuffle(entries)
+		logger.info(
+			"Order %s: paced eject of %s account(s) (gap=%.1f-%.1fs conc=%s type=%s)",
+			order_id, len(entries), gap_min, gap_max, max_conc, order_type,
+		)
+
+		async def _one(entry):
+			async with sem:
+				await self._leave_single(
+					entry, order_id, order_type, (data or {}).get("target_link"),
+					asyncio.Semaphore(1),  # already under outer sem
+				)
+
+		tasks = []
+		for idx, entry in enumerate(entries):
+			if idx > 0:
+				delay = random.uniform(gap_min, gap_max) + random.uniform(jitter_min, jitter_max)
+				try:
+					await asyncio.sleep(delay)
+				except asyncio.CancelledError:
+					break
+			tasks.append(asyncio.create_task(_one(entry)))
+		if tasks:
+			await asyncio.gather(*tasks, return_exceptions=True)
 
 	async def _fail_order(self, order_id, reason):
 		info = self.active_orders.get(order_id)
-		if info: await self._eject_all_fast(order_id, info.get("joined_accounts", []), info.get("data", {}))
-		vcm = _get_voice_call_manager()
-		if vcm: await vcm.stop_all_for_order(order_id, leave_group=True)
+		data = (info or {}).get("data", {}) if info else {}
+		order_type = data.get("order_type") if info else None
+		# Single leave path: voice → paced VCM only; else paced eject.
+		# stop_all_for_order is idempotent if cleanup already ran.
+		if order_type == "voice_chat" or not info:
+			vcm = _get_voice_call_manager()
+			if vcm:
+				try:
+					await vcm.stop_all_for_order(order_id, leave_group=True)
+				except Exception as exc:
+					logger.warning(f"Order {order_id}: fail-path vcm leave: {exc}")
+		elif info:
+			try:
+				await self._eject_all_fast(order_id, info.get("joined_accounts", []), data)
+			except Exception as exc:
+				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
 		self._voice_forget_order(order_id)
 		await DatabaseManager.update_order_status(order_id, "failed")
 		self.active_orders.pop(order_id, None)

@@ -9,6 +9,66 @@
 
 ---
 
+## نسخهٔ ۲.۲.۱ — 🚪 خروج مدیریت‌شده از ویس‌کال (ضد burst)
+
+<div dir="rtl">
+
+**تاریخ:** ۱۴۰۵/۰۶/۲۱
+
+### مشکل
+بعد از **پایان** یا **لغو** سفارش، همهٔ اکانت‌ها یک‌جا (هم‌زمان با `asyncio.gather`)
+از ویس‌کال و گروه خارج می‌شدند. این burst شبیه رفتار ربات است و می‌تواند
+FloodWait / محدودیت اکانت ایجاد کند.
+
+### فیکس
+- `VoiceCallManager.stop_all_for_order` و `cleanup_all` با **فاصلهٔ پلکانی**
+  (`VOICE_LEAVE_STAGGER_MIN/MAX` پیش‌فرض ۰.۸–۱.۵ ثانیه) و **سقف هم‌زمانی**
+  (`VOICE_LEAVE_MAX_CONCURRENCY=2`) اکانت‌ها را خارج می‌کنند.
+- مانیتور سفارش **قبل** از leave متوقف می‌شود تا وسط خروج دوباره join نکند.
+- `OrderExecutor._eject_all_fast` / `_cleanup_order` همان pacing را برای
+  group/channel و leftoverها اعمال می‌کنند (بدون double-leave روی voice).
+- ترتیب leave تصادفی می‌شود تا fingerprint ثابت نداشته باشد.
+- کلیدهای env جدید در `.env.example` و `config.py`.
+
+</div>
+
+---
+
+## نسخهٔ ۲.۲ — 🎨 UI رنگی + فیکس ایموجی پریمیوم
+
+<div dir="rtl">
+
+**تاریخ:** ۱۴۰۵/۰۶/۲۱ · **Bot API 9.4**
+
+### 🐛 باگ‌فیکس‌های حیاتی
+
+- **ایموجی پریمیوم بعد از یک خطا برای همیشه خاموش می‌شد:** خطای
+  `Can't parse entities: unclosed end tag` (ناشی از برش وسط تگ `<tg-emoji>`
+  در پیش‌نمایش بسته) کل چت ادمین را `mark_unsupported` می‌کرد و حتی با
+  روشن‌بودن سوئیچ‌ها دیگر ایموجی پریمیوم ارسال نمی‌شد. حالا فقط خطاهای
+  واقعیِ «custom emoji مجاز نیست» چت را blacklist می‌کنند؛ خطاهای parse
+  با sanitize + fallback درمان می‌شوند و چت سالم می‌ماند.
+- **پیش‌نمایش بسته:** پیام‌ها چندتکه (۲۵تایی) و با `safe_html_truncate`
+  فرستاده می‌شوند تا تگ وسط برش نخورد و سقف ۱۰۰ entity رعایت شود.
+- **کشف از اکانت (MTProto):** پارامتر درست `stickerset` (نه `sticker_set`)
+  برای kurigram/Layer جدید — خطای `GetStickerSet unexpected keyword` رفع شد.
+- **بازنشانی blacklist در استارت** و دکمهٔ «♻️ بازنشانی چت‌های مسدود» در پنل.
+
+### ✨ قابلیت‌های جدید UI
+
+- **دکمه‌های رنگی Bot API 9.4** روی همهٔ inline/reply:
+  سبز (`success`) = تایید/پرداخت/فعال · قرمز (`danger`) = حذف/انصراف/رد ·
+  آبی (`primary`) = بازگشت/ادامه/تنظیمات. تشخیص خودکار از متن دکمه
+  (`classify_button_style`) + امکان تنظیم دستی.
+- **HTML ایمن:** `safe_html_truncate` / `sanitize_html` / `strip_tg_emoji_tags`
+  + `blockquote` / `expandable` / `divider` / `section_title` برای UI تمیز.
+- **خوش‌آمدگویی HTML مینیمال** با موجودی فرمت‌شده و کیبورد پایدار.
+- کلید env جدید: `PREMIUM_EMOJI_COLORED_BUTTONS=true`
+
+</div>
+
+---
+
 ## نسخهٔ ۲.۱ — 💎 ایموجی پریمیوم (Custom Emoji)
 
 <div dir="rtl">

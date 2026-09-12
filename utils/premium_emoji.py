@@ -52,6 +52,16 @@ __all__ = [
     "escape_outside_tags",
     "markdown_to_html",
     "message_content_html",
+    "BUTTON_STYLE_SUCCESS",
+    "BUTTON_STYLE_DANGER",
+    "BUTTON_STYLE_PRIMARY",
+    "classify_button_style",
+    "styled_button",
+    "safe_html_truncate",
+    "blockquote",
+    "expandable",
+    "divider",
+    "section_title",
 ]
 
 
@@ -485,6 +495,46 @@ _KNOWN_HTML_TAGS = (
 _HTML_TAG_RE = re.compile(rf"</?({_KNOWN_HTML_TAGS})(?:\s[^<>]*)?/?>", re.IGNORECASE)
 _TAGS_BLOCKING_EMOJI = {"code", "pre", "tg-emoji"}
 
+# تگ‌های void (بدون بستن) که در HTML تلگرام استفاده می‌شوند — هیچ‌کدام.
+# همهٔ تگ‌های شناخته‌شده باید pair شوند؛ برای sanitize از این لیست استفاده می‌شود.
+_HTML_CLOSE_ORDER = (
+    "tg-emoji", "tg-spoiler", "tg-date", "blockquote", "pre", "code",
+    "strike", "del", "ins", "strong", "span", "spoiler", "em", "a",
+    "b", "i", "u", "s",
+)
+_TG_EMOJI_TAG_RE = re.compile(
+    r'<tg-emoji\s+emoji-id=["\']?(\d+)["\']?\s*>(.*?)</tg-emoji>',
+    re.IGNORECASE | re.DOTALL,
+)
+_BROKEN_TG_EMOJI_RE = re.compile(
+    r'<tg-emoji\b[^>]*>.*?(?:</tg-emoji>|$)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# سبک‌های رنگی رسمی Bot API 9.4 برای دکمه‌های inline/reply
+BUTTON_STYLE_SUCCESS = "success"   # سبز — تایید / انجام
+BUTTON_STYLE_DANGER = "danger"     # قرمز — حذف / انصراف / خطر
+BUTTON_STYLE_PRIMARY = "primary"   # آبی — اقدام اصلی / ناوبری
+
+# کلمات کلیدی فارسی/انگلیسی برای تشخیص خودکار رنگ دکمه
+_STYLE_DANGER_TOKENS = frozenset({
+    "حذف", "پاک", "انصراف", "لغو", "رد", "مسدود", "بن", "قطع",
+    "خاموش", "توقف", "stop", "cancel", "delete", "remove", "ban",
+    "reject", "decline", "no", "خیر", "نمیخوام", "نمی‌خوام",
+    "ترک", "خروج همگانی", "destroy", "wipe",
+})
+_STYLE_SUCCESS_TOKENS = frozenset({
+    "تایید", "تأیید", "بله", "فعال", "شروع", "پرداخت", "شارژ",
+    "خرید", "ثبت", "ارسال", "ok", "yes", "confirm", "accept",
+    "approve", "success", "done", "pay", "buy", "start", "enable",
+    "روشن", "ذخیره", "save", "اعمال", "apply", "عضو شدم",
+})
+_STYLE_PRIMARY_TOKENS = frozenset({
+    "بازگشت", "قبلی", "بعدی", "ادامه", "تنظیمات", "مشاهده", "جزئیات",
+    "back", "next", "prev", "more", "details", "view", "settings",
+    "منو", "menu", "home", "اصلی", "refresh", "بروزرسانی", "همگام",
+})
+
 
 def _utf16_len(text: str) -> int:
     """طول بر حسب «واحد کد UTF-16» (واحدِ آفست entity در تلگرام)."""
@@ -573,6 +623,136 @@ def markdown_to_html(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  HTML ایمن + UI رنگی (blockquote / truncate / button style)
+# ══════════════════════════════════════════════════════════════════════
+def safe_html_truncate(text: str, limit: int = 3900) -> str:
+    """برش متن HTML بدون شکستن تگ‌های باز (رفع «unclosed end tag»).
+
+    تلگرام سقف حدود ۴۰۹۶ کاراکتر دارد؛ اگر وسط ``<tg-emoji …>`` برش بزنیم
+    خطای parse می‌دهد و پیام نمی‌رود. این تابع:
+      1) متن را روی مرز امن (پایان تگ یا فاصله) کوتاه می‌کند
+      2) همهٔ تگ‌های باز را به‌ترتیب LIFO می‌بندد
+    """
+    if not text or len(text) <= limit:
+        return text
+
+    # هرگز وسط یک تگ باز قطع نکن
+    cut = limit
+    # اگر داخل تگ هستیم، به قبل از «<» برگرد
+    last_lt = text.rfind("<", 0, cut)
+    last_gt = text.rfind(">", 0, cut)
+    if last_lt > last_gt:
+        cut = last_lt
+    # ترجیح: برش روی newline یا فاصله
+    soft = max(text.rfind("\n", 0, cut), text.rfind(" ", 0, cut))
+    if soft > cut * 0.6:
+        cut = soft
+    head = text[:cut].rstrip()
+    if not head.endswith("…") and not head.endswith("..."):
+        head += "\n…"
+
+    # بستن تگ‌های باز
+    open_tags: List[str] = []
+    for m in _HTML_TAG_RE.finditer(head):
+        raw = m.group(0)
+        name = (m.group(1) or "").lower()
+        if raw.lstrip("<").startswith("/"):
+            for i in range(len(open_tags) - 1, -1, -1):
+                if open_tags[i] == name:
+                    del open_tags[i:]
+                    break
+        elif raw.endswith("/>"):
+            continue
+        else:
+            open_tags.append(name)
+    if open_tags:
+        head += "".join(f"</{t}>" for t in reversed(open_tags))
+    return head
+
+
+def blockquote(text: str, *, expandable: bool = False) -> str:
+    """نقل‌قول HTML تلگرام (با پشتیبانی از expandable از Bot API 7.0+)."""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    attr = ' expandable="true"' if expandable else ""
+    return f"<blockquote{attr}>{body}</blockquote>"
+
+
+def expandable(text: str) -> str:
+    """نقل‌قول تاشو — مناسب راهنماهای بلند بدون شلوغ‌کردن چت."""
+    return blockquote(text, expandable=True)
+
+
+def divider(char: str = "·", count: int = 12) -> str:
+    """جداکنندهٔ ظریف و مینیمال (بدون شلوغی خط‌های ➖➖➖)."""
+    return f"<i>{(char + ' ') * count}</i>".rstrip()
+
+
+def section_title(icon_token: str, title: str) -> str:
+    """عنوان بخش با ایموجی پریمیوم — یک خط تمیز."""
+    return f"{pe(icon_token)} <b>{title}</b>"
+
+
+def classify_button_style(text: str, callback_data: Optional[str] = None) -> Optional[str]:
+    """تشخیص خودکار رنگ دکمه از روی متن/callback (Bot API 9.4).
+
+    خروجی: ``\"success\"`` | ``\"danger\"`` | ``\"primary\"`` | ``None``
+    (``None`` = سبک پیش‌فرض کلاینت؛ برای دکمه‌های خنثی بهتر است).
+    """
+    raw = f"{text or ''} {callback_data or ''}".strip().lower()
+    if not raw:
+        return None
+    # حذف ایموجی‌ها برای مقایسهٔ کلمه‌ای
+    plain = _EMOJI_RE.sub(" ", raw) if _EMOJI_RE is not None else raw
+    plain = re.sub(r"\s+", " ", plain).strip()
+
+    def _hit(tokens: frozenset) -> bool:
+        for tok in tokens:
+            if tok in plain or tok in raw:
+                return True
+        return False
+
+    # اولویت: خطر > موفقیت > اصلی (تا «حذف و تایید» قرمز بماند)
+    if _hit(_STYLE_DANGER_TOKENS):
+        return BUTTON_STYLE_DANGER
+    if _hit(_STYLE_SUCCESS_TOKENS):
+        return BUTTON_STYLE_SUCCESS
+    if _hit(_STYLE_PRIMARY_TOKENS):
+        return BUTTON_STYLE_PRIMARY
+    return None
+
+
+def styled_button(
+    text: str,
+    *,
+    callback_data: Optional[str] = None,
+    url: Optional[str] = None,
+    style: Optional[str] = None,
+    auto_style: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """ساخت ``InlineKeyboardButton`` با رنگ و (در صورت امکان) آیکون پریمیوم.
+
+    اگر ``style`` داده نشود و ``auto_style=True`` باشد، از روی متن تشخیص
+    داده می‌شود. آیکون پریمیوم را لایهٔ خروجی (``upgrade_reply_markup``)
+    از روی ایموجیِ ابتدای متن می‌سازد — اینجا فقط رنگ را می‌گذاریم.
+    """
+    from telegram import InlineKeyboardButton
+
+    if style is None and auto_style:
+        style = classify_button_style(text, callback_data)
+    kw: Dict[str, Any] = dict(kwargs)
+    if callback_data is not None:
+        kw["callback_data"] = callback_data
+    if url is not None:
+        kw["url"] = url
+    if style in (BUTTON_STYLE_SUCCESS, BUTTON_STYLE_DANGER, BUTTON_STYLE_PRIMARY):
+        kw["style"] = style
+    return InlineKeyboardButton(text=text, **kw)
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  وضعیت سراسری
 # ══════════════════════════════════════════════════════════════════════
 class PremiumEmojiState:
@@ -602,6 +782,10 @@ class PremiumEmojiState:
         #: اگر true باشد، شناسه‌ای که ایموجیِ واقعی‌اش با ایموجیِ مورد انتظارِ
         #: بسته فرق دارد هم غیرفعال می‌شود (پیش‌فرض false = فقط گزارش).
         self.strict_emoji_match: bool = _truthy(os.getenv("PREMIUM_EMOJI_STRICT_MATCH", "false"))
+        #: رنگ‌آمیزی خودکار دکمه‌ها (سبز/قرمز/آبی) بر اساس متن — Bot API 9.4
+        self.colored_buttons: bool = _truthy(os.getenv("PREMIUM_EMOJI_COLORED_BUTTONS", "true"))
+        #: افکت ظریف پیام‌های مهم (مثلاً 🔥 موفقیت) — اختیاری، پیش‌فرض خاموش
+        self.message_effects: bool = _truthy(os.getenv("PREMIUM_EMOJI_MESSAGE_EFFECTS", "false"))
         try:
             self.max_entities = int(os.getenv("PREMIUM_EMOJI_MAX_PER_MESSAGE", str(self.MAX_ENTITIES_PER_MESSAGE)))
         except (TypeError, ValueError):
@@ -631,6 +815,7 @@ class PremiumEmojiState:
             "texts_upgraded": 0,
             "emojis_inserted": 0,
             "buttons_upgraded": 0,
+            "buttons_colored": 0,
             "labels_restored": 0,
             "fallbacks": 0,
         }
@@ -894,6 +1079,54 @@ class PremiumEmojiState:
         escaped = escape_outside_tags(text)
         return self.upgrade_html_text(escaped)
 
+    def sanitize_html(self, text: str) -> str:
+        """پاکسازی HTML معیوب قبل از ارسال مجدد (رفع unclosed/broken tags).
+
+        * تگ‌های ``tg-emoji`` ناقص → فقط ایموجی یونیکدِ داخلشان
+        * تگ‌های بازِ مانده در انتها → بسته می‌شوند
+        * سقف طول امن اعمال می‌شود
+        """
+        if not text:
+            return text
+
+        def _fix_broken(m: "re.Match[str]") -> str:
+            full = m.group(0)
+            # اگر تگ کامل و درست است، دست نزن
+            ok = _TG_EMOJI_TAG_RE.fullmatch(full)
+            if ok:
+                return full
+            # محتوای قابل‌نمایش را نگه دار
+            inner = re.sub(r"<[^>]+>", "", full).strip()
+            return inner or ""
+
+        cleaned = _BROKEN_TG_EMOJI_RE.sub(_fix_broken, text)
+        # بستن تگ‌های باز مانده
+        open_tags: List[str] = []
+        for m in _HTML_TAG_RE.finditer(cleaned):
+            raw = m.group(0)
+            name = (m.group(1) or "").lower()
+            if raw.lstrip("<").startswith("/"):
+                for i in range(len(open_tags) - 1, -1, -1):
+                    if open_tags[i] == name:
+                        del open_tags[i:]
+                        break
+            elif not raw.endswith("/>"):
+                open_tags.append(name)
+        if open_tags:
+            cleaned += "".join(f"</{t}>" for t in reversed(open_tags))
+        if len(cleaned) > 4000:
+            cleaned = safe_html_truncate(cleaned, 3900)
+        return cleaned
+
+    def strip_tg_emoji_tags(self, text: str) -> str:
+        """حذف همهٔ تگ‌های ``tg-emoji`` و نگه‌داشتن فقط ایموجی یونیکد."""
+        if not text or "<tg-emoji" not in text:
+            return text
+        out = _TG_EMOJI_TAG_RE.sub(lambda m: m.group(2), text)
+        # باقیمانده‌های شکسته
+        out = re.sub(r"</?tg-emoji\b[^>]*>", "", out, flags=re.IGNORECASE)
+        return out
+
     # ────────────────────────── ارتقای دکمه‌ها ──────────────────────────
     def _leading_emoji(self, text: str) -> Tuple[Optional[str], str]:
         """اگر متن با یک ایموجیِ شناخته‌شده شروع/تمام شود: (ایموجی, بقیهٔ متن).
@@ -939,7 +1172,10 @@ class PremiumEmojiState:
         """
         if markup is None or not self.enabled:
             return markup
-        if not self.inline_buttons_enabled and not self.reply_buttons_enabled:
+        # آیکون پریمیوم یا رنگ‌آمیزی — هر کدام روشن باشد ارتقا انجام می‌شود
+        do_inline = self.inline_buttons_enabled or self.colored_buttons
+        do_reply = self.reply_buttons_enabled or self.colored_buttons
+        if not do_inline and not do_reply:
             return markup
         if not self.chat_supports(chat_id, scope=scope):
             return markup
@@ -956,7 +1192,7 @@ class PremiumEmojiState:
 
         # ── Inline ──
         if isinstance(markup, InlineKeyboardMarkup):
-            if not self.inline_buttons_enabled:
+            if not do_inline:
                 return markup
             new_rows = []
             changed = False
@@ -974,7 +1210,7 @@ class PremiumEmojiState:
 
         # ── Reply ──
         if isinstance(markup, ReplyKeyboardMarkup):
-            if not self.reply_buttons_enabled:
+            if not do_reply:
                 return markup
             new_rows = []
             changed = False
@@ -1003,21 +1239,43 @@ class PremiumEmojiState:
 
         return markup
 
+    def _resolve_button_style(self, btn: Any, display_text: str) -> Optional[str]:
+        """سبک رنگی دکمه: مقدار موجود حفظ می‌شود؛ وگرنه تشخیص خودکار."""
+        existing = getattr(btn, "style", None)
+        if existing in (BUTTON_STYLE_SUCCESS, BUTTON_STYLE_DANGER, BUTTON_STYLE_PRIMARY):
+            return existing
+        if not self.colored_buttons:
+            return existing
+        cb = getattr(btn, "callback_data", None)
+        return classify_button_style(display_text or getattr(btn, "text", "") or "", cb)
+
     def _upgrade_inline_button(self, btn: Any, factory: Any) -> Any:
         text = getattr(btn, "text", None)
-        if not text or getattr(btn, "icon_custom_emoji_id", None):
+        if not text:
             return btn
-        emoji, rest = self._leading_emoji(text)
-        if not emoji or not rest:
-            # ایموجی ندارد، یا متن «فقط» ایموجی است (مثل ❌ در تقویم) →
-            # دست نمی‌زنیم تا متن خالی نشود.
+
+        has_icon = bool(getattr(btn, "icon_custom_emoji_id", None))
+        emoji, rest = (None, text)
+        emoji_id = None
+        # فقط وقتی آیکون‌های inline روشن‌اند ایموجی را به icon تبدیل کن
+        if not has_icon and self.inline_buttons_enabled:
+            emoji, rest = self._leading_emoji(text)
+            if emoji and rest:
+                emoji_id = self.resolve(emoji)
+
+        # اگر نه آیکون تازه داریم و نه رنگ، دست نزن
+        style = self._resolve_button_style(btn, rest if (emoji and rest) else text)
+        existing_style = getattr(btn, "style", None)
+        if not emoji_id and style == existing_style:
             return btn
-        emoji_id = self.resolve(emoji)
-        if not emoji_id:
+        # متنِ «فقط ایموجی» را خالی نکن
+        new_text = rest if (emoji_id and rest) else text
+        if emoji_id and not rest:
             return btn
+
         try:
             new_btn = factory(
-                text=rest,
+                text=new_text,
                 url=getattr(btn, "url", None),
                 callback_data=getattr(btn, "callback_data", None),
                 web_app=getattr(btn, "web_app", None),
@@ -1028,56 +1286,81 @@ class PremiumEmojiState:
                 copy_text=getattr(btn, "copy_text", None),
                 callback_game=getattr(btn, "callback_game", None),
                 pay=bool(getattr(btn, "pay", False)) or None,
-                icon_custom_emoji_id=emoji_id,
-                style=getattr(btn, "style", None),
+                icon_custom_emoji_id=emoji_id or getattr(btn, "icon_custom_emoji_id", None),
+                style=style,
             )
         except TypeError:
             # نسخهٔ PTB بدون یکی از این فیلدها → حداقل‌های ممکن
             try:
-                new_btn = factory(
-                    text=rest,
-                    url=getattr(btn, "url", None),
-                    callback_data=getattr(btn, "callback_data", None),
-                    icon_custom_emoji_id=emoji_id,
-                )
+                kw: Dict[str, Any] = {
+                    "text": new_text,
+                    "url": getattr(btn, "url", None),
+                    "callback_data": getattr(btn, "callback_data", None),
+                }
+                if emoji_id or getattr(btn, "icon_custom_emoji_id", None):
+                    kw["icon_custom_emoji_id"] = emoji_id or getattr(btn, "icon_custom_emoji_id", None)
+                if style:
+                    kw["style"] = style
+                new_btn = factory(**kw)
             except Exception:
                 return btn
         self.stats["buttons_upgraded"] += 1
+        if style and style != existing_style:
+            self.stats["buttons_colored"] = self.stats.get("buttons_colored", 0) + 1
         return new_btn
 
     def _upgrade_reply_button(self, btn: Any, factory: Any) -> Any:
         text = getattr(btn, "text", None)
-        if not text or getattr(btn, "icon_custom_emoji_id", None):
+        if not text:
             return btn
-        emoji, rest = self._leading_emoji(text)
-        if not emoji or not rest:
+
+        has_icon = bool(getattr(btn, "icon_custom_emoji_id", None))
+        emoji, rest = (None, text)
+        emoji_id = None
+        if not has_icon and self.reply_buttons_enabled:
+            emoji, rest = self._leading_emoji(text)
+            if emoji and rest:
+                emoji_id = self.resolve(emoji)
+
+        style = self._resolve_button_style(btn, rest if (emoji and rest) else text)
+        existing_style = getattr(btn, "style", None)
+        if not emoji_id and style == existing_style:
             return btn
-        emoji_id = self.resolve(emoji)
-        if not emoji_id:
+        new_text = rest if (emoji_id and rest) else text
+        if emoji_id and not rest:
             return btn
+
         try:
             new_btn = factory(
-                text=rest,
+                text=new_text,
                 request_contact=bool(getattr(btn, "request_contact", False)) or None,
                 request_location=bool(getattr(btn, "request_location", False)) or None,
                 request_poll=getattr(btn, "request_poll", None),
                 web_app=getattr(btn, "web_app", None),
                 request_chat=getattr(btn, "request_chat", None),
                 request_users=getattr(btn, "request_users", None),
-                icon_custom_emoji_id=emoji_id,
-                style=getattr(btn, "style", None),
+                icon_custom_emoji_id=emoji_id or getattr(btn, "icon_custom_emoji_id", None),
+                style=style,
             )
         except TypeError:
             try:
-                new_btn = factory(text=rest, icon_custom_emoji_id=emoji_id)
+                kw: Dict[str, Any] = {"text": new_text}
+                if emoji_id or getattr(btn, "icon_custom_emoji_id", None):
+                    kw["icon_custom_emoji_id"] = emoji_id or getattr(btn, "icon_custom_emoji_id", None)
+                if style:
+                    kw["style"] = style
+                new_btn = factory(**kw)
             except Exception:
                 return btn
         # ⚠️ نکتهٔ کلیدی: متنِ دکمهٔ reply همان چیزی است که کاربر می‌فرستد.
         # با حذف ایموجی، هندلرهای ``filters.Regex("^🆘 پشتیبانی$")`` از کار
         # می‌افتادند؛ بنابراین alias ثبت می‌کنیم و در
         # ``PremiumEmojiApplication.process_update`` متنِ اصلی برمی‌گردد.
-        self.register_label_alias(rest, text)
+        if emoji_id and rest and rest != text:
+            self.register_label_alias(rest, text)
         self.stats["buttons_upgraded"] += 1
+        if style and style != existing_style:
+            self.stats["buttons_colored"] = self.stats.get("buttons_colored", 0) + 1
         return new_btn
 
     # ────────────────────────── alias دکمه‌های reply ──────────────────────────
@@ -1157,6 +1440,7 @@ class PremiumEmojiState:
                 "T" if self.text_enabled else "-",
                 "B" if self.inline_buttons_enabled else "-",
                 "R" if self.reply_buttons_enabled else "-",
+                "C" if self.colored_buttons else "-",
             ]
         )
         extra = f" mismatch={len(self.emoji_mismatches)}" if self.emoji_mismatches else ""
