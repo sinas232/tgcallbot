@@ -14,6 +14,7 @@ from telegram.request import HTTPXRequest
 from telegram import Update
 
 from database import DatabaseManager
+from utils.premium_bot import PremiumEmojiApplication, PremiumEmojiBot
 
 logger = logging.getLogger(__name__)
 
@@ -60,25 +61,39 @@ class BotManager:
             persist_file = f"data/bot_data_{bot_id}.pickle"
             persistence = PicklePersistence(filepath=persist_file)
             
-            builder = Application.builder().token(token).persistence(persistence)
-
             # Keep reseller long-poll sockets bounded and independent from
             # ordinary Bot API requests.
-            builder.request(HTTPXRequest(
-                connection_pool_size=8,
-                read_timeout=30.0,
-                write_timeout=30.0,
-                connect_timeout=15.0,
-                pool_timeout=15.0,
-            ))
-            builder.get_updates_request(HTTPXRequest(
-                connection_pool_size=4,
-                read_timeout=45.0,
-                write_timeout=30.0,
-                connect_timeout=15.0,
-                pool_timeout=15.0,
-            ))
-            
+            # 💎 ایموجی پریمیوم: ربات‌های نمایندگی هم از همان لایهٔ خروجی استفاده
+            # می‌کنند (PremiumEmojiBot) تا منو/پیام‌هایشان ایموجی پریمیوم بگیرد.
+            # نکته: نمایش ایموجی سفارشی به اشتراک Premium «مالکِ هر ربات» بستگی
+            # دارد؛ اگر مالک پریمیوم نداشته باشد تلگرام یا ایموجی یونیکد را نشان
+            # می‌دهد یا خطا می‌دهد که در هر دو حالت fallback خودکار فعال می‌شود و
+            # پیام سالم ارسال می‌گردد.
+            reseller_bot = PremiumEmojiBot(
+                token=token,
+                request=HTTPXRequest(
+                    connection_pool_size=8,
+                    read_timeout=30.0,
+                    write_timeout=30.0,
+                    connect_timeout=15.0,
+                    pool_timeout=15.0,
+                ),
+                get_updates_request=HTTPXRequest(
+                    connection_pool_size=4,
+                    read_timeout=45.0,
+                    write_timeout=30.0,
+                    connect_timeout=15.0,
+                    pool_timeout=15.0,
+                ),
+            )
+
+            builder = (
+                Application.builder()
+                .bot(reseller_bot)
+                .application_class(PremiumEmojiApplication)
+                .persistence(persistence)
+            )
+
             app = builder.build()
             
             # ثبت هندلرها (دستورات ربات)

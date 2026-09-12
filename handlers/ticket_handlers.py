@@ -15,6 +15,8 @@ handlers/ticket_handlers.py
 """
 import logging
 from datetime import datetime
+from typing import Any, Optional
+
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
@@ -23,6 +25,10 @@ from config import Config
 from helpers.message_utils import send_safe
 from constants import *
 from utils.helpers import format_jalali_datetime
+# 💎 ایموجی پریمیوم: متنِ کاربر/ادمین را با همهٔ entityها (از جمله ایموجی
+# سفارشیِ خودشان) به HTML امن تبدیل می‌کند تا هنگام بازنشر، ایموجی پریمیومِ
+# آن‌ها دقیقاً همان‌طور که فرستاده‌اند نمایش داده شود.
+from utils.premium_emoji import escape_outside_tags, message_content_html
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,13 @@ STATUS_EMOJI = {"open": "🟢", "answered": "🔵", "closed": "⚫️"}
 PRIORITY_LABEL = {"low": "🟩 کم", "normal": "🟨 عادی", "high": "🟥 فوری"}
 
 
+def _esc(text: Any) -> str:
+    """فرارِ HTML برای متن‌های ذخیره‌شده در دیتابیس (جلوگیری از شکستن parse)."""
+    if text is None:
+        return ""
+    return escape_outside_tags(str(text))
+
+
 def _short(text: str, n: int = 40) -> str:
     if not text:
         return "—"
@@ -66,9 +79,11 @@ def _msg_line(m: dict) -> str:
     mtype = m.get("message_type", "text")
     if mtype != "text":
         icon = {"photo": "🖼", "voice": "🎤", "document": "📎", "video": "🎬"}.get(mtype, "📁")
-        body = f"{icon} [{mtype}] {m.get('content') or ''}".strip()
+        body = f"{icon} [{mtype}] {_esc(m.get('content'))}".strip()
     else:
-        body = m.get("content") or "—"
+        body = _esc(m.get("content")) or "—"
+    # ایموجی‌های یونیکدِ متنِ رونوشت هم به ایموجی پریمیوم ارتقا می‌یابند
+    # (لایهٔ خروجی ربات این کار را خودکار انجام می‌دهد)
     return f"{who}\n🕐 {when}\n💬 {body}"
 
 
@@ -81,8 +96,8 @@ def _build_transcript(ticket: dict, user: dict, messages: list) -> str:
 
     header = (
         f"🎫 <b>تیکت #{ticket['id']}</b>\n"
-        f"📌 موضوع: <b>{subject}</b>\n"
-        f"👤 کاربر: {user.get('first_name') or '—'}"
+        f"📌 موضوع: <b>{_esc(subject)}</b>\n"
+        f"👤 کاربر: {_esc(user.get('first_name') or '—')}"
     )
     if user.get("telegram_id"):
         header += f" (<code>{user['telegram_id']}</code>)"
@@ -260,8 +275,13 @@ async def _persist_user_message(update: Update, context: ContextTypes.DEFAULT_TY
     sender_name = update.effective_user.first_name
     await DatabaseManager.add_ticket_message(ticket_id, "user", msg_type, content[:1000], sender_name=sender_name, file_id=file_id)
 
+    # 💎 نسخهٔ HTMLِ پیامِ کاربر: اگر کاربر ایموجی پریمیوم (custom emoji)
+    # فرستاده باشد، text_html خودِ PTB آن را به <tg-emoji emoji-id="…"> تبدیل
+    # می‌کند؛ پس ادمین دقیقاً همان ایموجی پریمیوم را می‌بیند.
+    content_html = message_content_html(msg) if msg_type == "text" else _esc(content)
+
     user_db = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
-    await notify_admins_new_message(context, ticket_id, user_db, content, msg_type, bot_id)
+    await notify_admins_new_message(context, ticket_id, user_db, content, msg_type, bot_id, content_html=content_html)
 
 
 async def show_user_tickets_list(update, context):
@@ -555,21 +575,25 @@ async def handle_admin_reply_message(update, context):
         content = "(فایل ضمیمه)"
 
     subj = ticket.get("subject") or "بدون موضوع"
+    # 💎 پاسخ ادمین با همهٔ فرمت‌ها و ایموجی پریمیومِ خودش به کاربر می‌رسد:
+    # text_html/caption_html هم entityها (بولد/لینک/…) و هم custom_emoji را
+    # به تگ <tg-emoji> تبدیل می‌کند و متن را هم به‌درستی escape می‌نماید.
+    content_html = message_content_html(msg) or _esc(content)
     try:
         # ارسال به کاربر
-        header = f"🛡 <b>پاسخ پشتیبانی</b> — تیکت #{ticket_id}\n📌 {subj}\n━━━━━━━━━━\n"
+        header = f"🛡 <b>پاسخ پشتیبانی</b> — تیکت #{ticket_id}\n📌 {_esc(subj)}\n━━━━━━━━━━\n"
         if msg_type == "text":
-            await context.bot.send_message(user["telegram_id"], header + content, parse_mode="HTML")
+            await context.bot.send_message(user["telegram_id"], header + content_html, parse_mode="HTML")
         else:
             await context.bot.send_message(user["telegram_id"], header, parse_mode="HTML")
             if msg_type == "photo":
-                await context.bot.send_photo(user["telegram_id"], file_id, caption=content)
+                await context.bot.send_photo(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
             elif msg_type == "voice":
-                await context.bot.send_voice(user["telegram_id"], file_id, caption=content)
+                await context.bot.send_voice(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
             elif msg_type == "document":
-                await context.bot.send_document(user["telegram_id"], file_id, caption=content)
+                await context.bot.send_document(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
             elif msg_type == "video":
-                await context.bot.send_video(user["telegram_id"], file_id, caption=content)
+                await context.bot.send_video(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
 
         await DatabaseManager.add_ticket_message(ticket_id, "admin", msg_type, content[:1000], sender_name=admin_name, file_id=file_id)
         await msg.reply_text("✅ پاسخ برای کاربر ارسال شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
@@ -585,8 +609,8 @@ async def notify_admins_new_ticket(context, ticket_id, user, subject, bot_id):
     admins = await DatabaseManager.get_all_admins(bot_id=bot_id)
     txt = (
         f"🚨 <b>تیکت جدید #{ticket_id}</b>\n"
-        f"📌 موضوع: {subject}\n"
-        f"👤 {user.get('first_name') or 'کاربر'} (<code>{user.get('telegram_id')}</code>)"
+        f"📌 موضوع: {_esc(subject)}\n"
+        f"👤 {_esc(user.get('first_name') or 'کاربر')} (<code>{user.get('telegram_id')}</code>)"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👁 مشاهدهٔ تیکت", callback_data=f"adm_view_ticket_{ticket_id}")]])
     for a in admins:
@@ -596,12 +620,21 @@ async def notify_admins_new_ticket(context, ticket_id, user, subject, bot_id):
             pass
 
 
-async def notify_admins_new_message(context, ticket_id, user, content, msg_type, bot_id):
+async def notify_admins_new_message(context, ticket_id, user, content, msg_type, bot_id, content_html=None):
     admins = await DatabaseManager.get_all_admins(bot_id=bot_id)
-    preview = _short(content, 60) if msg_type == "text" else f"[{msg_type}] {_short(content, 40)}"
+    if msg_type == "text":
+        # 💎 پیام‌های کوتاه با همان HTMLِ اصلی (شامل ایموجی پریمیومِ کاربر)
+        # نمایش داده می‌شوند. برای پیام‌های بلند، متنِ ساده escape می‌شود تا
+        # برشِ پیش‌نمایش نتواند یک تگ HTML را نصفه کند.
+        if content_html and len(content or "") <= 60:
+            preview = content_html
+        else:
+            preview = _esc(_short(content, 60))
+    else:
+        preview = f"[{msg_type}] {_esc(_short(content, 40))}"
     txt = (
         f"📨 <b>پیام جدید</b> در تیکت #{ticket_id}\n"
-        f"👤 {user.get('first_name') or 'کاربر'} (<code>{user.get('telegram_id')}</code>)\n"
+        f"👤 {_esc(user.get('first_name') or 'کاربر')} (<code>{user.get('telegram_id')}</code>)\n"
         f"💬 {preview}"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👁 مشاهده و پاسخ", callback_data=f"adm_view_ticket_{ticket_id}")]])

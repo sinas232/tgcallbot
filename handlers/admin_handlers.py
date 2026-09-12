@@ -173,6 +173,7 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ["🆔 تنظیم کانال‌های لاگ", "🆔 متن احراز هویت (مرحله ۱)"],
         ["🆔 متن احراز هویت (مرحله ۲)"],
         ["🩺 تنظیمات بررسی سلامت (SpamBot)"],
+        [BTN_PREMIUM_EMOJI],
         ["📊 گزارش کلی", BTN_BACK]
     ]
     if is_god and bot_id == 1: kb.insert(5, ["🛠 مدیریت سرویس‌ها"])
@@ -184,6 +185,10 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
+        # 💎 ایموجی پریمیوم (Custom Emoji)
+        if "ایموجی پریمیوم" in text:
+            from handlers.premium_emoji_handlers import premium_emoji_menu
+            return await premium_emoji_menu(update, context)
         if "کانال‌های لاگ" in text: return await log_channels_menu(update, context)
         if "متن احراز هویت (مرحله ۱)" in text: 
             from handlers.kyc_handlers import set_kyc_text_start

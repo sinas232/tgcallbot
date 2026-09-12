@@ -96,6 +96,14 @@ from handlers.ticket_handlers import (
 )
 from constants import *
 from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
+# 💎 ایموجی پریمیوم (Custom Emoji) — لایهٔ خروجی + پنل ادمین
+from utils.premium_bot import PremiumEmojiApplication, PremiumEmojiBot
+from services import premium_emoji_service
+from handlers.premium_emoji_handlers import (
+    premium_emoji_menu,
+    premium_emoji_callback,
+    premium_emoji_receive_override,
+)
 
 # تنظیمات لاگینگ
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -735,6 +743,11 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📞 پیام خصوصی$"), private_message_start),
                 MessageHandler(filters.Regex("^📢 پیام همگانی$"), broadcast_start),
                 
+                # 💎 ایموجی پریمیوم (متن + دکمه‌ها با Custom Emoji)
+                MessageHandler(filters.Regex(f"^{BTN_PREMIUM_EMOJI}$"), premium_emoji_menu),
+                MessageHandler(filters.Regex("ایموجی پریمیوم"), premium_emoji_menu),
+                CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+
                 # آمار
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
@@ -754,6 +767,10 @@ def register_handlers(application: Application) -> None:
             AWAITING_PM_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, private_message_send)],
             AWAITING_BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, broadcast_confirm)],
             AWAITING_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_execute, pattern="^confirm_|^cancel_")],
+            # 💎 دریافت override شناسهٔ ایموجی پریمیوم (فقط متن‌های حاوی «=» یا «{»)
+            AWAITING_PREMIUM_EMOJI_OVERRIDE: [
+                MessageHandler(filters.Regex(r"[={]"), premium_emoji_receive_override)
+            ],
             
             # پلن
             AWAITING_PLAN_NAME: [MessageHandler(STD_TEXT, receive_plan_name)],
@@ -999,10 +1016,19 @@ async def main_loop():
 
     main_app = (
         Application.builder()
-        .token(Config.BOT_TOKEN)
+        .bot(
+            # لایهٔ «ایموجی پریمیوم»: همهٔ پیام‌ها/کپشن‌ها/دکمه‌های خروجی به‌صورت
+            # خودکار ارتقا می‌یابند و در صورت رد شدن توسط تلگرام، همان پیام بدون
+            # ایموجی پریمیوم ارسال می‌شود (fallback خودکار).
+            PremiumEmojiBot(
+                token=Config.BOT_TOKEN,
+                request=request,
+                get_updates_request=updates_request,
+            )
+        )
+        # پیش‌پردازش آپدیت‌ها: ثبت نوع چت + بازگردانی برچسب دکمه‌های reply
+        .application_class(PremiumEmojiApplication)
         .persistence(main_persistence)
-        .request(request)
-        .get_updates_request(updates_request)
         .build()
     )
     
@@ -1012,6 +1038,12 @@ async def main_loop():
     register_handlers(main_app)
     await main_app.initialize()
     await main_app.start()
+
+    # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها
+    try:
+        await premium_emoji_service.initialize(main_app.bot, bot_id=1)
+    except Exception as exc:
+        logger.warning(f"premium-emoji: initialize failed ({exc}) — قابلیت با تنظیمات .env کار می‌کند")
     
     await main_app.updater.start_polling(
         timeout=30,
@@ -1021,7 +1053,7 @@ async def main_loop():
     )
     
     bot_manager.active_bots[1] = main_app
-    logger.info("🚀 Main Bot Started.")
+    logger.info(f"🚀 Main Bot Started. (version {BOT_VERSION})")
     
     # راه‌اندازی ربات‌های نمایندگی
     await bot_manager.start_all_active_bots()
