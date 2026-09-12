@@ -91,11 +91,25 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_pyrogram_channel_id_range() -> None:
-    """Accept newer Telegram channel ids with the pinned Pyrogram release."""
+    """Accept newer Telegram channel ids on OLD Pyrogram releases only.
+
+    این وصله فقط برای Pyrogram قدیمی (۲.۰.۱۰۶) لازم بود که کران کانال‌ها را
+    درست تشخیص نمی‌داد. روی kurigram (fork به‌روز) تابع get_peer_type به‌صورت
+    بومی شناسه‌های مدرن کانال را پشتیبانی می‌کند و ثابت‌های قدیمی مثل
+    MIN_CHAT_ID دیگر وجود ندارند؛ پس اگر این ثابت‌ها نبودند، وصله را رد می‌کنیم
+    و به تابع بومیِ کتابخانه دست نمی‌زنیم (وگرنه join همهٔ اکانت‌ها می‌شکند).
+    """
     try:
         from pyrogram import utils as pyrogram_utils
         original = pyrogram_utils.get_peer_type
         if getattr(original, "_callmanager_wide_channels", False):
+            return
+
+        # فقط وقتی وصله کن که کتابخانه ثابت‌های قدیمی را داشته باشد
+        # (یعنی Pyrogram کلاسیک). در غیر این صورت (kurigram) کاری نکن.
+        if not all(hasattr(pyrogram_utils, name) for name in
+                   ("MIN_CHAT_ID", "MAX_CHANNEL_ID", "MAX_USER_ID")):
+            logger.info("Skipping channel-id patch: library has native modern-id support")
             return
 
         def get_peer_type(peer_id: int) -> str:
