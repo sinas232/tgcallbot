@@ -51,17 +51,39 @@ logger = logging.getLogger(__name__)
 __all__ = ["PremiumEmojiBot", "PremiumEmojiApplication"]
 
 
-# خطاهایی که نشان می‌دهند «این چت/این پیام ایموجی سفارشی را نمی‌پذیرد»
+# خطاهایی که واقعاً یعنی «این چت/ربات ایموجی سفارشی را نمی‌پذیرد»
+# (فقط این‌ها چت را از فهرست ارتقا خارج می‌کنند).
+# ⚠️ «can't parse entities» اینجا نیست — آن خطا معمولاً باگِ HTML خودمان
+# (تگ بسته‌نشده، entity زیاد، برش وسط تگ) است و نباید کل چت را برای
+# همیشه از ایموجی پریمیوم محروم کند.
 _UNSUPPORTED_HINTS = (
-    "custom emoji",
-    "custom_emoji",
+    "custom emoji is not allowed",
+    "custom emoji not allowed",
+    "custom_emoji_id is invalid",
+    "custom_emoji_id_invalid",
+    "emoji_id_invalid",
+    "wrong custom emoji identifier",
+    "wrong custom emoji",
+    "have no rights to send a message with custom emoji",
+    "have no rights to send custom emoji",
+    "bots can't send custom emojis",
+    "bot can't send custom emoji",
+    "can't use custom emoji",
+    "cannot use custom emoji",
+)
+
+# خطاهای parse که با payload اصلی (بدون ارتقا) باید retry شوند، ولی چت
+# را «unsupported» علامت نزنند.
+_PARSE_ENTITY_HINTS = (
     "can't parse entities",
     "cant parse entities",
     "parse entities",
-    "emoji_id_invalid",
-    "wrong custom emoji",
-    "have no rights",
-    "unsupported",
+    "unsupported start tag",
+    "unclosed start tag",
+    "unclosed end tag",
+    "unexpected end tag",
+    "entity too long",
+    "message is too long",
 )
 
 
@@ -239,7 +261,17 @@ class PremiumEmojiBot(ExtBot):
         return tuple(new_args), new_kwargs, changed, chat_id
 
     async def _send_with_premium(self, parent_method: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any], spec: _TextSpec) -> Any:
-        """اجرای متد والد با payload ارتقایافته + fallback خودکار."""
+        """اجرای متد والد با payload ارتقایافته + fallback هوشمند.
+
+        ترتیب تلاش:
+          1) payload ارتقایافته (ایموجی پریمیوم + دکمه‌های رنگی)
+          2) در خطای parse: یک‌بار sanitization HTML و ارسال دوباره
+          3) payload اصلی (بدون ارتقا) — پیام هرگز از دست نمی‌رود
+
+        فقط خطاهای «این چت custom emoji نمی‌پذیرد» چت را از فهرست ارتقا
+        خارج می‌کنند. خطای «unclosed end tag» / «can't parse entities» هرگز
+        نباید کل چت را برای همیشه خاموش کند (باگ قبلی دقیقاً همین بود).
+        """
         new_args, new_kwargs, changed, chat_id = self._prepare(args, kwargs, spec)
         if not changed:
             return await parent_method(*args, **kwargs)
@@ -248,7 +280,31 @@ class PremiumEmojiBot(ExtBot):
         except BadRequest as exc:
             premium_emoji.stats["fallbacks"] += 1
             message = str(exc).lower()
-            if any(hint in message for hint in _UNSUPPORTED_HINTS):
+
+            # ── خطای parse HTML/entity: sanitization و یک retry ──
+            if any(hint in message for hint in _PARSE_ENTITY_HINTS):
+                sanitized = self._sanitize_payload(new_args, new_kwargs, spec)
+                if sanitized is not None:
+                    s_args, s_kwargs = sanitized
+                    try:
+                        return await parent_method(*s_args, **s_kwargs)
+                    except BadRequest as exc2:
+                        logger.warning(
+                            "premium-emoji: sanitize retry هم ناموفق (%s) → plain fallback",
+                            exc2,
+                        )
+                else:
+                    logger.warning(
+                        "premium-emoji: parse entities روی payload ارتقایافته "
+                        "(%s) — بدون علامت‌زدن چت، plain fallback",
+                        exc,
+                    )
+                return await parent_method(*args, **kwargs)
+
+            # ── واقعاً custom emoji پشتیبانی نمی‌شود ──
+            if any(hint in message for hint in _UNSUPPORTED_HINTS) or (
+                "custom emoji" in message or "custom_emoji" in message
+            ):
                 premium_emoji.mark_unsupported(chat_id, scope=self._premium_scope)
                 logger.info(
                     "premium-emoji: chat %s custom emoji را نپذیرفت؛ این چت از فهرست "
@@ -259,6 +315,42 @@ class PremiumEmojiBot(ExtBot):
             else:
                 logger.debug("premium-emoji: falling back to plain payload (%s)", exc)
             return await parent_method(*args, **kwargs)
+
+    def _sanitize_payload(
+        self,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        spec: _TextSpec,
+    ) -> Optional[Tuple[Tuple[Any, ...], Dict[str, Any]]]:
+        """پاکسازی متن HTML ارتقایافته (بستن تگ‌های باز، حذف tg-emoji معیوب).
+
+        اگر متنی برای پاکسازی نباشد ``None`` برمی‌گرداند.
+        """
+        new_args = list(args)
+        new_kwargs = dict(kwargs)
+        text: Optional[str] = None
+        text_from_args = False
+        if spec.text_pos >= 0 and len(new_args) > spec.text_pos and isinstance(new_args[spec.text_pos], str):
+            text = new_args[spec.text_pos]
+            text_from_args = True
+        elif isinstance(new_kwargs.get(spec.text_kw), str):
+            text = new_kwargs[spec.text_kw]
+        if not text or ("<" not in text and "&" not in text):
+            return None
+
+        cleaned = premium_emoji.sanitize_html(text)
+        if cleaned == text:
+            # اگر تغییری نکرد، حداقل تگ‌های tg-emoji را به یونیکد ساده برگردان
+            # تا پیام حتماً برسد (دکمه‌های رنگی/آیکون ممکن است سالم بمانند).
+            cleaned = premium_emoji.strip_tg_emoji_tags(text)
+            if cleaned == text:
+                return None
+
+        if text_from_args:
+            new_args[spec.text_pos] = cleaned
+        else:
+            new_kwargs[spec.text_kw] = cleaned
+        return tuple(new_args), new_kwargs
 
     # ───────────────────────── متدهای ارسال ─────────────────────────
     async def send_message(self, *args: Any, **kwargs: Any) -> Any:

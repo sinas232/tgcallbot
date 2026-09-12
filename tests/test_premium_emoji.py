@@ -48,11 +48,13 @@ from utils.premium_emoji import (  # noqa: E402
     EMOJI_ID_BY_UNICODE,
     KEY_TO_ID,
     PREMIUM_EMOJI_PACK,
+    classify_button_style,
     escape_outside_tags,
     markdown_to_html,
     message_content_html,
     pe,
     premium_emoji,
+    safe_html_truncate,
 )
 
 
@@ -80,6 +82,7 @@ class _StateGuard(unittest.TestCase):
         "max_entities",
         "validated",
         "strict_emoji_match",
+        "colored_buttons",
     )
 
     def setUp(self) -> None:
@@ -101,6 +104,7 @@ class _StateGuard(unittest.TestCase):
         premium_emoji.trailing_icons = True
         premium_emoji.markdown_to_html = True
         premium_emoji.skip_channels = True
+        premium_emoji.colored_buttons = True
         premium_emoji.max_entities = premium_emoji.MAX_ENTITIES_PER_MESSAGE
         premium_emoji.overrides = {}
         premium_emoji.disabled_ids = set()
@@ -300,6 +304,40 @@ class TestMarkupUpgrade(_StateGuard):
         self.assertEqual(btn.text, "ارسال")
         self.assertEqual(btn.icon_custom_emoji_id, KEY_TO_ID["check"])
         self.assertEqual(btn.callback_data, "ok")
+        # «ارسال» در SUCCESS_TOKENS نیست ولی callback/ok و تاییدهای مشابه…
+        # رنگ بر اساس متن «ارسال» → success
+        self.assertEqual(btn.style, "success")
+
+    def test_colored_buttons_auto_style(self):
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ تایید", callback_data="y"),
+                    InlineKeyboardButton("❌ حذف", callback_data="del"),
+                ],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="back")],
+            ]
+        )
+        out = premium_emoji.upgrade_reply_markup(kb, chat_id=10)
+        self.assertEqual(out.inline_keyboard[0][0].style, "success")
+        self.assertEqual(out.inline_keyboard[0][1].style, "danger")
+        self.assertEqual(out.inline_keyboard[1][0].style, "primary")
+
+    def test_classify_button_style_helpers(self):
+        self.assertEqual(classify_button_style("تایید نهایی"), "success")
+        self.assertEqual(classify_button_style("حذف اکانت"), "danger")
+        self.assertEqual(classify_button_style("بازگشت"), "primary")
+        self.assertIsNone(classify_button_style("گزارش ماهانه"))
+
+    def test_safe_html_truncate_closes_tags(self):
+        tag = pe("check")  # <tg-emoji …>✅</tg-emoji>
+        body = (tag + " خط تست فارسی ") * 200
+        out = safe_html_truncate(body, 500)
+        self.assertLessEqual(len(out), 600)
+        # تگ‌های باز نباید مانده باشند
+        self.assertEqual(out.count("<tg-emoji"), out.count("</tg-emoji>"))
+        self.assertNotIn("<tg-emoji", out[out.rfind("</tg-emoji>") + 10:] if "</tg-emoji>" in out else out)
+
 
     def test_inline_trailing_emoji_becomes_icon(self):
         kb = InlineKeyboardMarkup(
@@ -591,7 +629,10 @@ class TestBotPipeline(_StateGuard):
         self.assertEqual(payload["caption"], "📸 عکس پروفایل")
 
     def test_bad_request_falls_back_to_plain_payload(self):
-        bot = _RecordingBot(fail_first_with="Bad Request: can't parse entities: unsupported custom emoji")
+        # خطای واقعی «custom emoji مجاز نیست» → چت از فهرست ارتقا خارج می‌شود
+        bot = _RecordingBot(
+            fail_first_with="Bad Request: bots can't send custom emoji"
+        )
         _run(bot.send_message(chat_id=11, text="✅ پرداخت موفق", parse_mode="HTML"))
         self.assertEqual(len(bot.calls), 2, "باید یک‌بار بدون ایموجی پریمیوم دوباره تلاش شود")
         first, second = bot.calls[0][1], bot.calls[1][1]
@@ -604,6 +645,22 @@ class TestBotPipeline(_StateGuard):
         _run(bot.send_message(chat_id=11, text="✅ دوباره"))
         self.assertEqual(len(bot.calls), 1)
         self.assertEqual(bot.calls[0][1]["text"], "✅ دوباره")
+
+    def test_parse_entity_error_does_not_blacklist_chat(self):
+        """باگ قبلی: unclosed end tag کل چت را برای همیشه خاموش می‌کرد."""
+        bot = _RecordingBot(
+            fail_first_with="Bad Request: Can't parse entities: unclosed end tag at byte offset 4398"
+        )
+        _run(bot.send_message(chat_id=42, text="✅ پرداخت موفق", parse_mode="HTML"))
+        # باید fallback شده باشد
+        self.assertGreaterEqual(len(bot.calls), 2)
+        # ولی چت نباید blacklist شود
+        self.assertTrue(premium_emoji.chat_supports(42, scope=bot.token))
+        # پیام بعدی دوباره با ایموجی پریمیوم تلاش می‌شود
+        bot.calls.clear()
+        object.__setattr__(bot, "_failed_once", True)  # این‌بار موفق
+        _run(bot.send_message(chat_id=42, text="✅ دوباره", parse_mode="HTML"))
+        self.assertIn("<tg-emoji", bot.calls[0][1]["text"])
 
     def test_channel_chat_skipped_without_extra_call(self):
         premium_emoji.note_chat(-100999, "channel")

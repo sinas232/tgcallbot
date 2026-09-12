@@ -340,6 +340,8 @@ class Config:
     PREMIUM_EMOJI_MAX_PER_MESSAGE = int(os.getenv('PREMIUM_EMOJI_MAX_PER_MESSAGE', '90'))
     # اگر true باشد شناسه‌ای که ایموجی واقعی‌اش با انتظار بسته نمی‌خواند هم حذف می‌شود
     PREMIUM_EMOJI_STRICT_MATCH = os.getenv('PREMIUM_EMOJI_STRICT_MATCH', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    # رنگ‌آمیزی خودکار دکمه‌ها (سبز=تایید، قرمز=حذف/انصراف، آبی=اصلی) — Bot API 9.4
+    PREMIUM_EMOJI_COLORED_BUTTONS = os.getenv('PREMIUM_EMOJI_COLORED_BUTTONS', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # جایگزینی/افزودن شناسه‌ها، با JSON یا فرمت ساده:
     #   PREMIUM_EMOJI_OVERRIDES={"rocket":"5389102131527556772","🚀":"5389102131527556772"}
     #   PREMIUM_EMOJI_OVERRIDES=rocket=5389102131527556772,🚀=5389102131527556772

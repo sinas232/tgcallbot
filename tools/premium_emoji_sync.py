@@ -131,19 +131,26 @@ async def _discover_pack(api_id: int, api_hash: str, session_string: str, packs:
     try:
         for short_name in packs:
             try:
-                try:
-                    res = await client.invoke(
-                        raw_functions.messages.GetStickerSet(
-                            sticker_set=raw_types.InputStickerSetShortName(short_name=short_name),
-                            hash=0,
+                # kurigram: پارامتر رسمی ``stickerset`` است (نه sticker_set)
+                stickerset = raw_types.InputStickerSetShortName(short_name=short_name)
+                res = None
+                last_err = None
+                for kwargs in (
+                    {"stickerset": stickerset, "hash": 0},
+                    {"sticker_set": stickerset, "hash": 0},
+                    {"stickerset": stickerset},
+                    {"sticker_set": stickerset},
+                ):
+                    try:
+                        res = await client.invoke(
+                            raw_functions.messages.GetStickerSet(**kwargs)
                         )
-                    )
-                except TypeError:
-                    res = await client.invoke(
-                        raw_functions.messages.GetStickerSet(
-                            sticker_set=raw_types.InputStickerSetShortName(short_name=short_name)
-                        )
-                    )
+                        break
+                    except TypeError as te:
+                        last_err = te
+                        continue
+                if res is None:
+                    raise last_err or TypeError("GetStickerSet signature mismatch")
                 for pack in getattr(res, "packs", []) or []:
                     emoticon = getattr(pack, "emoticon", None)
                     doc_ids = getattr(pack, "documents", None) or []

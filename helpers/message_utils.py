@@ -57,9 +57,23 @@ async def send_safe(
     try:
         return await sender(**kwargs)
     except BadRequest as e:
+        err = str(e).lower()
         logger.warning(f"Message send failed with {parse_mode} (trying plain text): {e}")
-        # تلاش مجدد بدون فرمت‌دهی در صورت خطا (مثلاً تگ بسته نشده)
+        # اگر HTML شکسته است، اول sanitize کن (بستن تگ‌های باز) بعد plain
+        if parse_mode and ("parse entities" in err or "unclosed" in err or "tag" in err):
+            try:
+                from utils.premium_emoji import premium_emoji
+                cleaned = premium_emoji.sanitize_html(text)
+                if cleaned and cleaned != text:
+                    kwargs["text"] = cleaned
+                    try:
+                        return await sender(**kwargs)
+                    except BadRequest:
+                        pass
+            except Exception:
+                pass
         kwargs['parse_mode'] = None
+        kwargs['text'] = text  # متن اصلی (نه sanitized با parse_mode)
         try:
             return await sender(**kwargs)
         except Exception as e2:

@@ -282,6 +282,13 @@ async def initialize(bot: Any, bot_id: int = 1) -> Dict[str, Any]:
     except Exception as exc:
         logger.warning("premium-emoji: initialize/load_settings: %s", exc)
 
+    # باگ قدیمی: خطای parse HTML چت را برای همیشه blacklist می‌کرد.
+    # در هر استارت فهرست را خالی می‌کنیم تا پس از آپدیت، ایموجی دوباره کار کند.
+    blocked = sum(len(v) for v in premium_emoji.unsupported_chats.values())
+    if blocked:
+        premium_emoji.unsupported_chats.clear()
+        logger.info("premium-emoji: %s چتِ blacklist‌شده پاک شد (استارت تازه)", blocked)
+
     if not premium_emoji.enabled:
         logger.info("premium-emoji: قابلیت خاموش است (PREMIUM_EMOJI_ENABLED=false)")
         return report
@@ -347,20 +354,27 @@ async def sync_from_account(
         async with await client.get_client() as app:
             for short_name in pack_names:
                 try:
-                    try:
-                        res = await app.invoke(
-                            raw_functions.messages.GetStickerSet(
-                                sticker_set=raw_types.InputStickerSetShortName(short_name=short_name),
-                                hash=0,
+                    # kurigram/pyrogram: پارامتر رسمی ``stickerset`` است
+                    # (نه sticker_set). چند نام را برای سازگاری می‌آزماییم.
+                    stickerset = raw_types.InputStickerSetShortName(short_name=short_name)
+                    res = None
+                    last_err: Optional[Exception] = None
+                    for kwargs in (
+                        {"stickerset": stickerset, "hash": 0},
+                        {"sticker_set": stickerset, "hash": 0},
+                        {"stickerset": stickerset},
+                        {"sticker_set": stickerset},
+                    ):
+                        try:
+                            res = await app.invoke(
+                                raw_functions.messages.GetStickerSet(**kwargs)
                             )
-                        )
-                    except TypeError:
-                        # نسخه‌های قدیمی‌ترِ Layer بدون پارامتر hash
-                        res = await app.invoke(
-                            raw_functions.messages.GetStickerSet(
-                                sticker_set=raw_types.InputStickerSetShortName(short_name=short_name)
-                            )
-                        )
+                            break
+                        except TypeError as te:
+                            last_err = te
+                            continue
+                    if res is None:
+                        raise last_err or TypeError("GetStickerSet signature mismatch")
                     for pack in getattr(res, "packs", []) or []:
                         emoticon = getattr(pack, "emoticon", None)
                         doc_ids = getattr(pack, "documents", None) or []
@@ -419,18 +433,21 @@ def status_html(bot_id: int = 1) -> str:
     def _flag(on: bool) -> str:
         return "✅ روشن" if on else "⛔ خاموش"
 
+    blocked_chats = sum(len(v) for v in premium_emoji.unsupported_chats.values())
     lines = [
-        "💎 <b>وضعیت ایموجی پریمیوم</b>",
+        "💎 <b>وضعیت ایموجی پریمیوم + UI رنگی</b>",
         "",
         f"🔘 قابلیت کلی: {_flag(premium_emoji.enabled)}",
         f"📝 ایموجی در متن پیام‌ها: {_flag(premium_emoji.text_enabled)}",
         f"🎛 آیکون دکمه‌های inline: {_flag(premium_emoji.inline_buttons_enabled)}",
         f"⌨️ آیکون دکمه‌های کیبورد اصلی: {_flag(premium_emoji.reply_buttons_enabled)}",
+        f"🎨 دکمه‌های رنگی (سبز/قرمز/آبی): {_flag(getattr(premium_emoji, 'colored_buttons', True))}",
         "",
         f"📦 شناسه‌های بسته: <code>{total_ids}</code>",
         f"✅ تاییدشده توسط تلگرام: <code>{valid}</code>",
         f"❌ نامعتبر (خودکار حذف شد): <code>{disabled}</code>",
         f"🔧 overrideهای دستی: <code>{len(premium_emoji.overrides)}</code>",
+        f"🚫 چت‌های موقتاً مسدود: <code>{blocked_chats}</code>",
     ]
     if premium_emoji.emoji_mismatches:
         lines += [
@@ -449,13 +466,14 @@ def status_html(bot_id: int = 1) -> str:
             + "."
         )
     stats = premium_emoji.stats
-    if stats.get("texts_upgraded") or stats.get("buttons_upgraded"):
+    if stats.get("texts_upgraded") or stats.get("buttons_upgraded") or stats.get("buttons_colored"):
         lines += [
             "",
             "📈 از لحظهٔ شروع:",
             f"• پیام ارتقایافته: <code>{stats.get('texts_upgraded', 0)}</code>",
             f"• ایموجی جایگزین‌شده: <code>{stats.get('emojis_inserted', 0)}</code>",
             f"• دکمه با آیکون پریمیوم: <code>{stats.get('buttons_upgraded', 0)}</code>",
+            f"• دکمه رنگی‌شده: <code>{stats.get('buttons_colored', 0)}</code>",
             f"• ارسال مجدد بدون ایموجی (fallback): <code>{stats.get('fallbacks', 0)}</code>",
         ]
     lines += [
