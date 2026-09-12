@@ -39,6 +39,20 @@ class Config:
     TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH', '')
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
+    # ── Outbound SOCKS5 proxy for the voice Pyrogram/PyTgCalls clients ──
+    # When USE_PROXY is truthy, every voice account's Pyrogram Client (and the
+    # PyTgCalls engine that rides on it) connects through this SOCKS5 proxy.
+    # In the always-WARP compose the bot runs with network_mode: service:warp,
+    # so it SHARES the warp container's network namespace — the warp SOCKS5
+    # proxy is therefore reachable on 127.0.0.1:1080 (NOT the container name,
+    # which does not resolve inside a shared netns; and port 1080 is what the
+    # caomingjun/warp image listens on, not 4000).
+    USE_PROXY = os.getenv('USE_PROXY', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    SOCKS5_HOST = os.getenv('SOCKS5_HOST', '127.0.0.1')
+    SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', '1080') or 1080)
+    SOCKS5_USERNAME = os.getenv('SOCKS5_USERNAME', '') or None
+    SOCKS5_PASSWORD = os.getenv('SOCKS5_PASSWORD', '') or None
+
     # Database
     DATABASE_URL = _safe_encode_db_url(os.getenv('DATABASE_URL', ''))
     REDIS_URL = _safe_encode_db_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
@@ -90,9 +104,55 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '5'))   # first wave size (5-10 recommended)
+    # First wave size. 2 is the safe default: combined with the staggered
+    # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
+    # WebRTC handshakes land several seconds apart, which keeps Telegram's
+    # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
+    # voice handshake. The Join Brain may still widen this (up to the max).
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '10'))         # per-order hard ceiling
+    # Per-order ceiling kept LOW on purpose: every simultaneous voice
+    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
+    # than ~2 concurrent media setups is where transports start dying AND
+    # where Telegram's per-IP burst budget starts answering with FloodWait.
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
+    # Accounts of one wave do NOT fire their joins in the same millisecond:
+    # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
+    # after the previous one. This spreads the phone.JoinGroupCall RPCs AND
+    # the WebRTC media handshakes over several seconds — no "N joins in one
+    # second" bursts (FloodWait loops) and no ffmpeg/CPU spike.
+    # The wave itself still overlaps: a single join takes 30-45s, so the
+    # build speed is nearly unchanged; only the *starts* are paced.
+    # Default gap 0.5-1.0s between account starts (user-requested pacing to
+    # avoid a one-shot CPU spike while still throttling the RPC cadence).
+    # NOTE: this is much tighter than the earlier 6-10s FloodWait-safe pacing —
+    # if Telegram starts issuing FloodWait during big ramp-ups, raise these two
+    # env vars back toward 3-6s.
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '0.5'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '1.0'))
+    # Extra small human-like jitter (seconds) added on top of the base
+    # start-gap between two account client starts, to avoid a perfectly
+    # periodic RPC cadence that automated anti-spam can fingerprint. Kept at 0
+    # by default so the total gap stays within the requested 0.5-1.0s window.
+    VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.0'))
+    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '0.0'))
+    # ── IN-CALL MESSAGE / REACTION PACING (anti-burst for customer chat) ──
+    # When a customer sends a comment or reaction from many accounts at once,
+    # the sends are NOT fired in the same millisecond. Each account's send
+    # starts INCALL_SEND_STAGGER_MIN..MAX seconds after the previous one, so
+    # Telegram sees a steady ~1 request/second cadence instead of a burst of
+    # N simultaneous phone.SendGroupCallMessage RPCs (which trip FloodWait and
+    # make the message effectively invisible in the call). Deterministic pacing,
+    # not a one-shot flood — but still fast enough to finish quickly.
+    # Default ~1 msg/second (0.8-1.2s gap). Raise if Telegram issues FloodWait.
+    INCALL_SEND_STAGGER_MIN = float(os.getenv('INCALL_SEND_STAGGER_MIN', '0.8'))
+    INCALL_SEND_STAGGER_MAX = float(os.getenv('INCALL_SEND_STAGGER_MAX', '1.2'))
+    # Hard ceiling on how many in-call sends may be in-flight at the same time.
+    # Even with the stagger above, a slow network could let many overlap; this
+    # bounds concurrency so we never dump the whole batch on Telegram at once.
+    INCALL_SEND_MAX_CONCURRENCY = int(os.getenv('INCALL_SEND_MAX_CONCURRENCY', '3'))
+
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.
@@ -124,6 +184,16 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── Stay-alive audio format (CPU) ────────────────────────────────────
+    # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
+    # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo, and a
+    # LOWER sample rate (24 kHz) further cuts the per-frame Opus work.  Since
+    # this is pure silence keeping a muted listener's WebRTC transport alive,
+    # 24 kHz mono is inaudibly sufficient and the cheapest to encode.  The
+    # generated silence.wav is built at the SAME rate so ffmpeg never resamples
+    # (pure pass-through).  Both are overridable via env.
+    VOICE_AUDIO_SAMPLE_RATE = int(os.getenv('VOICE_AUDIO_SAMPLE_RATE', '24000'))
+    VOICE_AUDIO_CHANNELS = int(os.getenv('VOICE_AUDIO_CHANNELS', '1'))
     # FloodWait at or below this many seconds is slept inside the join task;
     # longer server waits are persisted (data/voice_flood_cooldown.json, also
     # surviving restarts/wave cancellation) and the account is deferred by the
@@ -139,7 +209,21 @@ class Config:
     # account is inside the call.  play() returns only after Telegram accepted
     # the JoinGroupCall + the WebRTC transport is up, so this works even in
     # HUGE voice chats where the participant listing cannot be paginated.
-    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '30'))
+    # 40s gives the (now staggered, non-flooded) join full head-room before
+    # the code falls back to the participant-listing verification.
+    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '40'))
+    # Min seconds between two silence re-stream attempts for the SAME account
+    # when the engine media binding vanished but the account is still listed
+    # inside the call (ghost-media-only). Paced so the re-stream can never
+    # become a new JoinGroupCall burst.
+    VOICE_MEDIA_RESTORE_INTERVAL = int(os.getenv('VOICE_MEDIA_RESTORE_INTERVAL', '25'))
+    # After this many CONSECUTIVE failed restores for one slot, pause media
+    # restore attempts for VOICE_MEDIA_RESTORE_PAUSE_SECONDS (the account
+    # stays counted inside the call; we stop hammering a broken media path
+    # with new JoinGroupCalls). One probe is allowed again after the pause
+    # so a recovered network heals automatically.
+    VOICE_MEDIA_RESTORE_MAX_FAILS = int(os.getenv('VOICE_MEDIA_RESTORE_MAX_FAILS', '3'))
+    VOICE_MEDIA_RESTORE_PAUSE_SECONDS = int(os.getenv('VOICE_MEDIA_RESTORE_PAUSE_SECONDS', '600'))
     # Shared chat-info cache TTL (peer + access_hash + InputGroupCall): ONE
     # account resolves the chat and every other account reuses the cached
     # objects instead of each issuing resolve_peer/GetFullChannel from the same
@@ -157,6 +241,13 @@ class Config:
     # (logs/voice_telemetry.log) so every fall-out has a recorded reason.
     VOICE_DROP_LEDGER = os.getenv('VOICE_DROP_LEDGER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     VOICE_TELEMETRY = os.getenv('VOICE_TELEMETRY', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Verbose [VoiceDiag] JSON stream: emit one INFO log line for EVERY routine
+    # state transition (STARTING / CLIENT_STARTED / JOINING / JOINED …). With
+    # many accounts this is a high-frequency disk-I/O + CPU hot path. Off by
+    # default in production: routine transitions drop to DEBUG (suppressed at
+    # the default INFO log level) while warnings/errors/rate-limits are ALWAYS
+    # emitted. Set ENABLE_VERBOSE_DIAG=true to restore the full firehose.
+    ENABLE_VERBOSE_DIAG = os.getenv('ENABLE_VERBOSE_DIAG', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
     # Session guard: if an account's MTProto session silently died, reconnect it
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -186,8 +277,20 @@ class Config:
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
     # Web Server & Payment
+    # ⚠️ SERVER_URL باید آدرس عمومیِ قابل‌دسترس از اینترنت باشد (دامنه یا IP
+    # عمومی سرور + پورت منتشرشده)، چون درگاه پرداخت پس از پرداخت، کاربر را با
+    # همین آدرس (callback_url) ریدایرکت می‌کند. اگر روی مقدار پیش‌فرض
+    # localhost بماند، مرورگر کاربر به localhostِ خودش برمی‌گردد و کال‌بک هرگز
+    # به سرور نمی‌رسد → verify اجرا نمی‌شود و کیف پول شارژ نمی‌شود.
+    # نمونهٔ درست: https://your-domain.com  یا  http://SERVER_PUBLIC_IP:8080
     SERVER_URL = os.getenv('SERVER_URL', 'http://localhost:8080').rstrip('/')
     PORT = int(os.getenv('PORT', '8080'))
+
+    # پروکسی HTTP برای درخواست‌های درگاه پرداخت (زرین‌پال/آقای پرداخت).
+    # چون ربات با WARP اجرا می‌شود و درگاه‌های ایرانی اتصال از IP خارجی را
+    # نمی‌پذیرند، این درخواست‌ها از یک پروکسیِ بدون WARP (کانتینر payproxy روی
+    # IP ایرانیِ هاست) عبور می‌کنند. اگر خالی باشد، مستقیم (از WARP) می‌روند.
+    PAYMENT_HTTP_PROXY = os.getenv('PAYMENT_HTTP_PROXY', '').strip() or None
 
     # --- Payment Configuration (Corrected Names) ---
 
@@ -225,4 +328,30 @@ class Config:
 
         if errors:
             raise ValueError(f"خطای تنظیمات:\n" + "\n".join(f"- {e}" for e in errors))
+
+        # هشدار (نه خطای بلاک‌کننده) دربارهٔ SERVER_URL نامعتبر برای درگاه پرداخت.
+        # اگر روی localhost/127.0.0.1 مانده باشد، کال‌بک درگاه پرداخت هرگز به
+        # سرور نمی‌رسد و شارژ کیف پول انجام نمی‌شود.
+        try:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            _url = (cls.SERVER_URL or "").lower()
+            if ("localhost" in _url) or ("127.0.0.1" in _url) or (not _url):
+                _log.warning(
+                    "⚠️ SERVER_URL روی '%s' تنظیم شده است. برای کارکرد کال‌بک "
+                    "درگاه پرداخت (زرین‌پال/آقای پرداخت) باید آدرس عمومیِ سرور "
+                    "باشد؛ در غیر این صورت پس از پرداخت، کاربر به سرور بازنمی‌گردد "
+                    "و کیف پول شارژ نمی‌شود.", cls.SERVER_URL,
+                )
+            # هشدار merchant_id خالی/پیش‌فرض زرین‌پال (بدون آن، درخواست پرداخت
+            # ساخته نمی‌شود). merchant_id واقعی از پنل زرین‌پال گرفته می‌شود.
+            _mid = (cls.ZARINPAL_MERCHANT or "").strip()
+            if (not _mid) or _mid.startswith("xxxx"):
+                _log.warning(
+                    "⚠️ ZARINPAL_MERCHANT تنظیم نشده است (مقدار فعلی: '%s'). "
+                    "بدون شناسهٔ پذیرندهٔ معتبر (merchant_id)، درگاه زرین‌پال "
+                    "لینک پرداخت نمی‌سازد.", cls.ZARINPAL_MERCHANT,
+                )
+        except Exception:
+            pass
         return True

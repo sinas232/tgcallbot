@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 from database import DatabaseManager
 from helpers.message_utils import send_safe
 from constants import *
-from utils.helpers import clean_number, format_jalali_datetime
+from utils.helpers import clean_number, format_jalali_datetime, format_price
 from config import Config
 from services.order_executor import order_executor
 from services.bot_manager import bot_manager
@@ -626,15 +626,43 @@ async def stop_order_execute(update, context):
         return AWAITING_STOP_ORDER_INDEX
         
     if order['status'] == 'scheduled':
-        await DatabaseManager.update_order_status(oid, 'stopped')
-        msg = "✅ سفارش زمان‌بندی شده لغو شد."
+        # سفارش زمان‌بندی‌شده هنوز شروع نشده → عودت کامل بدون محاسبهٔ ثانیه‌ای
+        await order_executor.settle_and_refund_order(
+            oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
+            canceled_by_name=update.effective_user.first_name,
+            cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
+            bot_id=context.bot_data.get('bot_id', 1),
+        )
+        msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     else:
-        await order_executor.stop_active_order(oid)
-        msg = "✅ سفارش فعال متوقف شد."
-        
-    await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
-    
-    # 🔙 بازگشت هوشمند پس از لغو
+        # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
+        total_price = float(order.get('price_paid') or 0)
+        used_cost, refund_amount, _elapsed = order_executor.compute_prorated_settlement(
+            total_price, order.get('duration_minutes'), order.get('started_at')
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
+                callback_data=f"admincancel_refund_{oid}")],
+            [InlineKeyboardButton(
+                "🚫 لغو بدون عودت وجه",
+                callback_data=f"admincancel_norefund_{oid}")],
+            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
+        ])
+        txt = (
+            f"🛑 **لغو سفارش فعال #{oid}**\n\n"
+            f"💰 هزینه کل پلن: {format_price(total_price)} تومان\n"
+            f"📉 هزینه مصرف‌شده تا الان: {format_price(used_cost)} تومان\n"
+            f"💵 مبلغ قابل عودت: {format_price(refund_amount)} تومان\n\n"
+            f"لطفاً نوع لغو را انتخاب کنید:"
+        )
+        await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb)
+        # منوی اصلی را هم برگردان تا کیبورد پایین گیر نکند
+        await send_safe(context.bot, update.effective_chat.id, "👇", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
+        return AWAITING_SETTINGS_ACTION
+
+    # 🔙 بازگشت هوشمند پس از لغو (فقط برای مسیر scheduled)
     return_to = context.user_data.get('stop_order_return_to')
     if return_to == 'profile':
         uid = context.user_data.get('target_uid')
@@ -643,6 +671,52 @@ async def stop_order_execute(update, context):
     else: await manage_orders_start(update, context)
     
     return AWAITING_SETTINGS_ACTION
+
+
+async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        _, mode, oid_str = data.split("_", 2)
+        oid = int(oid_str)
+    except Exception:
+        return
+
+    if mode == "abort":
+        await query.edit_message_text("↩️ لغو منصرف شد. سفارش دست‌نخورده باقی ماند.")
+        return
+
+    order = await DatabaseManager.get_order(oid)
+    if not order:
+        await query.edit_message_text("❌ سفارش یافت نشد یا قبلاً بسته شده است.")
+        return
+
+    do_refund = (mode == "refund")
+    result = await order_executor.settle_and_refund_order(
+        oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
+        canceled_by_name=update.effective_user.first_name,
+        cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
+        bot_id=bot_id,
+    )
+
+    if do_refund:
+        txt = (
+            f"✅ سفارش #{oid} لغو شد و مبلغ عودت داده شد.\n\n"
+            f"💰 هزینه کل: {format_price(result['total_cost'])} تومان\n"
+            f"📉 مصرف‌شده: {format_price(result['used_cost'])} تومان\n"
+            f"💵 عودت‌شده: {format_price(result['refund_amount'])} تومان\n"
+            f"🧾 کد عودت: {result.get('refund_tx_id') or '—'}\n"
+            f"👛 موجودی جدید کاربر: {format_price(result.get('user_wallet_balance'))} تومان"
+        )
+    else:
+        txt = (
+            f"✅ سفارش #{oid} بدون عودت وجه لغو شد.\n\n"
+            f"💰 کل مبلغ ({format_price(result['total_cost'])} تومان) به‌عنوان مصرف‌شده در نظر گرفته شد."
+        )
+    await query.edit_message_text(txt)
 
 # ===================== USER & ADMIN MANAGEMENT =====================
 
@@ -1110,7 +1184,14 @@ async def handle_gateway_action(update, context):
         await DatabaseManager.update_gateway_config(slug, new_status, config, bot_id=bot_id)
         await update.message.reply_text(f"✅ وضعیت تغییر کرد.")
         return await handle_gateway_selection(update, context, gateway_name=gw['name'])
-    if "تنظیم PIN" in text or "تنظیم merchant_id" in text:
+    if "🔑 تنظیم Access Token" in text:
+        context.user_data['config_mode'] = "access_token"
+        await update.message.reply_text("✏️ لطفاً **Access Token** جدید را ارسال کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+        return AWAITING_GATEWAY_CONFIG_INPUT
+    # نام دکمهٔ تنظیم شناسه مطابق slug ساخته می‌شود («تنظیم pin» یا «تنظیم merchant_id»).
+    # چک را حساس‌به‌بزرگی/کوچکی نمی‌کنیم تا هم PIN و هم pin مطابقت کنند.
+    lowered = text.lower()
+    if "تنظیم pin" in lowered or "تنظیم merchant_id" in lowered:
         context.user_data['config_mode'] = "main_id"
         param_name = "PIN" if slug == 'aqayepardakht' else "Merchant ID"
         await update.message.reply_text(f"✏️ لطفاً **{param_name}** جدید را ارسال کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
@@ -1436,7 +1517,7 @@ async def handle_reseller_action(update, context):
                 return AWAITING_SETTINGS_ACTION
             count = 0
             for acc in main_accounts:
-                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'))
+                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'), first_name=acc.get('first_name'), last_name=acc.get('last_name'), username=acc.get('username'))
                 if res: count += 1
             await query.edit_message_text(f"✅ {count} اکانت کپی شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]))
         except: pass
@@ -1586,10 +1667,19 @@ async def services_management_menu(update, context):
     v_status = await DatabaseManager.get_setting("service_voice_chat", "true", bot_id=bot_id) == "true"
     g_status = await DatabaseManager.get_setting("service_group_join", "true", bot_id=bot_id) == "true"
     c_status = await DatabaseManager.get_setting("service_channel_join", "true", bot_id=bot_id) == "true"
+    # قابلیت چت درون ویس‌کال (پیش‌فرض خاموش)
+    ic_status = await DatabaseManager.get_setting("service_incall_chat", "false", bot_id=bot_id) == "true"
     v_txt = "✅ فعال" if v_status else "❌ غیرفعال"
     g_txt = "✅ فعال" if g_status else "❌ غیرفعال"
     c_txt = "✅ فعال" if c_status else "❌ غیرفعال"
-    kb = [[InlineKeyboardButton(f"ویس‌کال: {v_txt}", callback_data="toggle_srv_voice_chat")], [InlineKeyboardButton(f"گروه: {g_txt}", callback_data="toggle_srv_group_join")], [InlineKeyboardButton(f"کانال: {c_txt}", callback_data="toggle_srv_channel_join")], [InlineKeyboardButton("🔙", callback_data="back_to_settings")]]
+    ic_txt = "✅ فعال" if ic_status else "❌ غیرفعال"
+    kb = [
+        [InlineKeyboardButton(f"ویس‌کال: {v_txt}", callback_data="toggle_srv_voice_chat")],
+        [InlineKeyboardButton(f"گروه: {g_txt}", callback_data="toggle_srv_group_join")],
+        [InlineKeyboardButton(f"کانال: {c_txt}", callback_data="toggle_srv_channel_join")],
+        [InlineKeyboardButton(f"💬 چت در ویس‌کال: {ic_txt}", callback_data="toggle_srv_incall_chat")],
+        [InlineKeyboardButton("🔙", callback_data="back_to_settings")],
+    ]
     txt = "🛠 **مدیریت سرویس‌ها**\nروی دکمه بزنید تا وضعیت تغییر کند."
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -1605,7 +1695,13 @@ async def service_toggle_callback(update, context):
     srv = data.replace("toggle_srv_", "")
     bot_id = context.bot_data.get('bot_id', 1)
     curr = await DatabaseManager.get_setting(f"service_{srv}", "true", bot_id=bot_id) == "true"
-    await DatabaseManager.set_setting(f"service_{srv}", "false" if curr else "true", bot_id=bot_id)
+    new_val = "false" if curr else "true"
+    await DatabaseManager.set_setting(f"service_{srv}", new_val, bot_id=bot_id)
+    # بازخورد صریح به ادمین
+    try:
+        await query.answer("✅ فعال شد." if new_val == "true" else "❌ غیرفعال شد.", show_alert=False)
+    except Exception:
+        pass
     return await services_management_menu(update, context)
 
 # ===================== BACKUP & RESTORE (پشتیبان‌گیری و بازیابی) =====================

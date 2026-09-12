@@ -9,10 +9,43 @@ try:
 except Exception:
     pass
 
+# ── Suppress the PTBUserWarning spam from ConversationHandler ────────────
+# Our conversations deliberately use per_message=False (button-driven
+# conversations: each callback is handled regardless of which message it
+# came from — the documented safe pattern, see the PTB FAQ on per_*
+# settings).  PTB 20+ warns once per ConversationHandler that contains a
+# CallbackQueryHandler; with 7 conversations that floods the startup log.
+# NOTE: this warning is raised on the per_message VALUE, so even passing
+# per_message=False explicitly cannot silence it — the filter below is the
+# only way without changing conversation behavior.  Must be set BEFORE the
+# handlers are constructed further down in this module.
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
+
 import logging
 import os
 import time
 import asyncio
+
+# ── uvloop: drop-in, much faster asyncio loop (Linux/macOS) ──────────────
+# We do NOT call uvloop.install() here. Combined with the deprecated
+# asyncio.get_event_loop() used in the __main__ block below, install() routes
+# get_event_loop() through uvloop's policy, which on some uvloop builds
+# recurses infinitely ("get_event_loop" over and over) and crashes the bot at
+# boot. Instead we detect availability now and build an explicit uvloop loop in
+# __main__ (uvloop.new_event_loop()), which is the recommended, recursion-free
+# way to run on libuv. It is a no-op / unavailable on Windows.
+_UVLOOP = None
+if os.name != "nt":
+    try:
+        import uvloop as _UVLOOP
+    except Exception as _uvloop_exc:  # pragma: no cover - platform dependent
+        _UVLOOP = None
+        logging.getLogger(__name__).info(
+            "uvloop not available (falling back to default asyncio loop): %s", _uvloop_exc
+        )
+
 import html
 import json
 from datetime import datetime, timedelta
@@ -41,14 +74,25 @@ from handlers.menu_handlers import *
 from handlers.account_management import *
 from handlers.wallet_handlers import *
 from handlers.profile_handlers import *
+from handlers.incall_handlers import (
+    incall_center_start, incall_orders_refresh, incall_order_selected,
+    incall_toggle_account, incall_select_all, incall_select_none,
+    incall_accs_refresh, incall_back_orders, incall_compose,
+    incall_edit_accounts, incall_react, incall_write, incall_receive_text,
+    incall_close,
+)
 from handlers.kyc_handlers import *
 # ایمپورت هندلرهای تیکتینگ
 from handlers.ticket_handlers import (
     start_ticket_support, 
     handle_user_ticket_message, 
+    handle_ticket_subject,
+    handle_ticket_body,
+    user_ticket_callback,
     admin_tickets_list, 
     admin_ticket_actions, 
-    handle_admin_reply_message
+    handle_admin_reply_message,
+    auto_close_idle_tickets,
 )
 from constants import *
 from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
@@ -81,6 +125,10 @@ for _handler in logging.getLogger().handlers:
     _handler.addFilter(_PyTgCallsNoiseFilter())
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("pytgcalls").setLevel(logging.WARNING)
+# asyncio/ntgcalls emit per-task and per-frame chatter that burns CPU on the
+# console handler under many concurrent voice streams; keep only real problems.
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("ntgcalls").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -196,12 +244,24 @@ def get_html_response(title, message, color="#4CAF50", icon="✅"):
     """
 
 async def ap_callback_handler(request):
-    """کالبک آقای پرداخت"""
+    """کالبک آقای پرداخت (API V2).
+
+    چون هنگام ایجاد تراکنش callback_method=GET فرستاده می‌شود، بازگشت با متد
+    GET انجام می‌شود؛ اما برای اطمینان هر دو حالت GET و POST را می‌خوانیم.
+    پارامترها طبق مستندات: transid, status (۱ موفق/۰ ناموفق), cardnumber,
+    tracking_number, invoice_id, bank.
+    """
     try:
-        data = await request.post()
+        if request.method == 'POST':
+            data = await request.post()
+        else:
+            data = request.query
+
         trans_id = data.get('transid')
         status = data.get('status')
-        
+        card_pan = data.get('cardnumber') or data.get('card_number') or '---'
+        tracking_number = data.get('tracking_number')
+
         if not trans_id: 
             return web.Response(text="Missing transid", status=400)
         
@@ -216,7 +276,10 @@ async def ap_callback_handler(request):
         app = bot_manager.active_bots.get(bot_id)
 
         if str(status) == '1':
-            success, result_data = await payment_service.verify_payment(trans_id, int(transaction['amount']), "aqayepardakht", bot_id=bot_id)
+            success, result_data = await payment_service.verify_payment(
+                trans_id, int(transaction['amount']), "aqayepardakht", bot_id=bot_id,
+                extra={"card_pan": card_pan, "tracking_number": tracking_number},
+            )
             if success:
                 await DatabaseManager.update_payment_status(trans_id, 'paid')
                 await DatabaseManager.update_user_credit(transaction['user_id'], int(float(transaction['amount'])), "online_charge", f"شارژ آنلاین (کد: {trans_id})", bot_id=bot_id)
@@ -251,11 +314,14 @@ async def zp_callback_handler(request):
         app = bot_manager.active_bots.get(bot_id)
 
         if status == 'OK':
-            # طبق مستندات رسمی زرین‌پال، مبلغ برای اعتبارسنجی باید به ریال باشد
-            # مبلغ در دیتابیس شما به تومان ذخیره شده است، پس باید در 10 ضرب شود
-            amount_in_rials = int(float(transaction['amount'])) * 10
+            # مبلغ تراکنش به تومان در دیتابیس ذخیره شده است. آن را «به تومان»
+            # به لایهٔ سرویس پاس می‌دهیم؛ خودِ ZarinPalGateway.verify_payment
+            # تبدیل تومان→ریال (× ۱۰) را انجام می‌دهد (دقیقاً مثل مسیر آقای پرداخت).
+            # نکتهٔ مهم: اینجا نباید در ۱۰ ضرب شود، وگرنه مبلغ دوبار ضرب شده و
+            # ۱۰۰ برابر به زرین‌پال می‌رود و verify با خطای «مغایرت مبلغ» شکست می‌خورد.
+            amount_toman = int(float(transaction['amount']))
             
-            success, result_data = await payment_service.verify_payment(authority, amount_in_rials, "zarinpal", bot_id=bot_id)
+            success, result_data = await payment_service.verify_payment(authority, amount_toman, "zarinpal", bot_id=bot_id)
             
             if success:
                 await DatabaseManager.update_payment_status(authority, 'paid')
@@ -279,10 +345,96 @@ async def zp_callback_handler(request):
         logger.error(f"ZP Callback Error: {e}")
         return web.Response(text="Internal Error", status=500)
 
+async def pay_redirect_handler(request):
+    """صفحهٔ میانیِ فاکتور/هدایت به درگاه (روی دامنهٔ اصلیِ خودمان).
+
+    الزام شاپرک: پرداخت از بات نباید مستقیم به درگاه هدایت شود؛ باید ابتدا
+    از یک صفحهٔ وب روی «دامنهٔ اصلی» آغاز شود تا نشانی ارجاع‌دهنده (Referrer)
+    با دامنهٔ رسمیِ درگاه و صفحهٔ نتیجهٔ پرداخت (callback) تطابق داشته باشد.
+    این صفحه لینک واقعی درگاه را از دیتابیس می‌خواند و کاربر را (پس از یک
+    ریدایرکت کوتاه که Referrer را روی دامنهٔ ما ثبت می‌کند) به درگاه می‌برد.
+    """
+    trans_id = request.match_info.get('trans_id', '')
+    if not trans_id:
+        return web.Response(text="Bad Request", status=400)
+
+    transaction = await DatabaseManager.get_payment_transaction(trans_id)
+    if not transaction:
+        return web.Response(
+            text=get_html_response("تراکنش یافت نشد", "لینک پرداخت نامعتبر است.",
+                                   color="#F44336", icon="❌"),
+            content_type='text/html', status=404,
+        )
+
+    if transaction.get('status') == 'paid':
+        return web.Response(
+            text=get_html_response("پرداخت‌شده", "این تراکنش قبلاً پرداخت شده است."),
+            content_type='text/html',
+        )
+
+    pay_url = transaction.get('pay_url')
+    if not pay_url:
+        return web.Response(
+            text=get_html_response("خطا", "آدرس درگاه برای این تراکنش ثبت نشده است.",
+                                   color="#F44336", icon="❌"),
+            content_type='text/html', status=500,
+        )
+
+    amount = int(float(transaction.get('amount', 0)))
+    # صفحهٔ فاکتور با هدایت خودکار (meta refresh + JS) به درگاه. چون این صفحه
+    # روی دامنهٔ اصلی ما بارگذاری می‌شود، مرورگر هنگام رفتن به درگاه، همین دامنه
+    # را به‌عنوان Referrer ارسال می‌کند و الزام تطابق دامنه رعایت می‌شود.
+    html = f"""<!DOCTYPE html>
+<html lang="fa">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="1;url={pay_url}">
+    <title>در حال انتقال به درگاه پرداخت</title>
+    <style>
+        body {{ font-family: Tahoma, Arial, sans-serif; text-align: center; padding: 50px; direction: rtl; background:#f4f4f9; }}
+        .card {{ background:#fff; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,.1); display:inline-block; max-width:400px; width:100%; }}
+        h1 {{ color:#0088cc; }}
+        .amount {{ font-size:22px; font-weight:bold; color:#333; margin:14px 0; }}
+        .btn {{ display:inline-block; margin-top:24px; padding:12px 26px; background:#0088cc; color:#fff; text-decoration:none; border-radius:8px; font-weight:bold; }}
+        .muted {{ color:#888; font-size:13px; margin-top:16px; }}
+    </style>
+    <script>setTimeout(function(){{ window.location.href = "{pay_url}"; }}, 900);</script>
+</head>
+<body>
+    <div class="card">
+        <h1>در حال انتقال به درگاه پرداخت…</h1>
+        <div class="amount">مبلغ: {amount:,} تومان</div>
+        <p>لطفاً چند لحظه صبر کنید. اگر به‌صورت خودکار منتقل نشدید، روی دکمهٔ زیر بزنید:</p>
+        <a class="btn" href="{pay_url}">ورود به درگاه پرداخت</a>
+        <div class="muted">شناسهٔ تراکنش: {trans_id}</div>
+    </div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type='text/html')
+
+async def health_handler(request):
+    """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
+    اگر این آدرس را در مرورگر باز کردید و 'ok' دیدید، یعنی دامنه/پورت شما
+    درست به این سرور اشاره می‌کند و کال‌بک درگاه پرداخت هم به سرور خواهد رسید."""
+    return web.Response(
+        text=(
+            "ok - callback server is reachable\n"
+            f"SERVER_URL={Config.SERVER_URL}\n"
+            f"zarinpal_callback={Config.ZARINPAL_CALLBACK_URL}\n"
+            f"aqayepardakht_callback={Config.AGHAYE_PARDAKHT_CALLBACK_URL}\n"
+        ),
+        content_type='text/plain',
+    )
+
 async def start_web_server():
     """راه‌اندازی وب‌سرور aiohttp"""
     app = web.Application()
+    app.router.add_get('/', health_handler)
+    app.router.add_get('/health', health_handler)
+    app.router.add_get('/pay/{trans_id}', pay_redirect_handler)
     app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
+    app.router.add_get('/payment/callback/aqayepardakht', ap_callback_handler)
     app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
     
     runner = web.AppRunner(app)
@@ -435,6 +587,42 @@ def register_handlers(application: Application) -> None:
         await start_command(update, context)
         return ConversationHandler.END
 
+    async def global_back_safety_net(update, context):
+        """شبکه ایمنی سراسری برای دکمه‌های بازگشت.
+
+        وقتی کاربر در منویی است که هیچ مکالمه‌ای فعال نیست (مثلاً منوی
+        «مدیریت اکانت‌های ربات» که بعد از پایان مکالمهٔ ادمین نمایش داده
+        می‌شود) و دکمهٔ بازگشت را می‌زند، این هندلر آن را می‌گیرد و به منوی
+        مناسب برمی‌گرداند. چون در گروه ۰ و پس از تمام مکالمه‌ها ثبت می‌شود،
+        فقط زمانی اجرا می‌شود که هیچ مکالمهٔ فعالی این آپدیت را مصرف نکرده
+        باشد (مکالمه‌های فعال، بازگشت را از طریق fallback خودشان می‌گیرند).
+        """
+        text = (update.message.text if update.message else "") or ""
+        context.user_data.clear()
+        user = update.effective_user
+        if not user:
+            return
+        bot_id = context.bot_data.get('bot_id', 1)
+
+        # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
+        if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
+            return await start_command(update, context)
+
+        # تشخیص ادمین بودن
+        is_admin = user.id in Config.ADMIN_IDS
+        if not is_admin:
+            try:
+                db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+                is_admin = bool(db_user and db_user.get('is_admin'))
+            except Exception:
+                is_admin = False
+
+        # منوهای دارای دکمهٔ بازگشتِ بی‌مکالمه، همگی متعلق به بخش ادمین‌اند
+        if is_admin:
+            from handlers.admin_handlers import admin_panel_start
+            return await admin_panel_start(update, context)
+        return await start_command(update, context)
+
     STANDARD_FALLBACKS = [
         CommandHandler("start", start_command),
         CommandHandler("cancel", start_command),
@@ -446,10 +634,18 @@ def register_handlers(application: Application) -> None:
     support_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
         states={
-            AWAITING_TICKET_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message)]
+            AWAITING_TICKET_MESSAGE: [
+                CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
+                MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message),
+            ],
+            AWAITING_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_subject)],
+            AWAITING_TICKET_BODY: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_ticket_body)],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="support_ticket", persistent=True
+        name="support_ticket", persistent=True,
+        # Explicit per_* settings (documented, safe pattern for
+        # button-driven conversations — see the PTBUserWarning note above).
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(support_conv)
 
@@ -464,7 +660,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_KYC_VIDEO: [MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="kyc", persistent=True
+        name="kyc", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(kyc_conv)
 
@@ -496,6 +693,7 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
                 CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
                 CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+                CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
                 MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
                 
                 # اکشن‌های کاربر
@@ -540,6 +738,8 @@ def register_handlers(application: Application) -> None:
                 # آمار
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
+                # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
             ],
             
@@ -599,7 +799,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_RESELLER_EDIT_VALUE: [MessageHandler(STD_TEXT, receive_reseller_edit_value)], 
         },
         fallbacks=admin_fallbacks,
-        name="admin", persistent=True
+        name="admin", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(admin_conv)
     
@@ -614,7 +815,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_CHARGE_AMOUNT: [MessageHandler(STD_TEXT, handle_charge_amount)],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="wallet", persistent=True
+        name="wallet", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(wallet_conv)
     
@@ -643,7 +845,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="acc", persistent=True
+        name="acc", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(acc_conv)
 
@@ -651,11 +854,13 @@ def register_handlers(application: Application) -> None:
     prof_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل و استوری$"), profile_settings_start),
-            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start)
+            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start),
+            # ورود مستقیم به ویرایش اکانت از دکمهٔ شیشه‌ای لیست اکانت‌ها
+            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_")
         ],
         states={
             AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account)],
-            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_profile_menu_action)],
+            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)],
             AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler)],
             AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler)],
             AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler)],
@@ -663,14 +868,48 @@ def register_handlers(application: Application) -> None:
             AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler)],
             AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)],
             AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish)],
-            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, privacy_menu_handler)],
-            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, set_privacy_level)],
+            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)],
+            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
             AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="prof", persistent=True
+        name="prof", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(prof_conv)
+
+    # --- 6.5 مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
+    # فقط مرحلهٔ دریافت متن پیام حالت‌دار است؛ انتخاب سفارش/اکانت‌ها و ری‌اکشن‌ها
+    # بدون‌حالت و از طریق کالبک‌های سراسری انجام می‌شوند تا سریع و مکرر باشند.
+    incall_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(incall_write, pattern=r"^ic_write$"),
+        ],
+        states={
+            AWAITING_INCALL_TEXT: [
+                MessageHandler(FILTER_BACK, incall_receive_text),
+                MessageHandler(STD_TEXT, incall_receive_text),
+            ],
+        },
+        fallbacks=STANDARD_FALLBACKS,
+        name="incall", persistent=True,
+        per_chat=True, per_user=True, per_message=False
+    )
+    application.add_handler(incall_conv)
+
+    # ورود به مرکز (دکمهٔ منو) + کالبک‌های بدون‌حالت
+    application.add_handler(MessageHandler(filters.Regex(r"^💬 چت در ویس‌کال$"), incall_center_start), group=0)
+    application.add_handler(CallbackQueryHandler(incall_orders_refresh, pattern=r"^ic_orders_refresh$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_order_selected, pattern=r"^ic_order_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_toggle_account, pattern=r"^ic_toggle_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_select_all, pattern=r"^ic_all$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_select_none, pattern=r"^ic_none$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_accs_refresh, pattern=r"^ic_accs_refresh_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_back_orders, pattern=r"^ic_back_orders$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_compose, pattern=r"^ic_compose$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_edit_accounts, pattern=r"^ic_editaccs$"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_react, pattern=r"^ic_react_"), group=0)
+    application.add_handler(CallbackQueryHandler(incall_close, pattern=r"^ic_close$"), group=0)
 
     # --- 7. خرید سرویس ---
     buy_conv = ConversationHandler(
@@ -688,7 +927,8 @@ def register_handlers(application: Application) -> None:
             AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation)]
         },
         fallbacks=STANDARD_FALLBACKS,
-        name="buy", persistent=True
+        name="buy", persistent=True,
+        per_chat=True, per_user=True, per_message=False
     )
     application.add_handler(buy_conv)
 
@@ -704,6 +944,24 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"), group=0)
     application.add_handler(CallbackQueryHandler(handle_order_history_callback, pattern="^history_"), group=0)
     application.add_handler(CallbackQueryHandler(handle_back_to_history_menu, pattern="^back_to_history_menu"), group=0)
+
+    # 🔙 شبکهٔ ایمنی سراسری دکمه‌های بازگشت.
+    # در گروه ۰ و پس از همهٔ ConversationHandlerها ثبت می‌شود؛ چون در هر گروه
+    # فقط اولین هندلرِ منطبق اجرا می‌شود، مکالمه‌های فعال (که زودتر ثبت شده‌اند)
+    # اولویت دارند و این هندلر فقط زمانی اجرا می‌شود که هیچ مکالمه‌ای این
+    # آپدیت را مصرف نکرده باشد (یعنی دکمهٔ بازگشتِ منویِ بی‌مکالمه).
+    application.add_handler(
+        MessageHandler(FILTER_BACK | filters.Regex(REGEX_MAIN_MENU) | filters.Regex(f"^{BTN_EXIT_ADMIN}$"), global_back_safety_net),
+        group=0,
+    )
+
+    # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
+    application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|del|delyes|sync)_\d+$"), group=0)
+    # صفحه‌بندی/بستن لیست‌های شیشه‌ای انتخاب اکانت (پروفایل و دریافت کد)
+    application.add_handler(CallbackQueryHandler(profile_picker_page_callback, pattern=r"^profpage_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(getcode_picker_page_callback, pattern=r"^codepage_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(account_picker_close_callback, pattern=r"^acc_pickclose$"), group=0)
 
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
@@ -775,15 +1033,26 @@ async def main_loop():
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
+        # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
+        main_app.job_queue.run_repeating(
+            lambda ctx: auto_close_idle_tickets(ctx, bot_manager=bot_manager),
+            interval=3600, first=180,
+        )
 
     # زنده نگه داشتن برنامه
     stop_event = asyncio.Event()
     await stop_event.wait()
 
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+    # Build the event loop explicitly. Prefer an EXPLICIT uvloop loop (fast
+    # libuv backend, lower CPU under many concurrent voice tasks) when uvloop
+    # is available; this avoids the deprecated get_event_loop() path that can
+    # recurse under uvloop's policy. Fall back to the stock asyncio loop.
+    if _UVLOOP is not None:
+        loop = _UVLOOP.new_event_loop()
+        logger.info("uvloop active as the asyncio event loop (libuv backend)")
+    else:
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        logger.info("using the default asyncio event loop (uvloop unavailable)")
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(main_loop())

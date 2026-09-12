@@ -29,9 +29,16 @@ async def _cleanup_client(context):
 
 
 def _format_account_display(acc):
-    name = html.escape(
-        str(acc.get('name') or acc.get('username') or acc.get('first_name') or acc.get('last_name') or 'Unnamed')
-    )
+    first = (acc.get('first_name') or "").strip()
+    last = (acc.get('last_name') or "").strip()
+    full = (first + " " + last).strip()
+    if full:
+        display = full
+    elif acc.get('username'):
+        display = "@" + str(acc.get('username')).lstrip('@')
+    else:
+        display = "بدون نام"
+    name = html.escape(display)
     phone = html.escape(str(acc.get('phone_number') or 'No Phone'))
     status = html.escape(str(acc.get('account_status', 'active')).title())
     spam_info = ''
@@ -39,29 +46,20 @@ def _format_account_display(acc):
         spam_info = f" | ⛔️ {html.escape(str(acc['spam_status']))}"
     return name, phone, status, spam_info
 
-# --- دریافت کد ورود ---
+# --- دریافت کد ورود (لیست شیشه‌ای) ---
 async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from handlers.menu_handlers import build_account_picker
     bot_id = context.bot_data.get('bot_id', 1)
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
     if not accounts:
         await send_safe(context.bot, update.effective_chat.id, "❌ <b>هیچ اکانت فعالی در این ربات وجود ندارد.</b>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
-        
-    list_text = "📋 <b>لیست اکانت‌های موجود (جهت دریافت کد):</b>\n\n"
-    account_map = {}
-    for i, acc in enumerate(accounts):
-        row_num = i + 1
-        account_map[row_num] = acc['id']
-        name, phone, status, spam_info = _format_account_display(acc)
-        list_text += (
-            f"<b>{row_num}.</b> {name} | 📱 <code>{phone}</code> | وضعیت: <b>{status}</b>{spam_info} "
-            f"(ID: <code>{acc['id']}</code>)\n"
-        )
-    
-    context.user_data['account_map_code'] = account_map
-    await send_safe(context.bot, update.effective_chat.id, list_text, parse_mode=ParseMode.HTML)
-    await send_safe(context.bot, update.effective_chat.id, "📲 <b>شماره ردیف</b> یا <b>ID اکانت</b> مورد نظر را وارد کنید:", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True), parse_mode=ParseMode.HTML)
-    return AWAITING_GET_CODE_ACCOUNT
+
+    txt = "📩 <b>دریافت کد ورود</b>\n\n👇 اکانت موردنظر را انتخاب کنید تا آخرین کد/پیام ورود ارسال شود:"
+    kb = build_account_picker(accounts, pick_prefix="acc_getcode_", page_prefix="codepage_", page=1, back_cb="acc_pickclose")
+    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    # انتخاب از طریق کالبک acc_getcode_ انجام می‌شود (هندلر سراسری)
+    return ConversationHandler.END
 
 async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
@@ -189,8 +187,13 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
         await client.start()
         me = await client.get_me()
         phone = f"+{me.phone_number}" if me.phone_number else "Unknown"
+        profile_info = {
+            'first_name': getattr(me, 'first_name', None),
+            'last_name': getattr(me, 'last_name', None),
+            'username': getattr(me, 'username', None),
+        }
         await client.stop()
-        return await finalize_import(update, context, phone, sess_str)
+        return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
     except Exception as e:
         logger.error(f"Import Session Error: {e}")
         try: await client.stop() 
@@ -198,12 +201,13 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
         await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{e}")
         return AWAITING_SESSION_STRING
 
-async def finalize_import(update, context, phone, session_string):
+async def finalize_import(update, context, phone, session_string, profile_info=None):
     try:
         enc_sess = SecurityManager.encrypt_session(session_string)
         bot_id = context.bot_data.get('bot_id', 1)
         api_id = context.user_data.get('import_api_id')
         api_hash = context.user_data.get('import_api_hash')
+        profile_info = profile_info or {}
         tg_user = update.effective_user
         db_user = await DatabaseManager.create_or_update_user({
             'id': tg_user.id,
@@ -213,7 +217,10 @@ async def finalize_import(update, context, phone, session_string):
         }, bot_id=bot_id)
         
         success, status = await DatabaseManager.add_telegram_account(
-            db_user['id'], phone, enc_sess, bot_id=bot_id, api_id=api_id, api_hash=api_hash
+            db_user['id'], phone, enc_sess, bot_id=bot_id, api_id=api_id, api_hash=api_hash,
+            first_name=profile_info.get('first_name'),
+            last_name=profile_info.get('last_name'),
+            username=profile_info.get('username')
         )
         if success:
              await send_safe(context.bot, update.effective_chat.id, f"✅ **اکانت {phone} با موفقیت ایمپورت شد!**", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
@@ -247,7 +254,10 @@ async def finalize_session(update, context, client):
 
         success, status = await DatabaseManager.add_telegram_account(
             db_user['id'], phone, enc_sess,
-            bot_id=bot_id, api_id=api_id, api_hash=api_hash
+            bot_id=bot_id, api_id=api_id, api_hash=api_hash,
+            first_name=getattr(me, 'first_name', None),
+            last_name=getattr(me, 'last_name', None),
+            username=getattr(me, 'username', None)
         )
         safe_name = html.escape(me.first_name or "Unknown")
         if success:

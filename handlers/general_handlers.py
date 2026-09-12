@@ -54,7 +54,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     is_admin = is_god_admin or is_db_admin
     
     # کپی منوی کاربر از constants.py
-    menu = list(USER_MAIN_MENU) 
+    menu = [list(row) for row in USER_MAIN_MENU]
+    # نمایش دکمهٔ «چت در ویس‌کال» فقط وقتی ادمین قابلیت را فعال کرده باشد
+    try:
+        incall_on = await DatabaseManager.get_setting("service_incall_chat", "false", bot_id=bot_id) == "true"
+        if incall_on:
+            menu.append(["💬 چت در ویس‌کال"])
+    except Exception:
+        pass
     if is_admin: 
         menu.append(["🔐 پنل مدیریت (ادمین)"])
     

@@ -38,11 +38,13 @@ import asyncio
 import logging
 import os
 import random
+import sys
 import time
 import json
+import traceback
 import wave
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import deque
 
 from pyrogram import Client
@@ -58,6 +60,7 @@ from pyrogram.errors import (
 from pyrogram.raw import functions, types
 from pytgcalls import PyTgCalls, filters as pytgcalls_filters
 from pytgcalls.types import AudioQuality, ChatUpdate, MediaStream, StreamEnded
+from pytgcalls.types.raw import AudioParameters
 
 from database import DatabaseManager
 from security import SecurityManager
@@ -88,11 +91,25 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_pyrogram_channel_id_range() -> None:
-    """Accept newer Telegram channel ids with the pinned Pyrogram release."""
+    """Accept newer Telegram channel ids on OLD Pyrogram releases only.
+
+    این وصله فقط برای Pyrogram قدیمی (۲.۰.۱۰۶) لازم بود که کران کانال‌ها را
+    درست تشخیص نمی‌داد. روی kurigram (fork به‌روز) تابع get_peer_type به‌صورت
+    بومی شناسه‌های مدرن کانال را پشتیبانی می‌کند و ثابت‌های قدیمی مثل
+    MIN_CHAT_ID دیگر وجود ندارند؛ پس اگر این ثابت‌ها نبودند، وصله را رد می‌کنیم
+    و به تابع بومیِ کتابخانه دست نمی‌زنیم (وگرنه join همهٔ اکانت‌ها می‌شکند).
+    """
     try:
         from pyrogram import utils as pyrogram_utils
         original = pyrogram_utils.get_peer_type
         if getattr(original, "_callmanager_wide_channels", False):
+            return
+
+        # فقط وقتی وصله کن که کتابخانه ثابت‌های قدیمی را داشته باشد
+        # (یعنی Pyrogram کلاسیک). در غیر این صورت (kurigram) کاری نکن.
+        if not all(hasattr(pyrogram_utils, name) for name in
+                   ("MIN_CHAT_ID", "MAX_CHANNEL_ID", "MAX_USER_ID")):
+            logger.info("Skipping channel-id patch: library has native modern-id support")
             return
 
         def get_peer_type(peer_id: int) -> str:
@@ -127,10 +144,28 @@ from config import Config
 # LOOP the (short) file infinitely (-stream_loop -1) at play time, so the media
 # transport can never die of EOF — the effective silence duration is unlimited
 # (multi-hour orders stay inside the call).
-_SILENCE_RATE = 48000
-_SILENCE_CHANNELS = 2
+#
+# Audio format (CPU): the whole path is kept identical end-to-end so ffmpeg is a
+# pure pass-through (no resample, no downmix). In pytgcalls 2.x
+# AudioParameters(bitrate=<sample_rate>, channels=<n>) — the first field is the
+# SAMPLE RATE (AudioQuality.HIGH == (48000, 2), LOW == (24000, 1)). Because this
+# is pure SILENCE that only keeps a muted listener's WebRTC transport alive, we
+# default to 24 kHz MONO: the lowest-cost Opus frame that Telegram still accepts.
+# The .wav file, the ffmpeg -ar/-ac, and the ntgcalls AudioParameters ALL derive
+# from these two values, so they can never drift out of sync.
+_SILENCE_CHANNELS = 1 if int(getattr(Config, "VOICE_AUDIO_CHANNELS", 1) or 1) <= 1 else 2
+_SILENCE_RATE = max(8000, int(getattr(Config, "VOICE_AUDIO_SAMPLE_RATE", 24000) or 24000))
 _SILENCE_SECONDS = max(5, int(getattr(Config, "VOICE_SILENCE_SECONDS", 30) or 30))
 _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
+
+# Audio parameters handed to ntgcalls for the stay-alive silence — same rate and
+# channel count as the generated .wav above (pure pass-through).
+_SILENCE_AUDIO_RATE = _SILENCE_RATE
+_SILENCE_AUDIO_CHANNELS = _SILENCE_CHANNELS
+_SILENCE_AUDIO_PARAMS = AudioParameters(
+    bitrate=_SILENCE_AUDIO_RATE,
+    channels=_SILENCE_AUDIO_CHANNELS,
+)
 
 # pytgcalls 2.x ffmpeg-parameter DSL (see pytgcalls/ffmpeg.py):
 #   ``--audio`` selects the audio section and ``---start`` places the tokens
@@ -145,7 +180,16 @@ _SILENCE_FRAMES = _SILENCE_RATE * _SILENCE_SECONDS
 # flowed, ntgcalls reported stream end and Telegram dropped the participant
 # seconds after joining (this was the primary "joins then immediately gets
 # kicked" bug). The correct section selector is the double-dash form.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -stream_loop -1"
+#
+# CPU: ``---start -threads 1`` is placed as an INPUT option (before ``-i``) so
+# each ffmpeg helper decodes the silence on a SINGLE thread. With dozens of
+# accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
+# per core multiplies context-switching and pins every CPU core; pinning to 1
+# thread keeps the (trivial) silence decode cheap and bounded.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+
+# Same single-thread cap for the non-looping fallback (short file, plays once).
+_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -253,12 +297,47 @@ def _client_device_fingerprint(account_id: int) -> Dict[str, str]:
         "lang_code": "fa",
     }
 
+
+def _voice_proxy_config() -> Optional[Dict[str, Any]]:
+    """SOCKS5 proxy dict for Pyrogram Client, or None when USE_PROXY is off.
+
+    When enabled, the account's Pyrogram Client — and the PyTgCalls engine
+    that rides on the same MTProto connection — connect through the configured
+    SOCKS5 proxy (e.g. a local Cloudflare WARP proxy on 127.0.0.1:4000).
+    Returning None preserves the original direct-connection behaviour.
+    """
+    if not bool(getattr(Config, "USE_PROXY", False)):
+        return None
+    proxy: Dict[str, Any] = {
+        "scheme": "socks5",
+        "hostname": str(getattr(Config, "SOCKS5_HOST", "127.0.0.1")),
+        "port": int(getattr(Config, "SOCKS5_PORT", 4000)),
+    }
+    user = getattr(Config, "SOCKS5_USERNAME", None)
+    pwd = getattr(Config, "SOCKS5_PASSWORD", None)
+    if user:
+        proxy["username"] = user
+    if pwd:
+        proxy["password"] = pwd
+    return proxy
+
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
     _JOIN_PENDING_TIMEOUT,
     ACTIVE_CALL_CACHE_TTL,
     os.path.abspath(__file__),
 )
+if bool(getattr(Config, "USE_PROXY", False)):
+    logger.info(
+        "VoiceCallManager SOCKS5 proxy ENABLED for voice clients -> %s:%s",
+        getattr(Config, "SOCKS5_HOST", "127.0.0.1"),
+        getattr(Config, "SOCKS5_PORT", 4000),
+    )
+if not bool(getattr(Config, "ENABLE_VERBOSE_DIAG", False)):
+    logger.info(
+        "VoiceCallManager [VoiceDiag] verbose stream OFF (routine transitions at DEBUG); "
+        "set ENABLE_VERBOSE_DIAG=true to restore the full firehose"
+    )
 
 # ─── ACCOUNT STATE MACHINE ────────────────────────────────────────────────
 # The next account is released ONLY after the current account reaches a
@@ -354,10 +433,11 @@ class JoinAttemptTimeout(asyncio.TimeoutError):
 def _ensure_silence_file() -> None:
     """Create/validate the stay-alive silence stream.
 
-    Format = raw s16le @ 48 kHz STEREO — the exact wire format ntgcalls encodes
-    to 48 kHz Opus (identical to a real Telegram Android client), so the ffmpeg
-    stage is a pure pass-through.  The file is intentionally SHORT; the infinite
-    duration comes from `-stream_loop -1` at play time.
+    Format = raw s16le @ 48 kHz MONO — matches the AudioParameters(channels=1)
+    handed to ntgcalls, so the ffmpeg stage is a pure pass-through with no
+    downmix and Opus encodes a single channel (~50% less encode work than
+    stereo).  The file is intentionally SHORT; the infinite duration comes from
+    `-stream_loop -1` at play time.
     """
     try:
         valid = False
@@ -576,6 +656,24 @@ class VoiceCallManager:
         # A retry must observe the original in-flight request, never issue a
         # second JoinGroupCall for the same account and chat.
         self._inflight_joins: Dict[Tuple[int, int], asyncio.Task] = {}
+
+        # ── GHOST-MEDIA RESTORE BOOKKEEPING ─────────────────────────────
+        # When the engine media binding vanishes (chat not in pytg.group_calls)
+        # while the participant listing STILL shows the account inside the
+        # call, the old code treated the account as dropped and re-joined it;
+        # the rejoin found "Already in call" WITHOUT re-establishing the media
+        # → ghost again → infinite join/leave churn (the "dwell=6-31s
+        # media_transport_lost" storm).  Now we keep the account counted and
+        # pace a bounded silence re-stream instead.  These two structures
+        # make that re-stream at most ONCE per account per
+        # VOICE_MEDIA_RESTORE_INTERVAL seconds and never two in flight.
+        self._media_restore_inflight: Set[Tuple[int, int]] = set()   # (order_id, account_id)
+        self._media_restore_last: Dict[Tuple[int, int], float] = {}  # (order_id, account_id) -> ts
+        # Consecutive failed restores per slot: after VOICE_MEDIA_RESTORE_MAX_FAILS
+        # in a row we pause attempts (VOICE_MEDIA_RESTORE_PAUSE_SECONDS) so a
+        # broken media path is never hammered with new JoinGroupCalls.
+        self._media_restore_failures: Dict[Tuple[int, int], int] = {}
+        self._media_restore_paused_until: Dict[Tuple[int, int], float] = {}
 
         # Shared per-order monitor tasks
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
@@ -846,15 +944,18 @@ class VoiceCallManager:
         self._chat_info_put(chat_id, peer, cached[1] if cached else None)
         return peer
 
-    async def _get_cached_group_call(self, app: Client, chat_id: int) -> object:
+    async def _get_cached_group_call(self, app: Client, chat_id: int, force_refresh: bool = False) -> object:
         """Get the active group-call object for a chat, cached & shared.
 
         Returns the raw InputGroupCall, or None when there is no active call.
+        با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
+        گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
         """
         chat_id = int(chat_id)
-        cached = self._chat_info_get(chat_id)
-        if cached and cached[1] is not None:
-            return cached[1]
+        if not force_refresh:
+            cached = self._chat_info_get(chat_id)
+            if cached and cached[1] is not None:
+                return cached[1]
         peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
@@ -866,6 +967,253 @@ class VoiceCallManager:
         self._input_group_call_cache.pop(chat_id, None)
         self._active_call_cache.pop(int(chat_id), None)
         self._chat_info_cache.pop(int(chat_id), None)
+
+    async def _get_group_call_for_account(self, app: Client, chat_id: int,
+                                          force_refresh: bool = False) -> object:
+        """مرجع InputGroupCall را برای «همین اکانت» برمی‌گرداند.
+
+        نکتهٔ کلیدی: access_hash یک کانال، مختصِ هر سشن/اکانت است و سراسری
+        نیست. بنابراین برای فراخوانی channels.GetFullChannel باید peer با سشنِ
+        همین اکانت resolve شود، وگرنه خطای CHANNEL_INVALID رخ می‌دهد. اما خودِ
+        InputGroupCall (call id + access_hash تماس) سراسری است و می‌تواند بین
+        اکانت‌ها به‌اشتراک گذاشته شود؛ پس اگر قبلاً کش شده باشد از آن استفاده
+        می‌کنیم و از GetFullChannel صرف‌نظر می‌کنیم.
+        """
+        chat_id = int(chat_id)
+        if not force_refresh:
+            cached = self._chat_info_get(chat_id)
+            if cached and cached[1] is not None:
+                return cached[1]
+        # peer را با سشنِ همین اکانت resolve کن (نه از کش مشترک)
+        peer = await app.resolve_peer(chat_id)
+        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+        call = getattr(full.full_chat, "call", None)
+        # فقط مرجعِ تماس (سراسری) را کش کن؛ peerِ مختصِ اکانت را کش نمی‌کنیم
+        prev = self._chat_info_get(chat_id)
+        self._chat_info_put(chat_id, prev[0] if prev else peer, call)
+        return call
+
+    # ─── IN-CALL MESSAGES & REACTIONS (Telegram Layer 216+) ─────────────
+    #
+    # قابلیت جدید تلگرام (اکتبر ۲۰۲۵): شرکت‌کنندگان ویس‌کال می‌توانند در محیط
+    # خود تماس پیام یا ری‌اکشن اموجی بفرستند. متد MTProto مربوطه
+    # `phone.sendGroupCallMessage` است که از Layer 216 اضافه شده.
+    #
+    # نکتهٔ سازگاری: اگر نسخهٔ نصب‌شدهٔ Pyrogram این متد را در اسکیمای raw
+    # نداشته باشد (نسخه‌های قدیمی‌تر از پشتیبانی Layer 216)، این تابع بدون
+    # کرش، پیام خطای واضح برمی‌گرداند تا لایهٔ بالاتر به ادمین اطلاع دهد.
+
+    @staticmethod
+    def _incall_messages_supported() -> bool:
+        """آیا نسخهٔ نصب‌شدهٔ Pyrogram از پیام درون‌تماس پشتیبانی می‌کند؟"""
+        return hasattr(functions.phone, "SendGroupCallMessage")
+
+    async def send_incall_message(self, account_id: int, chat_id: int,
+                                  text: str = "", reaction_emoji: str = "") -> Tuple[bool, str]:
+        """ارسال پیام یا ری‌اکشن اموجی در محیط ویس‌کال با استفاده از اکانتی که
+        هم‌اکنون در همان تماس حاضر است.
+
+        - text: متن پیام درون‌تماس (اگر reaction_emoji خالی باشد).
+        - reaction_emoji: یک اموجی استاندارد؛ اگر پر باشد به‌صورت ری‌اکشن
+          انیمیشنی ارسال می‌شود (طبق مستندات تلگرام، پیامی که فقط شامل یک
+          اموجی ری‌اکشن است، به‌صورت افکت انیمیشنی نمایش داده می‌شود).
+
+        خروجی: (موفقیت, پیام وضعیت)
+        """
+        if not self._incall_messages_supported():
+            return False, (
+                "نسخهٔ فعلی کتابخانهٔ MTProto از «پیام/ری‌اکشن درون ویس‌کال» "
+                "پشتیبانی نمی‌کند (نیازمند Layer ≥216 تلگرام). ایمیج را با "
+                "kurigram دوباره بیلد کنید تا این قابلیت فعال شود."
+            )
+
+        app = self.pyrogram_clients.get(account_id)
+        if not app:
+            return False, "اکانت انتخاب‌شده هم‌اکنون در هیچ ویس‌کالی حاضر و متصل نیست."
+
+        payload = (reaction_emoji or text or "").strip()
+        if not payload:
+            return False, "متن یا اموجی خالی است."
+
+        # اسکیمای دقیق (Layer 216+):
+        #   phone.sendGroupCallMessage call:InputGroupCall random_id:long
+        #       message:TextWithEntities ...  = Updates
+        # پس message باید حتماً TextWithEntities باشد.
+        if hasattr(types, "TextWithEntities"):
+            msg_obj = types.TextWithEntities(text=payload, entities=[])
+        else:
+            msg_obj = payload
+
+        SendFn = getattr(functions.phone, "SendGroupCallMessage")
+
+        def _build_req(call_obj):
+            for kwargs in (
+                {"call": call_obj, "random_id": self._rand_id(), "message": msg_obj},
+                {"call": call_obj, "message": msg_obj, "random_id": self._rand_id()},
+                {"call": call_obj, "message": msg_obj},
+            ):
+                try:
+                    return SendFn(**kwargs)
+                except TypeError:
+                    continue
+            return SendFn(call=call_obj, message=payload)
+
+        kind = "ری‌اکشن" if reaction_emoji else "پیام"
+
+        # تلاش اول با مرجع کش‌شده؛ در صورت خطای GROUPCALL_INVALID/کهنه بودن
+        # مرجع، کش را پاک کرده و یک بار با مرجعِ تازه دوباره تلاش می‌کنیم.
+        last_err = None
+        for attempt in range(2):
+            force = attempt == 1
+            try:
+                # مرجعِ تماس را با سشنِ همین اکانت می‌گیریم تا خطای
+                # CHANNEL_INVALID (به‌خاطر access_hash مختصِ اکانت) رخ ندهد.
+                call = await self._get_group_call_for_account(app, int(chat_id), force_refresh=force)
+                if not call:
+                    if attempt == 0:
+                        self._clear_chat_cache(int(chat_id))
+                        continue
+                    return False, "در این چت ویس‌کال فعالی یافت نشد (تماس بسته شده است)."
+                await app.invoke(_build_req(call))
+                return True, f"✅ {kind} با موفقیت در ویس‌کال ارسال شد."
+            except Exception as e:
+                last_err = e
+                msg = str(e).upper()
+                stale = ("GROUPCALL_INVALID" in msg or "GROUPCALL_FORBIDDEN" in msg
+                         or "GROUPCALL_JOIN_MISSING" in msg or "CHANNEL_INVALID" in msg)
+                if attempt == 0 and stale:
+                    # مرجع کهنه/مختصِ اکانتِ دیگر است → کش را پاک کن و با
+                    # resolveِ تازه از سشنِ همین اکانت دوباره امتحان کن
+                    self._clear_chat_cache(int(chat_id))
+                    continue
+                break
+
+        e = last_err
+        logger.warning("send_incall_message failed acc=%s chat=%s: %s", account_id, chat_id, e)
+        emsg = str(e)
+        if "GROUPCALL_JOIN_MISSING" in emsg.upper():
+            return False, "❌ این اکانت هنوز به‌طور کامل به تماس نپیوسته است."
+        if "GROUPCALL_INVALID" in emsg.upper():
+            return False, "❌ ویس‌کال معتبر نیست یا بازنشانی شده؛ چند لحظه بعد دوباره امتحان کنید."
+        if "CHANNEL_INVALID" in emsg.upper() or "PEER_ID_INVALID" in emsg.upper():
+            return False, "❌ این اکانت به گروه/کانال دسترسی معتبر ندارد (چند لحظه بعد دوباره امتحان کنید)."
+        return False, f"❌ خطا در ارسال: {emsg}"
+
+    @staticmethod
+    def _rand_id() -> int:
+        import random
+        return random.randint(-(2**31), 2**31 - 1)
+
+    def get_active_call_accounts(self) -> List[Dict]:
+        """فهرست اکانت‌هایی که هم‌اکنون در ویس‌کال حاضر و متصل‌اند
+        (برای استفاده در منوی ارسال پیام/ری‌اکشن درون‌تماس).
+
+        هر آیتم: {account_id, chat_id, order_id}
+        """
+        out = []
+        for (order_id, account_id), rec in self.active_calls.items():
+            if account_id in self.pyrogram_clients:
+                out.append({
+                    "account_id": account_id,
+                    "chat_id": rec.get("chat_id"),
+                    "order_id": order_id,
+                })
+        return out
+
+    def get_order_incall_accounts(self, order_id: int) -> List[Dict]:
+        """اکانت‌هایی از یک سفارش که هم‌اکنون داخل ویس‌کال حاضر و متصل‌اند.
+
+        از دو منبع استفاده می‌کند: active_calls (کلید order,acc) و
+        joined_accounts_by_order (منبع پایدار). فقط اکانت‌هایی برگردانده
+        می‌شوند که کلاینت متصل دارند تا ارسال پیام سریع و بدون اتصال مجدد باشد.
+
+        هر آیتم: {account_id, chat_id}
+        """
+        order_id = int(order_id)
+        seen: Dict[int, int] = {}  # account_id -> chat_id
+
+        for (oid, account_id), rec in self.active_calls.items():
+            if int(oid) == order_id and rec.get("chat_id") is not None:
+                seen[account_id] = int(rec["chat_id"])
+
+        for account_id, rec in (self.joined_accounts_by_order.get(order_id) or {}).items():
+            cid = rec.get("chat_id")
+            if cid is not None:
+                seen.setdefault(account_id, int(cid))
+
+        # اگر chat_id از order_chat_ids در دسترس است، برای اکانت‌های بدون chat پرش می‌کنیم
+        fallback_chat = self.order_chat_ids.get(order_id)
+
+        out = []
+        for account_id, chat_id in seen.items():
+            if account_id not in self.pyrogram_clients:
+                continue  # فقط اکانت‌های متصل (ارسال آنی)
+            out.append({
+                "account_id": account_id,
+                "chat_id": chat_id or fallback_chat,
+            })
+        return out
+
+    async def broadcast_incall_message(self, account_ids: List[int], order_id: int,
+                                       text: str = "", reaction_emoji: str = "") -> Dict:
+        """ارسال پیام/ری‌اکشن از چند اکانت در ویس‌کال همان سفارش — با pacing مدیریت‌شده.
+
+        برخلاف حالت قبل که همهٔ درخواست‌ها در یک لحظه (asyncio.gather) شلیک
+        می‌شد و باعث flood و دیده‌نشدن پیام می‌شد، اینجا ارسال‌ها با فاصلهٔ کوتاه
+        (به‌طور پیش‌فرض حدود ۱ درخواست در ثانیه) و با سقف هم‌زمانی محدود انجام
+        می‌شوند: نه یک‌دفعه‌ای، ولی خیلی هم کند نیست.
+
+        خروجی: {sent, failed, total, errors:[...]}
+        """
+        order_id = int(order_id)
+        # نگاشت account_id → chat_id از وضعیت فعلی سفارش
+        chat_map = {a["account_id"]: a["chat_id"] for a in self.get_order_incall_accounts(order_id)}
+
+        # پارامترهای pacing از Config (با fallback امن)
+        gap_min = float(getattr(Config, "INCALL_SEND_STAGGER_MIN", 0.8))
+        gap_max = float(getattr(Config, "INCALL_SEND_STAGGER_MAX", 1.2))
+        if gap_max < gap_min:
+            gap_max = gap_min
+        max_conc = max(1, int(getattr(Config, "INCALL_SEND_MAX_CONCURRENCY", 3)))
+        sem = asyncio.Semaphore(max_conc)
+
+        async def _one(aid):
+            async with sem:
+                cid = chat_map.get(aid)
+                if cid is None:
+                    return aid, False, "اکانت در تماس فعال نیست"
+                try:
+                    ok, msg = await self.send_incall_message(
+                        aid, cid, text=text, reaction_emoji=reaction_emoji)
+                    return aid, ok, msg
+                except Exception as exc:
+                    return aid, False, str(exc)[:80]
+
+        # هر ارسال را با تأخیر پلکانی شروع کن تا cadence حدود ۱/ثانیه بماند
+        # (نه burst). هر task بعد از start-gap مربوط به خودش کلید می‌خورد؛ چون
+        # ارسال‌ها هم‌پوشانی دارند، کل عملیات همچنان سریع تمام می‌شود.
+        tasks = []
+        for idx, aid in enumerate(account_ids):
+            if idx > 0:
+                delay = random.uniform(gap_min, gap_max)
+                await asyncio.sleep(delay)
+            tasks.append(asyncio.ensure_future(_one(aid)))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        sent, failed, errors = 0, 0, []
+        for r in results:
+            if isinstance(r, Exception):
+                failed += 1
+                errors.append(str(r)[:80])
+                continue
+            aid, ok, msg = r
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+                errors.append(f"#{aid}: {msg}")
+        return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
 
     def _account_in_any_order(self, account_id: int) -> bool:
         return any(aid == account_id for (oid, aid) in self.active_calls.keys())
@@ -1116,10 +1464,33 @@ class VoiceCallManager:
                     "flood_wait_seconds", "retry_at",
                 }},
             }
-            logger.info(
-                f"[VoiceDiag] {json.dumps(entry, ensure_ascii=False)}"
+            # ── Log-level throttling (CPU / disk-I/O reduction) ──────────
+            # Routine state-transition spam (STARTING / CLIENT_STARTED /
+            # JOINING / JOINED with no error) is the high-frequency hot path.
+            # In production (ENABLE_VERBOSE_DIAG=false) those drop to DEBUG —
+            # suppressed at the default INFO level and NOT written to disk —
+            # while anything carrying an error / telegram-code / flood-wait, or
+            # a non-routine terminal state, is ALWAYS emitted (WARNING) and
+            # persisted so failures are never lost.
+            verbose = bool(getattr(Config, "ENABLE_VERBOSE_DIAG", False))
+            state_after = entry.get("state_after")
+            is_important = bool(
+                entry.get("exception_type")
+                or entry.get("exception_message")
+                or entry.get("telegram_error_code")
+                or entry.get("flood_wait_seconds")
+                or (state_after in {"FAILED", "RATE_LIMITED", "TEMPORARILY_UNKNOWN"})
             )
-            if self._vc_log_path:
+            line = f"[VoiceDiag] {json.dumps(entry, ensure_ascii=False)}"
+            if is_important:
+                logger.warning(line)
+            elif verbose:
+                logger.info(line)
+            else:
+                logger.debug(line)
+            # Persist to the JSONL trace only when the event matters or the
+            # operator explicitly asked for the full firehose.
+            if self._vc_log_path and (verbose or is_important):
                 with open(self._vc_log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
@@ -1475,6 +1846,7 @@ class VoiceCallManager:
                             # the voice transport handshake and participant sync.
                             no_updates=False,
                             in_memory=True,
+                            proxy=_voice_proxy_config(),
                             **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
@@ -1502,9 +1874,15 @@ class VoiceCallManager:
                         account_id, e,
                     )
                 if not healthy:
+                    # PyTgCalls 2.x has no stop(); leave each held call so the
+                    # engine (and its WebRTC connections) is truly torn down
+                    # before the fresh instance is built below.
                     try:
-                        if hasattr(pytg, 'stop'):
-                            await pytg.stop()
+                        for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
+                            try:
+                                await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     pytg = None
@@ -1532,9 +1910,18 @@ class VoiceCallManager:
 
         pytg = self.clients.pop(account_id, None)
         if pytg:
+            # PyTgCalls 2.x has NO stop() method (the old hasattr(pytg,'stop')
+            # check was a silent no-op — engines were NEVER torn down, so
+            # half-dead WebRTC connections outlived their calls and later
+            # caused 'Connection cannot be initialized more than once').
+            # leave_call() = engine stop + LeaveGroupCall, which is exactly
+            # what a real teardown should do.
             try:
-                if hasattr(pytg, 'stop'):
-                    await asyncio.wait_for(pytg.stop(), timeout=5)
+                for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
+                    try:
+                        await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -1655,6 +2042,235 @@ class VoiceCallManager:
                 account_id, chat_id, exc,
             )
 
+    def _media_restore_due(self, key: Tuple[int, int]) -> bool:
+        """Pacing gate: is this slot allowed to attempt a media restore now?"""
+        now = time.time()
+        if key in self._media_restore_inflight:
+            return False
+        interval = max(5, int(getattr(Config, "VOICE_MEDIA_RESTORE_INTERVAL", 25)))
+        if now - self._media_restore_last.get(key, 0.0) < interval:
+            return False
+        if self._media_restore_paused_until.get(key, 0.0) > now:
+            return False
+        return True
+
+    async def _rebuild_engine_for_account(self, order_id: int, account_id: int) -> Optional[PyTgCalls]:
+        """Discard the poisoned PyTgCalls engine and build a FRESH one on the
+        SAME pyrogram session.
+
+        'Connection cannot be initialized more than once' is raised by the
+        ntgcalls WebRTC layer when an engine still holds a half-dead peer
+        connection for a chat: no amount of per-chat stop() clears it, and a
+        new play() on the same engine can never initialize a new connection.
+        A brand-new PyTgCalls instance (fresh NTgCalls binding) has a clean
+        connection registry.  IMPORTANT: we do NOT send LeaveGroupCall — the
+        account stays inside the call while the new engine re-issues the
+        standard JoinGroupCall rejoin.
+        """
+        session_string = self._session_cache.get(account_id)
+        if not session_string:
+            return None
+        old = self.clients.pop(account_id, None)
+        if old is not None:
+            # Best-effort: leave any calls the OLD engine still believes it
+            # holds, then drop the engine object (its poisoned WebRTC state
+            # dies with it).
+            try:
+                for _cid in list(await asyncio.wait_for(old.group_calls, timeout=3) or {}):
+                    try:
+                        await asyncio.wait_for(old.leave_call(int(_cid)), timeout=5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # _get_or_create_client re-uses the live pyrogram client and builds a
+        # fresh PyTgCalls(app) because self.clients no longer has one.
+        return await self._get_or_create_client(order_id, account_id, session_string)
+
+    # Unrecoverable PyTgCalls/ntgcalls engine states that no per-chat
+    # stop/leave can fix — a FRESH PyTgCalls instance is required.
+    _ENGINE_STATE_MARKERS = (
+        "initialized more than once",
+        "connection cannot",
+        "connection not initialized",
+        "no active group call",
+    )
+
+    @classmethod
+    def _is_engine_state_error(cls, msg: str) -> bool:
+        s = (msg or "").lower()
+        return any(m in s for m in cls._ENGINE_STATE_MARKERS)
+
+    async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
+        """Re-establish the silent media transport for a GHOST-MEDIA-ONLY slot.
+
+        The participant listing says the account is STILL inside the call,
+        but the engine lost its media binding (``chat_id not in
+        pytg.group_calls``).  Presence — what the order sells — is intact, so
+        the account is kept counted; only the silence stream is re-attached.
+
+        Recovery ladder (fastest fix first, full rebuild last):
+          L1: play() — if the engine still holds the binding it just
+              re-attaches the stream (set_stream_sources, no re-init, and no
+              LeaveGroupCall sent).
+          L2: EXPLICIT ``leave_call(chat_id)`` cleanup of the existing WebRTC
+              session (engine stop + LeaveGroupCall + local cache cleanup)
+              followed by a fresh play().  When the engine has no call entry
+              for the chat (the usual ghost-media-only case) leave_call raises
+              NotInCallError BEFORE sending LeaveGroupCall — harmless, caught.
+          L3: on an unrecoverable engine state ('Connection cannot be
+              initialized more than once' & similar) — tear down the
+              PyTgCalls instance and build a FRESH PyTgCalls(client) on the
+              same pyrogram session, then re-join.
+
+        Diagnostics & loop protection:
+          * every failure logs the FULL traceback (logger + JSONL event)
+          * if the client instance itself is invalid (rebuild failed), the
+            account state is set to TEMPORARILY_UNKNOWN so nothing keeps
+            assuming a healthy engine; the monitor rebuilds the client next
+            cycle and re-verifies presence
+          * paced: one restore per VOICE_MEDIA_RESTORE_INTERVAL seconds,
+            non-stacking, under the per-(account, chat) join lock
+          * after VOICE_MEDIA_RESTORE_MAX_FAILS consecutive failures the slot
+            is paused (VOICE_MEDIA_RESTORE_PAUSE_SECONDS) — no infinite retry
+            loops on invalid client instances
+        """
+        key = (order_id, account_id)
+        if not self._media_restore_due(key):
+            return
+        pytg = self.clients.get(account_id)
+        if pytg is None:
+            return
+        cid = int(chat_id)
+        self._media_restore_inflight.add(key)
+        self._media_restore_last[key] = time.time()
+        lock_key = (account_id, cid)
+        result = "failed"
+        last_tb = ""
+        try:
+            await asyncio.sleep(random.uniform(0.5, 3.0))
+            # Slot may have been released while we waited.
+            if (order_id, account_id) not in self.active_calls:
+                result = "slot_gone"
+                return
+            async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
+                try:
+                    # ── L1: fast path — re-stream on the existing engine ──
+                    await self._play_silence(pytg, cid)
+                    result = "restored"
+                except Exception:
+                    _e1 = sys.exc_info()[1]
+                    msg1 = str(_e1) or type(_e1).__name__
+                    last_tb = traceback.format_exc(limit=8)
+                    logger.warning(
+                        "[VoiceMedia] restore L1 play failed acc=%s chat=%s: %s",
+                        account_id, cid, msg1[:120],
+                    )
+                    # ── L2: explicit WebRTC session cleanup, then rejoin ──
+                    # leave_call() inside try/except as required: it stops the
+                    # engine's connection for this chat and (if the engine
+                    # still lists it) sends LeaveGroupCall, so the NEXT play()
+                    # starts from a fully clean session.
+                    try:
+                        await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
+                    except Exception as e_leave:
+                        logger.debug(
+                            "[VoiceMedia] leave_call cleanup skipped acc=%s chat=%s: %s",
+                            account_id, cid,
+                            str(e_leave)[:80] or type(e_leave).__name__,
+                        )
+                    try:
+                        await self._play_silence(pytg, cid)
+                        result = "restored_after_leave"
+                    except Exception:
+                        _e2 = sys.exc_info()[1]
+                        msg2 = str(_e2) or type(_e2).__name__
+                        last_tb = traceback.format_exc(limit=8)
+                        if not self._is_engine_state_error(msg2):
+                            result = f"play_failed:{msg2[:70]}"
+                        else:
+                            # ── L3: unrecoverable engine state — REBUILD ──
+                            # No per-chat stop/leave can clear a half-dead
+                            # WebRTC peer connection; only a fresh PyTgCalls
+                            # instance (fresh NTgCalls binding) can.
+                            logger.warning(
+                                "[VoiceEngine] unrecoverable engine state acc=%s chat=%s (%s) — "
+                                "tearing down and building fresh PyTgCalls instance",
+                                account_id, cid, msg2[:80],
+                            )
+                            self._vc_event_log(order_id, account_id, "engine_rebuild", {
+                                "chat_id": cid, "reason": msg2[:120],
+                            })
+                            try:
+                                fresh = await self._rebuild_engine_for_account(order_id, account_id)
+                                if fresh is None:
+                                    result = "rebuild_failed:no_client"
+                                else:
+                                    await self._play_silence(fresh, cid)
+                                    result = "restored_after_engine_rebuild"
+                            except Exception:
+                                _e3 = sys.exc_info()[1]
+                                result = f"rebuild_failed:{(str(_e3) or type(_e3).__name__)[:70]}"
+                                last_tb = traceback.format_exc(limit=8)
+
+            # ── result handling ─────────────────────────────────────────
+            if result.startswith("restored"):
+                self._media_restore_failures[key] = 0
+                self._media_restore_paused_until.pop(key, None)
+                self._vc_event_log(order_id, account_id, "media_restored", {
+                    "chat_id": cid, "path": result,
+                })
+                logger.info(
+                    "[VoiceMedia] silence re-streamed acc=%s chat=%s (%s) — media transport back",
+                    account_id, cid, result,
+                )
+            else:
+                fails = self._media_restore_failures.get(key, 0) + 1
+                self._media_restore_failures[key] = fails
+                # Invalid client instance (rebuild failed / engine gone):
+                # update the presence status so NO code path keeps assuming a
+                # healthy engine for this account.  The monitor's next cycle
+                # rebuilds the client (its missing-client branch) and
+                # re-verifies presence; the pause gate below stops infinite
+                # restore loops in the meantime.
+                if result.startswith("rebuild_failed"):
+                    self._account_states_by_order.setdefault(order_id, {})[account_id] = "TEMPORARILY_UNKNOWN"
+                    rec = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
+                    if rec is not None:
+                        rec["status"] = "TEMPORARILY_UNKNOWN"
+                max_fails = max(1, int(getattr(Config, "VOICE_MEDIA_RESTORE_MAX_FAILS", 3)))
+                if fails >= max_fails:
+                    pause_s = max(60, int(getattr(Config, "VOICE_MEDIA_RESTORE_PAUSE_SECONDS", 600)))
+                    self._media_restore_paused_until[key] = time.time() + pause_s
+                    self._vc_event_log(order_id, account_id, "media_restore_paused", {
+                        "chat_id": cid, "fails": fails, "pause_s": pause_s,
+                        "reason": result[:120], "traceback": last_tb[-2500:],
+                    })
+                    logger.warning(
+                        "[VoiceMedia] media restore PAUSED for acc=%s chat=%s %ds after %d fails (%s) — "
+                        "account stays counted inside the call\n%s",
+                        account_id, cid, pause_s, fails, result[:60], last_tb[-2500:],
+                    )
+                else:
+                    self._vc_event_log(order_id, account_id, "media_restore_failed", {
+                        "chat_id": cid, "fails": fails,
+                        "reason": result[:120], "traceback": last_tb[-2500:],
+                    })
+                    logger.warning(
+                        "[VoiceMedia] media restore failed acc=%s chat=%s (%s) — attempt %d/%d\n%s",
+                        account_id, cid, result[:80], fails, max_fails, last_tb[-2500:],
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            last_tb = traceback.format_exc(limit=8)
+            logger.warning(
+                "[VoiceMedia] media restore error acc=%s chat=%s\n%s",
+                account_id, cid, last_tb[-2500:],
+            )
+        finally:
+            self._media_restore_inflight.discard(key)
+
     def flood_wait_remaining(self, account_id: int) -> float:
         """Remaining server-directed cooldown for an account (0 if clear)."""
         try:
@@ -1671,17 +2287,20 @@ class VoiceCallManager:
         account is already in the call).  The silence is looped forever with
         ``-stream_loop -1`` so the transport can never die of EOF.
         """
+        # Always cap ffmpeg at a single decode thread (CPU). When looping is on
+        # we also add ``-stream_loop -1``; otherwise fall back to the
+        # threads-only input options so the non-loop path is still bounded.
         loop_flag = (
             _SILENCE_FFMPEG_LOOP_PARAMS
             if getattr(Config, "VOICE_SILENCE_LOOP", True)
-            else None
+            else _SILENCE_FFMPEG_THREADS_PARAMS
         )
         try:
             await pytg.play(
                 int(chat_id),
                 MediaStream(
                     SILENT_AUDIO_PATH,
-                    audio_parameters=AudioQuality.HIGH,
+                    audio_parameters=_SILENCE_AUDIO_PARAMS,
                     video_flags=MediaStream.Flags.IGNORE,
                     ffmpeg_parameters=loop_flag,
                 ),
@@ -2119,6 +2738,22 @@ class VoiceCallManager:
                 presence = await self._is_in_voice_call(app, chat_id)
                 if presence is True:
                     if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True):
+                        # The account is inside the call.  If the engine has
+                        # NO media binding for this chat (a rejoin after the
+                        # transport died), attach the silence stream through
+                        # the PACED restore path — without this, the account
+                        # would stay a "ghost" (present but no media) and the
+                        # monitor would keep flagging it.  _schedule_media_restore
+                        # is rate-limited and non-stacking, so this can never
+                        # create a JoinGroupCall burst.
+                        try:
+                            group_calls = await pytg.group_calls
+                            if int(chat_id) not in group_calls:
+                                asyncio.create_task(
+                                    self._schedule_media_restore(order_id, account_id, int(chat_id))
+                                )
+                        except Exception:
+                            pass
                         return True, "Already in call"
 
                 # Ultra-short delay to avoid rate limits
@@ -2615,14 +3250,49 @@ class VoiceCallManager:
                         if media_alive is True:
                             present = True
                         elif media_alive is False:
-                            self._vc_event_log(order_id, acc_id, "media_transport_lost", {
-                                "chat_id": cid,
-                                "verdict": "confirmed_media_disconnect",
-                            })
-                            self._record_drop(order_id, acc_id, cid, "media_transport_lost",
-                                              reason="engine media connection missing (ghost)",
-                                              extra={"media_known": media_known})
-                            present = False
+                            if present is True:
+                                # ── GHOST-MEDIA-ONLY (presence intact) ──────────
+                                # The participant listing says the account is
+                                # STILL inside the call — only the engine's
+                                # media binding vanished.  Presence is what the
+                                # order sells, so the account STAYS COUNTED and
+                                # no fail-cycle/rejoin is triggered (the old
+                                # code forced present=False here, which spun the
+                                # join → ghost → rejoin → ghost loop forever and
+                                # is what made accounts visibly bounce out).
+                                # Instead: pace ONE bounded media restore per
+                                # VOICE_MEDIA_RESTORE_INTERVAL seconds (full
+                                # recovery ladder inside _schedule_media_restore).
+                                # Log the drop event ONLY when a restore attempt
+                                # is actually due (otherwise this branch would
+                                # spam a warning every ~7s per ghosted account).
+                                if self._media_restore_due((order_id, acc_id)):
+                                    self._vc_event_log(order_id, acc_id, "media_lost_presence_ok", {
+                                        "chat_id": cid,
+                                        "verdict": "ghost_media_only",
+                                    })
+                                    self._record_drop(order_id, acc_id, cid, "media_transport_lost",
+                                                      reason="engine media connection missing but presence confirmed (ghost media only)",
+                                                      extra={"media_known": media_known,
+                                                             "verdict": "media_only_presence_intact"})
+                                try:
+                                    asyncio.create_task(
+                                        self._schedule_media_restore(order_id, acc_id, cid)
+                                    )
+                                except RuntimeError:
+                                    pass
+                            else:
+                                # Media binding gone AND the listing does not
+                                # confirm presence → treat as a real loss
+                                # (existing fail-cycle / recovery logic below).
+                                self._vc_event_log(order_id, acc_id, "media_transport_lost", {
+                                    "chat_id": cid,
+                                    "verdict": "confirmed_media_disconnect",
+                                })
+                                self._record_drop(order_id, acc_id, cid, "media_transport_lost",
+                                                  reason="engine media connection missing (ghost)",
+                                                  extra={"media_known": media_known})
+                                present = False
 
                         # ── DL HOLD-RISK (online deep-learning model) ───
                         # Score every cycle, learn from the resolved outcome, and
@@ -2851,6 +3521,7 @@ class VoiceCallManager:
                                 # Voice clients must receive raw updates from Telegram.
                                 no_updates=False,
                                 in_memory=True,
+                                proxy=_voice_proxy_config(),
                                 **_client_device_fingerprint(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)

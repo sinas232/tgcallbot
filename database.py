@@ -114,6 +114,10 @@ class TelegramAccount(Base):
     session_string = Column(Text, nullable=False)
     api_id = Column(Integer, nullable=True)
     api_hash = Column(String(100), nullable=True)
+    # 🔥 اطلاعات کش‌شدهٔ پروفایل اکانت (برای نمایش در لیست بدون نیاز به اتصال زنده)
+    first_name = Column(String(255), nullable=True)
+    last_name = Column(String(255), nullable=True)
+    username = Column(String(255), nullable=True)
     account_status = Column(String(20), default="active")
     health_score = Column(Integer, default=100)
     last_health_check = Column(DateTime, nullable=True)
@@ -213,6 +217,10 @@ class PaymentTransaction(Base):
     trans_id = Column(String(100), unique=True, nullable=False)
     status = Column(String(20), default="pending")
     gateway_slug = Column(String(50))
+    # لینک واقعی درگاه (StartPay). صفحهٔ میانیِ /pay/{trans_id} روی دامنهٔ خودمان
+    # کاربر را به این آدرس هدایت می‌کند تا Referrer با دامنهٔ اصلی تطابق داشته باشد
+    # (الزام شاپرک برای بات‌ها).
+    pay_url = Column(String(500))
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Ticket(Base):
@@ -220,17 +228,22 @@ class Ticket(Base):
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, default=1, index=True)
     user_id = Column(Integer, nullable=False, index=True)
-    status = Column(String(20), default="open") # open, answered, closed
+    subject = Column(String(255), nullable=True)          # موضوع تیکت
+    priority = Column(String(20), default="normal")        # low, normal, high
+    status = Column(String(20), default="open")            # open, answered, closed
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)            # زمان بسته‌شدن
 
 class TicketMessage(Base):
     __tablename__ = "ticket_messages"
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(Integer, nullable=False, index=True)
-    sender_type = Column(String(20), nullable=False)
-    message_type = Column(String(20), default="text")
+    sender_type = Column(String(20), nullable=False)       # user, admin, system
+    sender_name = Column(String(255), nullable=True)       # نام نمایشیِ فرستنده
+    message_type = Column(String(20), default="text")      # text, photo, voice, document, video
     content = Column(Text, nullable=True)
+    file_id = Column(String(255), nullable=True)           # برای بازنمایی ضمیمه‌ها
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # ===================== MANAGER =====================
@@ -248,6 +261,8 @@ class DatabaseManager:
     async def _run_safe_migrations():
         commands = [
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_id INTEGER DEFAULT 1;",
+            # لینک واقعی درگاه برای صفحهٔ میانیِ Referrer-safe (الزام شاپرک برای بات‌ها)
+            "ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS pay_url VARCHAR(500);",
             # جدول کارت بانکی
             """
             CREATE TABLE IF NOT EXISTS bank_cards (
@@ -280,7 +295,17 @@ class DatabaseManager:
                 content TEXT,
                 created_at TIMESTAMP WITHOUT TIME ZONE
             );
-            """
+            """,
+            # ستون‌های جدیدِ سیستم تیکتینگ حرفه‌ای (موضوع، اولویت، زمان بستن).
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'normal';",
+            "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP WITHOUT TIME ZONE;",
+            "ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS sender_name VARCHAR(255);",
+            "ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS file_id VARCHAR(255);",
+            # اطلاعات کش‌شدهٔ پروفایل اکانت‌های تلگرام (نام/نام‌خانوادگی/یوزرنیم)
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);",
+            "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS username VARCHAR(255);",
         ]
         async with engine.connect() as conn:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -339,22 +364,37 @@ class DatabaseManager:
             return [to_dict(t) for t in res.scalars().all()]
 
     @staticmethod
-    async def create_ticket(user_id: int, bot_id: int = 1):
+    async def create_ticket(user_id: int, bot_id: int = 1, subject: str = None, priority: str = 'normal'):
         async with AsyncSessionLocal() as db_session:
-            ticket = Ticket(user_id=user_id, bot_id=bot_id, status='open')
+            now = datetime.utcnow()
+            ticket = Ticket(user_id=user_id, bot_id=bot_id, status='open', subject=subject, priority=priority, created_at=now, updated_at=now)
             db_session.add(ticket)
             await db_session.commit()
             await db_session.refresh(ticket)
             return to_dict(ticket)
 
     @staticmethod
-    async def add_ticket_message(ticket_id: int, sender_type: str, message_type: str, content: str):
+    async def add_ticket_message(ticket_id: int, sender_type: str, message_type: str, content: str, sender_name: str = None, file_id: str = None):
         async with AsyncSessionLocal() as db_session:
-            msg = TicketMessage(ticket_id=ticket_id, sender_type=sender_type, message_type=message_type, content=content)
+            msg = TicketMessage(
+                ticket_id=ticket_id, sender_type=sender_type, message_type=message_type,
+                content=content, sender_name=sender_name, file_id=file_id, created_at=datetime.utcnow(),
+            )
             db_session.add(msg)
-            status = 'open' if sender_type == 'user' else 'answered'
-            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(updated_at=datetime.utcnow(), status=status))
+            # پیام‌های سیستمی وضعیت را تغییر نمی‌دهند؛ پیام کاربر → open، پاسخ ادمین → answered.
+            if sender_type == 'user':
+                new_status = 'open'
+            elif sender_type == 'admin':
+                new_status = 'answered'
+            else:
+                new_status = None
+            vals = {"updated_at": datetime.utcnow()}
+            if new_status:
+                vals["status"] = new_status
+            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(**vals))
             await db_session.commit()
+            await db_session.refresh(msg)
+            return to_dict(msg)
 
     @staticmethod
     async def get_ticket_messages(ticket_id: int):
@@ -371,8 +411,36 @@ class DatabaseManager:
     @staticmethod
     async def close_ticket(ticket_id: int):
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(status='closed'))
+            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(status='closed', closed_at=datetime.utcnow()))
             await db_session.commit()
+
+    @staticmethod
+    async def set_ticket_priority(ticket_id: int, priority: str):
+        async with AsyncSessionLocal() as db_session:
+            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(priority=priority))
+            await db_session.commit()
+
+    @staticmethod
+    async def reopen_ticket(ticket_id: int):
+        """بازکردن مجدد تیکت بسته‌شده (مثلاً وقتی کاربر دوباره پیام می‌دهد)."""
+        async with AsyncSessionLocal() as db_session:
+            await db_session.execute(update(Ticket).where(Ticket.id == ticket_id).values(status='open', closed_at=None, updated_at=datetime.utcnow()))
+            await db_session.commit()
+
+    @staticmethod
+    async def get_tickets_to_autoclose(bot_id: int = None, idle_hours: int = 48):
+        """تیکت‌هایی که ادمین به آن‌ها پاسخ داده (answered) و از آخرین فعالیت
+        بیش از idle_hours ساعت گذشته → کاندید بستنِ خودکار.
+
+        نکته: فقط تیکت‌های 'answered' بسته می‌شوند؛ یعنی حتماً پاسخ ادمین را
+        گرفته‌اند و کاربر پیام جدیدی نداده (پیام جدید کاربر → status=open)."""
+        cutoff = datetime.utcnow() - timedelta(hours=idle_hours)
+        async with AsyncSessionLocal() as db_session:
+            q = select(Ticket).filter(Ticket.status == 'answered', Ticket.updated_at <= cutoff)
+            if bot_id is not None:
+                q = q.filter(Ticket.bot_id == bot_id)
+            res = await db_session.execute(q)
+            return [to_dict(t) for t in res.scalars().all()]
 
     @staticmethod
     async def get_tickets_by_status(bot_id: int, status_filter: str = 'all', user_id: int = None):
@@ -394,7 +462,24 @@ class DatabaseManager:
                 
             q = q.order_by(desc(Ticket.updated_at))
             res = await db_session.execute(q)
-            return [{'ticket': to_dict(t), 'user': to_dict(u)} for t, u in res.all()]
+            rows = res.all()
+            out = []
+            for t, u in rows:
+                # آخرین پیام و تعداد پیام‌ها برای پیش‌نمایش در لیست.
+                mres = await db_session.execute(
+                    select(TicketMessage).filter(TicketMessage.ticket_id == t.id).order_by(desc(TicketMessage.created_at)).limit(1)
+                )
+                last_msg = mres.scalar_one_or_none()
+                cnt = (await db_session.execute(
+                    select(func.count(TicketMessage.id)).filter(TicketMessage.ticket_id == t.id)
+                )).scalar() or 0
+                out.append({
+                    'ticket': to_dict(t),
+                    'user': to_dict(u),
+                    'last_message': to_dict(last_msg),
+                    'message_count': cnt,
+                })
+            return out
 
     @staticmethod
     async def get_tickets_count(bot_id: int, status_filter: str = 'all'):
@@ -631,6 +716,23 @@ class DatabaseManager:
             return to_dict(order)
 
     @staticmethod
+    async def get_user_running_voice_orders(user_id: int, bot_id: int = 1):
+        """سفارش‌های ویس‌کالِ در حال اجرای یک کاربر (برای مرکز پیام درون‌تماس)."""
+        async with AsyncSessionLocal() as db_session:
+            q = (
+                select(Order)
+                .filter(
+                    Order.user_id == user_id,
+                    Order.bot_id == bot_id,
+                    Order.status == 'running',
+                    Order.order_type.ilike('%voice%'),
+                )
+                .order_by(desc(Order.created_at))
+            )
+            res = await db_session.execute(q)
+            return [to_dict(o) for o in res.scalars().all()]
+
+    @staticmethod
     async def get_orders_history(user_id=None, limit=20, offset=0):
         async with AsyncSessionLocal() as db_session:
             q = select(Order).order_by(desc(Order.created_at)).limit(limit).offset(offset)
@@ -778,7 +880,8 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None):
+    async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None,
+                                   first_name=None, last_name=None, username=None):
         async with AsyncSessionLocal() as db_session:
             try:
                 existing = await db_session.execute(select(TelegramAccount).filter(TelegramAccount.phone_number == phone, TelegramAccount.bot_id == bot_id))
@@ -789,12 +892,16 @@ class DatabaseManager:
                     acc.account_status = 'active'
                     if api_id: acc.api_id = api_id
                     if api_hash: acc.api_hash = api_hash
+                    if first_name is not None: acc.first_name = first_name
+                    if last_name is not None: acc.last_name = last_name
+                    if username is not None: acc.username = username
                     status = "updated"
                 else:
                     acc = TelegramAccount(
                         bot_id=bot_id, user_id=user_id, phone_number=phone, 
                         session_string=session_str, is_verified=True, 
-                        account_status='active', api_id=api_id, api_hash=api_hash
+                        account_status='active', api_id=api_id, api_hash=api_hash,
+                        first_name=first_name, last_name=last_name, username=username
                     )
                     db_session.add(acc)
                 await db_session.commit()
@@ -802,6 +909,23 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"❌ Add account db error: {e}")
                 return False, "error"
+
+    @staticmethod
+    async def update_account_profile_cache(aid, first_name=None, last_name=None, username=None):
+        """بروزرسانی اطلاعات کش‌شدهٔ پروفایل یک اکانت (فقط فیلدهای ارسال‌شده)."""
+        async with AsyncSessionLocal() as db_session:
+            try:
+                acc = await db_session.get(TelegramAccount, aid)
+                if not acc:
+                    return False
+                if first_name is not None: acc.first_name = first_name
+                if last_name is not None: acc.last_name = last_name
+                if username is not None: acc.username = username
+                await db_session.commit()
+                return True
+            except Exception as e:
+                logger.error(f"❌ update_account_profile_cache error: {e}")
+                return False
 
     @staticmethod
     async def get_accounts_paginated(limit=10, offset=0, active_only=False, bot_id=1):
@@ -1071,9 +1195,9 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             await db_session.commit()
 
     @staticmethod
-    async def create_payment_transaction(user_id: int, amount: float, trans_id: str, gateway: str, bot_id=1):
+    async def create_payment_transaction(user_id: int, amount: float, trans_id: str, gateway: str, bot_id=1, pay_url: str = None):
         async with AsyncSessionLocal() as db_session:
-            pt = PaymentTransaction(bot_id=bot_id, user_id=user_id, amount=amount, trans_id=trans_id, gateway_slug=gateway)
+            pt = PaymentTransaction(bot_id=bot_id, user_id=user_id, amount=amount, trans_id=trans_id, gateway_slug=gateway, pay_url=pay_url)
             db_session.add(pt)
             await db_session.commit()
 
@@ -1198,6 +1322,14 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             gws = res.scalars().all()
             if not gws: return None
             return to_dict(gws[0])
+
+    @staticmethod
+    async def get_active_gateways(bot_id=1):
+        """همهٔ درگاه‌های فعال (نه فقط یکی) را برمی‌گرداند تا بتوان چند درگاه را
+        هم‌زمان فعال داشت و به کاربر امکان انتخاب داد."""
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(select(PaymentGateway).filter(PaymentGateway.bot_id == bot_id, PaymentGateway.is_active == True))
+            return [to_dict(g) for g in res.scalars().all()]
 
     @staticmethod
     async def get_all_users_list(bot_id=1):

@@ -2,6 +2,7 @@ FROM python:3.11-slim-bookworm
 
 ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Tehran
 
 # 1. نصب پیش‌نیازهای اولیه (شامل curl، git و ffmpeg که برای تماس صوتی حیاتی هستند)
@@ -27,8 +28,13 @@ RUN mkdir -p /app/data
 COPY . /app
 
 # 3. نصب و آپدیت کتابخانه‌های پایتون
+#    ابتدا هر نسخهٔ قبلی/متضاد از pyrogram و forkهایش را حذف می‌کنیم تا با
+#    kurigram (که با همان نام pyrogram ایمپورت می‌شود) تداخل نکند و خطاهای
+#    عجیب ImportError رخ ندهد؛ سپس وابستگی‌ها را نصب می‌کنیم.
 RUN pip install --upgrade pip wheel setuptools && \
-    pip install -r requirements.txt
+    pip uninstall -y pyrogram pyrofork pyrotgfork 2>/dev/null || true && \
+    pip install -r requirements.txt && \
+    python -c "import pyrogram; from pyrogram.raw import functions; assert hasattr(functions.phone, 'SendGroupCallMessage'), 'Layer too old: sendGroupCallMessage missing'; print('pyrogram', pyrogram.__version__, '- in-call messages supported')"
 
 # تغییر مهم: اول اسکریپت انتظار دیتابیس اجرا می‌شود، سپس ربات اصلی
 # اگر این خط را به حالت ساده ["python", "main.py"] برگردانید، ربات دوباره کرش می‌کند.

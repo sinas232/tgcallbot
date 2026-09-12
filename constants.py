@@ -63,6 +63,7 @@ AWAITING_ACCOUNT_ID_DELETE = 71
 AWAITING_GET_CODE_ACCOUNT = 72
 AWAITING_LEAVE_ALL_CONFIRM = 73  # وضعیت جدید برای تایید خروج همگانی
 AWAITING_ACCOUNT_MENU = 74  # منوی اصلی مدیریت اکانت‌ها
+AWAITING_INCALL_TEXT = 79   # دریافت متن پیام درون ویس‌کال
 
 AWAITING_PRIVACY_CHOICE = 80
 AWAITING_PRIVACY_VALUE = 81
@@ -98,6 +99,11 @@ AWAITING_RESELLER_EDIT_VALUE = 166
 # 🔥 وضعیت‌های تیکت
 AWAITING_TICKET_MESSAGE = 200
 AWAITING_ADMIN_TICKET_REPLY = 201
+AWAITING_TICKET_SUBJECT = 202   # انتخاب/نوشتن موضوع تیکت جدید
+AWAITING_TICKET_BODY = 203      # نوشتن متن تیکت پس از موضوع
+
+# مدت زمان بی‌فعالیتی برای بستن خودکار تیکت (ساعت)
+TICKET_AUTOCLOSE_HOURS = 48
 
 # 💾 وضعیت‌های پشتیبان‌گیری و بازیابی
 AWAITING_RESTORE_FILE = 210

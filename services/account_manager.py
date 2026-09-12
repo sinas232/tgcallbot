@@ -164,7 +164,10 @@ async def finalize_session(update, context, client):
 
         success, status = await DatabaseManager.add_telegram_account(
             db_user['id'], context.user_data['phone'], enc_sess,
-            bot_id=bot_id, api_id=api_id, api_hash=api_hash
+            bot_id=bot_id, api_id=api_id, api_hash=api_hash,
+            first_name=getattr(me, 'first_name', None),
+            last_name=getattr(me, 'last_name', None),
+            username=getattr(me, 'username', None)
         )
 
         safe_name = html.escape(me.first_name or "Unknown")
