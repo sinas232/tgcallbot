@@ -137,6 +137,22 @@ class Config:
     # by default so the total gap stays within the requested 0.5-1.0s window.
     VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.0'))
     VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '0.0'))
+    # ── IN-CALL MESSAGE / REACTION PACING (anti-burst for customer chat) ──
+    # When a customer sends a comment or reaction from many accounts at once,
+    # the sends are NOT fired in the same millisecond. Each account's send
+    # starts INCALL_SEND_STAGGER_MIN..MAX seconds after the previous one, so
+    # Telegram sees a steady ~1 request/second cadence instead of a burst of
+    # N simultaneous phone.SendGroupCallMessage RPCs (which trip FloodWait and
+    # make the message effectively invisible in the call). Deterministic pacing,
+    # not a one-shot flood — but still fast enough to finish quickly.
+    # Default ~1 msg/second (0.8-1.2s gap). Raise if Telegram issues FloodWait.
+    INCALL_SEND_STAGGER_MIN = float(os.getenv('INCALL_SEND_STAGGER_MIN', '0.8'))
+    INCALL_SEND_STAGGER_MAX = float(os.getenv('INCALL_SEND_STAGGER_MAX', '1.2'))
+    # Hard ceiling on how many in-call sends may be in-flight at the same time.
+    # Even with the stagger above, a slow network could let many overlap; this
+    # bounds concurrency so we never dump the whole batch on Telegram at once.
+    INCALL_SEND_MAX_CONCURRENCY = int(os.getenv('INCALL_SEND_MAX_CONCURRENCY', '3'))
+
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))
     # Failure-rate (per wave) above which the window is narrowed.

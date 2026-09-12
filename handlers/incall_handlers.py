@@ -405,7 +405,12 @@ async def incall_react(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.answer("ابتدا اکانت انتخاب کنید.", show_alert=True)
         return ConversationHandler.END
 
-    await query.answer(f"در حال ارسال {emo} ...")
+    n = len(selected)
+    if n > 3:
+        est = _est_seconds(n)
+        await query.answer(f"در حال ارسال {emo} به {n} اکانت با فاصلهٔ منظم (~{est} ثانیه)...")
+    else:
+        await query.answer(f"در حال ارسال {emo} ...")
     vcm = _get_vcm()
     res = await vcm.broadcast_incall_message(selected, oid, reaction_emoji=emo)
     note = _fmt_result(res, f"ری‌اکشن {emo}")
@@ -446,6 +451,10 @@ async def incall_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     vcm = _get_vcm()
+    n = len(selected)
+    if n > 3:
+        await send_safe(context.bot, update.effective_chat.id,
+                        f"⏳ در حال ارسال پیام به {n} اکانت با فاصلهٔ منظم (~{_est_seconds(n)} ثانیه)...")
     res = await vcm.broadcast_incall_message(selected, oid, text=text)
     note = _fmt_result(res, "پیام")
     # بازگرداندن کیبورد اصلی و نمایش دوبارهٔ پنل (تا کاربر بتواند باز هم بفرستد)
@@ -453,6 +462,17 @@ async def incall_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
     await _render_compose_panel(update, context, edit=False, note=note)
     return ConversationHandler.END
+
+
+def _est_seconds(n: int) -> int:
+    """تخمین تقریبی زمان ارسال پلکانی برای n اکانت (بر اساس فاصلهٔ ~۱ ثانیه)."""
+    try:
+        from config import Config
+        gap = (float(getattr(Config, "INCALL_SEND_STAGGER_MIN", 0.8)) +
+               float(getattr(Config, "INCALL_SEND_STAGGER_MAX", 1.2))) / 2.0
+    except Exception:
+        gap = 1.0
+    return max(1, int(round(max(0, n - 1) * gap)))
 
 
 def _fmt_result(res: dict, kind: str) -> str:

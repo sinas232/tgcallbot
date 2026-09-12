@@ -1156,7 +1156,12 @@ class VoiceCallManager:
 
     async def broadcast_incall_message(self, account_ids: List[int], order_id: int,
                                        text: str = "", reaction_emoji: str = "") -> Dict:
-        """ارسال هم‌زمان یک پیام/ری‌اکشن از چند اکانت در ویس‌کال همان سفارش.
+        """ارسال پیام/ری‌اکشن از چند اکانت در ویس‌کال همان سفارش — با pacing مدیریت‌شده.
+
+        برخلاف حالت قبل که همهٔ درخواست‌ها در یک لحظه (asyncio.gather) شلیک
+        می‌شد و باعث flood و دیده‌نشدن پیام می‌شد، اینجا ارسال‌ها با فاصلهٔ کوتاه
+        (به‌طور پیش‌فرض حدود ۱ درخواست در ثانیه) و با سقف هم‌زمانی محدود انجام
+        می‌شوند: نه یک‌دفعه‌ای، ولی خیلی هم کند نیست.
 
         خروجی: {sent, failed, total, errors:[...]}
         """
@@ -1164,14 +1169,37 @@ class VoiceCallManager:
         # نگاشت account_id → chat_id از وضعیت فعلی سفارش
         chat_map = {a["account_id"]: a["chat_id"] for a in self.get_order_incall_accounts(order_id)}
 
-        async def _one(aid):
-            cid = chat_map.get(aid)
-            if cid is None:
-                return aid, False, "اکانت در تماس فعال نیست"
-            ok, msg = await self.send_incall_message(aid, cid, text=text, reaction_emoji=reaction_emoji)
-            return aid, ok, msg
+        # پارامترهای pacing از Config (با fallback امن)
+        gap_min = float(getattr(Config, "INCALL_SEND_STAGGER_MIN", 0.8))
+        gap_max = float(getattr(Config, "INCALL_SEND_STAGGER_MAX", 1.2))
+        if gap_max < gap_min:
+            gap_max = gap_min
+        max_conc = max(1, int(getattr(Config, "INCALL_SEND_MAX_CONCURRENCY", 3)))
+        sem = asyncio.Semaphore(max_conc)
 
-        results = await asyncio.gather(*[_one(a) for a in account_ids], return_exceptions=True)
+        async def _one(aid):
+            async with sem:
+                cid = chat_map.get(aid)
+                if cid is None:
+                    return aid, False, "اکانت در تماس فعال نیست"
+                try:
+                    ok, msg = await self.send_incall_message(
+                        aid, cid, text=text, reaction_emoji=reaction_emoji)
+                    return aid, ok, msg
+                except Exception as exc:
+                    return aid, False, str(exc)[:80]
+
+        # هر ارسال را با تأخیر پلکانی شروع کن تا cadence حدود ۱/ثانیه بماند
+        # (نه burst). هر task بعد از start-gap مربوط به خودش کلید می‌خورد؛ چون
+        # ارسال‌ها هم‌پوشانی دارند، کل عملیات همچنان سریع تمام می‌شود.
+        tasks = []
+        for idx, aid in enumerate(account_ids):
+            if idx > 0:
+                delay = random.uniform(gap_min, gap_max)
+                await asyncio.sleep(delay)
+            tasks.append(asyncio.ensure_future(_one(aid)))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         sent, failed, errors = 0, 0, []
         for r in results:
