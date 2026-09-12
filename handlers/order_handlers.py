@@ -449,7 +449,10 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await order_executor.stop_active_order(
             order_id,
             is_expired=False,
-            reason="User cancelled order via inline button"
+            reason="User cancelled order via inline button",
+            # گزارش کاملِ لغو را پایین‌تر همین هندلر می‌فرستد؛ جلوی گزارش
+            # «cancelled» تکراری/ناقصِ order_executor را بگیر.
+            suppress_cancel_log=True,
         )
         msg_prefix = "✅ سفارش فعال با موفقیت لغو شد."
 

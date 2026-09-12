@@ -63,6 +63,17 @@ class OrderExecutor:
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
+		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
+		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
+		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
+		self._suppress_cancel_log: Set[int] = set()
+
+	def _consume_cancel_log_suppression(self, order_id: int) -> bool:
+		"""اگر گزارش لغو این سفارش سرکوب شده باشد True برمی‌گرداند و flag را مصرف می‌کند."""
+		if order_id in self._suppress_cancel_log:
+			self._suppress_cancel_log.discard(order_id)
+			return True
+		return False
 
 	def init_app(self, application):
 		self.app = application
@@ -279,10 +290,11 @@ class OrderExecutor:
 	                    logger.info(f"Order {order_id}: cancelled - ejecting all accounts NOW")
 	                    await self._cleanup_order(order_id, joined_list, data)
 	                    await DatabaseManager.update_order_status(order_id, "stopped")
-	                    try:
-	                        await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id, reason="User cancelled")
-	                    except Exception:
-	                        pass
+	                    if not self._consume_cancel_log_suppression(order_id):
+	                        try:
+	                            await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id, reason="User cancelled")
+	                        except Exception:
+	                            pass
 	                    self.active_orders.pop(order_id, None)
 	                    return
 
@@ -303,14 +315,15 @@ class OrderExecutor:
 	                        logger.info(f"Order {order_id}: cancelled — ejecting all accounts")
 	                        await self._cleanup_order(order_id, joined_list, data)
 	                        await DatabaseManager.update_order_status(order_id, "stopped")
-	                        try:
-	                            await self._log_to_channel(
-	                                "cancelled", order_id, data,
-	                            success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id,
-	                            reason="User cancelled",
-	                            )
-	                        except Exception:
-	                            pass
+	                        if not self._consume_cancel_log_suppression(order_id):
+	                            try:
+	                                await self._log_to_channel(
+	                                    "cancelled", order_id, data,
+	                                success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id,
+	                                reason="User cancelled",
+	                                )
+	                            except Exception:
+	                                pass
 	                        self.active_orders.pop(order_id, None)
 	                        return
 
@@ -356,8 +369,9 @@ class OrderExecutor:
 	    except asyncio.CancelledError:
 	        await self._cleanup_order(order_id, joined_list, data)
 	        await DatabaseManager.update_order_status(order_id, "stopped")
-	        try: await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, data.get("order_type"), joined_list), bot_id=data.get("bot_id", 1))
-	        except: pass
+	        if not self._consume_cancel_log_suppression(order_id):
+	            try: await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, data.get("order_type"), joined_list), bot_id=data.get("bot_id", 1))
+	            except: pass
 	        self.active_orders.pop(order_id, None)
 	    except Exception as e:
 	        logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
@@ -1208,7 +1222,12 @@ class OrderExecutor:
 					await client.leave_chat(chat_id)
 			except: pass
 
-	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None):
+	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
+	                            suppress_cancel_log: bool = False):
+		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
+		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
+		if suppress_cancel_log:
+			self._suppress_cancel_log.add(order_id)
 		if order_id in self.active_orders:
 			info = self.active_orders[order_id]
 			info["cancel_requested"] = True
@@ -1321,9 +1340,12 @@ class OrderExecutor:
 			fresh = await DatabaseManager.get_user_by_id(user["id"])
 			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
 
-		# توقف واقعی سفارش/اکانت‌ها
+		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
+		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
 		try:
-			await self.stop_active_order(order_id, is_expired=False, reason=cancellation_reason)
+			await self.stop_active_order(order_id, is_expired=False,
+			                             reason=cancellation_reason,
+			                             suppress_cancel_log=True)
 		except Exception as exc:
 			logger.warning(f"Order {order_id}: stop during settlement failed: {exc}")
 
