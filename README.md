@@ -16,6 +16,7 @@
 | سند | موضوع |
 |---|---|
 | [`docs/new-server-setup.fa.md`](docs/new-server-setup.fa.md) | **راه‌اندازی کامل روی سرور جدید** (از صفر تا اجرا، با WARP در داکر) |
+| [`CHANGELOG.md`](CHANGELOG.md) | **تاریخچهٔ تغییرات** (آخرین قابلیت‌ها و رفع اشکال‌ها) |
 | [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md) | **راه‌اندازی درگاه پرداخت زرین‌پال** (دامنه، Referrer، callback، عیب‌یابی) |
 | [`docs/voice-reliability-deploy.fa.md`](docs/voice-reliability-deploy.fa.md) | پایداری تماس صوتی و استقرار |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
@@ -28,6 +29,9 @@
   با پخش استریمِ سکوت (۲۴kHz مونو) به‌صورت پایدار در تماس باقی می‌مانند.
 - **مغز تطبیقی ورود (Adaptive Join):** مدیریت هوشمند هم‌زمانی و backoff برای
   کاهش FloodWait تلگرام.
+- **چت داخل تماس (In-Call Chat):** مشتری می‌تواند از اکانت‌های فعالِ سفارش،
+  تکی یا گروهی، کامنت و ری‌اکشن بفرستد (با pacing ضدِ burst، ~۱ درخواست در
+  ثانیه). قابل روشن/خاموش‌شدن توسط ادمین.
 - **کیف پول و پرداخت آنلاین:** شارژ کیف پول از طریق **زرین‌پال** و **آقای پرداخت**.
 - **پنل مدیریت کامل:** مدیریت کاربران، سفارش‌ها، پلن‌ها، تیکت، بکاپ خودکار،
   گزارش‌های مالی، و لغو/استرداد سفارش.
@@ -197,6 +201,40 @@ tgcallbot/
 
 ---
 
+## 🚀 راه‌اندازی سریع روی سرور جدید
+
+راهنمای کامل و گام‌به‌گام در [`docs/new-server-setup.fa.md`](docs/new-server-setup.fa.md)
+آمده است. خلاصهٔ مسیر:
+
+</div>
+
+```bash
+# ۱) دریافت کد (نام پوشهٔ پروژه طبق قرارداد: callmanager)
+git clone <REPO_URL> callmanager
+cd callmanager
+
+# ۲) ساخت فایل تنظیمات و پرکردن مقادیر واقعی
+cp .env.example .env
+nano .env        # حداقل: TELEGRAM_API_ID/HASH، BOT_TOKEN، ADMIN_IDS،
+                 #        SESSION_ENCRYPTION_KEY، رمزهای دیتابیس، SERVER_URL
+
+# کلید رمزنگاری سشن‌ها:
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# ۳) بالا آوردن کل استک (bot + WARP + db + redis + nginx) با داکر
+docker compose up -d --build
+
+# ۴) بررسی سلامت
+docker compose logs -f bot
+```
+
+<div dir="rtl">
+
+> ⚠️ **WARP الزامی است** و فقط داخل داکر اجرا می‌شود. هرگز روی خودِ هاست
+> `warp-cli connect` نزنید (SSH قطع می‌شود).
+
+---
+
 ## 🛠️ دستورات پرکاربرد
 
 </div>
@@ -209,7 +247,7 @@ docker compose logs -f bot
 docker compose restart bot
 
 # بازسازی و بالا آوردن پس از تغییر کد
-git pull origin arena/01a08f7a-tgcallbot
+git pull
 docker compose up -d --build
 
 # بررسی مصرف منابع
@@ -235,8 +273,9 @@ curl -s http://SERVER_URL:8080/health
 
 ---
 
-## 📄 شاخهٔ فعال
+## 📄 نسخه و توسعه
 
-توسعه روی شاخهٔ `arena/01a08f7a-tgcallbot` انجام می‌شود.
+- نسخهٔ پایدار روی شاخهٔ `main` منتشر می‌شود.
+- تاریخچهٔ کامل تغییرات در [`CHANGELOG.md`](CHANGELOG.md) آمده است.
 
 </div>
