@@ -714,6 +714,108 @@ class TelegramClientGuardTests(unittest.TestCase):
         _run(scenario())
 
 
+# ────────────────────────────────────────────────────────────────────────
+# 9. Managed leave stagger (anti-burst mass-exit after cancel/end)
+# ────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class LeaveStaggerTests(unittest.TestCase):
+    """After cancel/end, N accounts must NOT all LeaveGroupCall in one burst."""
+
+    def setUp(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.mgr = VoiceCallManager()
+        # Tight but measurable gaps so the test stays fast.
+        self._orig = {
+            "VOICE_LEAVE_STAGGER_MIN": getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8),
+            "VOICE_LEAVE_STAGGER_MAX": getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5),
+            "VOICE_LEAVE_MAX_CONCURRENCY": getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2),
+            "VOICE_LEAVE_JITTER_MIN": getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0),
+            "VOICE_LEAVE_JITTER_MAX": getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4),
+        }
+        Config.VOICE_LEAVE_STAGGER_MIN = 0.05
+        Config.VOICE_LEAVE_STAGGER_MAX = 0.08
+        Config.VOICE_LEAVE_MAX_CONCURRENCY = 2
+        Config.VOICE_LEAVE_JITTER_MIN = 0.0
+        Config.VOICE_LEAVE_JITTER_MAX = 0.0
+
+    def tearDown(self) -> None:
+        for k, v in self._orig.items():
+            setattr(Config, k, v)
+        self.loop.run_until_complete(self.mgr.cleanup_all())
+        self.loop.close()
+
+    def test_stop_all_for_order_paces_leaves(self):
+        """5 accounts: start gaps must exist; peak concurrent leave ≤ max_conc."""
+        order_id = 4242
+        n = 5
+        start_ts: list = []
+        peak = {"n": 0, "cur": 0}
+        lock = asyncio.Lock()
+
+        async def fake_stop(oid, aid, leave_group=False, cleanup_client=False):
+            async with lock:
+                start_ts.append(asyncio.get_event_loop().time())
+                peak["cur"] += 1
+                peak["n"] = max(peak["n"], peak["cur"])
+            await asyncio.sleep(0.04)  # simulate leave RPC duration
+            async with lock:
+                peak["cur"] -= 1
+            # Mirror real stop_call bookkeeping so cleanup is clean.
+            self.mgr.active_calls.pop((oid, aid), None)
+            (self.mgr.joined_accounts_by_order.get(oid) or {}).pop(aid, None)
+            return True, "Stopped"
+
+        async def scenario():
+            for aid in range(1, n + 1):
+                self.mgr.active_calls[(order_id, aid)] = {
+                    "chat_id": -100999, "joined_at": 0, "target": "t.me/x",
+                }
+                self.mgr.register_join(order_id, aid, -100999, "t.me/x")
+            # Fake a running monitor so stop_all must cancel it first.
+            mon = asyncio.create_task(asyncio.sleep(3600))
+            self.mgr._monitor_tasks[order_id] = mon
+
+            self.mgr.stop_call = fake_stop  # type: ignore[method-assign]
+            t0 = asyncio.get_event_loop().time()
+            count = await self.mgr.stop_all_for_order(order_id, leave_group=True)
+            elapsed = asyncio.get_event_loop().time() - t0
+
+            self.assertEqual(count, n)
+            self.assertEqual(len(start_ts), n)
+            # Monitor stopped before/during leave.
+            self.assertTrue(mon.cancelled() or mon.done())
+            self.assertNotIn(order_id, self.mgr._monitor_tasks)
+            # Peak concurrent leave must respect the concurrency ceiling.
+            self.assertLessEqual(peak["n"], Config.VOICE_LEAVE_MAX_CONCURRENCY)
+            # Starts are staggered: wall clock ≥ (n-1) * min_gap (approx).
+            min_expected = (n - 1) * Config.VOICE_LEAVE_STAGGER_MIN * 0.7
+            self.assertGreaterEqual(elapsed, min_expected,
+                                    f"burst exit too fast: {elapsed:.3f}s < {min_expected:.3f}s")
+            # Gaps between consecutive STARTS (not completions) ≥ ~half min gap.
+            ordered = sorted(start_ts)
+            gaps = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1)]
+            # With conc=2, some starts can be closer; at least ONE gap should
+            # reflect the stagger (not all near-zero like a pure gather).
+            self.assertTrue(
+                any(g >= Config.VOICE_LEAVE_STAGGER_MIN * 0.5 for g in gaps),
+                f"no stagger gaps observed: {gaps}",
+            )
+            # Order state fully cleared.
+            self.assertNotIn(order_id, self.mgr.joined_accounts_by_order)
+            self.assertFalse(any(k[0] == order_id for k in self.mgr.active_calls))
+
+        self.loop.run_until_complete(scenario())
+
+    def test_config_leave_defaults_sane(self):
+        self.assertGreaterEqual(float(self._orig["VOICE_LEAVE_STAGGER_MIN"]), 0.0)
+        self.assertGreaterEqual(
+            float(self._orig["VOICE_LEAVE_STAGGER_MAX"]),
+            float(self._orig["VOICE_LEAVE_STAGGER_MIN"]),
+        )
+        self.assertGreaterEqual(int(self._orig["VOICE_LEAVE_MAX_CONCURRENCY"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -9,6 +9,31 @@
 
 ---
 
+## نسخهٔ ۲.۲.۱ — 🚪 خروج مدیریت‌شده از ویس‌کال (ضد burst)
+
+<div dir="rtl">
+
+**تاریخ:** ۱۴۰۵/۰۶/۲۱
+
+### مشکل
+بعد از **پایان** یا **لغو** سفارش، همهٔ اکانت‌ها یک‌جا (هم‌زمان با `asyncio.gather`)
+از ویس‌کال و گروه خارج می‌شدند. این burst شبیه رفتار ربات است و می‌تواند
+FloodWait / محدودیت اکانت ایجاد کند.
+
+### فیکس
+- `VoiceCallManager.stop_all_for_order` و `cleanup_all` با **فاصلهٔ پلکانی**
+  (`VOICE_LEAVE_STAGGER_MIN/MAX` پیش‌فرض ۰.۸–۱.۵ ثانیه) و **سقف هم‌زمانی**
+  (`VOICE_LEAVE_MAX_CONCURRENCY=2`) اکانت‌ها را خارج می‌کنند.
+- مانیتور سفارش **قبل** از leave متوقف می‌شود تا وسط خروج دوباره join نکند.
+- `OrderExecutor._eject_all_fast` / `_cleanup_order` همان pacing را برای
+  group/channel و leftoverها اعمال می‌کنند (بدون double-leave روی voice).
+- ترتیب leave تصادفی می‌شود تا fingerprint ثابت نداشته باشد.
+- کلیدهای env جدید در `.env.example` و `config.py`.
+
+</div>
+
+---
+
 ## نسخهٔ ۲.۲ — 🎨 UI رنگی + فیکس ایموجی پریمیوم
 
 <div dir="rtl">

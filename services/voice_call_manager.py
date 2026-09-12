@@ -3833,15 +3833,67 @@ class VoiceCallManager:
         return False, "Stop failed after retries"
 
     async def stop_all_for_order(self, order_id: int, leave_group: bool = False, cleanup_client: bool = False) -> int:
-        """Stop all active calls AND clear persistent joined state for an order."""
-        keys = [k for k in self.active_calls.keys() if k[0] == order_id]
-        tasks = [
-            self.stop_call(k[0], k[1], leave_group=leave_group, cleanup_client=cleanup_client)
-            for k in keys
-        ]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Stop all active calls AND clear persistent joined state for an order.
+
+        Leaves are **paced** (stagger + concurrency cap) so N accounts never
+        fire LeaveGroupCall / leave_chat in the same millisecond — that burst
+        is a classic anti-spam trigger and can flood/limit sessions.
+        """
+        # Collect every account still associated with this order (active_calls
+        # + durable joined set) so nothing is left behind after cancel/end.
+        key_set = {k for k in self.active_calls.keys() if k[0] == order_id}
+        for aid in list((self.joined_accounts_by_order.get(order_id) or {}).keys()):
+            key_set.add((order_id, aid))
+        keys = list(key_set)
+
+        # Stop the shared monitor FIRST so it cannot rejoin while we leave.
         self._stop_monitor(order_id)
+
+        if keys:
+            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+            jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+            jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            # Shuffle so the leave order is not the same join order every time
+            # (harder for anti-spam fingerprinting of a fixed sequence).
+            random.shuffle(keys)
+            sem = asyncio.Semaphore(max_conc)
+            logger.info(
+                "[VoiceLeave] order=%s paced exit of %s account(s) "
+                "(gap=%.1f-%.1fs conc=%s leave_group=%s)",
+                order_id, len(keys), gap_min, gap_max, max_conc, leave_group,
+            )
+
+            async def _one(oid: int, aid: int) -> None:
+                async with sem:
+                    try:
+                        await self.stop_call(
+                            oid, aid,
+                            leave_group=leave_group,
+                            cleanup_client=cleanup_client,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.debug(
+                            "[VoiceLeave] stop_call failed order=%s acc=%s: %s",
+                            oid, aid, exc,
+                        )
+
+            tasks: List[asyncio.Task] = []
+            for idx, (oid, aid) in enumerate(keys):
+                if idx > 0:
+                    delay = random.uniform(gap_min, gap_max) + random.uniform(jitter_min, jitter_max)
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        # Still finish already-started leaves; cancel the rest.
+                        break
+                tasks.append(asyncio.create_task(_one(oid, aid)))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)
         self.order_chat_ids.pop(order_id, None)
@@ -3850,9 +3902,31 @@ class VoiceCallManager:
         self._account_meta_by_order.pop(order_id, None)
         self._order_timeline.pop(order_id, None)
         self._order_join_locks.pop(order_id, None)
+        self._presence_reconcilers.pop(order_id, None)
         for key in [k for k in self._rejoin_failures if k[0] == order_id]:
             self._rejoin_failures.pop(key, None)
+        for key in [k for k in self._media_restore_inflight if k[0] == order_id]:
+            self._media_restore_inflight.discard(key)
+        for key in [k for k in list(self._media_restore_last) if k[0] == order_id]:
+            self._media_restore_last.pop(key, None)
+        for key in [k for k in list(self._media_restore_failures) if k[0] == order_id]:
+            self._media_restore_failures.pop(key, None)
+        for key in [k for k in list(self._media_restore_paused_until) if k[0] == order_id]:
+            self._media_restore_paused_until.pop(key, None)
         return len(keys)
+
+    async def cleanup_all(self) -> None:
+        """Cleanup everything — for shutdown (also paced, not a burst)."""
+        order_ids = set()
+        for oid, _aid in list(self.active_calls.keys()):
+            order_ids.add(oid)
+        for oid in list(self.joined_accounts_by_order.keys()):
+            order_ids.add(oid)
+        for oid in order_ids:
+            try:
+                await self.stop_all_for_order(oid, leave_group=True)
+            except Exception as exc:
+                logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
 
     # ─── UNRECOVERABLE-SLOT API (executor-side replacement support) ───
 
@@ -3888,13 +3962,6 @@ class VoiceCallManager:
         self._vc_event_log(order_id, account_id, "slot_released_for_replacement", {})
         await self.stop_call(order_id, account_id, leave_group=leave_group, cleanup_client=False)
         return True, "Slot released for replacement"
-
-    async def cleanup_all(self) -> None:
-        """Cleanup everything — for shutdown."""
-        keys = list(self.active_calls.keys())
-        tasks = [self.stop_call(k[0], k[1], leave_group=True) for k in keys]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ─── Global singleton ───
