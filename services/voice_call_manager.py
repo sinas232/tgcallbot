@@ -954,6 +954,31 @@ class VoiceCallManager:
         self._active_call_cache.pop(int(chat_id), None)
         self._chat_info_cache.pop(int(chat_id), None)
 
+    async def _get_group_call_for_account(self, app: Client, chat_id: int,
+                                          force_refresh: bool = False) -> object:
+        """مرجع InputGroupCall را برای «همین اکانت» برمی‌گرداند.
+
+        نکتهٔ کلیدی: access_hash یک کانال، مختصِ هر سشن/اکانت است و سراسری
+        نیست. بنابراین برای فراخوانی channels.GetFullChannel باید peer با سشنِ
+        همین اکانت resolve شود، وگرنه خطای CHANNEL_INVALID رخ می‌دهد. اما خودِ
+        InputGroupCall (call id + access_hash تماس) سراسری است و می‌تواند بین
+        اکانت‌ها به‌اشتراک گذاشته شود؛ پس اگر قبلاً کش شده باشد از آن استفاده
+        می‌کنیم و از GetFullChannel صرف‌نظر می‌کنیم.
+        """
+        chat_id = int(chat_id)
+        if not force_refresh:
+            cached = self._chat_info_get(chat_id)
+            if cached and cached[1] is not None:
+                return cached[1]
+        # peer را با سشنِ همین اکانت resolve کن (نه از کش مشترک)
+        peer = await app.resolve_peer(chat_id)
+        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+        call = getattr(full.full_chat, "call", None)
+        # فقط مرجعِ تماس (سراسری) را کش کن؛ peerِ مختصِ اکانت را کش نمی‌کنیم
+        prev = self._chat_info_get(chat_id)
+        self._chat_info_put(chat_id, prev[0] if prev else peer, call)
+        return call
+
     # ─── IN-CALL MESSAGES & REACTIONS (Telegram Layer 216+) ─────────────
     #
     # قابلیت جدید تلگرام (اکتبر ۲۰۲۵): شرکت‌کنندگان ویس‌کال می‌توانند در محیط
@@ -1027,7 +1052,9 @@ class VoiceCallManager:
         for attempt in range(2):
             force = attempt == 1
             try:
-                call = await self._get_cached_group_call(app, int(chat_id), force_refresh=force)
+                # مرجعِ تماس را با سشنِ همین اکانت می‌گیریم تا خطای
+                # CHANNEL_INVALID (به‌خاطر access_hash مختصِ اکانت) رخ ندهد.
+                call = await self._get_group_call_for_account(app, int(chat_id), force_refresh=force)
                 if not call:
                     if attempt == 0:
                         self._clear_chat_cache(int(chat_id))
@@ -1039,9 +1066,10 @@ class VoiceCallManager:
                 last_err = e
                 msg = str(e).upper()
                 stale = ("GROUPCALL_INVALID" in msg or "GROUPCALL_FORBIDDEN" in msg
-                         or "GROUPCALL_JOIN_MISSING" in msg)
+                         or "GROUPCALL_JOIN_MISSING" in msg or "CHANNEL_INVALID" in msg)
                 if attempt == 0 and stale:
-                    # مرجع تماس کهنه است → کش را پاک کن و با مرجع تازه دوباره امتحان کن
+                    # مرجع کهنه/مختصِ اکانتِ دیگر است → کش را پاک کن و با
+                    # resolveِ تازه از سشنِ همین اکانت دوباره امتحان کن
                     self._clear_chat_cache(int(chat_id))
                     continue
                 break
@@ -1053,6 +1081,8 @@ class VoiceCallManager:
             return False, "❌ این اکانت هنوز به‌طور کامل به تماس نپیوسته است."
         if "GROUPCALL_INVALID" in emsg.upper():
             return False, "❌ ویس‌کال معتبر نیست یا بازنشانی شده؛ چند لحظه بعد دوباره امتحان کنید."
+        if "CHANNEL_INVALID" in emsg.upper() or "PEER_ID_INVALID" in emsg.upper():
+            return False, "❌ این اکانت به گروه/کانال دسترسی معتبر ندارد (چند لحظه بعد دوباره امتحان کنید)."
         return False, f"❌ خطا در ارسال: {emsg}"
 
     @staticmethod
