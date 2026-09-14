@@ -1,16 +1,18 @@
 """Admission control for concurrent orders.
 
-A new instant order is refused when starting it would risk dropping the
-orders already running (too many concurrent orders, too many live voice
-accounts, or memory pressure). Existing timers/durations are never shortened.
+A new instant order is refused only when the *host* is about to overflow
+(RAM / CPU filling up) or the concurrent-order ceiling is hit. Busy voice
+accounts are NOT a refuse reason — several orders may run together as long
+as system resources still have headroom. Existing timers are never shortened.
 
-Scheduled orders are allowed to be *purchased* while the host is full; they
-only consume a slot when they actually start.
+Scheduled orders may be purchased while the host is full; they only consume
+a slot when they actually start.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +33,9 @@ class LoadSnapshot:
     host_available: Optional[int] = None
     memory_pressure: bool = False
     memory_critical: bool = False
+    cpu_load: Optional[float] = None
+    cpu_count: Optional[int] = None
+    cpu_pressure: bool = False
 
 
 @dataclass(frozen=True)
@@ -66,7 +71,7 @@ def _is_voice(order_type: Optional[str]) -> bool:
 
 
 def read_memory_status() -> Dict[str, Any]:
-    """Read cgroup + host memory without extra packages."""
+    """Read cgroup + host memory and CPU load without extra packages."""
     used = None
     limit = None
     host_available = None
@@ -113,12 +118,27 @@ def read_memory_status() -> Dict[str, Any]:
     if used is not None and limit and limit > 0 and (used / limit) >= 0.95:
         is_critical = True
 
+    cpu_load = None
+    cpu_count = os.cpu_count() or 1
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as fh:
+            cpu_load = float(fh.read().split()[0])
+    except Exception:
+        pass
+    cpu_ratio = float(getattr(Config, "CPU_ADMISSION_LOAD_RATIO", 1.5) or 1.5)
+    cpu_pressure = bool(
+        cpu_load is not None and cpu_count > 0 and cpu_load >= (cpu_count * cpu_ratio)
+    )
+
     return {
         "used": used,
         "limit": limit,
         "host_available": host_available,
         "pressure": pressure,
         "critical": is_critical,
+        "cpu_load": cpu_load,
+        "cpu_count": cpu_count,
+        "cpu_pressure": cpu_pressure,
     }
 
 
@@ -173,20 +193,49 @@ def snapshot_from_active(
         host_available=mem.get("host_available"),
         memory_pressure=bool(mem.get("pressure")),
         memory_critical=bool(mem.get("critical")),
+        cpu_load=mem.get("cpu_load"),
+        cpu_count=mem.get("cpu_count"),
+        cpu_pressure=bool(mem.get("cpu_pressure")),
     )
+
+
+def _fmt_mb(nbytes: Optional[int]) -> str:
+    if not nbytes or nbytes < 0:
+        return "نامشخص"
+    mb = int(nbytes / (1024 * 1024))
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} گیگابایت"
+    return f"{mb} مگابایت"
 
 
 def build_user_message(snapshot: LoadSnapshot, reason: str) -> str:
     max_orders = int(getattr(Config, "MAX_CONCURRENT_ORDERS", 10) or 10)
-    max_voice = int(getattr(Config, "MAX_CONCURRENT_VOICE_ACCOUNTS", 80) or 80)
     eta = format_eta_fa(snapshot.eta_seconds)
-    return (
-        "⛔️ ظرفیت اجرای همزمان پر است.\n\n"
-        "برای اینکه سفارش‌های در حال اجرا قطع نشوند، سفارش آنی جدید "
-        "پذیرفته نمی‌شود تا حداقل یکی از آن‌ها تمام شود.\n\n"
+    ram_line = f"🧠 RAM آزاد میزبان: {_fmt_mb(snapshot.host_available)}"
+    if snapshot.cpu_load is not None and snapshot.cpu_count:
+        cpu_line = f"⚙️ بار CPU: {snapshot.cpu_load:.1f} از {snapshot.cpu_count} هسته"
+    else:
+        cpu_line = "⚙️ بار CPU: نامشخص"
+    stats = (
         f"📦 سفارش‌های در حال اجرا: {snapshot.running_orders} از {max_orders}\n"
-        f"👥 اکانت‌های ویس فعال: {snapshot.voice_accounts} از {max_voice}\n"
-        f"⏳ نزدیک‌ترین زمان آزاد شدن ظرفیت: {eta}\n\n"
+        f"{ram_line}\n"
+        f"{cpu_line}\n"
+        f"⏳ نزدیک‌ترین زمان آزاد شدن ظرفیت: {eta}"
+    )
+    if reason == "max_orders":
+        headline = (
+            "⛔️ سقف تعداد سفارش همزمان پر است.\n\n"
+            f"حداکثر {max_orders} سفارش می‌تواند هم‌زمان اجرا شود تا "
+            "سفارش‌های جاری قطع نشوند."
+        )
+    else:
+        headline = (
+            "⛔️ منابع سیستم در حال پر شدن است.\n\n"
+            "RAM یا CPU سرور نزدیک ظرفیت است. اگر سفارش آنی دیگری الان "
+            "شروع شود، سفارش‌های در حال اجرا ممکن است قطع شوند."
+        )
+    return (
+        f"{headline}\n\n{stats}\n\n"
         "می‌توانید کمی صبر کنید و دوباره «شروع آنی» را بزنید، "
         "یا سفارش را برای بعد زمان‌بندی کنید."
     )
@@ -199,8 +248,6 @@ def decide(
 ) -> AdmissionDecision:
     needed = max(0, int(accounts_needed or 0))
     max_orders = int(getattr(Config, "MAX_CONCURRENT_ORDERS", 10) or 0)
-    max_voice = int(getattr(Config, "MAX_CONCURRENT_VOICE_ACCOUNTS", 80) or 0)
-    is_voice = _is_voice(order_type)
 
     if snapshot.memory_critical:
         return AdmissionDecision(
@@ -216,24 +263,14 @@ def decide(
             snapshot, needed,
         )
 
-    # One large order is allowed when the host is empty. Additional orders
-    # must fit next to the ones already running so we never starve them.
-    if (
-        is_voice
-        and max_voice > 0
-        and snapshot.voice_accounts > 0
-        and (snapshot.voice_accounts + needed) > max_voice
-    ):
+    # Busy accounts are NOT a refuse reason. Extra orders are only blocked
+    # when RAM/CPU is actually filling up, so existing calls are not OOM-killed.
+    resource_pressure = snapshot.memory_pressure or snapshot.cpu_pressure
+    if resource_pressure and snapshot.running_orders > 0:
+        reason = "cpu_pressure" if snapshot.cpu_pressure and not snapshot.memory_pressure else "memory_pressure"
         return AdmissionDecision(
-            False, "max_voice_accounts",
-            build_user_message(snapshot, "max_voice_accounts"),
-            snapshot, needed,
-        )
-
-    if snapshot.memory_pressure and snapshot.running_orders > 0:
-        return AdmissionDecision(
-            False, "memory_pressure",
-            build_user_message(snapshot, "memory_pressure"),
+            False, reason,
+            build_user_message(snapshot, reason),
             snapshot, needed,
         )
 
@@ -262,8 +299,10 @@ async def evaluate(
     decision = decide(snapshot, accounts_needed, order_type)
     if not decision.ok:
         logger.info(
-            "admission refused (%s): running=%s voice=%s need=%s type=%s eta=%s",
+            "admission refused (%s): running=%s voice=%s need=%s type=%s "
+            "mem_p=%s cpu_p=%s load=%s eta=%s",
             decision.reason, snapshot.running_orders, snapshot.voice_accounts,
-            accounts_needed, order_type, snapshot.eta_seconds,
+            accounts_needed, order_type, snapshot.memory_pressure,
+            snapshot.cpu_pressure, snapshot.cpu_load, snapshot.eta_seconds,
         )
     return decision

@@ -32,6 +32,7 @@ class ConfigAdmissionKeysTests(unittest.TestCase):
             "MEMORY_ADMISSION_RATIO",
             "MEMORY_ADMISSION_MIN_AVAILABLE_MB",
             "MEMORY_ADMISSION_CRITICAL_MB",
+            "CPU_ADMISSION_LOAD_RATIO",
         ):
             self.assertIn(key, src, f"missing {key}")
 
@@ -76,7 +77,7 @@ class ConfigAdmissionKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.3"', src)
+        self.assertIn('BOT_VERSION = "2.2.4"', src)
 
 
 class DecideLogicTests(unittest.TestCase):
@@ -124,15 +125,30 @@ class DecideLogicTests(unittest.TestCase):
         )
         self.assertTrue(d.ok)
 
-    def test_second_order_that_would_overflow_is_refused(self):
+    def test_voice_account_count_does_not_refuse(self):
+        """Busy accounts are not a gate — only RAM/CPU / max orders."""
         d = self.oa.decide(
             self._snap(running_orders=2, voice_accounts=74, eta_seconds=840),
             accounts_needed=37, order_type="voice_chat",
         )
-        self.assertFalse(d.ok)
-        self.assertEqual(d.reason, "max_voice_accounts")
-        self.assertIn("ظرفیت", d.user_message)
-        self.assertIn("14", d.user_message)  # ~14 minutes
+        self.assertTrue(d.ok)
+
+    def test_cpu_pressure_refuses_when_something_is_running(self):
+        empty = self.oa.decide(
+            self._snap(cpu_pressure=True, cpu_load=20.0, cpu_count=8),
+            accounts_needed=37, order_type="voice_chat",
+        )
+        self.assertTrue(empty.ok)
+        busy = self.oa.decide(
+            self._snap(
+                running_orders=1, voice_accounts=37, cpu_pressure=True,
+                cpu_load=20.0, cpu_count=8, eta_seconds=120,
+            ),
+            accounts_needed=10, order_type="voice_chat",
+        )
+        self.assertFalse(busy.ok)
+        self.assertEqual(busy.reason, "cpu_pressure")
+        self.assertIn("منابع سیستم", busy.user_message)
 
     def test_max_orders_refuses(self):
         setattr(self.Config, "MAX_CONCURRENT_ORDERS", 2)
@@ -142,6 +158,7 @@ class DecideLogicTests(unittest.TestCase):
         )
         self.assertFalse(d.ok)
         self.assertEqual(d.reason, "max_orders")
+        self.assertIn("سقف تعداد سفارش", d.user_message)
 
     def test_memory_pressure_refuses_only_when_something_is_running(self):
         empty = self.oa.decide(
