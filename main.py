@@ -123,6 +123,12 @@ class _PyTgCallsNoiseFilter(logging.Filter):
 
     def filter(self, record):
         message = record.getMessage()
+        if record.exc_info and record.exc_info[1] is not None:
+            err = str(record.exc_info[1])
+            if "UpdateGroupCall" in err and "chat_id" in err:
+                return False
+        if "UpdateGroupCall" in message and "chat_id" in message:
+            return False
         return not (
             record.name.startswith("pytgcalls")
             and (

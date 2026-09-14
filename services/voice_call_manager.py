@@ -134,6 +134,84 @@ def _patch_pyrogram_channel_id_range() -> None:
 
 _patch_pyrogram_channel_id_range()
 
+
+def _patch_pytgcalls_kurigram_updategroupcall() -> None:
+    """kurigram Layer 229 ``UpdateGroupCall`` has ``peer``, not ``chat_id``.
+
+    py-tgcalls 2.2.5 still does ``chats[update.chat_id]`` on every group-call
+    raw update (mute / join / leave / discarded).  That AttributeError is
+    caught by pyrogram's dispatcher and printed as a full traceback — it does
+    NOT drop the WebRTC call, but it floods the log once per account per
+    update.  Restore a ``chat_id`` property from ``peer`` and swallow leftover
+    KeyError/AttributeError inside pytgcalls' own raw handler.
+    """
+    try:
+        from pyrogram.raw.types import UpdateGroupCall
+    except Exception as exc:
+        logger.debug("UpdateGroupCall patch skipped (no type): %s", exc)
+        return
+
+    slots = getattr(UpdateGroupCall, "__slots__", None) or []
+    native_chat_id = "chat_id" in slots or hasattr(UpdateGroupCall, "chat_id")
+    if not getattr(UpdateGroupCall, "_callmanager_chat_id_compat", False) and not native_chat_id:
+        def _chat_id_from_peer(self):
+            peer = getattr(self, "peer", None)
+            if peer is None:
+                raise AttributeError("chat_id")
+            cid = getattr(peer, "channel_id", None)
+            if cid is not None:
+                return int(cid)
+            cid = getattr(peer, "chat_id", None)
+            if cid is not None:
+                return int(cid)
+            raise AttributeError("chat_id")
+
+        try:
+            UpdateGroupCall.chat_id = property(_chat_id_from_peer)
+            UpdateGroupCall._callmanager_chat_id_compat = True
+        except Exception as exc:
+            logger.debug("UpdateGroupCall.chat_id property skipped: %s", exc)
+
+    try:
+        from pytgcalls.mtproto.pyrogram_client import PyrogramClient
+    except Exception:
+        logger.info("Enabled UpdateGroupCall.chat_id compat (type only)")
+        return
+
+    if getattr(PyrogramClient.__init__, "_callmanager_ugc_wrap", False):
+        return
+
+    _orig_init = PyrogramClient.__init__
+
+    def _init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        client = getattr(self, "_app", None)
+        groups = getattr(getattr(client, "dispatcher", None), "groups", None) or {}
+        for handler in list(groups.get(-9999) or []):
+            cb = getattr(handler, "callback", None)
+            if cb is None or getattr(cb, "_callmanager_ugc_wrap", False):
+                continue
+            if getattr(cb, "__name__", "") != "on_update":
+                continue
+
+            async def _wrapped(c, update, users, chats, _orig=cb):
+                try:
+                    return await _orig(c, update, users, chats)
+                except (AttributeError, KeyError):
+                    if type(update).__name__ != "UpdateGroupCall":
+                        raise
+                    return None
+
+            _wrapped._callmanager_ugc_wrap = True
+            handler.callback = _wrapped
+
+    _init._callmanager_ugc_wrap = True
+    PyrogramClient.__init__ = _init
+    logger.info("Enabled UpdateGroupCall.chat_id compat for kurigram/pytgcalls")
+
+
+_patch_pytgcalls_kurigram_updategroupcall()
+
 SILENT_AUDIO_PATH = "silence.wav"
 
 from config import Config
