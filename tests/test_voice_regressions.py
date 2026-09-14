@@ -503,6 +503,41 @@ class EngineLifecycleTests(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────────────────
+# 5b. kurigram join_chat() returns ChatJoinResultSuccess (no .id)
+# ────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ChatJoinResultIdTests(unittest.TestCase):
+    def test_chat_join_result_success_exposes_chat_id(self):
+        chat = SimpleNamespace(id=-100555)
+        result = SimpleNamespace(chat=chat)  # kurigram ChatJoinResultSuccess
+        self.assertEqual(VoiceCallManager._chat_id_from_obj(result), -100555)
+
+    def test_plain_chat_still_works(self):
+        self.assertEqual(VoiceCallManager._chat_id_from_obj(SimpleNamespace(id=-1001)), -1001)
+
+    def test_resolve_chat_id_does_not_read_id_on_join_result(self):
+        class JoinResult:
+            def __init__(self):
+                self.chat = SimpleNamespace(id=-100777)
+
+        class App:
+            async def join_chat(self, target):
+                return JoinResult()  # no .id — old code AttributeError'd here
+
+            async def get_chat(self, target):
+                raise AssertionError("get_chat must not run when join already gave chat")
+
+        mgr = VoiceCallManager()
+
+        async def scenario():
+            cid = await mgr._resolve_chat_id(App(), 42, "https://t.me/+AbCdEf")
+            self.assertEqual(cid, -100777)
+            self.assertEqual(mgr.order_chat_ids[42], -100777)
+
+        _run(scenario())
+
+
+# ────────────────────────────────────────────────────────────────────────
 # 6. FloodWait gate + participant RPC use, at manager level
 # ────────────────────────────────────────────────────────────────────────
 @unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")

@@ -459,7 +459,7 @@ _VALID_TRANSITIONS = {
     REJOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED},
     RATE_LIMITED: {RETRY_PENDING, FAILED, LEAVING},
     RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING},
-    FAILED: {LEAVING, COMPLETED},
+    FAILED: {STARTING, LEAVING, COMPLETED},
     LEAVING: {COMPLETED},
     COMPLETED: set(),
 }
@@ -2523,6 +2523,9 @@ class VoiceCallManager:
         cid = getattr(obj, "id", None)
         if isinstance(cid, int):
             return cid
+        cid = getattr(obj, "chat_id", None)
+        if isinstance(cid, int):
+            return cid
         for attr in ("chat", "channel", "user"):
             inner = getattr(obj, attr, None)
             if inner is None:
@@ -2557,27 +2560,22 @@ class VoiceCallManager:
             return self.order_chat_ids[order_id]
         chat_id = None
         try:
-            if target.startswith("https"):
+            try:
+                chat_id = self._chat_id_from_obj(await app.join_chat(target))
+            except UserAlreadyParticipant:
+                chat_id = None
+            if not chat_id:
                 try:
-                    chat_id = (await app.join_chat(target)).id
-                except UserAlreadyParticipant:
-                    try:
-                        chat_id = (await app.get_chat(target)).id
-                    except Exception:
-                        try:
-                            invite = target.split("+")[-1].split("/")[-1]
-                            inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
-                            if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
-                        except Exception:
-                            pass
-            else:
-                try:
-                    chat_id = (await app.join_chat(target)).id
-                except UserAlreadyParticipant:
-                    chat_id = (await app.get_chat(target)).id
+                    chat_id = self._chat_id_from_obj(await app.get_chat(target))
                 except Exception:
-                    chat_id = (await app.get_chat(target)).id
+                    chat_id = None
+            if not chat_id and "+" in str(target):
+                try:
+                    invite = str(target).split("+")[-1].split("/")[-1]
+                    inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
+                    chat_id = self._chat_id_from_obj(getattr(inv, "chat", None))
+                except Exception:
+                    chat_id = None
         except RPCError as e:
             msg = str(e)
             if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
@@ -2585,11 +2583,6 @@ class VoiceCallManager:
             if "USERNAME_INVALID" in msg:
                 raise RuntimeError(f"Invalid Link: {target}") from e
             raise
-        except UserAlreadyParticipant:
-            try:
-                chat_id = (await app.get_chat(target)).id
-            except Exception:
-                pass
 
         if chat_id:
             self.order_chat_ids[order_id] = int(chat_id)
