@@ -110,6 +110,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # کاهش سطح لاگ کتابخانه‌های پرحرف
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
+# Access log of the payment callback server (GET / from scanners / nginx
+# healthcheck) otherwise floods INFO at dozens of lines per second.
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 # Pyrogram emits one INFO line per transport reconnect.  Operational details
 # remain in voice_calls.log; console output should expose actionable failures.
 logging.getLogger("pytgcalls").setLevel(logging.CRITICAL)
@@ -422,23 +425,13 @@ async def pay_redirect_handler(request):
     return web.Response(text=html, content_type='text/html')
 
 async def health_handler(request):
-    """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
-    اگر این آدرس را در مرورگر باز کردید و 'ok' دیدید، یعنی دامنه/پورت شما
-    درست به این سرور اشاره می‌کند و کال‌بک درگاه پرداخت هم به سرور خواهد رسید."""
-    return web.Response(
-        text=(
-            "ok - callback server is reachable\n"
-            f"SERVER_URL={Config.SERVER_URL}\n"
-            f"zarinpal_callback={Config.ZARINPAL_CALLBACK_URL}\n"
-            f"aqayepardakht_callback={Config.AGHAYE_PARDAKHT_CALLBACK_URL}\n"
-        ),
-        content_type='text/plain',
-    )
+    """Liveness داخلی. از اینترنت در دسترس نیست (nginx فقط /pay و /payment را پروکسی می‌کند)."""
+    return web.Response(text="ok\n", content_type='text/plain')
 
 async def start_web_server():
     """راه‌اندازی وب‌سرور aiohttp"""
     app = web.Application()
-    app.router.add_get('/', health_handler)
+    # GET / عمداً ثبت نمی‌شود تا اسکنرهای اینترنتی صفحهٔ سلامت/آدرس کال‌بک نبینند.
     app.router.add_get('/health', health_handler)
     app.router.add_get('/pay/{trans_id}', pay_redirect_handler)
     app.router.add_post('/payment/callback/aqayepardakht', ap_callback_handler)
