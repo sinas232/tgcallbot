@@ -753,6 +753,12 @@ class VoiceCallManager:
         self._media_restore_failures: Dict[Tuple[int, int], int] = {}
         self._media_restore_paused_until: Dict[Tuple[int, int], float] = {}
 
+        # Chat ids whose group-call was discarded (CLOSED_VOICE_CHAT).  Media
+        # restore / leave_call on these only produces ntgcalls "already removed"
+        # spam; we wait for Telegram to expose a new call and then rejoin.
+        self._closed_chats: Dict[int, float] = {}
+        self._rejoin_closed_inflight: Set[Tuple[int, int]] = set()
+
         # Shared per-order monitor tasks
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
 
@@ -1331,6 +1337,35 @@ class VoiceCallManager:
 
     def get_active_count(self, order_id: Optional[int] = None) -> int:
         return len(self.get_active_account_ids(order_id))
+
+    def get_present_account_ids(self, order_id: Optional[int] = None) -> Set[int]:
+        """Accounts believed to be IN the call right now.
+
+        Durable ``get_active_account_ids`` stays counted through a
+        CLOSED_VOICE_CHAT so the order is not failed/replaced.  This lens
+        drops those slots until the call is started again and they rejoin.
+        """
+        def _in_call(rec: Optional[Dict]) -> bool:
+            rec = rec or {}
+            if rec.get("voice_chat_closed"):
+                return False
+            st = str(rec.get("status") or "")
+            if st in ("CONFIRMED_DISCONNECTED", "UNRECOVERABLE"):
+                return False
+            return True
+
+        if order_id is None:
+            out: Set[int] = set()
+            for recs in self.joined_accounts_by_order.values():
+                for aid, rec in recs.items():
+                    if _in_call(rec):
+                        out.add(aid)
+            return out
+        recs = self.joined_accounts_by_order.get(order_id) or {}
+        return {aid for aid, rec in recs.items() if _in_call(rec)}
+
+    def get_present_count(self, order_id: Optional[int] = None) -> int:
+        return len(self.get_present_account_ids(order_id))
 
     def register_join(self, order_id: int, account_id: int, chat_id: int, target: str) -> bool:
         """
@@ -2028,15 +2063,40 @@ class VoiceCallManager:
     # ─── Engine event handlers (stream-end / kicked observability) ───
     def _order_id_for_account(self, account_id: int, chat_id: int = 0) -> Optional[int]:
         """Find the order this account is serving right now (if any)."""
-        for (oid, aid), info in self.active_calls.items():
-            if aid == account_id and (
-                not chat_id or int((info or {}).get("chat_id") or 0) == int(chat_id)
-            ):
+        want = int(chat_id or 0)
+        if want:
+            for (oid, aid), info in self.active_calls.items():
+                if aid == account_id and int((info or {}).get("chat_id") or 0) == want:
+                    return oid
+            for oid, recs in self.joined_accounts_by_order.items():
+                rec = recs.get(account_id) or {}
+                if int(rec.get("chat_id") or 0) == want:
+                    return oid
+        for (oid, aid), _info in self.active_calls.items():
+            if aid == account_id:
                 return oid
         for oid, recs in self.joined_accounts_by_order.items():
             if account_id in recs:
                 return oid
         return None
+
+    def _orders_for_chat(self, chat_id: int) -> List[int]:
+        """Every order that currently holds accounts in this chat."""
+        want = int(chat_id or 0)
+        out: List[int] = []
+        if not want:
+            return out
+        for (oid, _aid), info in self.active_calls.items():
+            if int((info or {}).get("chat_id") or 0) == want and oid not in out:
+                out.append(oid)
+        for oid, recs in self.joined_accounts_by_order.items():
+            if oid in out:
+                continue
+            for rec in recs.values():
+                if int((rec or {}).get("chat_id") or 0) == want:
+                    out.append(oid)
+                    break
+        return out
 
     def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
         """Register stream-end / kick handlers on a freshly built engine.
@@ -2081,8 +2141,147 @@ class VoiceCallManager:
                     order_id, account_id, cid, "chat_left_update",
                     reason=f"engine chat update: {status}",
                 )
+                if cid and self._status_is_closed_call(status):
+                    asyncio.create_task(self._on_voice_chat_closed(cid))
         except Exception as exc:
             logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
+
+    @staticmethod
+    def _status_is_closed_call(status) -> bool:
+        """True when Telegram discarded the whole group call (not a single kick)."""
+        try:
+            st = ChatUpdate.Status
+            return bool(status & (st.CLOSED_VOICE_CHAT | st.DISCARDED_CALL))
+        except Exception:
+            name = str(status or "").upper()
+            return "CLOSED_VOICE_CHAT" in name or "DISCARDED_CALL" in name
+
+    async def _on_voice_chat_closed(self, chat_id: int) -> None:
+        """Telegram ended this voice chat. Keep the order, rejoin when it reopens.
+
+        CLOSED_VOICE_CHAT fires once per account in the same millisecond.
+        The first coroutine (no await before the inflight add) owns recovery;
+        the rest are no-ops.  Durable join count is NOT dropped — present
+        count goes to 0 until the call is started again.
+        """
+        chat_id = int(chat_id or 0)
+        if not chat_id:
+            return
+        self._closed_chats[chat_id] = time.time()
+        self._clear_chat_cache(chat_id)
+        orders = self._orders_for_chat(chat_id)
+        logger.warning(
+            "[VoiceChat] chat=%s CLOSED/DISCARDED — %s order(s) will rejoin when the call starts again",
+            chat_id, len(orders),
+        )
+        for oid in orders:
+            recs = self.joined_accounts_by_order.get(oid) or {}
+            marked = 0
+            for _aid, rec in recs.items():
+                if int((rec or {}).get("chat_id") or 0) != chat_id:
+                    continue
+                rec["status"] = "CONFIRMED_DISCONNECTED"
+                rec["voice_chat_closed"] = True
+                self._account_states_by_order.setdefault(oid, {})[_aid] = "CONFIRMED_DISCONNECTED"
+                marked += 1
+            self._vc_event_log(oid, None, "voice_chat_closed", {
+                "chat_id": chat_id, "accounts": marked,
+            })
+            key = (int(oid), chat_id)
+            if key in self._rejoin_closed_inflight:
+                continue
+            self._rejoin_closed_inflight.add(key)
+            asyncio.create_task(self._rejoin_when_call_returns(oid, chat_id))
+
+    async def _rejoin_when_call_returns(self, order_id: int, chat_id: int) -> None:
+        """Poll until Telegram exposes a new call, then rejoin every slot."""
+        key = (int(order_id), int(chat_id))
+        self._rejoin_closed_inflight.add(key)
+        chat_id = int(chat_id)
+        order_id = int(order_id)
+        poll = max(3.0, float(getattr(Config, "VOICE_CLOSED_REJOIN_POLL", 5)))
+        try:
+            while True:
+                if order_id not in self.joined_accounts_by_order:
+                    return
+                tl = self._order_timeline.get(order_id) or {}
+                if str(tl.get("order_state") or "") == "COMPLETED":
+                    return
+                end = tl.get("end_time")
+                if end is not None:
+                    try:
+                        if datetime.utcnow() > end:
+                            return
+                    except Exception:
+                        pass
+
+                recs = dict(self.joined_accounts_by_order.get(order_id) or {})
+                app = None
+                for aid, rec in recs.items():
+                    if int((rec or {}).get("chat_id") or 0) != chat_id:
+                        continue
+                    app = self.pyrogram_clients.get(aid)
+                    if app:
+                        break
+                if app is None:
+                    await asyncio.sleep(poll)
+                    continue
+
+                self._clear_chat_cache(chat_id)
+                try:
+                    state = await self._has_active_voice_call(app, chat_id)
+                except Exception:
+                    state = None
+                if state is not True:
+                    await asyncio.sleep(poll)
+                    continue
+
+                logger.warning(
+                    "[VoiceChat] chat=%s order=%s call is back — rejoining %s account(s)",
+                    chat_id, order_id, len(recs),
+                )
+                self._closed_chats.pop(chat_id, None)
+                self._vc_event_log(order_id, None, "voice_chat_reopened", {
+                    "chat_id": chat_id, "accounts": len(recs),
+                })
+                for aid, rec in recs.items():
+                    if aid not in (self.joined_accounts_by_order.get(order_id) or {}):
+                        continue
+                    if int((rec or {}).get("chat_id") or 0) != chat_id:
+                        continue
+                    app2 = self.pyrogram_clients.get(aid)
+                    pytg = self.clients.get(aid)
+                    tgt = (rec or {}).get("target") or ""
+                    if not app2 or not pytg:
+                        continue
+                    rec["voice_chat_closed"] = False
+                    try:
+                        ok = await self._recover_same_account(
+                            order_id, aid, chat_id, tgt, app2, pytg,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[VoiceChat] rejoin after CLOSED failed order=%s acc=%s: %s",
+                            order_id, aid, exc,
+                        )
+                        ok = False
+                    if ok:
+                        rec["status"] = "JOINED"
+                        rec.pop("voice_chat_closed", None)
+                        self._account_states_by_order.setdefault(order_id, {})[aid] = "JOINED"
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[VoiceChat] rejoin-when-returns error order=%s chat=%s: %s",
+                order_id, chat_id, exc,
+            )
+        finally:
+            self._rejoin_closed_inflight.discard(key)
 
     async def _restart_silence(self, account_id: int, chat_id: int) -> None:
         """One best-effort silence restart after a StreamEnded event."""
@@ -2091,6 +2290,8 @@ class VoiceCallManager:
             # NOTE: valid Telegram chat ids are NEGATIVE (e.g. -1001234567890);
             # only zero/unset means "no call at all".
             if not chat_id:
+                return
+            if int(chat_id) in self._closed_chats:
                 return
             # Account is no longer expected in any call → nothing to restart.
             if not any(aid == account_id for (oid, aid) in self.active_calls):
@@ -2172,7 +2373,30 @@ class VoiceCallManager:
         "connection cannot",
         "connection not initialized",
         "no active group call",
+        "already removed",
     )
+
+    async def _leave_call_if_bound(self, pytg: Optional[PyTgCalls], chat_id: int) -> None:
+        """leave_call only when ntgcalls still holds this chat.
+
+        After CLOSED_VOICE_CHAT the binding is already gone; calling
+        leave_call then produces ``ntgcalls: Call … not found, already removed``.
+        """
+        cid = int(chat_id or 0)
+        if not cid or pytg is None:
+            return
+        if cid in self._closed_chats:
+            return
+        try:
+            calls = await pytg.group_calls
+        except Exception:
+            return
+        try:
+            if cid not in calls:
+                return
+        except Exception:
+            return
+        await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
 
     @classmethod
     def _is_engine_state_error(cls, msg: str) -> bool:
@@ -2245,12 +2469,11 @@ class VoiceCallManager:
                         account_id, cid, msg1[:120],
                     )
                     # ── L2: explicit WebRTC session cleanup, then rejoin ──
-                    # leave_call() inside try/except as required: it stops the
-                    # engine's connection for this chat and (if the engine
-                    # still lists it) sends LeaveGroupCall, so the NEXT play()
-                    # starts from a fully clean session.
+                    # leave_call() only when ntgcalls still holds this chat.
+                    # On CLOSED_VOICE_CHAT / already-removed bindings it just
+                    # prints ``Call … not found, already removed``.
                     try:
-                        await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
+                        await self._leave_call_if_bound(pytg, cid)
                     except Exception as e_leave:
                         logger.debug(
                             "[VoiceMedia] leave_call cleanup skipped acc=%s chat=%s: %s",
@@ -3261,6 +3484,11 @@ class VoiceCallManager:
                 self._participant_snapshot.clear()
 
                 for chat_id, acc_ids in by_chat.items():
+                    if int(chat_id) in self._closed_chats:
+                        # Whole call was discarded. Media restore / leave_call
+                        # only spam ntgcalls "already removed"; the dedicated
+                        # waiter rejoins everyone when Telegram exposes a new call.
+                        continue
                     # Pick one representative app for this chat.
                     rep_app = None
                     for acc_id in acc_ids:
@@ -4009,6 +4237,8 @@ class VoiceCallManager:
             self._media_restore_failures.pop(key, None)
         for key in [k for k in list(self._media_restore_paused_until) if k[0] == order_id]:
             self._media_restore_paused_until.pop(key, None)
+        for key in [k for k in list(self._rejoin_closed_inflight) if k[0] == order_id]:
+            self._rejoin_closed_inflight.discard(key)
         return len(keys)
 
     async def cleanup_all(self) -> None:

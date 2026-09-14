@@ -389,6 +389,7 @@ class FakePyTgCalls:
         self.stopped = 0
         self.active_chats = set()
         self.played = []
+        self.left = []
         FakePyTgCalls.instances.append(self)
 
     def on_update(self, flt):
@@ -406,6 +407,10 @@ class FakePyTgCalls:
     async def play(self, chat_id, stream):
         self.played.append((chat_id, stream))
         self.active_chats.add(int(chat_id))
+
+    async def leave_call(self, chat_id):
+        self.left.append(int(chat_id))
+        self.active_chats.discard(int(chat_id))
 
     async def mute(self, chat_id):
         return True
@@ -849,6 +854,109 @@ class LeaveStaggerTests(unittest.TestCase):
             float(self._orig["VOICE_LEAVE_STAGGER_MIN"]),
         )
         self.assertGreaterEqual(int(self._orig["VOICE_LEAVE_MAX_CONCURRENCY"]), 1)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 10. CLOSED_VOICE_CHAT: don't lie 37/37, don't leave_call already-removed
+# ────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ClosedVoiceChatTests(unittest.TestCase):
+    def test_order_id_prefers_matching_chat(self):
+        mgr = VoiceCallManager()
+        mgr.active_calls[(682, 10)] = {"chat_id": -1003295330318}
+        mgr.active_calls[(683, 10)] = {"chat_id": -1003992770078}
+        self.assertEqual(mgr._order_id_for_account(10, -1003992770078), 683)
+        self.assertEqual(mgr._order_id_for_account(10, -1003295330318), 682)
+
+    def test_orders_for_chat_from_joined_and_active(self):
+        mgr = VoiceCallManager()
+        chat = -1003295330318
+        mgr.active_calls[(682, 1)] = {"chat_id": chat}
+        mgr.register_join(683, 2, chat, "t.me/x")
+        mgr.register_join(683, 3, -100111, "t.me/y")
+        self.assertEqual(sorted(mgr._orders_for_chat(chat)), [682, 683])
+
+    def test_closed_drops_present_keeps_durable_and_debounces(self):
+        async def scenario():
+            mgr = VoiceCallManager()
+            chat = -1003295330318
+            for aid in (1, 2, 3):
+                mgr.register_join(682, aid, chat, "t.me/x")
+                mgr.active_calls[(682, aid)] = {
+                    "chat_id": chat, "joined_at": 0, "target": "t.me/x",
+                }
+            self.assertEqual(mgr.get_active_count(682), 3)
+            self.assertEqual(mgr.get_present_count(682), 3)
+            await mgr._on_voice_chat_closed(chat)
+            self.assertEqual(mgr.get_active_count(682), 3)
+            self.assertEqual(mgr.get_present_count(682), 0)
+            rec = mgr.joined_accounts_by_order[682][1]
+            self.assertTrue(rec.get("voice_chat_closed"))
+            self.assertEqual(rec.get("status"), "CONFIRMED_DISCONNECTED")
+            self.assertEqual(mgr._rejoin_closed_inflight, {(682, chat)})
+            await mgr._on_voice_chat_closed(chat)  # 37-account burst
+            self.assertEqual(mgr._rejoin_closed_inflight, {(682, chat)})
+            mgr.joined_accounts_by_order.pop(682, None)
+            await asyncio.sleep(0)
+
+        _run(scenario())
+
+    def test_leave_call_skipped_when_unbound_or_closed(self):
+        async def scenario():
+            mgr = VoiceCallManager()
+            engine = FakePyTgCalls(FakeApp())
+            await mgr._leave_call_if_bound(engine, -1001)
+            self.assertEqual(engine.left, [])
+            engine.active_chats.add(-1001)
+            await mgr._leave_call_if_bound(engine, -1001)
+            self.assertEqual(engine.left, [-1001])
+            engine.active_chats.add(-1002)
+            mgr._closed_chats[-1002] = 1.0
+            await mgr._leave_call_if_bound(engine, -1002)
+            self.assertEqual(engine.left, [-1001])
+
+        _run(scenario())
+
+    def test_left_call_handler_closed_triggers_rejoin(self):
+        async def scenario():
+            from pytgcalls.types import ChatUpdate
+            mgr = VoiceCallManager()
+            engine = FakePyTgCalls(FakeApp())
+            mgr._attach_engine_handlers(engine, 5)
+            mgr.register_join(682, 5, -1009, "t.me/x")
+            mgr.active_calls[(682, 5)] = {"chat_id": -1009, "target": "t.me/x"}
+            self.assertEqual(len(engine.handlers), 2)
+            _, left_handler = engine.handlers[1]
+            update = SimpleNamespace(
+                chat_id=-1009, status=ChatUpdate.Status.CLOSED_VOICE_CHAT,
+            )
+            await left_handler(engine, update)
+            await asyncio.sleep(0)
+            self.assertIn(-1009, mgr._closed_chats)
+            self.assertEqual(mgr.get_present_count(682), 0)
+            mgr.joined_accounts_by_order.pop(682, None)
+            await asyncio.sleep(0)
+
+        _run(scenario())
+
+    def test_kicked_does_not_mark_whole_chat_closed(self):
+        async def scenario():
+            from pytgcalls.types import ChatUpdate
+            mgr = VoiceCallManager()
+            engine = FakePyTgCalls(FakeApp())
+            mgr._attach_engine_handlers(engine, 5)
+            mgr.register_join(682, 5, -1009, "t.me/x")
+            mgr.active_calls[(682, 5)] = {"chat_id": -1009}
+            _, left_handler = engine.handlers[1]
+            update = SimpleNamespace(
+                chat_id=-1009, status=ChatUpdate.Status.KICKED,
+            )
+            await left_handler(engine, update)
+            await asyncio.sleep(0.05)
+            self.assertNotIn(-1009, mgr._closed_chats)
+            self.assertEqual(mgr.get_present_count(682), 1)
+
+        _run(scenario())
 
 
 if __name__ == "__main__":

@@ -129,6 +129,11 @@ class _PyTgCallsNoiseFilter(logging.Filter):
                 return False
         if "UpdateGroupCall" in message and "chat_id" in message:
             return False
+        low = message.lower()
+        if record.name.startswith("ntgcalls") and (
+            "already removed" in low or "not found" in low
+        ):
+            return False
         return not (
             record.name.startswith("pytgcalls")
             and (

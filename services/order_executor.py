@@ -92,6 +92,17 @@ class OrderExecutor:
 					pass
 		return len(joined_list)
 
+	def _present_count(self, order_id: int, order_type: str, joined_list: List[Dict]) -> int:
+		"""In-call presence right now (0 after CLOSED_VOICE_CHAT until rejoin)."""
+		if order_type == "voice_chat":
+			vcm = _get_voice_call_manager()
+			if vcm and hasattr(vcm, "get_present_count"):
+				try:
+					return int(vcm.get_present_count(order_id))
+				except Exception:
+					pass
+		return self._live_count(order_id, order_type, joined_list)
+
 	def _prune_joined(self, order_id: int, order_type: str, joined_list: List[Dict]) -> List[Dict]:
 		if order_type != "voice_chat":
 			return joined_list
@@ -305,9 +316,10 @@ class OrderExecutor:
 	                    self.active_orders[order_id]["remaining_seconds"] = remaining_now
 
 	                if _tick % _log_interval == 0:
+	                    present = self._present_count(order_id, order_type, joined_list)
 	                    logger.info(
 	                        f"Order {order_id}: {_format_timer(remaining_now)} "
-	                        f"| live={live}/{exact}"
+	                        f"| live={present}/{exact}"
 	                    )
 
 	                if _tick % _check_interval == 0 and _tick > 0:
@@ -350,8 +362,9 @@ class OrderExecutor:
 	                    if order_id in self.active_orders:
 	                        self.active_orders[order_id]["live_count"] = live
 	                        self.active_orders[order_id]["joined_accounts"] = joined_list
+	                    present = self._present_count(order_id, order_type, joined_list)
 	                    logger.info(
-	                        f"Order {order_id}: stable live={live}/{exact} "
+	                        f"Order {order_id}: stable live={present}/{exact} "
 	                        f"(rejoin by monitor; unrecoverable slots replaced)"
 	                    )
 
