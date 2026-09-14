@@ -2429,6 +2429,31 @@ class VoiceCallManager:
             clean = clean.split("/")[0]
         return clean
 
+    @staticmethod
+    def _chat_id_from_obj(obj) -> Optional[int]:
+        """chat_id from a Chat, ChatJoinResultSuccess (kurigram), or similar.
+
+        Newer pyrogram/kurigram `join_chat()` returns ChatJoinResultSuccess
+        (no `.id`) instead of a Chat. Accessing `.id` directly is what produced
+        ``'ChatJoinResultSuccess' object has no attribute 'id'`` and failed the
+        first join attempt of every account.
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, int):
+            return int(obj)
+        cid = getattr(obj, "id", None)
+        if isinstance(cid, int):
+            return cid
+        for attr in ("chat", "channel", "user"):
+            inner = getattr(obj, attr, None)
+            if inner is None:
+                continue
+            inner_id = getattr(inner, "id", None)
+            if isinstance(inner_id, int):
+                return inner_id
+        return None
+
     async def _ensure_membership(self, app: Client, chat_id: int, target: str) -> None:
         try:
             await app.get_chat_member(chat_id, "me")
