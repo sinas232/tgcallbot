@@ -801,6 +801,13 @@ class PremiumEmojiState:
         #: واقعی‌شان (``Sticker.emoji``) با ایموجیِ انتظارِ بسته نمی‌خواند.
         #: هر مورد = {"id": str, "expected": [str], "actual": str, "keys": [str]}
         self.emoji_mismatches: List[Dict[str, Any]] = []
+        #: شناسه → ایموجیِ واقعیِ استیکر (از getCustomEmojiStickers). داخل
+        #: ``<tg-emoji>`` باید دقیقاً همین کاراکتر باشد وگرنه تلگرام
+        #: ``Entity_text_invalid`` می‌دهد.
+        self.actual_emoji_by_id: Dict[str, str] = {}
+        #: شناسه‌هایی که شکل واقعی‌شان با بسته نمی‌خواند — به‌عنوان custom
+        #: emoji فرستاده نمی‌شوند (یونیکد جایگزین می‌شود).
+        self.mismatched_ids: Set[str] = set()
 
         # ── کش نوع چت (برای رد کردن کانال‌ها) ──
         self.chat_types: Dict[int, str] = {}
@@ -874,6 +881,9 @@ class PremiumEmojiState:
         self.validated = False
         self.valid_ids = set()
         self.disabled_ids = set()
+        self.actual_emoji_by_id = {}
+        self.emoji_mismatches = []
+        self.mismatched_ids = set()
 
     # ────────────────────────── حل شناسه ──────────────────────────
     def fallback_for(self, token: str) -> str:
@@ -905,10 +915,29 @@ class PremiumEmojiState:
             return None
         if emoji_id in self.disabled_ids:
             return None
+        # شناسهٔ معتبر ولی با شکلِ دیگر: تلگرام Entity_text_invalid می‌دهد
+        # اگر یونیکدِ بسته را داخل تگ بگذاریم. اصلاً نفرست.
+        if emoji_id in self.mismatched_ids:
+            return None
         # پس از اعتبارسنجی موفق، فقط شناسه‌های تاییدشده استفاده می‌شوند.
         if self.validated and emoji_id not in self.valid_ids:
             return None
         return emoji_id
+
+    @staticmethod
+    def _norm_emoji_char(char: str) -> str:
+        return (char or "").replace("\ufe0f", "").replace("\u200d", "").strip()
+
+    def bound_emoji(self, emoji_id: Optional[str], fallback: str) -> str:
+        """کاراکتر داخل ``<tg-emoji>``: ایموجیِ واقعیِ استیکر اگر شناخته شده باشد."""
+        if emoji_id:
+            actual = self.actual_emoji_by_id.get(str(emoji_id))
+            if actual:
+                return actual
+        return fallback
+
+    def _emoji_compatible(self, left: str, right: str) -> bool:
+        return self._norm_emoji_char(left) == self._norm_emoji_char(right)
 
     def html(self, token: str) -> str:
         """تگ HTML ایموجی پریمیوم (یا ایموجی معمولی در صورت نبودِ شناسه)."""
@@ -916,7 +945,8 @@ class PremiumEmojiState:
         fallback = self.fallback_for(token)
         if not emoji_id:
             return fallback
-        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+        inner = self.bound_emoji(emoji_id, fallback)
+        return f'<tg-emoji emoji-id="{emoji_id}">{inner}</tg-emoji>'
 
     # ────────────────────────── نوع چت ──────────────────────────
     def note_chat(self, chat_id: Any, chat_type: Optional[str]) -> None:
@@ -1027,8 +1057,13 @@ class PremiumEmojiState:
             emoji_id = self.resolve(emoji)
             if not emoji_id:
                 return emoji
+            inner = self.bound_emoji(emoji_id, emoji)
+            # تلگرام متنِ داخل تگ را باید با شکل واقعی استیکر یکی بداند.
+            # اگر نمی‌خواند، همان یونیکد را بدون تگ می‌گذاریم (نه Entity_text_invalid).
+            if not self._emoji_compatible(inner, emoji):
+                return emoji
             count += 1
-            return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
+            return f'<tg-emoji emoji-id="{emoji_id}">{inner}</tg-emoji>'
 
         return _EMOJI_RE.sub(_sub, chunk), count
 
@@ -1054,6 +1089,9 @@ class PremiumEmojiState:
                 break
             emoji_id = self.resolve(m.group(0))
             if not emoji_id:
+                continue
+            actual = self.actual_emoji_by_id.get(str(emoji_id))
+            if actual and not self._emoji_compatible(actual, m.group(0)):
                 continue
             entities.append(
                 MessageEntity(

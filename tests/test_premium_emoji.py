@@ -95,6 +95,8 @@ class _StateGuard(unittest.TestCase):
         self._saved_aliases = copy.deepcopy(premium_emoji.label_aliases)
         self._saved_stats = dict(premium_emoji.stats)
         self._saved_mismatches = list(premium_emoji.emoji_mismatches)
+        self._saved_actual = dict(getattr(premium_emoji, "actual_emoji_by_id", {}))
+        self._saved_mismatched_ids = set(getattr(premium_emoji, "mismatched_ids", set()))
         # حالت پایهٔ تست‌ها: همه‌چیز روشن، بدون اعتبارسنجی (تا شناسه‌های بسته
         # بدون تماس با تلگرام قابل استفاده باشند)
         premium_emoji.enabled = True
@@ -114,6 +116,9 @@ class _StateGuard(unittest.TestCase):
         premium_emoji.unsupported_chats = {}
         premium_emoji.label_aliases = type(premium_emoji.label_aliases)()
         premium_emoji.stats = dict.fromkeys(premium_emoji.stats, 0)
+        premium_emoji.emoji_mismatches = []
+        premium_emoji.actual_emoji_by_id = {}
+        premium_emoji.mismatched_ids = set()
 
     def tearDown(self) -> None:
         for key, value in self._saved.items():
@@ -178,6 +183,19 @@ class TestPack(_StateGuard):
         self.assertIn("✅", tag)
         # کلید ناشناخته با fallback سفارشی
         self.assertEqual(pe("unknown_key", "🙂"), "🙂")
+
+    def test_mismatched_id_not_sent_as_custom_emoji(self):
+        """شناسهٔ نامربوط نباید تگ tg-emoji بسازد (Entity_text_invalid)."""
+        key, (emoji_id, fallback) = next(iter(PREMIUM_EMOJI_PACK.items()))
+        premium_emoji.emoji_mismatches = [
+            {"id": emoji_id, "expected": [fallback], "actual": "🧊", "keys": [key]}
+        ]
+        premium_emoji.mismatched_ids = {emoji_id}
+        premium_emoji.actual_emoji_by_id = {emoji_id: "🧊"}
+        self.assertIsNone(premium_emoji.resolve(key))
+        self.assertEqual(premium_emoji.html(key), fallback)
+        self.assertEqual(pe(key), fallback)
+        self.assertNotIn("<tg-emoji", premium_emoji.upgrade_html_text(fallback + " تست"))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -662,6 +680,19 @@ class TestBotPipeline(_StateGuard):
         _run(bot.send_message(chat_id=42, text="✅ دوباره", parse_mode="HTML"))
         self.assertIn("<tg-emoji", bot.calls[0][1]["text"])
 
+    def test_entity_text_invalid_strips_original_pe_tags(self):
+        """پیش‌نمایش بسته: payload از قبل tg-emoji دارد و Entity_text_invalid می‌آید."""
+        bot = _RecordingBot(fail_first_with="Bad Request: Entity_text_invalid")
+        text = f"{pe('rocket')} <b>پیش‌نمایش</b>"
+        _run(bot.send_message(chat_id=11, text=text, parse_mode="HTML"))
+        self.assertGreaterEqual(len(bot.calls), 2)
+        last = bot.calls[-1][1]["text"]
+        self.assertNotIn("<tg-emoji", last)
+        self.assertIn("🚀", last)
+        self.assertIn("<b>پیش‌نمایش</b>", last)
+        # چت نباید blacklist شود
+        self.assertTrue(premium_emoji.chat_supports(11, scope=bot.token))
+
     def test_channel_chat_skipped_without_extra_call(self):
         premium_emoji.note_chat(-100999, "channel")
         bot = _RecordingBot()
@@ -759,8 +790,11 @@ class TestValidation(_StateGuard):
         item = report["emoji_mismatch"][0]
         self.assertEqual(item["actual"], "🧊")
         self.assertIn(fallback.rstrip("\ufe0f"), [e.rstrip("\ufe0f") for e in item["expected"]])
-        # در حالت عادی فقط «گزارش» می‌شود و شناسه فعال می‌ماند
+        # در حالت عادی فقط «گزارش» می‌شود و شناسه در disabled_ids نمی‌رود،
+        # ولی برای ارسال custom emoji استفاده نمی‌شود (Entity_text_invalid).
         self.assertNotIn(emoji_id, premium_emoji.disabled_ids)
+        self.assertIn(emoji_id, premium_emoji.mismatched_ids)
+        self.assertIsNone(premium_emoji.resolve(next(iter(PREMIUM_EMOJI_PACK))))
 
     def test_emoji_binding_match_not_reported(self):
         from services.premium_emoji_service import validate_pack

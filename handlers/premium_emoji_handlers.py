@@ -444,7 +444,18 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
             return
         text = "\n".join(lines)
         text = safe_html_truncate(text, 3900)
-        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            logger.warning("premium-emoji: preview chunk failed (%s); sending plain unicode", exc)
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    premium_emoji.strip_tg_emoji_tags(text),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc2:
+                logger.error("premium-emoji: preview plain fallback failed: %s", exc2)
 
     for key, (emoji_id, _uni) in PREMIUM_EMOJI_PACK.items():
         if premium_emoji.validated and emoji_id not in premium_emoji.valid_ids:

@@ -84,6 +84,8 @@ _PARSE_ENTITY_HINTS = (
     "unexpected end tag",
     "entity too long",
     "message is too long",
+    "entity_text_invalid",
+    "entity text invalid",
 )
 
 
@@ -265,40 +267,55 @@ class PremiumEmojiBot(ExtBot):
 
         ترتیب تلاش:
           1) payload ارتقایافته (ایموجی پریمیوم + دکمه‌های رنگی)
-          2) در خطای parse: یک‌بار sanitization HTML و ارسال دوباره
+          2) در خطای parse / Entity_text_invalid: sanitization، سپس حذف
+             تگ‌های ``<tg-emoji>`` (حتی اگر payload اصلی هم از ``pe()`` آمده)
           3) payload اصلی (بدون ارتقا) — پیام هرگز از دست نمی‌رود
 
         فقط خطاهای «این چت custom emoji نمی‌پذیرد» چت را از فهرست ارتقا
-        خارج می‌کنند. خطای «unclosed end tag» / «can't parse entities» هرگز
-        نباید کل چت را برای همیشه خاموش کند (باگ قبلی دقیقاً همین بود).
+        خارج می‌کنند. خطای «unclosed end tag» / «can't parse entities» /
+        «Entity_text_invalid» هرگز نباید کل چت را برای همیشه خاموش کند.
         """
         new_args, new_kwargs, changed, chat_id = self._prepare(args, kwargs, spec)
-        if not changed:
-            return await parent_method(*args, **kwargs)
+        send_args = new_args if changed else args
+        send_kwargs = new_kwargs if changed else kwargs
         try:
-            return await parent_method(*new_args, **new_kwargs)
+            return await parent_method(*send_args, **send_kwargs)
         except BadRequest as exc:
             premium_emoji.stats["fallbacks"] += 1
             message = str(exc).lower()
 
-            # ── خطای parse HTML/entity: sanitization و یک retry ──
+            # ── خطای parse HTML/entity: sanitization، سپس strip تگ‌ها ──
             if any(hint in message for hint in _PARSE_ENTITY_HINTS):
-                sanitized = self._sanitize_payload(new_args, new_kwargs, spec)
+                sanitized = self._sanitize_payload(send_args, send_kwargs, spec)
                 if sanitized is not None:
                     s_args, s_kwargs = sanitized
                     try:
                         return await parent_method(*s_args, **s_kwargs)
                     except BadRequest as exc2:
                         logger.warning(
-                            "premium-emoji: sanitize retry هم ناموفق (%s) → plain fallback",
+                            "premium-emoji: sanitize retry هم ناموفق (%s) → strip tags",
                             exc2,
                         )
-                else:
-                    logger.warning(
-                        "premium-emoji: parse entities روی payload ارتقایافته "
-                        "(%s) — بدون علامت‌زدن چت، plain fallback",
-                        exc,
-                    )
+                stripped = self._strip_custom_emoji_payload(send_args, send_kwargs, spec)
+                if stripped is not None:
+                    try:
+                        return await parent_method(*stripped[0], **stripped[1])
+                    except BadRequest as exc3:
+                        logger.warning(
+                            "premium-emoji: strip retry هم ناموفق (%s) → plain fallback",
+                            exc3,
+                        )
+                orig_stripped = self._strip_custom_emoji_payload(args, kwargs, spec)
+                if orig_stripped is not None:
+                    try:
+                        return await parent_method(*orig_stripped[0], **orig_stripped[1])
+                    except BadRequest:
+                        pass
+                logger.warning(
+                    "premium-emoji: parse entities روی payload "
+                    "(%s) — بدون علامت‌زدن چت، plain fallback",
+                    exc,
+                )
                 return await parent_method(*args, **kwargs)
 
             # ── واقعاً custom emoji پشتیبانی نمی‌شود ──
@@ -314,6 +331,12 @@ class PremiumEmojiBot(ExtBot):
                 )
             else:
                 logger.debug("premium-emoji: falling back to plain payload (%s)", exc)
+            orig_stripped = self._strip_custom_emoji_payload(args, kwargs, spec)
+            if orig_stripped is not None:
+                try:
+                    return await parent_method(*orig_stripped[0], **orig_stripped[1])
+                except BadRequest:
+                    pass
             return await parent_method(*args, **kwargs)
 
     def _sanitize_payload(
@@ -340,12 +363,35 @@ class PremiumEmojiBot(ExtBot):
 
         cleaned = premium_emoji.sanitize_html(text)
         if cleaned == text:
-            # اگر تغییری نکرد، حداقل تگ‌های tg-emoji را به یونیکد ساده برگردان
-            # تا پیام حتماً برسد (دکمه‌های رنگی/آیکون ممکن است سالم بمانند).
-            cleaned = premium_emoji.strip_tg_emoji_tags(text)
-            if cleaned == text:
-                return None
+            return None
 
+        if text_from_args:
+            new_args[spec.text_pos] = cleaned
+        else:
+            new_kwargs[spec.text_kw] = cleaned
+        return tuple(new_args), new_kwargs
+
+    def _strip_custom_emoji_payload(
+        self,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        spec: _TextSpec,
+    ) -> Optional[Tuple[Tuple[Any, ...], Dict[str, Any]]]:
+        """حذف تگ‌های ``<tg-emoji>`` از text/caption — آخرین راه Entity_text_invalid."""
+        new_args = list(args)
+        new_kwargs = dict(kwargs)
+        text: Optional[str] = None
+        text_from_args = False
+        if spec.text_pos >= 0 and len(new_args) > spec.text_pos and isinstance(new_args[spec.text_pos], str):
+            text = new_args[spec.text_pos]
+            text_from_args = True
+        elif isinstance(new_kwargs.get(spec.text_kw), str):
+            text = new_kwargs[spec.text_kw]
+        if not text or "<tg-emoji" not in text:
+            return None
+        cleaned = premium_emoji.strip_tg_emoji_tags(text)
+        if cleaned == text:
+            return None
         if text_from_args:
             new_args[spec.text_pos] = cleaned
         else:

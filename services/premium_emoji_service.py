@@ -196,7 +196,9 @@ def _check_emoji_bindings(bindings: Dict[str, str]) -> List[Dict[str, Any]]:
             }
         )
 
+    premium_emoji.actual_emoji_by_id = dict(bindings)
     premium_emoji.emoji_mismatches = mismatches
+    premium_emoji.mismatched_ids = {m["id"] for m in mismatches}
     if mismatches:
         sample = "; ".join(
             f"{m['actual']}≠{'/'.join(m['expected'])}[{','.join(m['keys'][:2])}]" for m in mismatches[:12]
