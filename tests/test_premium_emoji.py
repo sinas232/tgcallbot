@@ -131,6 +131,8 @@ class _StateGuard(unittest.TestCase):
         premium_emoji.label_aliases = self._saved_aliases
         premium_emoji.stats = self._saved_stats
         premium_emoji.emoji_mismatches = self._saved_mismatches
+        premium_emoji.actual_emoji_by_id = self._saved_actual
+        premium_emoji.mismatched_ids = self._saved_mismatched_ids
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -184,18 +186,31 @@ class TestPack(_StateGuard):
         # کلید ناشناخته با fallback سفارشی
         self.assertEqual(pe("unknown_key", "🙂"), "🙂")
 
-    def test_mismatched_id_not_sent_as_custom_emoji(self):
-        """شناسهٔ نامربوط نباید تگ tg-emoji بسازد (Entity_text_invalid)."""
+    def test_mismatched_id_sent_with_actual_sticker_char(self):
+        """شناسهٔ معتبر با شکل دیگر همچنان custom emoji است؛ داخل تگ Sticker.emoji است."""
         key, (emoji_id, fallback) = next(iter(PREMIUM_EMOJI_PACK.items()))
         premium_emoji.emoji_mismatches = [
             {"id": emoji_id, "expected": [fallback], "actual": "🧊", "keys": [key]}
         ]
         premium_emoji.mismatched_ids = {emoji_id}
         premium_emoji.actual_emoji_by_id = {emoji_id: "🧊"}
-        self.assertIsNone(premium_emoji.resolve(key))
-        self.assertEqual(premium_emoji.html(key), fallback)
-        self.assertEqual(pe(key), fallback)
-        self.assertNotIn("<tg-emoji", premium_emoji.upgrade_html_text(fallback + " تست"))
+        self.assertEqual(premium_emoji.resolve(key), emoji_id)
+        expected = f'<tg-emoji emoji-id="{emoji_id}">🧊</tg-emoji>'
+        self.assertEqual(premium_emoji.html(key), expected)
+        self.assertEqual(pe(key), expected)
+        upgraded = premium_emoji.upgrade_html_text(fallback + " تست")
+        self.assertIn(expected, upgraded)
+        self.assertNotIn(f">{fallback}</tg-emoji>", upgraded)
+        # مسیر entity متن را عوض نمی‌کند؛ overlay روی کاراکتر نامنطبق نمی‌رود.
+        self.assertEqual(premium_emoji.build_entities(fallback + " تست"), [])
+        # دکمه فقط شناسه می‌خواهد؛ آیکون حتی با mismatch می‌ماند.
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(fallback + " ارسال", callback_data="ok")]]
+        )
+        out = premium_emoji.upgrade_reply_markup(kb, chat_id=10)
+        btn = out.inline_keyboard[0][0]
+        self.assertEqual(btn.icon_custom_emoji_id, emoji_id)
+        self.assertEqual(btn.text, "ارسال")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -790,11 +805,16 @@ class TestValidation(_StateGuard):
         item = report["emoji_mismatch"][0]
         self.assertEqual(item["actual"], "🧊")
         self.assertIn(fallback.rstrip("\ufe0f"), [e.rstrip("\ufe0f") for e in item["expected"]])
-        # در حالت عادی فقط «گزارش» می‌شود و شناسه در disabled_ids نمی‌رود،
-        # ولی برای ارسال custom emoji استفاده نمی‌شود (Entity_text_invalid).
+        # در حالت عادی فقط «گزارش» می‌شود؛ شناسه همچنان custom emoji است
+        # و داخل تگ کاراکتر واقعی استیکر می‌نشیند (نه یونیکد بسته).
         self.assertNotIn(emoji_id, premium_emoji.disabled_ids)
         self.assertIn(emoji_id, premium_emoji.mismatched_ids)
-        self.assertIsNone(premium_emoji.resolve(next(iter(PREMIUM_EMOJI_PACK))))
+        first_key = next(iter(PREMIUM_EMOJI_PACK))
+        self.assertEqual(premium_emoji.resolve(first_key), emoji_id)
+        self.assertEqual(
+            premium_emoji.html(first_key),
+            f'<tg-emoji emoji-id="{emoji_id}">🧊</tg-emoji>',
+        )
 
     def test_emoji_binding_match_not_reported(self):
         from services.premium_emoji_service import validate_pack

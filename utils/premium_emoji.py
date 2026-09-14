@@ -805,8 +805,9 @@ class PremiumEmojiState:
         #: ``<tg-emoji>`` باید دقیقاً همین کاراکتر باشد وگرنه تلگرام
         #: ``Entity_text_invalid`` می‌دهد.
         self.actual_emoji_by_id: Dict[str, str] = {}
-        #: شناسه‌هایی که شکل واقعی‌شان با بسته نمی‌خواند — به‌عنوان custom
-        #: emoji فرستاده نمی‌شوند (یونیکد جایگزین می‌شود).
+        #: شناسه‌هایی که شکل واقعی‌شان با یونیکد بسته نمی‌خواند. همچنان
+        #: فرستاده می‌شوند؛ فقط متن داخل تگ از ``Sticker.emoji`` می‌آید.
+        #: تنها ``strict_emoji_match`` آن‌ها را در ``disabled_ids`` می‌گذارد.
         self.mismatched_ids: Set[str] = set()
 
         # ── کش نوع چت (برای رد کردن کانال‌ها) ──
@@ -915,11 +916,9 @@ class PremiumEmojiState:
             return None
         if emoji_id in self.disabled_ids:
             return None
-        # شناسهٔ معتبر ولی با شکلِ دیگر: تلگرام Entity_text_invalid می‌دهد
-        # اگر یونیکدِ بسته را داخل تگ بگذاریم. اصلاً نفرست.
-        if emoji_id in self.mismatched_ids:
-            return None
         # پس از اعتبارسنجی موفق، فقط شناسه‌های تاییدشده استفاده می‌شوند.
+        # mismatch شکل استیکر شناسه را باطل نمی‌کند؛ html()/pe() کاراکتر
+        # واقعی را داخل تگ می‌گذارند تا Entity_text_invalid نیاید.
         if self.validated and emoji_id not in self.valid_ids:
             return None
         return emoji_id
@@ -1057,11 +1056,9 @@ class PremiumEmojiState:
             emoji_id = self.resolve(emoji)
             if not emoji_id:
                 return emoji
+            # متن داخل تگ باید همان Sticker.emoji باشد (حتی اگر با یونیکد
+            # منبع فرق کند)؛ در غیر این صورت تلگرام Entity_text_invalid می‌دهد.
             inner = self.bound_emoji(emoji_id, emoji)
-            # تلگرام متنِ داخل تگ را باید با شکل واقعی استیکر یکی بداند.
-            # اگر نمی‌خواند، همان یونیکد را بدون تگ می‌گذاریم (نه Entity_text_invalid).
-            if not self._emoji_compatible(inner, emoji):
-                return emoji
             count += 1
             return f'<tg-emoji emoji-id="{emoji_id}">{inner}</tg-emoji>'
 
@@ -1090,6 +1087,8 @@ class PremiumEmojiState:
             emoji_id = self.resolve(m.group(0))
             if not emoji_id:
                 continue
+            # مسیر entity متن را عوض نمی‌کند؛ اگر کاراکتر منبع با شکل
+            # واقعی استیکر یکی نباشد تلگرام entity را رد می‌کند.
             actual = self.actual_emoji_by_id.get(str(emoji_id))
             if actual and not self._emoji_compatible(actual, m.group(0)):
                 continue
@@ -1514,7 +1513,8 @@ def pe(token: str, fallback: Optional[str] = None) -> str:
     placeholder = fallback or KEY_TO_FALLBACK.get(token) or token
     if not emoji_id:
         return placeholder
-    return f'<tg-emoji emoji-id="{emoji_id}">{placeholder}</tg-emoji>'
+    inner = premium_emoji.bound_emoji(emoji_id, placeholder)
+    return f'<tg-emoji emoji-id="{emoji_id}">{inner}</tg-emoji>'
 
 
 #: نام مستعار (خوانا در متن‌های فارسی)

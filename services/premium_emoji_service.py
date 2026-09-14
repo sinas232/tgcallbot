@@ -455,7 +455,8 @@ def status_html(bot_id: int = 1) -> str:
         lines += [
             "",
             f"⚠️ ایموجیِ واقعیِ <code>{len(premium_emoji.emoji_mismatches)}</code> شناسه با",
-            "بستهٔ داخل کد نمی‌خواند (شکلِ دیگری نمایش داده می‌شود). نمونه:",
+            "بستهٔ داخل کد نمی‌خواند؛ همچنان به‌صورت custom emoji با شکل",
+            "واقعی استیکر فرستاده می‌شوند. نمونه:",
         ]
         for item in premium_emoji.emoji_mismatches[:6]:
             keys = "/".join(item["keys"][:2]) or "?"
