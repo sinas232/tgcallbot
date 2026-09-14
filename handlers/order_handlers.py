@@ -20,6 +20,7 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
+from services import order_admission
 
 logger = logging.getLogger(__name__)
 
@@ -329,10 +330,30 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
             )
             return ConversationHandler.END
 
-        await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
-        
         schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
-        
+
+        # Instant orders only: refuse BEFORE charging if starting now would
+        # starve the orders already running. Scheduled purchases wait for a slot.
+        if not schedule_time:
+            decision = await order_admission.evaluate(
+                int(plan.get('accounts_count') or 0),
+                plan.get('service_type'),
+                bot_id=bot_id,
+            )
+            if not decision.ok:
+                await query.edit_message_text(decision.user_message)
+                try:
+                    await context.bot.send_message(
+                        update.effective_chat.id,
+                        "⏰ می‌توانید سفارش را برای بعد رزرو کنید (بدون فشار روی سفارش‌های جاری):",
+                        reply_markup=ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True),
+                    )
+                except Exception:
+                    pass
+                return AWAITING_ORDER_TIMING_TYPE
+
+        await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
+
         order = await DatabaseManager.create_order(
             user['id'], plan['service_type'], link,
             plan['accounts_count'], plan['duration_minutes'], plan['price'],
@@ -340,7 +361,36 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         )
         
         if not schedule_time:
-            await order_executor.submit_order(order['id'], order)
+            started = await order_executor.submit_order(order['id'], order)
+            if not started:
+                # Race: capacity filled between the pre-check and submit.
+                # Keep the paid order queued until a slot frees.
+                eta = 60.0
+                try:
+                    again = await order_admission.evaluate(
+                        int(plan.get('accounts_count') or 0),
+                        plan.get('service_type'),
+                        bot_id=bot_id,
+                    )
+                    eta = float(again.snapshot.eta_seconds or 60.0)
+                except Exception:
+                    pass
+                when = datetime.utcnow() + timedelta(seconds=max(60.0, eta) + 15.0)
+                try:
+                    await DatabaseManager.reschedule_order(order['id'], when)
+                except Exception:
+                    pass
+                kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🛑 لغو این سفارش رزرو‌شده", callback_data=f"cancel_order_{order['id']}")]]
+                )
+                await query.edit_message_text(
+                    f"✅ **سفارش ثبت شد و به‌محض آزاد شدن ظرفیت شروع می‌شود.**\n"
+                    f"🆔 کد پیگیری: `{order['id']}`\n"
+                    f"⏳ شروع تقریبی: {format_jalali_datetime(when)}\n"
+                    "مبلغ کسر شده است؛ اگر منصرف شدید تا قبل از شروع می‌توانید لغو کنید و کل مبلغ برگردد.",
+                    reply_markup=kb,
+                )
+                return ConversationHandler.END
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]

@@ -71,6 +71,16 @@ class Config:
 
     # Order Settings
     MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
+    # Hard cap on voice accounts that may be live across ALL running orders
+    # at once. A single order larger than this is still allowed when the host
+    # is empty; extra orders are refused until a slot frees so existing calls
+    # are never starved / dropped. Default 80 fits a 16GB host with headroom.
+    MAX_CONCURRENT_VOICE_ACCOUNTS = int(os.getenv('MAX_CONCURRENT_VOICE_ACCOUNTS', '80'))
+    # Refuse extra orders when cgroup usage ≥ this fraction of its limit, or
+    # when host MemAvailable falls below the MB thresholds.
+    MEMORY_ADMISSION_RATIO = float(os.getenv('MEMORY_ADMISSION_RATIO', '0.85') or 0.85)
+    MEMORY_ADMISSION_MIN_AVAILABLE_MB = int(os.getenv('MEMORY_ADMISSION_MIN_AVAILABLE_MB', '1536') or 1536)
+    MEMORY_ADMISSION_CRITICAL_MB = int(os.getenv('MEMORY_ADMISSION_CRITICAL_MB', '512') or 512)
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)

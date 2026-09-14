@@ -835,6 +835,23 @@ class DatabaseManager:
             return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
+    async def get_running_orders(limit: int = 500):
+        """All running orders across bots — used by admission (host-wide load)."""
+        async with AsyncSessionLocal() as db_session:
+            q = select(Order).filter(Order.status == 'running').order_by(Order.id).limit(max(1, int(limit or 500)))
+            res = await db_session.execute(q)
+            return [to_dict(o) for o in res.scalars().all()]
+
+    @staticmethod
+    async def reschedule_order(order_id: int, when: datetime):
+        """Keep a paid order queued until capacity frees (do not fail it)."""
+        async with AsyncSessionLocal() as db_session:
+            await db_session.execute(
+                update(Order).where(Order.id == order_id).values(status='scheduled', scheduled_for=when)
+            )
+            await db_session.commit()
+
+    @staticmethod
     async def has_active_order_for_link(link: str, bot_id: int = 1) -> bool:
         """بررسی وجود سفارش فعال برای یک لینک خاص (جهت خروج هوشمند)"""
         async with AsyncSessionLocal() as db_session:

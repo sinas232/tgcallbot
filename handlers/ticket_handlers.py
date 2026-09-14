@@ -29,6 +29,11 @@ from utils.helpers import format_jalali_datetime
 # سفارشیِ خودشان) به HTML امن تبدیل می‌کند تا هنگام بازنشر، ایموجی پریمیومِ
 # آن‌ها دقیقاً همان‌طور که فرستاده‌اند نمایش داده شود.
 from utils.premium_emoji import escape_outside_tags, message_content_html
+from utils.media_relay import (
+    classify_message_media,
+    copy_or_send_as_received,
+    send_stored_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,30 +263,22 @@ async def handle_ticket_body(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _persist_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_id: int, bot_id: int):
     """ثبت پیام کاربر (متن/رسانه) در دیتابیس."""
     msg = update.message
-    msg_type = "text"
-    file_id = None
+    msg_type, file_id = classify_message_media(msg)
     content = msg.text or msg.caption or ""
-    if msg.photo:
-        msg_type = "photo"; file_id = msg.photo[-1].file_id
-    elif msg.voice:
-        msg_type = "voice"; file_id = msg.voice.file_id
-    elif msg.document:
-        msg_type = "document"; file_id = msg.document.file_id
-    elif msg.video:
-        msg_type = "video"; file_id = msg.video.file_id
     if not content and msg_type != "text":
         content = "(فایل ضمیمه)"
 
     sender_name = update.effective_user.first_name
     await DatabaseManager.add_ticket_message(ticket_id, "user", msg_type, content[:1000], sender_name=sender_name, file_id=file_id)
 
-    # 💎 نسخهٔ HTMLِ پیامِ کاربر: اگر کاربر ایموجی پریمیوم (custom emoji)
-    # فرستاده باشد، text_html خودِ PTB آن را به <tg-emoji emoji-id="…"> تبدیل
-    # می‌کند؛ پس ادمین دقیقاً همان ایموجی پریمیوم را می‌بیند.
-    content_html = message_content_html(msg) if msg_type == "text" else _esc(content)
+    # 💎 نسخهٔ HTMLِ پیامِ کاربر: text_html/caption_html شامل ایموجی پریمیوم.
+    content_html = message_content_html(msg) or _esc(content)
 
     user_db = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
-    await notify_admins_new_message(context, ticket_id, user_db, content, msg_type, bot_id, content_html=content_html)
+    await notify_admins_new_message(
+        context, ticket_id, user_db, content, msg_type, bot_id,
+        content_html=content_html, src_message=msg,
+    )
 
 
 async def show_user_tickets_list(update, context):
@@ -524,20 +521,11 @@ async def show_ticket_conversation(update, context, ticket_id):
 
 
 async def _send_media_attachments(context, chat_id, messages):
-    """ارسال ضمیمه‌های رسانه‌ای تیکت (اگر وجود دارند) پس از رونوشت متنی."""
+    """ارسال ضمیمه‌های رسانه‌ای تیکت با همان کپشن اصلی (نه برچسب مصنوعی)."""
     for m in messages:
-        if m.get("message_type") in ("photo", "voice", "document", "video") and m.get("file_id"):
+        if m.get("message_type") in ("photo", "voice", "document", "video", "animation", "audio", "video_note", "sticker") and m.get("file_id"):
             try:
-                cap = f"#{m['id']} · {'👤 کاربر' if m['sender_type']=='user' else '🛡 پشتیبان'}"
-                mt = m["message_type"]
-                if mt == "photo":
-                    await context.bot.send_photo(chat_id, m["file_id"], caption=cap)
-                elif mt == "voice":
-                    await context.bot.send_voice(chat_id, m["file_id"], caption=cap)
-                elif mt == "document":
-                    await context.bot.send_document(chat_id, m["file_id"], caption=cap)
-                elif mt == "video":
-                    await context.bot.send_video(chat_id, m["file_id"], caption=cap)
+                await send_stored_media(context.bot, chat_id, m)
             except Exception:
                 pass
 
@@ -560,24 +548,13 @@ async def handle_admin_reply_message(update, context):
     admin_name = update.effective_user.first_name
 
     # تشخیص نوع پیام ادمین
-    msg_type = "text"
-    file_id = None
+    msg_type, file_id = classify_message_media(msg)
     content = msg.text or msg.caption or ""
-    if msg.photo:
-        msg_type = "photo"; file_id = msg.photo[-1].file_id
-    elif msg.voice:
-        msg_type = "voice"; file_id = msg.voice.file_id
-    elif msg.document:
-        msg_type = "document"; file_id = msg.document.file_id
-    elif msg.video:
-        msg_type = "video"; file_id = msg.video.file_id
     if not content and msg_type != "text":
         content = "(فایل ضمیمه)"
 
     subj = ticket.get("subject") or "بدون موضوع"
-    # 💎 پاسخ ادمین با همهٔ فرمت‌ها و ایموجی پریمیومِ خودش به کاربر می‌رسد:
-    # text_html/caption_html هم entityها (بولد/لینک/…) و هم custom_emoji را
-    # به تگ <tg-emoji> تبدیل می‌کند و متن را هم به‌درستی escape می‌نماید.
+    # 💎 پاسخ ادمین: متن با HTML، رسانه با copy تا عکس و کپشن دقیقاً با هم برسند.
     content_html = message_content_html(msg) or _esc(content)
     try:
         # ارسال به کاربر
@@ -586,14 +563,7 @@ async def handle_admin_reply_message(update, context):
             await context.bot.send_message(user["telegram_id"], header + content_html, parse_mode="HTML")
         else:
             await context.bot.send_message(user["telegram_id"], header, parse_mode="HTML")
-            if msg_type == "photo":
-                await context.bot.send_photo(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
-            elif msg_type == "voice":
-                await context.bot.send_voice(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
-            elif msg_type == "document":
-                await context.bot.send_document(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
-            elif msg_type == "video":
-                await context.bot.send_video(user["telegram_id"], file_id, caption=content_html, parse_mode="HTML")
+            await copy_or_send_as_received(context.bot, user["telegram_id"], msg)
 
         await DatabaseManager.add_ticket_message(ticket_id, "admin", msg_type, content[:1000], sender_name=admin_name, file_id=file_id)
         await msg.reply_text("✅ پاسخ برای کاربر ارسال شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
@@ -620,7 +590,7 @@ async def notify_admins_new_ticket(context, ticket_id, user, subject, bot_id):
             pass
 
 
-async def notify_admins_new_message(context, ticket_id, user, content, msg_type, bot_id, content_html=None):
+async def notify_admins_new_message(context, ticket_id, user, content, msg_type, bot_id, content_html=None, src_message=None):
     admins = await DatabaseManager.get_all_admins(bot_id=bot_id)
     if msg_type == "text":
         # 💎 پیام‌های کوتاه با همان HTMLِ اصلی (شامل ایموجی پریمیومِ کاربر)
@@ -643,6 +613,11 @@ async def notify_admins_new_message(context, ticket_id, user, content, msg_type,
             await context.bot.send_message(a["telegram_id"], txt, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
+        if src_message is not None and msg_type != "text":
+            try:
+                await copy_or_send_as_received(context.bot, a["telegram_id"], src_message)
+            except Exception:
+                pass
 
 
 async def _notify_user_ticket_closed(context, ticket_id):

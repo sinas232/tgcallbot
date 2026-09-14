@@ -140,21 +140,33 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
-		if order_id in self.active_orders:
-			return
-		self.active_orders[order_id] = {
-			"status": "running",
-			"data": order_data,
-			"joined_accounts": [],
-			"task": None,
-			"dead_accounts_count": 0,
-			"cancel_requested": False,
-			"target_count": int(order_data.get("accounts_count") or 0),
-			"live_count": 0,
-			"pool_ids": set(),
-			"swapped_accounts": 0,
-		}
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+		from services import order_admission
+		async with order_admission.admission_lock:
+			if order_id in self.active_orders:
+				return True
+			needed = int((order_data or {}).get("accounts_count") or 0)
+			order_type = (order_data or {}).get("order_type")
+			bot_id = int((order_data or {}).get("bot_id") or 1)
+			decision = await order_admission.evaluate(needed, order_type, bot_id=bot_id)
+			if not decision.ok:
+				logger.warning(
+					"Order %s: admission refused (%s) — not starting so running orders stay intact",
+					order_id, decision.reason,
+				)
+				return False
+			self.active_orders[order_id] = {
+				"status": "running",
+				"data": order_data,
+				"joined_accounts": [],
+				"task": None,
+				"dead_accounts_count": 0,
+				"cancel_requested": False,
+				"target_count": needed,
+				"live_count": 0,
+				"pool_ids": set(),
+				"swapped_accounts": 0,
+			}
 		try:
 			await DatabaseManager.mark_order_as_running(order_id)
 		except Exception:
@@ -162,6 +174,7 @@ class OrderExecutor:
 			raise
 		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
 		self.active_orders[order_id]["task"] = task
+		return True
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
 	    joined_list: List[Dict[str, Any]] = []

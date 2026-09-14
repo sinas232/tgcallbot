@@ -511,12 +511,43 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        from services import order_admission
         due_orders = await DatabaseManager.get_due_scheduled_orders()
         if not due_orders: return
         for order in due_orders:
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            decision = await order_admission.evaluate(
+                int(order.get('accounts_count') or 0),
+                order.get('order_type'),
+                bot_id=bot_id,
+            )
+            if not decision.ok:
+                logger.info(
+                    "Scheduled order %s waiting for capacity (%s)",
+                    order.get('id'), decision.reason,
+                )
+                notified = getattr(check_scheduled_orders_job, "_delay_notified", set())
+                check_scheduled_orders_job._delay_notified = notified
+                oid = order.get('id')
+                if oid not in notified:
+                    notified.add(oid)
+                    try:
+                        app = bot_manager.active_bots.get(bot_id)
+                        user = await DatabaseManager.get_user_by_id(order['user_id'])
+                        if app and user and user.get('telegram_id'):
+                            await app.bot.send_message(
+                                user['telegram_id'],
+                                "⏳ سفارش زمان‌بندی‌شده شما به زمان اجرا رسیده، "
+                                "اما ظرفیت سرور پر است. به‌محض آزاد شدن حداقل یک سفارش جاری، "
+                                "بدون تغییر مدت زمان، شروع می‌شود.\n"
+                                f"🆔 کد سفارش: `{oid}`",
+                            )
+                    except Exception:
+                        pass
+                continue
+            started = await order_executor.submit_order(order['id'], order)
+            if not started:
+                continue
             try:
                 app = bot_manager.active_bots.get(bot_id)
                 if app:
