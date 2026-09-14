@@ -9,7 +9,7 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 from database import DatabaseManager
-from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS
+from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, AWAITING_SETTINGS_ACTION, BTN_BACK, BTN_LEAVE_ALL_CHATS
 from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
@@ -71,7 +71,9 @@ async def account_management_handler(update: Update, context: ContextTypes.DEFAU
         menu.insert(3, [BTN_LEAVE_ALL_CHATS])
     
     await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True), parse_mode=ParseMode.HTML)
-    return ConversationHandler.END
+    # Stay inside admin_conv. Returning END dropped the conversation so later
+    # admin buttons (settings, users, …) did nothing until the user sent /start.
+    return AWAITING_SETTINGS_ACTION
 
 @require_admin
 async def list_accounts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

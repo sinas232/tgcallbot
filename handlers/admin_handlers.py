@@ -1043,9 +1043,59 @@ async def admin_user_actions_handler(update, context):
         await show_user_profile(update, context, user)
     return AWAITING_SETTINGS_ACTION
 
+def build_admin_credit_log_text(
+    *,
+    admin_name: str,
+    admin_tg_id: int,
+    admin_username: str = None,
+    user_name: str,
+    user_tg_id: int,
+    user_internal_id: int,
+    action_str: str,
+    amount: float,
+    old_balance: float,
+    new_balance: float,
+    when_str: str,
+) -> str:
+    """گزارش کامل تغییر دستی موجودی برای کانال لاگ پرداخت‌ها."""
+    uname = f"\n🔗 یوزرنیم ادمین: @{str(admin_username).lstrip('@')}" if admin_username else ""
+    sign_icon = "📈" if action_str == "افزایش" else "📉"
+    return (
+        "💳 **گزارش تغییر موجودی توسط ادمین**\n"
+        "➖➖➖➖➖➖➖➖\n"
+        f"👮 ادمین: {admin_name}\n"
+        f"🆔 آیدی ادمین: `{admin_tg_id}`{uname}\n"
+        "➖➖➖➖➖➖➖➖\n"
+        f"👤 کاربر: {user_name}\n"
+        f"🆔 تلگرام کاربر: `{user_tg_id}`\n"
+        f"🔢 شناسه داخلی: `{user_internal_id}`\n"
+        "➖➖➖➖➖➖➖➖\n"
+        f"{sign_icon} نوع عملیات: **{action_str} موجودی**\n"
+        f"💵 مبلغ: `{int(amount):,}` تومان\n"
+        f"💰 موجودی قبل: `{int(old_balance):,}` تومان\n"
+        f"💎 موجودی بعد: `{int(new_balance):,}` تومان\n"
+        "📝 توضیحات: تغییر دستی توسط ادمین\n"
+        f"📅 زمان: {when_str}"
+    )
+
+
+async def log_admin_credit_change(bot, bot_id: int, text: str) -> None:
+    """ارسال گزارش تغییر موجودی به همان کانال لاگ پرداخت‌ها."""
+    try:
+        log_channel = await DatabaseManager.get_setting("log_channel_payments", bot_id=bot_id)
+        if not log_channel or log_channel in ["off", "0", ""]:
+            return
+        await bot.send_message(chat_id=log_channel, text=text)
+    except Exception as e:
+        logger.error(f"Failed to send admin credit log: {e}")
+
+
 async def set_user_credit(update, context):
     try:
-        text_input = clean_number(update.message.text)
+        raw = (update.message.text or "") if update.message else ""
+        if BTN_CANCEL in raw or BTN_BACK in raw:
+            return await admin_panel_start(update, context)
+        text_input = clean_number(raw)
         if not text_input.isdigit():
              await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
              return AWAITING_USER_AMOUNT
@@ -1057,7 +1107,11 @@ async def set_user_credit(update, context):
         if not user:
             await update.message.reply_text("❌ کاربر یافت نشد.")
             return AWAITING_SETTINGS_ACTION
-        success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین")
+        old_balance = float(user.get('credit') or 0)
+        bot_id = context.bot_data.get('bot_id', 1)
+        success, new_balance = await DatabaseManager.update_user_credit(
+            target_uid, final_change, "admin", "تغییر توسط ادمین", bot_id=bot_id
+        )
         if success:
             action_str = "افزایش" if sign > 0 else "کاهش"
             admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{int(new_balance):,}` تومان")
@@ -1066,6 +1120,21 @@ async def set_user_credit(update, context):
                 user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
                 await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
             except: pass
+            admin_user = update.effective_user
+            log_txt = build_admin_credit_log_text(
+                admin_name=(admin_user.first_name or "Unknown") if admin_user else "Unknown",
+                admin_tg_id=admin_user.id if admin_user else 0,
+                admin_username=getattr(admin_user, "username", None) if admin_user else None,
+                user_name=user.get("first_name") or "Unknown",
+                user_tg_id=user.get("telegram_id") or 0,
+                user_internal_id=user["id"],
+                action_str=action_str,
+                amount=amt,
+                old_balance=old_balance,
+                new_balance=float(new_balance or 0),
+                when_str=format_jalali_datetime(datetime.utcnow()),
+            )
+            await log_admin_credit_change(context.bot, bot_id, log_txt)
         else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
     except Exception as e:
         logger.error(f"Set credit error: {e}")

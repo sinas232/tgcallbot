@@ -679,16 +679,17 @@ def register_handlers(application: Application) -> None:
         states={
             AWAITING_TICKET_MESSAGE: [
                 CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
-                MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message),
+                MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_user_ticket_message),
             ],
-            AWAITING_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_subject)],
-            AWAITING_TICKET_BODY: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_ticket_body)],
+            AWAITING_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_ticket_subject)],
+            AWAITING_TICKET_BODY: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_ticket_body)],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="support_ticket", persistent=True,
         # Explicit per_* settings (documented, safe pattern for
         # button-driven conversations — see the PTBUserWarning note above).
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(support_conv)
 
@@ -704,21 +705,23 @@ def register_handlers(application: Application) -> None:
         },
         fallbacks=STANDARD_FALLBACKS,
         name="kyc", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True
     )
     application.add_handler(kyc_conv)
 
     # --- 3. پنل ادمین ---
-    admin_fallbacks = [
-        CommandHandler("start", start_command),
-        CommandHandler("cancel", start_command),
-        MessageHandler(filters.CONTACT, handle_contact),
-        MessageHandler(FILTER_BACK, admin_panel_start),
-    ]
-    admin_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
-        states={
-            AWAITING_SETTINGS_ACTION: [
+    async def end_nested_to_admin(update, context):
+        """Finish a nested account/profile conversation and show admin home.
+
+        Returning admin_panel_start's state (AWAITING_SETTINGS_ACTION) from
+        acc/prof conversations stored a state those convs do not have, so the
+        next menu click was swallowed until /start.
+        """
+        await admin_panel_start(update, context)
+        return ConversationHandler.END
+
+    admin_home_handlers = [
                 # نمایندگی
                 MessageHandler(filters.Regex("^🤖 مدیریت نمایندگی‌ها$"), reseller_management_menu),
                 CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
@@ -789,7 +792,23 @@ def register_handlers(application: Application) -> None:
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
-            ],
+            ]
+
+    admin_fallbacks = [
+        CommandHandler("start", start_command),
+        CommandHandler("cancel", start_command),
+        MessageHandler(filters.CONTACT, handle_contact),
+        MessageHandler(FILTER_BACK, admin_panel_start),
+        *admin_home_handlers,
+        # Nested admin states use STD_TEXT (which excludes nav buttons).
+        # Without this, tapping another admin section did nothing until /start.
+        MessageHandler(FILTER_NAV_BUTTONS, admin_panel_start),
+    ]
+    admin_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
+        states={
+            AWAITING_SETTINGS_ACTION: admin_home_handlers,
+
             
             # وضعیت‌های ادمین
             AWAITING_ADMIN_TICKET_REPLY: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_admin_reply_message)],
@@ -852,7 +871,8 @@ def register_handlers(application: Application) -> None:
         },
         fallbacks=admin_fallbacks,
         name="admin", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(admin_conv)
     
@@ -868,7 +888,8 @@ def register_handlers(application: Application) -> None:
         },
         fallbacks=STANDARD_FALLBACKS,
         name="wallet", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(wallet_conv)
     
@@ -885,20 +906,26 @@ def register_handlers(application: Application) -> None:
             MessageHandler(filters.Regex(f"^{BTN_LEAVE_ALL_CHATS}$"), leave_all_chats_start),
         ],
         states={
-            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, end_nested_to_admin)],
+            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, end_nested_to_admin)],
             # 🔥 وضعیت تایید برای خروج همگانی
             AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
         },
-        fallbacks=STANDARD_FALLBACKS,
+        fallbacks=[
+            CommandHandler("start", start_command),
+            CommandHandler("cancel", start_command),
+            MessageHandler(filters.CONTACT, handle_contact),
+            MessageHandler(FILTER_BACK, end_nested_to_admin),
+        ],
         name="acc", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(acc_conv)
 
@@ -924,9 +951,15 @@ def register_handlers(application: Application) -> None:
             AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
             AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
         },
-        fallbacks=STANDARD_FALLBACKS,
+        fallbacks=[
+            CommandHandler("start", start_command),
+            CommandHandler("cancel", start_command),
+            MessageHandler(filters.CONTACT, handle_contact),
+            MessageHandler(FILTER_BACK, end_nested_to_admin),
+        ],
         name="prof", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(prof_conv)
 
@@ -945,7 +978,8 @@ def register_handlers(application: Application) -> None:
         },
         fallbacks=STANDARD_FALLBACKS,
         name="incall", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(incall_conv)
 
@@ -980,7 +1014,8 @@ def register_handlers(application: Application) -> None:
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
-        per_chat=True, per_user=True, per_message=False
+        per_chat=True, per_user=True, per_message=False,
+        allow_reentry=True,
     )
     application.add_handler(buy_conv)
 
