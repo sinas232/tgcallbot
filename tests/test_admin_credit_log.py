@@ -47,10 +47,11 @@ class AdminCreditLogTests(unittest.TestCase):
                 "bot_id": 1,
             }
 
+            fake_send_safe = AsyncMock()
             with patch("handlers.admin_handlers.DatabaseManager.get_user_by_id", AsyncMock(return_value=fake_user)), \
                  patch("handlers.admin_handlers.DatabaseManager.update_user_credit", AsyncMock(return_value=(True, 150000))), \
                  patch("handlers.admin_handlers.DatabaseManager.get_setting", AsyncMock(return_value="-1009876543210")), \
-                 patch("handlers.admin_handlers.send_safe", AsyncMock()):
+                 patch("handlers.admin_handlers.send_safe", fake_send_safe):
 
                 res = await set_user_credit(update, context)
                 self.assertEqual(res, AWAITING_SETTINGS_ACTION)
@@ -61,13 +62,13 @@ class AdminCreditLogTests(unittest.TestCase):
                     text="🔔 **اعلان تغییر موجودی**\n\nمبلغ `50,000` تومان به حساب شما اضافه شد.\n💰 موجودی فعلی: `150,000` تومان"
                 )
 
-                # Verify log channel received report
+                # Verify log channel received report via send_safe
                 channel_calls = [
-                    call for call in context.bot.send_message.await_args_list
-                    if call.kwargs.get("chat_id") == "-1009876543210"
+                    call for call in fake_send_safe.await_args_list
+                    if len(call.args) >= 2 and (call.args[1] == -1009876543210 or call.args[1] == "-1009876543210")
                 ]
                 self.assertEqual(len(channel_calls), 1)
-                log_text = channel_calls[0].kwargs.get("text", "")
+                log_text = channel_calls[0].args[2]
                 self.assertIn("گزارش افزایش موجودی دستی (توسط مدیریت)", log_text)
                 self.assertIn("TestCustomer", log_text)
                 self.assertIn("777888999", log_text)
@@ -99,23 +100,61 @@ class AdminCreditLogTests(unittest.TestCase):
                 "bot_id": 1,
             }
 
+            fake_send_safe = AsyncMock()
             with patch("handlers.admin_handlers.DatabaseManager.get_user_by_id", AsyncMock(return_value=fake_user)), \
                  patch("handlers.admin_handlers.DatabaseManager.update_user_credit", AsyncMock(return_value=(True, 30000))), \
                  patch("handlers.admin_handlers.DatabaseManager.get_setting", AsyncMock(return_value="-1009876543210")), \
-                 patch("handlers.admin_handlers.send_safe", AsyncMock()):
+                 patch("handlers.admin_handlers.send_safe", fake_send_safe):
 
                 res = await set_user_credit(update, context)
                 self.assertEqual(res, AWAITING_SETTINGS_ACTION)
 
                 channel_calls = [
-                    call for call in context.bot.send_message.await_args_list
-                    if call.kwargs.get("chat_id") == "-1009876543210"
+                    call for call in fake_send_safe.await_args_list
+                    if len(call.args) >= 2 and (call.args[1] == -1009876543210 or call.args[1] == "-1009876543210")
                 ]
                 self.assertEqual(len(channel_calls), 1)
-                log_text = channel_calls[0].kwargs.get("text", "")
+                log_text = channel_calls[0].args[2]
                 self.assertIn("گزارش کاهش موجودی دستی (توسط مدیریت)", log_text)
                 self.assertIn("20,000", log_text)
                 self.assertIn("30,000", log_text)
+
+        self.loop.run_until_complete(scenario())
+
+    def test_set_user_credit_falls_back_to_plain_text_on_send_safe_failure(self):
+        async def scenario():
+            update = MagicMock()
+            update.message.text = "10000"
+            update.effective_chat.id = 999
+            update.effective_user = SimpleNamespace(id=111, first_name="Admin")
+
+            context = MagicMock()
+            context.user_data = {"credit_action": 1, "target_uid": 42}
+            context.bot_data = {"bot_id": 1}
+            context.bot.send_message = AsyncMock()
+
+            fake_user = {"id": 42, "telegram_id": 777888999, "first_name": "Customer", "bot_id": 1}
+
+            async def failing_send_safe(*args, **kwargs):
+                if len(args) >= 2 and args[1] == -1009876543210:
+                    raise RuntimeError("Markdown parse failure")
+                return None
+
+            with patch("handlers.admin_handlers.DatabaseManager.get_user_by_id", AsyncMock(return_value=fake_user)), \
+                 patch("handlers.admin_handlers.DatabaseManager.update_user_credit", AsyncMock(return_value=(True, 40000))), \
+                 patch("handlers.admin_handlers.DatabaseManager.get_setting", AsyncMock(return_value="-1009876543210")), \
+                 patch("handlers.admin_handlers.send_safe", side_effect=failing_send_safe):
+
+                res = await set_user_credit(update, context)
+                self.assertEqual(res, AWAITING_SETTINGS_ACTION)
+
+                # Channel should have received the plain fallback via context.bot.send_message
+                channel_calls = [
+                    call for call in context.bot.send_message.await_args_list
+                    if call.kwargs.get("chat_id") == -1009876543210
+                ]
+                self.assertEqual(len(channel_calls), 1)
+                self.assertIn("گزارش افزایش موجودی دستی (توسط مدیریت)", channel_calls[0].kwargs.get("text", ""))
 
         self.loop.run_until_complete(scenario())
 

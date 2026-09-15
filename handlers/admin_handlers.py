@@ -1069,9 +1069,13 @@ async def set_user_credit(update, context):
 
             # ارسال گزارش به کانال لاگ پرداختی‌ها
             try:
-                bot_id = context.bot_data.get('bot_id') or user.get('bot_id', 1)
+                bot_id = context.bot_data.get('bot_id', 1) or user.get('bot_id', 1) or 1
                 log_channel = await DatabaseManager.get_setting("log_channel_payments", bot_id=bot_id)
-                if log_channel and str(log_channel).strip() not in ["off", "0", ""]:
+                if not log_channel or str(log_channel).strip() in ["off", "0", "", "تعیین نشده", "none", "None"]:
+                    if bot_id != 1:
+                        log_channel = await DatabaseManager.get_setting("log_channel_payments", bot_id=1)
+
+                if log_channel and str(log_channel).strip() not in ["off", "0", "", "تعیین نشده", "none", "None"]:
                     admin_user = update.effective_user
                     admin_name = admin_user.first_name if admin_user else "مدیریت"
                     admin_id_str = f"`{admin_user.id}`" if admin_user else "---"
@@ -1088,9 +1092,23 @@ async def set_user_credit(update, context):
                         f"👮‍♂️ توسط ادمین: {admin_name} (ID: {admin_id_str})\n"
                         f"📅 زمان: {pay_time}"
                     )
-                    await context.bot.send_message(chat_id=log_channel, text=channel_msg)
+                    ch_str = str(log_channel).strip()
+                    target_chat = int(ch_str) if ch_str.lstrip("-").isdigit() else ch_str
+                    try:
+                        await send_safe(context.bot, target_chat, channel_msg, parse_mode="Markdown")
+                        logger.info(f"[AdminCreditLog] Successfully sent credit log to {target_chat} for user {user_tg_id}")
+                    except Exception as e_safe:
+                        logger.warning(f"[AdminCreditLog] send_safe failed for {target_chat} ({e_safe}), falling back to plain text")
+                        try:
+                            plain_text = channel_msg.replace("**", "").replace("`", "")
+                            await context.bot.send_message(chat_id=target_chat, text=plain_text)
+                            logger.info(f"[AdminCreditLog] Successfully sent plain credit log to {target_chat}")
+                        except Exception as e_plain:
+                            logger.error(f"[AdminCreditLog] Failed to send credit log to {target_chat}: {e_plain}")
+                else:
+                    logger.warning("[AdminCreditLog] log_channel_payments is not configured or disabled in settings.")
             except Exception as log_err:
-                logger.error(f"Failed to send manual credit log to channel: {log_err}")
+                logger.error(f"[AdminCreditLog] Unexpected error sending manual credit log: {log_err}", exc_info=True)
         else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
     except Exception as e:
         logger.error(f"Set credit error: {e}")
