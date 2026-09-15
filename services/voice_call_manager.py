@@ -38,6 +38,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sys
 import time
 import json
@@ -67,6 +68,7 @@ from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
 from services.session_ownership import session_ownership
+from utils.link_utils import permanent_link_error_token, validate_target_link
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -88,6 +90,12 @@ from services.presence_reconciler import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from services.self_healing import heal_pytgcalls
+    heal_pytgcalls(verbose=False)
+except Exception:
+    pass
 
 
 def _patch_pyrogram_channel_id_range() -> None:
@@ -928,39 +936,21 @@ class VoiceCallManager:
         self._chat_info_cache[int(chat_id)] = (time.time(), peer, call)
 
     async def _resolve_cached_peer(self, app: Client, chat_id: int) -> object:
-        """Resolve the raw peer ONCE (cached) and reuse it for all accounts.
-
-        ONE account does resolve_peer (a single API call); every other account
-        reuses the cached raw peer object.  A peer's channel id + access_hash
-        are GLOBAL (not per-account), so sharing the object is safe and removes
-        the biggest per-IP API-flood source.
-        """
+        """Resolve peer using the account's own session."""
         chat_id = int(chat_id)
-        cached = self._chat_info_get(chat_id)
-        if cached and cached[0] is not None:
-            return cached[0]
-        peer = await app.resolve_peer(chat_id)
-        cached = self._chat_info_get(chat_id)
-        self._chat_info_put(chat_id, peer, cached[1] if cached else None)
-        return peer
+        return await app.resolve_peer(chat_id)
 
     async def _get_cached_group_call(self, app: Client, chat_id: int, force_refresh: bool = False) -> object:
         """Get the active group-call object for a chat, cached & shared.
 
         Returns the raw InputGroupCall, or None when there is no active call.
-        با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
-        گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
         """
         chat_id = int(chat_id)
         if not force_refresh:
             cached = self._chat_info_get(chat_id)
             if cached and cached[1] is not None:
                 return cached[1]
-        peer = await self._resolve_cached_peer(app, chat_id)
-        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-        call = getattr(full.full_chat, "call", None)
-        self._chat_info_put(chat_id, peer, call)
-        return call
+        return await self._get_group_call_for_account(app, chat_id, force_refresh=force_refresh)
 
     def _clear_chat_cache(self, chat_id: int) -> None:
         self._chat_refresh_cache.pop(chat_id, None)
@@ -986,8 +976,19 @@ class VoiceCallManager:
                 return cached[1]
         # peer را با سشنِ همین اکانت resolve کن (نه از کش مشترک)
         peer = await app.resolve_peer(chat_id)
-        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-        call = getattr(full.full_chat, "call", None)
+        call = None
+        if isinstance(peer, (types.InputPeerChannel, types.InputChannel)):
+            full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+            call = getattr(full.full_chat, "call", None)
+        elif isinstance(peer, (types.InputPeerChat, types.InputChat)):
+            full = await app.invoke(functions.messages.GetFullChat(chat_id=peer.chat_id))
+            call = getattr(full.full_chat, "call", None)
+        else:
+            try:
+                full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+                call = getattr(full.full_chat, "call", None)
+            except Exception:
+                pass
         # فقط مرجعِ تماس (سراسری) را کش کن؛ peerِ مختصِ اکانت را کش نمی‌کنیم
         prev = self._chat_info_get(chat_id)
         self._chat_info_put(chat_id, prev[0] if prev else peer, call)
@@ -1866,7 +1867,7 @@ class VoiceCallManager:
                 # engine is reusable as long as that coroutine answers.
                 healthy = False
                 try:
-                    await pytg.group_calls
+                    await asyncio.wait_for(pytg.group_calls, timeout=5)
                     healthy = True
                 except Exception as e:
                     logger.warning(
@@ -1874,9 +1875,15 @@ class VoiceCallManager:
                         account_id, e,
                     )
                 if not healthy:
-                    # PyTgCalls 2.x has no stop(); leave each held call so the
-                    # engine (and its WebRTC connections) is truly torn down
-                    # before the fresh instance is built below.
+                    # If the engine has a stop() method (e.g. mock/subclass), invoke it;
+                    # otherwise leave each held call so the WebRTC connections are torn down.
+                    try:
+                        if hasattr(pytg, "stop") and callable(getattr(pytg, "stop")):
+                            _res = pytg.stop()
+                            if asyncio.iscoroutine(_res):
+                                await _res
+                    except Exception:
+                        pass
                     try:
                         for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
                             try:
@@ -2021,7 +2028,7 @@ class VoiceCallManager:
             if pytg is None:
                 return
             try:
-                calls = await pytg.group_calls
+                calls = await asyncio.wait_for(pytg.group_calls, timeout=5)
             except Exception:
                 calls = {}
             if int(chat_id) not in calls:
@@ -2341,7 +2348,7 @@ class VoiceCallManager:
         if pytg is None:
             return False
         try:
-            group_calls = await pytg.group_calls
+            group_calls = await asyncio.wait_for(pytg.group_calls, timeout=5)
         except Exception:
             return None
         try:
@@ -2351,12 +2358,7 @@ class VoiceCallManager:
 
     async def _protocol_mute(self, app: Client, chat_id: int) -> bool:
         try:
-            # Properly resolve the peer with correct access_hash (cached/shared)
-            peer = await self._resolve_cached_peer(app, int(chat_id))
-            full_chat = await app.invoke(
-                functions.channels.GetFullChannel(channel=peer)
-            )
-            call = getattr(full_chat.full_chat, "call", None)
+            call = await self._get_cached_group_call(app, int(chat_id))
             if not call:
                 return False
             
@@ -2412,81 +2414,236 @@ class VoiceCallManager:
 
     # ─── Chat resolution ───
 
+    @staticmethod
+    def _extract_invite_hash(link: str) -> Optional[str]:
+        """استخراج هش لینک دعوت تلگرام (t.me/+HASH یا t.me/joinchat/HASH)"""
+        if not link:
+            return None
+        s = str(link).strip()
+        if "?" in s:
+            s = s.split("?")[0]
+        if "#" in s:
+            s = s.split("#")[0]
+        s = s.rstrip("/")
+        if "+" in s:
+            h = s.split("+")[-1]
+        elif "joinchat/" in s:
+            h = s.split("joinchat/")[-1]
+        elif s.startswith("+"):
+            h = s[1:]
+        else:
+            return None
+        h = h.strip("/")
+        if re.match(r"^[A-Za-z0-9_-]{6,128}$", h):
+            return h
+        return None
+
     def _extract_join_target(self, link: str) -> str:
         link = (link or "").strip()
         if "?" in link:
             link = link.split("?")[0]
+        if "#" in link:
+            link = link.split("#")[0]
+        link = link.rstrip("/")
+        inv = self._extract_invite_hash(link)
+        if inv:
+            return f"https://t.me/+{inv}"
         clean = link
         for p in ("https://", "http://", "t.me/", "telegram.me/", "telegram.dog/"):
             clean = clean.replace(p, "")
-        if clean.startswith("+"):
-            return f"https://t.me/{clean}"
-        if "joinchat/" in clean:
-            part = clean if clean.startswith("joinchat/") else "joinchat/" + clean.split("joinchat/")[-1]
-            return f"https://t.me/{part}"
-        clean = clean.replace("@", "")
+        clean = clean.strip().rstrip("/")
+        if clean.startswith("@"):
+            clean = clean[1:]
         if "/" in clean:
             clean = clean.split("/")[0]
         return clean
 
     async def _ensure_membership(self, app: Client, chat_id: int, target: str) -> None:
+        chat_id = int(chat_id)
+        # مرحله ۱: اگر اکانت همین الان دسترسی معتبر به این چت دارد، نیاز به کار اضافه‌ای نیست
         try:
-            await app.get_chat_member(chat_id, "me")
-            return
+            peer = await app.storage.get_peer_by_id(chat_id)
+            if peer:
+                member = await app.get_chat_member(chat_id, "me")
+                if member:
+                    return
         except Exception:
             pass
-        try:
-            await app.join_chat(target)
-        except UserAlreadyParticipant:
-            pass
-        except Exception as exc:
-            # Never continue to the voice-call stage when group membership
-            # itself failed; doing so hid the real error and produced 0/N.
-            raise RuntimeError(f"Group join failed: {str(exc)[:100]}") from exc
 
-        try:
-            await app.get_chat_member(chat_id, "me")
-        except Exception as exc:
-            raise RuntimeError(f"Group membership not confirmed: {str(exc)[:100]}") from exc
+        # مرحله ۲: عضویت یا همگام‌سازی دسترسی سشن
+        invite_hash = self._extract_invite_hash(target)
+        if invite_hash:
+            join_url = f"https://t.me/+{invite_hash}"
+            try:
+                res = await app.join_chat(join_url)
+                if type(res).__name__ == "ChatJoinResultRequestSent":
+                    raise RuntimeError("Join request sent: group requires admin approval")
+                return
+            except UserAlreadyParticipant:
+                try:
+                    inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite_hash))
+                    chat = getattr(inv, "chat", None)
+                    if chat:
+                        await app.fetch_peers([chat])
+                except Exception as exc:
+                    logger.debug("CheckChatInvite peer sync: %s", exc)
+                return
+            except RPCError as e:
+                msg = str(e)
+                if "USER_ALREADY_PARTICIPANT" in msg:
+                    try:
+                        inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite_hash))
+                        chat = getattr(inv, "chat", None)
+                        if chat:
+                            await app.fetch_peers([chat])
+                    except Exception:
+                        pass
+                    return
+                if "INVITE_HASH_EXPIRED" in msg:
+                    raise RuntimeError(f"Invalid Link (INVITE_HASH_EXPIRED): {target}") from e
+                if "INVITE_HASH_INVALID" in msg:
+                    raise RuntimeError(f"Invalid Link (INVITE_HASH_INVALID): {target}") from e
+                raise RuntimeError(f"Group join failed: {str(e)[:100]}") from e
+            except Exception as exc:
+                raise RuntimeError(f"Group join failed: {str(exc)[:100]}") from exc
+        else:
+            clean_target = (
+                target.replace("https://t.me/", "")
+                .replace("http://t.me/", "")
+                .replace("t.me/", "")
+                .strip("@")
+                .strip()
+            )
+            if "/" in clean_target:
+                clean_target = clean_target.split("/")[0]
+            try:
+                res = await app.join_chat(clean_target)
+                if type(res).__name__ == "ChatJoinResultRequestSent":
+                    raise RuntimeError("Join request sent: group requires admin approval")
+                return
+            except UserAlreadyParticipant:
+                try:
+                    await app.get_chat(clean_target)
+                except Exception:
+                    pass
+                return
+            except RPCError as e:
+                msg = str(e)
+                if "USER_ALREADY_PARTICIPANT" in msg:
+                    try:
+                        await app.get_chat(clean_target)
+                    except Exception:
+                        pass
+                    return
+                if "USERNAME_INVALID" in msg:
+                    raise RuntimeError(f"Invalid Link (USERNAME_INVALID): {target}") from e
+                if "USERNAME_NOT_OCCUPIED" in msg:
+                    raise RuntimeError(f"Invalid Link (USERNAME_NOT_OCCUPIED): {target}") from e
+                raise RuntimeError(f"Group join failed: {str(e)[:100]}") from e
+            except Exception as exc:
+                raise RuntimeError(f"Group join failed: {str(exc)[:100]}") from exc
 
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
             return self.order_chat_ids[order_id]
+
+        # ═══ PRE-FLIGHT: never spend a Telegram RPC on something that cannot
+        # be a chat reference.  A copy/pasted message (e.g. the "order
+        # registered" receipt) stored as the target link used to burn the
+        # whole account pool one account at a time with "Invalid Link".
+        if getattr(Config, "LINK_VALIDATION_ENABLED", True):
+            ok, clean_target, reason = validate_target_link(target)
+            if not ok:
+                raise RuntimeError(
+                    f"Invalid Link ({reason}): {str(target)[:80]}"
+                )
+            target = clean_target
+
         chat_id = None
-        try:
-            if target.startswith("https"):
-                try:
-                    chat_id = (await app.join_chat(target)).id
-                except UserAlreadyParticipant:
-                    try:
-                        chat_id = (await app.get_chat(target)).id
-                    except Exception:
-                        try:
-                            invite = target.split("+")[-1].split("/")[-1]
-                            inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
-                            if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
-                        except Exception:
-                            pass
-            else:
-                try:
-                    chat_id = (await app.join_chat(target)).id
-                except UserAlreadyParticipant:
-                    chat_id = (await app.get_chat(target)).id
-                except Exception:
-                    chat_id = (await app.get_chat(target)).id
-        except RPCError as e:
-            msg = str(e)
-            if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
-                raise RuntimeError("Account Restricted") from e
-            if "USERNAME_INVALID" in msg:
-                raise RuntimeError(f"Invalid Link: {target}") from e
-            raise
-        except UserAlreadyParticipant:
+        invite_hash = self._extract_invite_hash(target)
+
+        if invite_hash:
+            join_url = f"https://t.me/+{invite_hash}"
             try:
-                chat_id = (await app.get_chat(target)).id
-            except Exception:
-                pass
+                res = await app.join_chat(join_url)
+                if type(res).__name__ == "ChatJoinResultRequestSent":
+                    raise RuntimeError("Join request sent: group requires admin approval")
+                chat = getattr(res, "chat", res)
+                cid = getattr(chat, "id", None)
+                if cid is not None:
+                    chat_id = int(cid)
+            except UserAlreadyParticipant:
+                try:
+                    inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite_hash))
+                    chat = getattr(inv, "chat", None)
+                    if chat:
+                        await app.fetch_peers([chat])
+                        from pyrogram import utils as pyrogram_utils
+                        if isinstance(chat, types.Channel):
+                            chat_id = pyrogram_utils.get_channel_id(chat.id)
+                        elif isinstance(chat, types.Chat):
+                            chat_id = -chat.id
+                        else:
+                            chat_id = getattr(chat, "id", None)
+                except RPCError as e:
+                    msg = str(e)
+                    if "INVITE_HASH_EXPIRED" in msg:
+                        raise RuntimeError(f"Invalid Link (INVITE_HASH_EXPIRED): {target}") from e
+                    if "INVITE_HASH_INVALID" in msg:
+                        raise RuntimeError(f"Invalid Link (INVITE_HASH_INVALID): {target}") from e
+                    logger.warning(f"CheckChatInvite failed for {invite_hash}: {e}")
+                except Exception as exc:
+                    logger.warning(f"CheckChatInvite error for {invite_hash}: {exc}")
+            except RPCError as e:
+                msg = str(e)
+                if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
+                    raise RuntimeError("Account Restricted") from e
+                if "INVITE_HASH_EXPIRED" in msg:
+                    raise RuntimeError(f"Invalid Link (INVITE_HASH_EXPIRED): {target}") from e
+                if "INVITE_HASH_INVALID" in msg:
+                    raise RuntimeError(f"Invalid Link (INVITE_HASH_INVALID): {target}") from e
+                token = permanent_link_error_token(msg)
+                if token:
+                    raise RuntimeError(f"Invalid Link ({token}): {target}") from e
+                raise
+        else:
+            clean_target = (
+                target.replace("https://t.me/", "")
+                .replace("http://t.me/", "")
+                .replace("t.me/", "")
+                .strip("@")
+                .strip()
+            )
+            if "/" in clean_target:
+                clean_target = clean_target.split("/")[0]
+            try:
+                res = await app.join_chat(clean_target)
+                if type(res).__name__ == "ChatJoinResultRequestSent":
+                    raise RuntimeError("Join request sent: group requires admin approval")
+                chat = getattr(res, "chat", res)
+                cid = getattr(chat, "id", None)
+                if cid is not None:
+                    chat_id = int(cid)
+            except UserAlreadyParticipant:
+                try:
+                    chat = await app.get_chat(clean_target)
+                    cid = getattr(chat, "id", None)
+                    if cid is not None:
+                        chat_id = int(cid)
+                except Exception:
+                    pass
+            except RPCError as e:
+                msg = str(e)
+                if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
+                    raise RuntimeError("Account Restricted") from e
+                if "USERNAME_INVALID" in msg:
+                    raise RuntimeError(f"Invalid Link (USERNAME_INVALID): {target}") from e
+                if "USERNAME_NOT_OCCUPIED" in msg:
+                    raise RuntimeError(f"Invalid Link (USERNAME_NOT_OCCUPIED): {target}") from e
+                token = permanent_link_error_token(msg)
+                if token:
+                    raise RuntimeError(f"Invalid Link ({token}): {target}") from e
+                raise
 
         if chat_id:
             self.order_chat_ids[order_id] = int(chat_id)
@@ -2747,7 +2904,7 @@ class VoiceCallManager:
                         # is rate-limited and non-stacking, so this can never
                         # create a JoinGroupCall burst.
                         try:
-                            group_calls = await pytg.group_calls
+                            group_calls = await asyncio.wait_for(pytg.group_calls, timeout=5)
                             if int(chat_id) not in group_calls:
                                 asyncio.create_task(
                                     self._schedule_media_restore(order_id, account_id, int(chat_id))

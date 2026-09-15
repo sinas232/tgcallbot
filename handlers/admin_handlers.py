@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 from database import DatabaseManager
 from helpers.message_utils import send_safe
 from constants import *
-from utils.helpers import clean_number, format_jalali_datetime, format_price
+from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time
 from config import Config
 from services.order_executor import order_executor
 from services.bot_manager import bot_manager
@@ -1066,6 +1066,31 @@ async def set_user_credit(update, context):
                 user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
                 await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
             except: pass
+
+            # ارسال گزارش به کانال لاگ پرداختی‌ها
+            try:
+                bot_id = context.bot_data.get('bot_id') or user.get('bot_id', 1)
+                log_channel = await DatabaseManager.get_setting("log_channel_payments", bot_id=bot_id)
+                if log_channel and str(log_channel).strip() not in ["off", "0", ""]:
+                    admin_user = update.effective_user
+                    admin_name = admin_user.first_name if admin_user else "مدیریت"
+                    admin_id_str = f"`{admin_user.id}`" if admin_user else "---"
+                    user_tg_id = user.get('telegram_id', user.get('id', '---'))
+                    user_name = user.get('first_name', 'Unknown')
+                    pay_time = format_jalali_datetime(get_tehran_time())
+                    icon = "➕" if sign > 0 else "➖"
+                    title = "افزایش موجودی دستی (توسط مدیریت)" if sign > 0 else "کاهش موجودی دستی (توسط مدیریت)"
+                    channel_msg = (
+                        f"{icon} **گزارش {title}**\n\n"
+                        f"👤 کاربر: {user_name} (ID: `{user_tg_id}`)\n"
+                        f"💵 مبلغ: `{int(amt):,}` تومان\n"
+                        f"💎 موجودی جدید: `{int(new_balance):,}` تومان\n"
+                        f"👮‍♂️ توسط ادمین: {admin_name} (ID: {admin_id_str})\n"
+                        f"📅 زمان: {pay_time}"
+                    )
+                    await context.bot.send_message(chat_id=log_channel, text=channel_msg)
+            except Exception as log_err:
+                logger.error(f"Failed to send manual credit log to channel: {log_err}")
         else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
     except Exception as e:
         logger.error(f"Set credit error: {e}")

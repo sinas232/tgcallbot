@@ -360,11 +360,72 @@ def health():
         return "self_healing=report_error"
 
 
+def heal_pytgcalls(verbose=True):
+    """Heal pytgcalls RawUpdateHandler compatibility with Kurigram / Telegram Layer >= 198.
+
+    Telegram changed UpdateGroupCall in newer layers:
+      - Old layer: UpdateGroupCall(chat_id=..., call=...)
+      - New layer: UpdateGroupCall(peer=..., call=...)
+    pytgcalls 2.2.5 accesses update.chat_id and chats[update.chat_id].
+    This patch:
+      1) Adds property UpdateGroupCall.chat_id returning peer.channel_id / peer.chat_id.
+      2) Wraps Client.on_raw_update so group=-9999 (pytgcalls update handler) injects
+         chats[cid] = peer if missing, and catches any lingering AttributeError on chat_id.
+    """
+    try:
+        from pyrogram.raw.types import UpdateGroupCall
+        if not hasattr(UpdateGroupCall, "_tgcallbot_chat_id_healed"):
+            UpdateGroupCall.chat_id = property(
+                lambda self: (
+                    getattr(getattr(self, "peer", None), "channel_id", None)
+                    or getattr(getattr(self, "peer", None), "chat_id", None)
+                    or getattr(getattr(self, "peer", None), "user_id", None)
+                )
+            )
+            UpdateGroupCall._tgcallbot_chat_id_healed = True
+            if verbose:
+                log.info("[SelfHeal] UpdateGroupCall.chat_id property installed")
+    except Exception as e:
+        log.warning("[SelfHeal] Could not patch UpdateGroupCall: %s", e)
+
+    try:
+        from pyrogram import Client
+        if not getattr(Client, "_tgcallbot_raw_update_healed", False):
+            orig_on_raw_update = Client.on_raw_update
+
+            def safe_on_raw_update(self, filters=None, group=0):
+                decorator = orig_on_raw_update(self, filters=filters, group=group)
+                def wrapper(func):
+                    async def safe_func(client, update, users, chats):
+                        if type(update).__name__ == "UpdateGroupCall":
+                            cid = getattr(update, "chat_id", None)
+                            if cid is not None and chats is not None and cid not in chats:
+                                peer = getattr(update, "peer", None)
+                                if peer is not None:
+                                    chats[cid] = peer
+                        try:
+                            return await func(client, update, users, chats)
+                        except AttributeError as err:
+                            if "chat_id" in str(err):
+                                return None
+                            raise
+                    return decorator(safe_func)
+                return wrapper
+
+            Client.on_raw_update = safe_on_raw_update
+            Client._tgcallbot_raw_update_healed = True
+            if verbose:
+                log.info("[SelfHeal] Client.on_raw_update wrapped for pytgcalls compatibility")
+    except Exception as e:
+        log.warning("[SelfHeal] Could not patch Client.on_raw_update: %s", e)
+
+
 def install():
     """Full install - call as the FIRST statement of main.py."""
     try:
         load()
         heal()
+        heal_pytgcalls()
         for _m in ("pyrogram.raw", "pyrogram.raw.types", "pyrogram.raw.base",
                    "pyrogram.raw.functions", "pyrogram.raw.core"):
             try:
