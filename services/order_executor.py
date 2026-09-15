@@ -16,6 +16,7 @@ from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
 from services.session_ownership import SessionInUseError
 from services import self_healing
+from utils.telegram_links import normalize_telegram_target
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +130,41 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+		"""Accept a persisted order for execution only when its target is valid.
+
+		Returning ``False`` tells scheduled-order callers not to announce a
+		start.  Invalid legacy rows are failed/refunded synchronously, before a
+		background task can open an account session or retry against every
+		available account.
+		"""
 		if order_id in self.active_orders:
-			return
+			return True
+
+		valid_target, canonical_target, target_error = normalize_telegram_target(
+			(order_data or {}).get("target_link")
+		)
+		if not valid_target or not canonical_target:
+			logger.error("Order %s rejected before scheduling: %s", order_id, target_error)
+			self.active_orders[order_id] = {
+				"status": "failed",
+				"data": dict(order_data or {}),
+				"joined_accounts": [],
+				"task": None,
+				"dead_accounts_count": 0,
+				"cancel_requested": False,
+				"target_count": 0,
+				"live_count": 0,
+				"pool_ids": set(),
+				"swapped_accounts": 0,
+			}
+			await self._fail_order(order_id, f"Invalid destination link: {target_error}")
+			return False
+
+		# Do not retain a caller-owned dict: the order can be reused by a job
+		# queue, while all execution paths must see the same canonical target.
+		order_data = dict(order_data)
+		order_data["target_link"] = canonical_target
 		self.active_orders[order_id] = {
 			"status": "running",
 			"data": order_data,
@@ -151,6 +184,7 @@ class OrderExecutor:
 			raise
 		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
 		self.active_orders[order_id]["task"] = task
+		return True
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
 	    joined_list: List[Dict[str, Any]] = []
@@ -159,7 +193,21 @@ class OrderExecutor:
 	    try:
 	        requested = int(data["accounts_count"])
 	        bot_id = data.get("bot_id", 1)
-	        target = data["target_link"]
+	        valid_target, target, target_error = normalize_telegram_target(data.get("target_link"))
+	        if not valid_target or not target:
+	            # A legacy/manual database row must never trigger one failed join
+	            # attempt per account. Stop before touching Telegram and invoke
+	            # the no-service refund path below.
+	            logger.error("Order %s rejected before execution: %s", order_id, target_error)
+	            await self._fail_order(order_id, f"Invalid destination link: {target_error}")
+	            return
+	        # Keep the in-memory record canonical for logs, retries and duration
+	        # maintenance even if the row predates input canonicalization.
+	        data = dict(data)
+	        data["target_link"] = target
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["data"] = data
+
 	        duration = int(data.get("duration_minutes") or 0)
 	        order_type = data["order_type"]
 
@@ -1319,7 +1367,51 @@ class OrderExecutor:
 			except Exception as exc:
 				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
 		self._voice_forget_order(order_id)
-		await DatabaseManager.update_order_status(order_id, "failed")
+
+		# A failed build has delivered no billable service (started_at is still
+		# NULL).  Claim status + refund + transaction atomically so a concurrent
+		# cancel/retry cannot credit the wallet twice.  This also remediates any
+		# old order that predates target-link validation.
+		refund = {}
+		settlement_available = True
+		try:
+			refund = await DatabaseManager.fail_order_and_refund_if_unstarted(order_id, reason)
+		except AttributeError:
+			# Compatibility only for an old/stub DatabaseManager. Do not run the
+			# unconditional fallback merely because another path already claimed
+			# this order (for example, the customer's cancel callback).
+			settlement_available = False
+		except Exception as exc:
+			logger.error("Order %s: atomic failure settlement failed: %s", order_id, exc, exc_info=True)
+
+		if not settlement_available:
+			try:
+				await DatabaseManager.update_order_status(order_id, "failed")
+			except Exception as exc:
+				logger.error("Order %s: could not mark failed: %s", order_id, exc)
+
+		if refund.get("refunded"):
+			amount = float(refund.get("refund_amount") or 0)
+			logger.warning(
+				"Order %s failed before service; refunded %.0f to user %s",
+				order_id, amount, refund.get("user_id"),
+			)
+			telegram_id = refund.get("telegram_id")
+			if telegram_id:
+				try:
+					from services.bot_manager import bot_manager
+					app = bot_manager.active_bots.get(int(refund.get("bot_id") or data.get("bot_id") or 1))
+					if app:
+						await app.bot.send_message(
+							telegram_id,
+							f"⚠️ سفارش `{order_id}` پیش از شروع سرویس ناموفق بود.\n"
+							f"💵 کل مبلغ `{int(round(amount)):,}` تومان به کیف‌پول شما بازگردانده شد.\n"
+							"لطفاً با یک لینک معتبر دوباره سفارش ثبت کنید.",
+							parse_mode="Markdown",
+						)
+				except Exception as exc:
+					logger.warning("Order %s: failure-refund notification failed: %s", order_id, exc)
+
 		self.active_orders.pop(order_id, None)
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):

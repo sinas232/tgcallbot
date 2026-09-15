@@ -511,8 +511,11 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
         if not due_orders: return
         for order in due_orders:
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            # submit_order validates legacy/persisted targets before it marks
+            # them running. Do not tell the customer an invalid order started.
+            started = await order_executor.submit_order(order['id'], order)
+            if not started:
+                continue
             try:
                 app = bot_manager.active_bots.get(bot_id)
                 if app:
@@ -983,11 +986,21 @@ def register_handlers(application: Application) -> None:
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
     await DatabaseManager.init_db()
+    startup_failure_refunds = []
     try:
+        # Must precede reset_stuck_orders: invalid rows from older versions
+        # have no service start time and are entitled to their full refund.
+        startup_failure_refunds = await DatabaseManager.fail_invalid_unstarted_orders()
+        if startup_failure_refunds:
+            logger.warning(
+                "Startup settlement: refunded/failed %s invalid unstarted order(s)",
+                len(startup_failure_refunds),
+            )
         await DatabaseManager.reset_stuck_orders()
         from telegram_client import TelegramAccountClient
         await TelegramAccountClient.preload_all_clients()
-    except: pass
+    except Exception as exc:
+        logger.error("Startup order recovery failed: %s", exc, exc_info=True)
     
     # راه‌اندازی وب‌سرور پرداخت
     await start_web_server()
@@ -1057,6 +1070,26 @@ async def main_loop():
     
     # راه‌اندازی ربات‌های نمایندگی
     await bot_manager.start_all_active_bots()
+
+    # Inform owners of legacy invalid orders after the corresponding bot is
+    # live. The atomic database settlement above is already complete, so a
+    # notification failure can never affect the returned balance.
+    for settlement in startup_failure_refunds:
+        if not settlement.get('refunded') or not settlement.get('telegram_id'):
+            continue
+        try:
+            app = bot_manager.active_bots.get(int(settlement.get('bot_id') or 1))
+            if app:
+                amount = int(round(float(settlement.get('refund_amount') or 0)))
+                await app.bot.send_message(
+                    settlement['telegram_id'],
+                    f"⚠️ سفارش `{settlement.get('order_id')}` پیش از شروع سرویس ناموفق بود.\n"
+                    f"💵 کل مبلغ `{amount:,}` تومان به کیف‌پول شما بازگردانده شد.\n"
+                    "لطفاً با یک لینک معتبر دوباره سفارش ثبت کنید.",
+                    parse_mode="Markdown",
+                )
+        except Exception as exc:
+            logger.warning("Startup failure-refund notification failed: %s", exc)
     
     # زمان‌بندی جاب‌ها
     if main_app.job_queue:

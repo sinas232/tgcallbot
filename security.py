@@ -128,19 +128,17 @@ class SecurityManager:
 
     @staticmethod
     def validate_telegram_link(link: str) -> Tuple[bool, Optional[str]]:
-        if not link:
-            return False, "لینک الزامی است"
-        link = link.strip()
-        full_link_pattern = r'^(https?://)?t\.me/([a-zA-Z0-9_]{5,32})$'
-        username_pattern = r'^@[a-zA-Z0-9_]{5,32}$'
-        simple_username_pattern = r'^[a-zA-Z0-9_]{5,32}$'
-        private_link_pattern = r'^(https?://)?t\.me/(\+|joinchat/)([a-zA-Z0-9_\-]{10,})$'
-        if (re.match(full_link_pattern, link) or
-            re.match(username_pattern, link) or
-            re.match(simple_username_pattern, link) or
-            re.match(private_link_pattern, link)):
-            return True, None
-        return False, "فرمت لینک نادرست است. لینک‌های عمومی (@user) یا خصوصی (t.me/+) پشتیبانی می‌شوند."
+        """Validate exactly the same target syntax used by order execution.
+
+        The old regular expressions were only used by a few callers and had
+        drifted from the voice resolver.  A shared normalizer means a string
+        accepted before payment cannot later become ``USERNAME_INVALID`` in
+        Pyrogram.
+        """
+        from utils.telegram_links import normalize_telegram_target
+
+        valid, _canonical, error = normalize_telegram_target(link)
+        return valid, error
 
     @staticmethod
     def sanitize_input(user_input: str, max_length: int = 1000) -> Optional[str]:
