@@ -437,6 +437,10 @@ async def health_handler(request):
 
 async def start_web_server():
     """راه‌اندازی وب‌سرور aiohttp"""
+    # بی‌صدا کردن لاگ‌های مکرر دسترسی aiohttp برای جلوگیری از اسپم لاگ‌ها
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp.server").setLevel(logging.WARNING)
+
     app = web.Application()
     app.router.add_get('/', health_handler)
     app.router.add_get('/health', health_handler)
@@ -445,7 +449,7 @@ async def start_web_server():
     app.router.add_get('/payment/callback/aqayepardakht', ap_callback_handler)
     app.router.add_get('/payment/callback/zarinpal', zp_callback_handler)
     
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     
     # گوش دادن روی تمام اینترفیس‌ها برای دسترسی از بیرون کانتینر
