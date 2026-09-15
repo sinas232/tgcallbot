@@ -162,10 +162,10 @@ class SilenceStreamCommandTests(unittest.TestCase):
         vcm_mod.SILENT_AUDIO_PATH = path
         vcm_mod._ensure_silence_file()
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), vcm_mod._SILENCE_RATE)
+            self.assertEqual(r.getnchannels(), vcm_mod._SILENCE_CHANNELS)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(r.getnframes(), vcm_mod._SILENCE_RATE * 30)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).

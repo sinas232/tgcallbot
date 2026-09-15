@@ -6,6 +6,7 @@ telegram_client.py
 import logging
 import asyncio
 import os
+import re
 from pyrogram import Client, errors
 from pyrogram.errors import (
     UserAlreadyParticipant,
@@ -122,17 +123,22 @@ class TelegramAccountClient:
                 raw = (link or "").strip()
                 if "?" in raw:
                     raw = raw.split("?")[0]
+                if "#" in raw:
+                    raw = raw.split("#")[0]
+                raw = raw.rstrip("/")
 
-                # لینک کامل خصوصی
-                if "t.me/+" in raw or "joinchat/" in raw or raw.startswith("+"):
-                    target = raw
-                    if not target.startswith("http"):
-                        if target.startswith("+"):
-                            target = f"https://t.me/{target}"
-                        elif "joinchat/" in target:
-                            part = target.split("t.me/")[-1] if "t.me/" in target else target
-                            target = f"https://t.me/{part}"
-                    await app.join_chat(target)
+                # استخراج هش لینک دعوت خصوصی
+                invite_hash = None
+                if "+" in raw:
+                    invite_hash = raw.split("+")[-1].strip("/")
+                elif "joinchat/" in raw:
+                    invite_hash = raw.split("joinchat/")[-1].strip("/")
+                elif raw.startswith("+"):
+                    invite_hash = raw[1:].strip("/")
+
+                if invite_hash and re.match(r"^[A-Za-z0-9_-]{6,128}$", invite_hash):
+                    target = f"https://t.me/+{invite_hash}"
+                    res = await app.join_chat(target)
                 else:
                     clean_link = (
                         raw.replace("https://t.me/", "")
@@ -143,7 +149,10 @@ class TelegramAccountClient:
                     )
                     if "/" in clean_link:
                         clean_link = clean_link.split("/")[0]
-                    await app.join_chat(clean_link)
+                    res = await app.join_chat(clean_link)
+
+                if str(type(res).__name__) == "ChatJoinResultRequestSent":
+                    return False, "Request Sent (Admin Approval Required)"
 
                 return True, "Joined"
         except UserAlreadyParticipant:
@@ -153,7 +162,9 @@ class TelegramAccountClient:
             try:
                 await asyncio.sleep(wait_s)
                 async with await self.get_client() as app:
-                    await app.join_chat(link)
+                    res = await app.join_chat(link)
+                    if str(type(res).__name__) == "ChatJoinResultRequestSent":
+                        return False, "Request Sent (Admin Approval Required)"
                 return True, "Joined after FloodWait"
             except UserAlreadyParticipant:
                 return True, "Already Joined"
