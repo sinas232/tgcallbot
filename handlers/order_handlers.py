@@ -20,6 +20,7 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
+from utils.telegram_links import normalize_telegram_target
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +121,29 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return AWAITING_ORDER_LINK
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = update.message.text
-    if BTN_CANCEL in link:
+    raw_link = (update.message.text or "").strip()
+    if BTN_CANCEL in raw_link:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
-        
+
+    # Do not let arbitrary chat text reach a paid order.  In particular, this
+    # blocks an accidentally pasted bot confirmation (the exact failure that
+    # otherwise reaches Pyrogram as ``Invalid Link`` after charging the user).
+    valid, link, error = normalize_telegram_target(raw_link)
+    if not valid or not link:
+        context.user_data.pop('target_link', None)
+        await update.message.reply_text(
+            f"⛔️ {error}\n\n"
+            "نمونهٔ لینک عمومی: `https://t.me/channelname`\n"
+            "نمونهٔ لینک خصوصی: `https://t.me/+AbCdEf...`",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ORDER_LINK
+
+    # Store only the canonical target.  The same value is displayed, used for
+    # overlap detection, persisted in the order, and sent to the voice engine.
     context.user_data['target_link'] = link
-    
+
     # انتخاب نوع زمان اجرا
     kb = ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True)
     await update.message.reply_text("⏰ **زمان شروع سفارش را انتخاب کنید:**", reply_markup=kb)
@@ -305,8 +322,24 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         user_id = update.effective_user.id
         bot_id = context.bot_data.get('bot_id', 1)
         plan = context.user_data['selected_plan']
-        link = context.user_data['target_link']
-        
+        # Context is persisted by PTB and can survive an interrupted/replayed
+        # conversation, so validate again immediately before any wallet debit.
+        valid, link, error = normalize_telegram_target(context.user_data.get('target_link'))
+        if not valid or not link:
+            context.user_data.pop('target_link', None)
+            await query.edit_message_text(
+                f"⛔️ {error}\n\n"
+                "هیچ مبلغی از کیف‌پول کسر نشد. لطفاً لینک مقصد را دوباره ارسال کنید."
+            )
+            await send_safe(
+                context.bot,
+                update.effective_chat.id,
+                "🔗 لینک معتبر گروه/کانال/ویس مقصد را ارسال کنید:",
+                reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+            )
+            return AWAITING_ORDER_LINK
+        context.user_data['target_link'] = link
+
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
@@ -340,7 +373,15 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         )
         
         if not schedule_time:
-            await order_executor.submit_order(order['id'], order)
+            accepted = await order_executor.submit_order(order['id'], order)
+            if not accepted:
+                # Defensive fallback: submit_order has already failed/refunded
+                # the row atomically. Never show a false "started" message.
+                await query.edit_message_text(
+                    "⚠️ سفارش پیش از شروع متوقف شد و مبلغ آن به کیف‌پول شما بازگردانده شد. "
+                    "لطفاً لینک مقصد را بررسی کرده و دوباره تلاش کنید."
+                )
+                return ConversationHandler.END
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]

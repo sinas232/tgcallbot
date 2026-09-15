@@ -695,6 +695,106 @@ class DatabaseManager:
             return False
 
     @staticmethod
+    async def fail_order_and_refund_if_unstarted(order_id: int, failure_reason: str = "") -> Dict[str, Any]:
+        """Atomically fail an unserved order and return its full payment.
+
+        The order row is locked before checking ``started_at`` and before the
+        wallet/transaction mutation.  Therefore a concurrent cancel, retry,
+        or second executor can never refund the same order twice.  Once a
+        billable window has started, this method only marks the order failed
+        and leaves settlement to the normal cancellation/support flow.
+        """
+        async with AsyncSessionLocal() as db_session:
+            order = await db_session.get(Order, order_id, with_for_update=True)
+            if not order or order.status not in ('pending', 'running', 'scheduled'):
+                return {'claimed': False, 'refunded': False, 'refund_amount': 0.0, 'order_id': order_id}
+
+            now = datetime.utcnow()
+            order.status = 'failed'
+            order.completed_at = now
+
+            # Build/join time is deliberately not billable.  If no service
+            # window ever started, refund the entire paid amount automatically.
+            refund_amount = max(0.0, float(order.price_paid or 0.0))
+            if order.started_at is not None or refund_amount <= 0:
+                await db_session.commit()
+                return {
+                    'claimed': True,
+                    'order_id': order_id,
+                    'refunded': False,
+                    'refund_amount': 0.0,
+                    'user_id': order.user_id,
+                }
+
+            user = await db_session.get(User, order.user_id, with_for_update=True)
+            if not user:
+                await db_session.commit()
+                logger.error("Order %s failed before service, but user %s is missing", order_id, order.user_id)
+                return {
+                    'claimed': True,
+                    'order_id': order_id,
+                    'refunded': False,
+                    'refund_amount': 0.0,
+                    'user_id': order.user_id,
+                }
+
+            user.credit += refund_amount
+            reason = (failure_reason or 'عدم امکان شروع سرویس')[:160]
+            db_session.add(Transaction(
+                bot_id=order.bot_id,
+                user_id=user.id,
+                amount=refund_amount,
+                type='order_failure_refund',
+                description=f'عودت خودکار سفارش ناموفق {order_id}: {reason}',
+            ))
+            await db_session.commit()
+            return {
+                'claimed': True,
+                'order_id': order_id,
+                'refunded': True,
+                'refund_amount': refund_amount,
+                'user_id': user.id,
+                'telegram_id': user.telegram_id,
+                'bot_id': order.bot_id,
+                'new_balance': user.credit,
+            }
+
+    @staticmethod
+    async def fail_invalid_unstarted_orders() -> List[Dict[str, Any]]:
+        """Refund old active rows whose target is no longer a Telegram target.
+
+        This is a startup safety net for records created before order-target
+        validation existed.  It must run before ``reset_stuck_orders`` turns
+        running rows into ``stopped``; otherwise an unserved invalid order can
+        no longer be claimed by the atomic no-service refund path.
+        """
+        from utils.telegram_links import normalize_telegram_target
+
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                select(Order.id, Order.target_link).where(
+                    Order.status.in_(('pending', 'running', 'scheduled')),
+                    Order.started_at.is_(None),
+                )
+            )
+            candidates = result.all()
+
+        refunds: List[Dict[str, Any]] = []
+        for order_id, target_link in candidates:
+            valid, _canonical, error = normalize_telegram_target(target_link)
+            if valid:
+                continue
+            try:
+                settlement = await DatabaseManager.fail_order_and_refund_if_unstarted(
+                    int(order_id), f'Invalid destination link on startup: {error}',
+                )
+                if settlement.get('claimed'):
+                    refunds.append(settlement)
+            except Exception as exc:
+                logger.error("Could not settle invalid unstarted order %s: %s", order_id, exc)
+        return refunds
+
+    @staticmethod
     async def create_order(user_id, order_type, target_link, accounts_count, duration_minutes, price_paid=0, plan_id=None, scheduled_for=None, bot_id=1):
         async with AsyncSessionLocal() as db_session:
             status = "scheduled" if scheduled_for else "pending"

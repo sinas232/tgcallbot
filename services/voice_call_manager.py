@@ -67,6 +67,7 @@ from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
 from services.session_ownership import session_ownership
+from utils.telegram_links import normalize_telegram_target
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -3557,6 +3558,15 @@ class VoiceCallManager:
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
         """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
         key = (order_id, account_id)
+
+        # Last-line invariant: even callers outside the purchase handler must
+        # never send arbitrary bot/user text to Pyrogram's username resolver.
+        valid_target, canonical_target, target_error = normalize_telegram_target(chat_link)
+        if not valid_target or not canonical_target:
+            self._set_state(order_id, account_id, FAILED, "invalid order target")
+            self._vc_event_log(order_id, account_id, "invalid_target_rejected", {})
+            return False, f"Invalid Link: {target_error}", 0
+        chat_link = canonical_target
 
         # If already durably joined & counted for this order, return success
         # (idempotent — no duplicate counting, no duplicate join).
