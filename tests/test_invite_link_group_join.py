@@ -28,10 +28,14 @@ Scenarios covered:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
+os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef")
 
 from pyrogram import Client, errors, utils
 from pyrogram.raw import functions, types
