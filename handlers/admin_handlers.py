@@ -1077,10 +1077,10 @@ async def set_user_credit(update, context):
 
                 if log_channel and str(log_channel).strip() not in ["off", "0", "", "تعیین نشده", "none", "None"]:
                     admin_user = update.effective_user
-                    admin_name = admin_user.first_name if admin_user else "مدیریت"
+                    admin_name = (admin_user.first_name if admin_user else None) or "مدیریت"
                     admin_id_str = f"`{admin_user.id}`" if admin_user else "---"
-                    user_tg_id = user.get('telegram_id', user.get('id', '---'))
-                    user_name = user.get('first_name', 'Unknown')
+                    user_tg_id = user.get('telegram_id') or user.get('id') or '---'
+                    user_name = user.get('first_name') or user.get('username') or 'Unknown'
                     pay_time = format_jalali_datetime(get_tehran_time())
                     icon = "➕" if sign > 0 else "➖"
                     title = "افزایش موجودی دستی (توسط مدیریت)" if sign > 0 else "کاهش موجودی دستی (توسط مدیریت)"
