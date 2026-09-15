@@ -185,11 +185,17 @@ class Config:
     VOICE_RECOVERY_MAX_ATTEMPTS = int(os.getenv('VOICE_RECOVERY_MAX_ATTEMPTS', '3'))
     # Replace unrecoverable slots during the paid duration phase?
     VOICE_DURATION_REPLACEMENT = os.getenv('VOICE_DURATION_REPLACEMENT', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
     # Keep at least this many seconds of paid time left before bothering to
     # replace a lost slot (avoids pointless joins at the very end).
     VOICE_REPLACEMENT_GRACE_SECONDS = int(os.getenv('VOICE_REPLACEMENT_GRACE_SECONDS', '60'))
     # Live-count maintenance sweep inside the duration loop.
     VOICE_DURATION_CHECK_INTERVAL = int(os.getenv('VOICE_DURATION_CHECK_INTERVAL', '20'))
+
+    # اعتبارسنجی لینک مقصد سفارش: جلوگیری از ثبت متن‌های غیرلینک
+    # (مثلاً پیامِ «سفارش ثبت شد» که کاربر کپی می‌کند) به‌جای لینک.
+    # false = فقط trim (رفتار قدیمی) — فقط برای مواقع اضطراری.
+    LINK_VALIDATION_ENABLED = os.getenv('LINK_VALIDATION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # ─── Voice-call STAY-ALIVE & anti-detection tuning ─────────────────
     # Silence stream: raw s16le @ 48 kHz STEREO — the exact wire format a real
