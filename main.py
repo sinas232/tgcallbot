@@ -1072,16 +1072,17 @@ async def main_loop():
             except Exception as e:
                 logger.debug(f"Memory cleanup error: {e}")
 
-        main_app.job_queue.run_repeating(memory_cleanup_job, interval=300, first=60)
-        main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
-        main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
-        main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
-        main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
-        main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
+        _job_kw = {"misfire_grace_time": 120}
+        main_app.job_queue.run_repeating(memory_cleanup_job, interval=300, first=60, job_kwargs=_job_kw)
+        main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60, job_kwargs=_job_kw)
+        main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10, job_kwargs=_job_kw)
+        main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30, job_kwargs=_job_kw)
+        main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60, job_kwargs=_job_kw)
+        main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120, job_kwargs=_job_kw)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
         main_app.job_queue.run_repeating(
             lambda ctx: auto_close_idle_tickets(ctx, bot_manager=bot_manager),
-            interval=3600, first=180,
+            interval=3600, first=180, job_kwargs=_job_kw,
         )
 
     # زنده نگه داشتن برنامه

@@ -13,10 +13,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef")
 
-from handlers.admin_handlers import set_user_credit
-from constants import AWAITING_SETTINGS_ACTION
+import importlib.util
+
+HAS_TELEGRAM = importlib.util.find_spec("telegram") is not None
+
+if HAS_TELEGRAM:
+    from handlers.admin_handlers import set_user_credit
+    from constants import AWAITING_SETTINGS_ACTION
 
 
+@unittest.skipUnless(HAS_TELEGRAM, "telegram (python-telegram-bot) not installed")
 class AdminCreditLogTests(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()

@@ -31,19 +31,26 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# این ماژول‌ها هیچ وابستگی به دیتابیس/شبکه ندارند.
-from telegram import (  # noqa: E402
-    Chat,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    MessageEntity,
-    ReplyKeyboardMarkup,
-)
-from telegram.error import BadRequest  # noqa: E402
+import importlib.util
 
-from utils.premium_bot import PremiumEmojiBot  # noqa: E402
+HAS_TELEGRAM = importlib.util.find_spec("telegram") is not None
+
+if HAS_TELEGRAM:
+    # این ماژول‌ها هیچ وابستگی به دیتابیس/شبکه ندارند.
+    from telegram import (  # noqa: E402
+        Chat,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        KeyboardButton,
+        Message,
+        MessageEntity,
+        ReplyKeyboardMarkup,
+    )
+    from telegram.error import BadRequest  # noqa: E402
+    from utils.premium_bot import PremiumEmojiBot  # noqa: E402
+else:
+    PremiumEmojiBot = object
+
 from utils.premium_emoji import (  # noqa: E402
     EMOJI_ID_BY_UNICODE,
     KEY_TO_ID,
@@ -67,6 +74,7 @@ def _run(coro):
         loop.close()
 
 
+@unittest.skipUnless(HAS_TELEGRAM, "telegram not installed")
 class _StateGuard(unittest.TestCase):
     """پایهٔ مشترک: وضعیت سراسری را پیش/پس از هر تست snapshot می‌کند."""
 

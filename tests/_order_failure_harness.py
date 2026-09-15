@@ -298,12 +298,45 @@ async def scenario_e_failure_after_timer_started():
     return "no auto-refund after the billable timer started"
 
 
+async def scenario_f_link_error_after_partial_joins():
+    """Permanent link error on subsequent accounts must NOT abort order if accounts joined."""
+    def outcome(order_id, acc_id):
+        if acc_id in (4, 5):
+            return False, "Invalid Link (INVITE_HASH_EXPIRED): https://t.me/+fakeinvite", -1001234567890
+        return True, "ok", -1001234567890
+
+    ex, vcm = await run(
+        make_order("https://t.me/+fakeinvite", order_id=704, accounts=5),
+        outcome,
+    )
+    joined = vcm.joined.get(704, set())
+    assert len(joined) >= 3, f"at least 3 accounts must have joined, got {joined}"
+    assert refunds() == [], f"an order with live accounts must NEVER be refunded/aborted: {refunds()}"
+    assert statuses() != [("status", 704, "failed")], "order with live accounts must not fail"
+    return f"filled {len(joined)} accounts despite invite expired on 2 accounts · refunds={refunds()}"
+
+
+async def scenario_g_invite_link_dead_from_start():
+    """An invite link expired from the start (0 joins) must abort early and refund."""
+    ex, vcm = await run(
+        make_order("https://t.me/+deadinvite", order_id=705, accounts=5),
+        lambda o, a: (False, "Invalid Link (INVITE_HASH_EXPIRED): https://t.me/+deadinvite", 0),
+    )
+    assert len(set(vcm.attempts)) <= 5, f"must abort after bounded attempts, got {vcm.attempts}"
+    assert len(vcm.attempts) < FakeDB.pool_size or len(vcm.attempts) <= 5
+    assert [(r[1], r[2]) for r in refunds()] == [(7, float(FakeDB.price))], refunds()
+    assert statuses() == [("status", 705, "failed")], statuses()
+    return f"aborted after {len(set(vcm.attempts))}/{FakeDB.pool_size} accounts · refund {FakeDB.price:,}"
+
+
 SCENARIOS = (
     ("A receipt-as-link", scenario_a_receipt_stored_as_link),
     ("B link rejected by Telegram", scenario_b_link_rejected_by_telegram),
     ("C all accounts fail (non-link)", scenario_c_all_accounts_fail_generic),
     ("D healthy order", scenario_d_healthy_order_no_refund),
     ("E failure after timer start", scenario_e_failure_after_timer_started),
+    ("F link error after partial joins", scenario_f_link_error_after_partial_joins),
+    ("G invite link dead from start", scenario_g_invite_link_dead_from_start),
 )
 
 

@@ -37,14 +37,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef")
 
-from pyrogram import Client, errors, utils
-from pyrogram.raw import functions, types
-from pyrogram.types import ChatJoinResultSuccess
+import importlib.util
 
-from services.voice_call_manager import VoiceCallManager
+HAS_PYROGRAM = importlib.util.find_spec("pyrogram") is not None
+
+if HAS_PYROGRAM:
+    from pyrogram import Client, errors, utils
+    from pyrogram.raw import functions, types
+    from pyrogram.types import ChatJoinResultSuccess
+    from services.voice_call_manager import VoiceCallManager
+
 from utils.link_utils import is_permanent_link_error, validate_target_link
 
 
+@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
 class InviteLinkNormalizationTests(unittest.TestCase):
     def setUp(self):
         self.mgr = VoiceCallManager()
@@ -96,6 +102,7 @@ class InviteLinkNormalizationTests(unittest.TestCase):
                 self.assertEqual(self.mgr._extract_join_target(raw), expected)
 
 
+@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
 class InviteLinkResolutionTests(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()
@@ -259,6 +266,7 @@ class LinkErrorClassificationTests(unittest.TestCase):
                 )
 
 
+@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
 class TelegramClientJoinChatTests(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()

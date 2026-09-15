@@ -244,15 +244,6 @@ class OrderExecutor:
 	            self.active_orders.pop(order_id, None)
 	            return
 
-	        # لینک مقصد در سطح تلگرام نامعتبر/منقضی است → بستن سریع سفارش
-	        fatal = self._voice_fatal.get(order_id) or {}
-	        if len(fatal.get("accounts") or ()) >= self.FATAL_LINK_ERROR_ACCOUNTS:
-	            await self._abort_order_bad_link(
-	                order_id, data, target,
-	                f"لینک مقصد در تلگرام یافت نشد/منقضی شده ({fatal.get('msg') or 'Invalid Link'})",
-	            )
-	            return
-
 	        joined_list = self._prune_joined(order_id, order_type, joined_list)
 	        live = self._live_count(order_id, order_type, joined_list)
 
@@ -260,6 +251,17 @@ class OrderExecutor:
 	            self.active_orders[order_id]["joined_accounts"] = joined_list
 	            self.active_orders[order_id]["dead_accounts_count"] = dead_count
 	            self.active_orders[order_id]["live_count"] = live
+
+	        # لینک مقصد در سطح تلگرام نامعتبر/منقضی است:
+	        # فقط در صورتی کل سفارش باطل می‌شود که هیچ اکانتی نتوانسته باشد وصل شود (live == 0).
+	        # اگر حتی یک اکانت وصل شده باشد، لینک در تلگرام کار کرده و نباید سفارش باطل یا اکانت‌های فعال اخراج شوند.
+	        fatal = self._voice_fatal.get(order_id) or {}
+	        if live == 0 and len(fatal.get("accounts") or ()) >= self.FATAL_LINK_ERROR_ACCOUNTS:
+	            await self._abort_order_bad_link(
+	                order_id, data, target,
+	                f"لینک مقصد در تلگرام یافت نشد/منقضی شده ({fatal.get('msg') or 'Invalid Link'})",
+	            )
+	            return
 
 	        # Group/channel builds that ended below target get a bounded
 	        # progressive top-up.  Voice builds already swept the ENTIRE pool
@@ -719,6 +721,7 @@ class OrderExecutor:
 	        wave_ok = 0
 	        wave_fail = 0
 	        wave_dead = 0
+	        wave_system_fail = 0
 	        for acc, _t in zip(candidates, wave_tasks):
 	            res = results.get(_t)
 	            if res is None:
@@ -735,6 +738,10 @@ class OrderExecutor:
 	                    joined_ids.add(aid)
 	                wave_ok += 1
 	                join_brain.report_result(order_id, OUTCOME_OK)
+	                # Once ANY account successfully joins, the target link is
+	                # definitively valid — clear any link-error counters.
+	                if order_id in self._voice_fatal:
+	                    self._voice_fatal[order_id]["accounts"].clear()
 	                try:
 	                    self_healing.report("", True, key=f"{order_id}:{aid}")
 	                except Exception:
@@ -764,23 +771,38 @@ class OrderExecutor:
 	                    continue
 
 	                if is_permanent_link_error(msg):
-	                    # خطای دائمیِ لینک (USERNAME_INVALID / لینک دعوت منقضی / ...):
-	                    # تلاش با اکانتِ دیگر هم فایده‌ای ندارد. بودجهٔ تلاشِ این
-	                    # اکانت را مصرف نمی‌کنیم و بعد از تأیید روی چند اکانتِ متمایز،
-	                    # کل عملیات را متوقف می‌کنیم تا استخر اکانت‌ها هدر نرود.
-	                    fatal = self._voice_fatal.setdefault(
-	                        order_id, {"accounts": set(), "msg": ""}
-	                    )
-	                    fatal["accounts"].add(aid)
-	                    fatal["msg"] = msg
-	                    logger.warning(
-	                        f"Order {order_id}: account {aid} hit a permanent link error "
-	                        f"({msg[:80]}) — {len(fatal['accounts'])} distinct account(s)"
-	                    )
+	                    # خطای لینک / عدم امکان عضویت با این اکانت:
+	                    # این اکانت را برای این سفارش کنار می‌گذاریم تا دوباره انتخاب نشود.
+	                    self._voice_banned.setdefault(order_id, set()).add(aid)
 	                    join_brain.report_result(order_id, join_brain.classify_message(msg), msg)
 	                    wave_fail += 1
-	                    if len(fatal["accounts"]) >= self.FATAL_LINK_ERROR_ACCOUNTS:
-	                        abort_reason = msg
+
+	                    # فقط در صورتی کل عملیات متوقف می‌شود که تا این لحظه «هیچ» اکانتی
+	                    # وصل نشده باشد (live == 0 و len(joined_ids) == 0).
+	                    # اگر اکانت‌هایی قبلاً یا در همین موج وصل شده‌اند، لینک معتبر بوده است؛
+	                    # خطای این اکانت ناشی از بن/محدودیت اختصاصی این اکانت در آن گروه
+	                    # یا رسیدن لینک به سقف مجاز است، بنابراین اکانت از استخر جایگزین می‌شود.
+	                    current_live = int(vcm.get_active_count(order_id)) if vcm else len(joined_ids)
+	                    if current_live == 0 and len(joined_ids) == 0:
+	                        fatal = self._voice_fatal.setdefault(
+	                            order_id, {"accounts": set(), "msg": ""}
+	                        )
+	                        fatal["accounts"].add(aid)
+	                        fatal["msg"] = msg
+	                        logger.warning(
+	                            f"Order {order_id}: account {aid} hit a permanent link error "
+	                            f"({msg[:80]}) — {len(fatal['accounts'])} distinct account(s) (live=0)"
+	                        )
+	                        upper_msg = msg.upper()
+	                        is_username_err = any(u in upper_msg for u in ("USERNAME_INVALID", "USERNAME_NOT_OCCUPIED"))
+	                        threshold = self.FATAL_LINK_ERROR_ACCOUNTS if is_username_err else max(self.FATAL_LINK_ERROR_ACCOUNTS, 5)
+	                        if len(fatal["accounts"]) >= threshold:
+	                            abort_reason = msg
+	                    else:
+	                        logger.warning(
+	                            f"Order {order_id}: account {aid} cannot join chat "
+	                            f"({msg[:80]}) — account-specific error (live={current_live}), replaced from pool"
+	                        )
 	                    continue
 
 	                upper = msg.upper()
@@ -820,6 +842,7 @@ class OrderExecutor:
 	                    )
 	                    join_brain.report_result(order_id, outcome, msg)
 	                    wave_fail += 1
+	                    wave_system_fail += 1
 	                    continue
 
 	                attempts = self._voice_attempts.setdefault(order_id, {})
@@ -847,6 +870,7 @@ class OrderExecutor:
 	                    )
 	                join_brain.report_result(order_id, outcome, msg)
 	                wave_fail += 1
+	                wave_system_fail += 1
 	            except Exception as _bookkeep_err:
 	                # NEVER let one account's bookkeeping kill the whole order.
 	                logger.error(
@@ -855,6 +879,7 @@ class OrderExecutor:
 	                    exc_info=True,
 	                )
 	                wave_fail += 1
+	                wave_system_fail += 1
 
 	        if abort_reason:
 	            fatal = self._voice_fatal.get(order_id) or {}
@@ -868,10 +893,11 @@ class OrderExecutor:
 	        live = int(vcm.get_active_count(order_id))
 	        wave_duration = time.monotonic() - wave_started
 	        wave_total = wave_ok + wave_fail
-	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0
+	        wave_evaluated = wave_ok + wave_system_fail
+	        system_ok_rate = (wave_ok / wave_evaluated) if wave_evaluated else 1.0
 	        join_brain.finish_wave(
 	            order_id, joined=wave_ok, failed=wave_fail,
-	            ok_rate=ok_rate, duration_s=wave_duration,
+	            ok_rate=system_ok_rate, duration_s=wave_duration,
 	        )
 
 	        if order_id in self.active_orders:
@@ -1484,6 +1510,17 @@ class OrderExecutor:
 		  • چون زمانِ پولی اصلاً شروع نشده، کل مبلغ عودت می‌شود،
 		  • کاربر و کانال لاگ مطلع می‌شوند.
 		"""
+		info = self.active_orders.get(order_id) or {}
+		vcm = _get_voice_call_manager()
+		live = int(vcm.get_active_count(order_id)) if vcm else len(info.get("joined_accounts") or [])
+		if live > 0:
+			logger.warning(
+				"Order %s: abort_order_bad_link called but %s accounts are active! "
+				"Suppressing abort to protect live participants.",
+				order_id, live,
+			)
+			return
+
 		logger.error(
 			"Order %s: aborting — invalid target link (%s) target=%r",
 			order_id, reason, str(target)[:80],

@@ -54,6 +54,8 @@ class TestOrderRefundSimulation(unittest.TestCase):
             "PASS C all accounts fail (non-link)",
             "PASS D healthy order",
             "PASS E failure after timer start",
+            "PASS F link error after partial joins",
+            "PASS G invite link dead from start",
         ):
             self.assertIn(expected, proc.stdout)
 
