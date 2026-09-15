@@ -67,6 +67,7 @@ from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
 from services.session_ownership import session_ownership
+from utils.link_utils import permanent_link_error_token, validate_target_link
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -2452,6 +2453,19 @@ class VoiceCallManager:
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
             return self.order_chat_ids[order_id]
+
+        # ═══ PRE-FLIGHT: never spend a Telegram RPC on something that cannot
+        # be a chat reference.  A copy/pasted message (e.g. the "order
+        # registered" receipt) stored as the target link used to burn the
+        # whole account pool one account at a time with "Invalid Link".
+        if getattr(Config, "LINK_VALIDATION_ENABLED", True):
+            ok, clean_target, reason = validate_target_link(target)
+            if not ok:
+                raise RuntimeError(
+                    f"Invalid Link ({reason}): {str(target)[:80]}"
+                )
+            target = clean_target
+
         chat_id = None
         try:
             if target.startswith("https"):
@@ -2479,8 +2493,13 @@ class VoiceCallManager:
             msg = str(e)
             if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
                 raise RuntimeError("Account Restricted") from e
-            if "USERNAME_INVALID" in msg:
-                raise RuntimeError(f"Invalid Link: {target}") from e
+            token = permanent_link_error_token(msg)
+            if token:
+                # A link-level (permanent) failure: retrying with the same or
+                # another account cannot fix it.  The token is kept in the
+                # message so the executor can classify and abort the order
+                # instead of draining the whole account pool.
+                raise RuntimeError(f"Invalid Link ({token}): {target}") from e
             raise
         except UserAlreadyParticipant:
             try:

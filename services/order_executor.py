@@ -11,10 +11,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
-from utils.helpers import format_jalali_datetime
+from utils.helpers import format_jalali_datetime, format_price
+from utils.link_utils import (
+    INVALID_LINK_USER_NOTICE_FA,
+    is_permanent_link_error,
+    validate_target_link,
+)
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
 from services.session_ownership import SessionInUseError
+from constants import ORDER_UNSTARTED_REFUND_NOTICE_FA
 from services import self_healing
 
 logger = logging.getLogger(__name__)
@@ -51,6 +57,11 @@ class OrderExecutor:
 	paid duration are replaced with fresh accounts.
 	"""
 
+	# حداقل تعداد اکانت‌های متمایزی که باید با خطای دائمیِ لینک مواجه شوند تا
+	# کل عملیات سفارش متوقف شود. یک اکانتِ مشکل‌دار نباید یک سفارش سالم را ببندد،
+	# اما وقتی چند اکانت مختلف عیناً همین خطا را می‌گیرند، مشکل از لینک است.
+	FATAL_LINK_ERROR_ACCOUNTS = 2
+
 	def __init__(self):
 		self.active_orders: Dict[int, Dict[str, Any]] = {}
 		self.app = None
@@ -63,6 +74,9 @@ class OrderExecutor:
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
+		# خطای دائمیِ لینک مقصد (USERNAME_INVALID / لینک منقضی / ...):
+		# order_id -> {"accounts": {account_id, ...}, "msg": str}
+		self._voice_fatal: Dict[int, Dict[str, Any]] = {}
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
 		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
@@ -163,12 +177,28 @@ class OrderExecutor:
 	        duration = int(data.get("duration_minutes") or 0)
 	        order_type = data["order_type"]
 
+	        # 🔒 پیش‌چک اعتبار لینک مقصد: اگر لینک نامعتبر باشد (مثلاً متنِ
+	        # پیامِ «سفارش ثبت شد» به‌جای لینک ذخیره شده) هرگز وارد فاز ساخت
+	        # نمی‌شویم؛ در غیر این صورت کل استخر اکانت‌ها با تلاش‌های بی‌ثمر
+	        # مصرف می‌شود و سفارش هیچ‌وقت اجرا نمی‌شود.
+	        if getattr(Config, "LINK_VALIDATION_ENABLED", True):
+	            ok, clean_target, bad_reason = validate_target_link(target)
+	        else:
+	            ok, clean_target, bad_reason = True, str(target or "").strip(), "ok"
+	        if not ok:
+	            await self._abort_order_bad_link(
+	                order_id, data, target,
+	                f"لینک مقصد نامعتبر است ({bad_reason})",
+	            )
+	            return
+	        target = clean_target
+
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
 	        exact = min(requested, eligible_count)
 	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
 
 	        if exact <= 0:
-	            await self._fail_order(order_id, "No eligible active accounts available.")
+	            await self._fail_order(order_id, "No eligible active accounts available.", refund_if_unstarted=True)
 	            return
 
 	        if order_id in self.active_orders:
@@ -214,6 +244,15 @@ class OrderExecutor:
 	            self.active_orders.pop(order_id, None)
 	            return
 
+	        # لینک مقصد در سطح تلگرام نامعتبر/منقضی است → بستن سریع سفارش
+	        fatal = self._voice_fatal.get(order_id) or {}
+	        if len(fatal.get("accounts") or ()) >= self.FATAL_LINK_ERROR_ACCOUNTS:
+	            await self._abort_order_bad_link(
+	                order_id, data, target,
+	                f"لینک مقصد در تلگرام یافت نشد/منقضی شده ({fatal.get('msg') or 'Invalid Link'})",
+	            )
+	            return
+
 	        joined_list = self._prune_joined(order_id, order_type, joined_list)
 	        live = self._live_count(order_id, order_type, joined_list)
 
@@ -252,7 +291,7 @@ class OrderExecutor:
 	            self.active_orders[order_id]["live_count"] = live
 
 	        if live == 0:
-	            await self._fail_order(order_id, "All accounts failed to join.")
+	            await self._fail_order(order_id, "All accounts failed to join.", refund_if_unstarted=True)
 	            return
 
 	        # ────────────────────────────────────────────────────────────
@@ -266,6 +305,9 @@ class OrderExecutor:
 	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
 	                started_at = None
 	            started_at = started_at or datetime.utcnow()
+	            # همگام‌سازی با دادهٔ درون‌حافظه‌ای: هر شکستِ بعد از این نقطه
+	            # دیگر «هیچ خدمتی ارائه نشد» نیست و نباید عودتِ کامل بدهد.
+	            data["started_at"] = started_at
 	            end_time = started_at + timedelta(minutes=duration)
 	            total_secs = duration * 60
 	            logger.info(
@@ -376,7 +418,8 @@ class OrderExecutor:
 	    except Exception as e:
 	        logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
 	        await self._cleanup_order(order_id, joined_list, data)
-	        await self._fail_order(order_id, f"System Error: {e}")
+	        await self._fail_order(order_id, f"System Error: {e}", refund_if_unstarted=True,
+	                               joined_accounts=joined_list)
 
 	# ═══════════════════════════════════════════════════════════════════
 	# JOIN BRAIN — ADAPTIVE BATCH FILL (voice_chat)
@@ -389,6 +432,7 @@ class OrderExecutor:
 	    self._voice_banned.setdefault(order_id, set())
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
+	    self._voice_fatal.setdefault(order_id, {"accounts": set(), "msg": ""})
 
 	def _voice_forget_order(self, order_id: int) -> None:
 	    """Release all Join-Brain scratch state for an order (idempotent)."""
@@ -401,6 +445,7 @@ class OrderExecutor:
 	    self._voice_banned.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
+	    self._voice_fatal.pop(order_id, None)
 
 	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
 	    """Load (or refresh) the eligible-account pool for an order.
@@ -551,6 +596,7 @@ class OrderExecutor:
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
 	    live = int(vcm.get_active_count(order_id))
+	    abort_reason = None   # set when the TARGET LINK itself is provably broken
 
 	    while self._is_order_active(order_id) and live < target_count:
 	        await join_brain.wait_if_paused(order_id)
@@ -717,6 +763,26 @@ class OrderExecutor:
 	                    wave_fail += 1
 	                    continue
 
+	                if is_permanent_link_error(msg):
+	                    # خطای دائمیِ لینک (USERNAME_INVALID / لینک دعوت منقضی / ...):
+	                    # تلاش با اکانتِ دیگر هم فایده‌ای ندارد. بودجهٔ تلاشِ این
+	                    # اکانت را مصرف نمی‌کنیم و بعد از تأیید روی چند اکانتِ متمایز،
+	                    # کل عملیات را متوقف می‌کنیم تا استخر اکانت‌ها هدر نرود.
+	                    fatal = self._voice_fatal.setdefault(
+	                        order_id, {"accounts": set(), "msg": ""}
+	                    )
+	                    fatal["accounts"].add(aid)
+	                    fatal["msg"] = msg
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} hit a permanent link error "
+	                        f"({msg[:80]}) — {len(fatal['accounts'])} distinct account(s)"
+	                    )
+	                    join_brain.report_result(order_id, join_brain.classify_message(msg), msg)
+	                    wave_fail += 1
+	                    if len(fatal["accounts"]) >= self.FATAL_LINK_ERROR_ACCOUNTS:
+	                        abort_reason = msg
+	                    continue
+
 	                upper = msg.upper()
 	                if status == "dead" or any(x in upper for x in (
 	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
@@ -789,6 +855,14 @@ class OrderExecutor:
 	                    exc_info=True,
 	                )
 	                wave_fail += 1
+
+	        if abort_reason:
+	            fatal = self._voice_fatal.get(order_id) or {}
+	            logger.error(
+	                f"Order {order_id}: target link is invalid/unreachable for "
+	                f"{len(fatal.get('accounts') or ())} distinct accounts — aborting fill"
+	            )
+	            break
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))
@@ -1300,7 +1374,8 @@ class OrderExecutor:
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
-	async def _fail_order(self, order_id, reason):
+	async def _fail_order(self, order_id, reason, refund_if_unstarted: bool = False,
+	                     joined_accounts: Optional[List[Dict[str, Any]]] = None):
 		info = self.active_orders.get(order_id)
 		data = (info or {}).get("data", {}) if info else {}
 		order_type = data.get("order_type") if info else None
@@ -1321,6 +1396,119 @@ class OrderExecutor:
 		self._voice_forget_order(order_id)
 		await DatabaseManager.update_order_status(order_id, "failed")
 		self.active_orders.pop(order_id, None)
+
+		# «پول گرفته‌ایم اما هیچ خدمتی ارائه نشده» → عودت کامل + اطلاع‌رسانی.
+		# شرطِ عودت این است که زمانِ پولی هرگز شروع نشده باشد **و** هیچ اکانتی
+		# در مقصد حضور نداشته باشد؛ در غیر این صورت (مثلاً خطای سیستمیِ بعد از
+		# اتصالِ موفق) تسویه باید از مسیر لغو/پشتیبانی انجام شود، نه اینجا.
+		if refund_if_unstarted:
+			delivered = joined_accounts if joined_accounts is not None else (
+				(info or {}).get("joined_accounts", [])
+			)
+			try:
+				live_now = len(self._prune_joined(order_id, order_type, delivered))
+			except Exception:
+				live_now = len(delivered or [])
+			if not (data or {}).get("started_at") and live_now <= 0:
+				await self._refund_unstarted_order(order_id, data, reason)
+
+	async def _refund_unstarted_order(self, order_id: int, data: Dict[str, Any],
+	                                  reason: str, notice: str = None,
+	                                  notice_fields: Optional[Dict[str, Any]] = None) -> float:
+		"""عودت کامل + اطلاع‌رسانی برای سفارشی که زمانِ پولی‌اش شروع نشده است.
+
+		اگر هیچ اکانتی به مقصد متصل نشده باشد (یا اصلاً اکانتی در دسترس نباشد)،
+		مشتری هیچ خدمتی دریافت نکرده است؛ بنابراین کل مبلغ برمی‌گردد و به او
+		اطلاع داده می‌شود. وقتی زمانِ پولی شروع شده باشد، تسویهٔ لحظه‌ای فقط از
+		مسیر لغو (``settle_and_refund_order``) انجام می‌شود.
+		"""
+		bot_id = int(data.get("bot_id") or 1)
+		refund_amount = 0.0
+		user = None
+		try:
+			user = await DatabaseManager.get_user_by_id(data.get("user_id"))
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not load user for refund: {exc}")
+
+		price = float(data.get("price_paid") or 0)
+		if price > 0 and user:
+			try:
+				ok_refund, _balance = await DatabaseManager.update_user_credit(
+					user["id"], price, "order_refund",
+					f"عودت کامل سفارش {order_id} | اجرا نشد",
+					bot_id=bot_id,
+				)
+				refund_amount = price if ok_refund else 0.0
+			except Exception as exc:
+				logger.warning(f"Order {order_id}: refund of {price} failed: {exc}")
+
+		# اطلاع‌رسانی به مشتری
+		try:
+			from services.bot_manager import bot_manager
+			app = bot_manager.active_bots.get(bot_id)
+			if app and user:
+				fields = {
+					"order_id": order_id,
+					"reason": reason,
+					"refund": format_price(refund_amount),
+				}
+				if notice_fields:
+					fields.update(notice_fields)
+				await app.bot.send_message(
+					user["telegram_id"],
+					(notice or ORDER_UNSTARTED_REFUND_NOTICE_FA).format(**fields),
+				)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not notify user about refund: {exc}")
+
+		# گزارش در کانال لاگ سفارش‌ها
+		try:
+			await self._log_to_channel(
+				"failed", order_id, data, user=user, success_cnt=0,
+				reason=reason, bot_id=bot_id,
+				extra={"refund_amount": refund_amount},
+			)
+		except Exception:
+			pass
+
+		return refund_amount
+
+
+	async def _abort_order_bad_link(self, order_id: int, data: Dict[str, Any],
+	                               target: str, reason: str) -> None:
+		"""بستن سفارشی که لینک مقصدش نامعتبر است + عودت کامل + اطلاع‌رسانی.
+
+		این مسیر فقط وقتی صدا زده می‌شود که مشکل از خودِ لینک باشد (نه از اکانت‌ها
+		و نه از فشار سرورِ تلگرام). بنابراین:
+		  • هیچ اکانتی بن/غیرفعال نمی‌شود (همه با همین خطا مواجه می‌شوند)،
+		  • چون زمانِ پولی اصلاً شروع نشده، کل مبلغ عودت می‌شود،
+		  • کاربر و کانال لاگ مطلع می‌شوند.
+		"""
+		logger.error(
+			"Order %s: aborting — invalid target link (%s) target=%r",
+			order_id, reason, str(target)[:80],
+		)
+
+		# 1) آزادسازیِ امنِ هرچه احتمالاً وصل شده + پاک‌سازی وضعیت Join Brain
+		try:
+			info = self.active_orders.get(order_id) or {}
+			await self._cleanup_order(order_id, info.get("joined_accounts", []), data)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: cleanup during bad-link abort failed: {exc}")
+		self._voice_forget_order(order_id)
+		try:
+			await DatabaseManager.update_order_status(order_id, "failed")
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not mark order as failed: {exc}")
+		self.active_orders.pop(order_id, None)
+
+		# 2) عودت کاملِ مبلغ (زمانِ پولی شروع نشده) + اطلاع‌رسانی + گزارش لاگ
+		await self._refund_unstarted_order(
+			order_id, data,
+			f"لینک مقصد نامعتبر/غیرقابل دسترس: {reason}",
+			notice=INVALID_LINK_USER_NOTICE_FA,
+			notice_fields={"link": str(target)[:80]},
+		)
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))

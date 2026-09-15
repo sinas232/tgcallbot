@@ -20,6 +20,7 @@
 | [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md) | **راه‌اندازی درگاه پرداخت زرین‌پال** (دامنه، Referrer، callback، عیب‌یابی) |
 | [`docs/voice-reliability-deploy.fa.md`](docs/voice-reliability-deploy.fa.md) | پایداری تماس صوتی و استقرار |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
+| [`docs/order-link-validation.fa.md`](docs/order-link-validation.fa.md) | **🔒 اعتبارسنجی لینک مقصد** (چرا سفارش اجرا نمی‌شد + پاک‌سازی سفارش‌های قبلی) |
 | [`docs/premium-emoji.fa.md`](docs/premium-emoji.fa.md) | **💎 ایموجی پریمیوم (Custom Emoji)** در همهٔ منوها، دکمه‌ها، تیکت و بازنشر پیام کاربر |
 
 ---

@@ -20,6 +20,7 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
+from utils.link_utils import INVALID_LINK_HELP_FA, validate_target_link, strip_link_noise
 
 logger = logging.getLogger(__name__)
 
@@ -120,12 +121,29 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return AWAITING_ORDER_LINK
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = update.message.text
-    if BTN_CANCEL in link:
+    raw = update.message.text or update.message.caption or ""
+    if BTN_CANCEL in raw:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
-        
-    context.user_data['target_link'] = link
+
+    # 🔒 اعتبارسنجی لینک مقصد: از ذخیرهٔ متن‌های غیرلینک (مثلاً پیامِ تأیید
+    # سفارش قبلی که کاربر کپی/فوروارد می‌کند) به‌عنوان لینک جلوگیری می‌کند.
+    if getattr(Config, "LINK_VALIDATION_ENABLED", True):
+        ok, clean_link, reason = validate_target_link(raw)
+    else:
+        ok, clean_link, reason = True, strip_link_noise(raw), "ok"
+    if not ok:
+        logger.info(
+            "Rejected invalid target link from user %s (reason=%s, input=%r)",
+            update.effective_user.id, reason, (raw or "")[:80],
+        )
+        await update.message.reply_text(
+            INVALID_LINK_HELP_FA,
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ORDER_LINK
+
+    context.user_data['target_link'] = clean_link
     
     # انتخاب نوع زمان اجرا
     kb = ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True)
@@ -306,7 +324,26 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         bot_id = context.bot_data.get('bot_id', 1)
         plan = context.user_data['selected_plan']
         link = context.user_data['target_link']
-        
+
+        # 🔒 بررسی دوباره پیش از کسر موجودی (دفاع در برابر user_data مانده از
+        # نسخه‌های قدیمی یا تغییر مقدار بین مراحل گفتگو).
+        if getattr(Config, "LINK_VALIDATION_ENABLED", True):
+            ok, clean_link, reason = validate_target_link(link)
+        else:
+            ok, clean_link, reason = True, str(link or "").strip(), "ok"
+        if not ok:
+            logger.warning(
+                "Blocked order creation for user %s: invalid target link (%s)",
+                user_id, reason,
+            )
+            context.user_data.pop('target_link', None)
+            await query.edit_message_text(
+                INVALID_LINK_HELP_FA + "\n\n"
+                "لطفاً از منوی «🛍 خرید سرویس جدید» دوباره اقدام کنید."
+            )
+            return ConversationHandler.END
+        link = clean_link
+
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
