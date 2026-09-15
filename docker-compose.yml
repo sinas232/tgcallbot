@@ -103,17 +103,22 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      nproc: 65535
     # ── محدودیت سخت‌افزاری (فضای تنفس برای هاست) ─────────────────────────
     # سقف CPU/RAM کانتینر ربات؛ با `docker compose up` (پلاگین v2) اعمال می‌شود.
-    # سقف ۱۲ گیگابایت رم و ۷ هسته برای سرور ۱۶ گیگ / ۸ هسته‌ای جهت جلوگیری قطعی از OOM Killer.
+    # سقف ۱۳ گیگابایت رم و ۷.۵ هسته برای سرور ۱۶ گیگ / ۸ هسته‌ای جهت جلوگیری قطعی از OOM Killer.
     deploy:
       resources:
         limits:
-          cpus: "${BOT_CPUS_LIMIT:-7.0}"
-          memory: "${BOT_MEM_LIMIT:-12G}"
+          cpus: "${BOT_CPUS_LIMIT:-7.5}"
+          memory: "${BOT_MEM_LIMIT:-13G}"
+        reservations:
+          cpus: "2.0"
+          memory: "2G"
     # سازگاری با اجرای غیر-swarm قدیمی‌تر (docker-compose v1) در صورت وجود:
-    mem_limit: ${BOT_MEM_LIMIT:-12g}
-    cpus: ${BOT_CPUS_LIMIT:-7.0}
+    mem_limit: ${BOT_MEM_LIMIT:-13g}
+    mem_reservation: 2g
+    cpus: ${BOT_CPUS_LIMIT:-7.5}
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}

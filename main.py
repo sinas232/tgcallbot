@@ -1060,6 +1060,15 @@ async def main_loop():
     
     # زمان‌بندی جاب‌ها
     if main_app.job_queue:
+        async def memory_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+            """پاکسازی دوره‌ای حافظه رم و آزادسازی اشیای بدون ارجاع"""
+            try:
+                import gc
+                gc.collect()
+            except Exception as e:
+                logger.debug(f"Memory cleanup error: {e}")
+
+        main_app.job_queue.run_repeating(memory_cleanup_job, interval=300, first=60)
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
