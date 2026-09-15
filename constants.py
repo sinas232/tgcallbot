@@ -20,6 +20,16 @@ AWAITING_SESSION_API_HASH = 5
 
 AWAITING_SELECT_PLAN = 10
 AWAITING_ORDER_LINK = 11
+# پیام عودت برای سفارشی که هیچ اکانتی به مقصد متصل نشده (زمان پولی شروع نشده).
+# جای‌نگاشت‌ها: {order_id}، {reason}، {refund}
+ORDER_UNSTARTED_REFUND_NOTICE_FA = (
+    "⚠️ **سفارش #{order_id} اجرا نشد.**\n\n"
+    "هیچ اکانتی به مقصد متصل نشد، بنابراین زمانِ پولیِ سفارش هرگز شروع نشد.\n"
+    "📝 دلیل: {reason}\n\n"
+    "💳 مبلغ پرداختی ({refund} تومان) به‌طور کامل به کیف پول شما بازگشت.\n"
+    "می‌توانید دوباره سفارش ثبت کنید یا با پشتیبانی در تماس باشید."
+)
+
 AWAITING_ORDER_CONFIRMATION = 12
 AWAITING_ORDER_TIMING_TYPE = 13
 AWAITING_SCHEDULE_DATE = 14

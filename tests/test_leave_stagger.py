@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import os
+import re
 import sys
 import tempfile
 import types
@@ -38,6 +39,14 @@ def _run(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+
+
+def _to_ascii_digits(text: str) -> str:
+    """Persian digits → ASCII (CHANGELOG headings are written in Persian)."""
+    return (text or "").translate(_FA_DIGITS)
 
 
 def _read_source(rel: str) -> str:
@@ -110,8 +119,23 @@ class ConfigLeaveKeysTests(unittest.TestCase):
         )
 
     def test_bot_version_bumped(self):
+        """BOT_VERSION must stay in sync with the newest CHANGELOG entry.
+
+        (Previously this pinned a hard-coded version string, so every release
+        broke the suite until the test was hand-edited.)
+        """
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.1"', src)
+        match = re.search(r'^BOT_VERSION\s*=\s*"([^"]+)"', src, re.M)
+        self.assertIsNotNone(match, "BOT_VERSION not found in constants.py")
+        version = match.group(1)
+
+        changelog = _read_source("CHANGELOG.md")
+        heading = re.search(r"##\s*نسخهٔ\s*([0-9۰-۹][0-9۰-۹.]*)", _to_ascii_digits(changelog))
+        self.assertIsNotNone(heading, "no '## نسخهٔ X.Y.Z' heading in CHANGELOG.md")
+        self.assertEqual(
+            version, heading.group(1),
+            "BOT_VERSION (constants.py) و جدیدترین نسخهٔ CHANGELOG باید یکی باشند",
+        )
 
 
 class StopAllPacingLogicTests(unittest.TestCase):

@@ -20,6 +20,7 @@ from utils.link_utils import (
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
 from services.session_ownership import SessionInUseError
+from constants import ORDER_UNSTARTED_REFUND_NOTICE_FA
 from services import self_healing
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,7 @@ class OrderExecutor:
 	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
 
 	        if exact <= 0:
-	            await self._fail_order(order_id, "No eligible active accounts available.")
+	            await self._fail_order(order_id, "No eligible active accounts available.", refund_if_unstarted=True)
 	            return
 
 	        if order_id in self.active_orders:
@@ -290,7 +291,7 @@ class OrderExecutor:
 	            self.active_orders[order_id]["live_count"] = live
 
 	        if live == 0:
-	            await self._fail_order(order_id, "All accounts failed to join.")
+	            await self._fail_order(order_id, "All accounts failed to join.", refund_if_unstarted=True)
 	            return
 
 	        # ────────────────────────────────────────────────────────────
@@ -304,6 +305,9 @@ class OrderExecutor:
 	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
 	                started_at = None
 	            started_at = started_at or datetime.utcnow()
+	            # همگام‌سازی با دادهٔ درون‌حافظه‌ای: هر شکستِ بعد از این نقطه
+	            # دیگر «هیچ خدمتی ارائه نشد» نیست و نباید عودتِ کامل بدهد.
+	            data["started_at"] = started_at
 	            end_time = started_at + timedelta(minutes=duration)
 	            total_secs = duration * 60
 	            logger.info(
@@ -414,7 +418,8 @@ class OrderExecutor:
 	    except Exception as e:
 	        logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
 	        await self._cleanup_order(order_id, joined_list, data)
-	        await self._fail_order(order_id, f"System Error: {e}")
+	        await self._fail_order(order_id, f"System Error: {e}", refund_if_unstarted=True,
+	                               joined_accounts=joined_list)
 
 	# ═══════════════════════════════════════════════════════════════════
 	# JOIN BRAIN — ADAPTIVE BATCH FILL (voice_chat)
@@ -1369,7 +1374,8 @@ class OrderExecutor:
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
-	async def _fail_order(self, order_id, reason):
+	async def _fail_order(self, order_id, reason, refund_if_unstarted: bool = False,
+	                     joined_accounts: Optional[List[Dict[str, Any]]] = None):
 		info = self.active_orders.get(order_id)
 		data = (info or {}).get("data", {}) if info else {}
 		order_type = data.get("order_type") if info else None
@@ -1391,6 +1397,83 @@ class OrderExecutor:
 		await DatabaseManager.update_order_status(order_id, "failed")
 		self.active_orders.pop(order_id, None)
 
+		# «پول گرفته‌ایم اما هیچ خدمتی ارائه نشده» → عودت کامل + اطلاع‌رسانی.
+		# شرطِ عودت این است که زمانِ پولی هرگز شروع نشده باشد **و** هیچ اکانتی
+		# در مقصد حضور نداشته باشد؛ در غیر این صورت (مثلاً خطای سیستمیِ بعد از
+		# اتصالِ موفق) تسویه باید از مسیر لغو/پشتیبانی انجام شود، نه اینجا.
+		if refund_if_unstarted:
+			delivered = joined_accounts if joined_accounts is not None else (
+				(info or {}).get("joined_accounts", [])
+			)
+			try:
+				live_now = len(self._prune_joined(order_id, order_type, delivered))
+			except Exception:
+				live_now = len(delivered or [])
+			if not (data or {}).get("started_at") and live_now <= 0:
+				await self._refund_unstarted_order(order_id, data, reason)
+
+	async def _refund_unstarted_order(self, order_id: int, data: Dict[str, Any],
+	                                  reason: str, notice: str = None,
+	                                  notice_fields: Optional[Dict[str, Any]] = None) -> float:
+		"""عودت کامل + اطلاع‌رسانی برای سفارشی که زمانِ پولی‌اش شروع نشده است.
+
+		اگر هیچ اکانتی به مقصد متصل نشده باشد (یا اصلاً اکانتی در دسترس نباشد)،
+		مشتری هیچ خدمتی دریافت نکرده است؛ بنابراین کل مبلغ برمی‌گردد و به او
+		اطلاع داده می‌شود. وقتی زمانِ پولی شروع شده باشد، تسویهٔ لحظه‌ای فقط از
+		مسیر لغو (``settle_and_refund_order``) انجام می‌شود.
+		"""
+		bot_id = int(data.get("bot_id") or 1)
+		refund_amount = 0.0
+		user = None
+		try:
+			user = await DatabaseManager.get_user_by_id(data.get("user_id"))
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not load user for refund: {exc}")
+
+		price = float(data.get("price_paid") or 0)
+		if price > 0 and user:
+			try:
+				ok_refund, _balance = await DatabaseManager.update_user_credit(
+					user["id"], price, "order_refund",
+					f"عودت کامل سفارش {order_id} | اجرا نشد",
+					bot_id=bot_id,
+				)
+				refund_amount = price if ok_refund else 0.0
+			except Exception as exc:
+				logger.warning(f"Order {order_id}: refund of {price} failed: {exc}")
+
+		# اطلاع‌رسانی به مشتری
+		try:
+			from services.bot_manager import bot_manager
+			app = bot_manager.active_bots.get(bot_id)
+			if app and user:
+				fields = {
+					"order_id": order_id,
+					"reason": reason,
+					"refund": format_price(refund_amount),
+				}
+				if notice_fields:
+					fields.update(notice_fields)
+				await app.bot.send_message(
+					user["telegram_id"],
+					(notice or ORDER_UNSTARTED_REFUND_NOTICE_FA).format(**fields),
+				)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not notify user about refund: {exc}")
+
+		# گزارش در کانال لاگ سفارش‌ها
+		try:
+			await self._log_to_channel(
+				"failed", order_id, data, user=user, success_cnt=0,
+				reason=reason, bot_id=bot_id,
+				extra={"refund_amount": refund_amount},
+			)
+		except Exception:
+			pass
+
+		return refund_amount
+
+
 	async def _abort_order_bad_link(self, order_id: int, data: Dict[str, Any],
 	                               target: str, reason: str) -> None:
 		"""بستن سفارشی که لینک مقصدش نامعتبر است + عودت کامل + اطلاع‌رسانی.
@@ -1401,7 +1484,6 @@ class OrderExecutor:
 		  • چون زمانِ پولی اصلاً شروع نشده، کل مبلغ عودت می‌شود،
 		  • کاربر و کانال لاگ مطلع می‌شوند.
 		"""
-		bot_id = int(data.get("bot_id") or 1)
 		logger.error(
 			"Order %s: aborting — invalid target link (%s) target=%r",
 			order_id, reason, str(target)[:80],
@@ -1420,52 +1502,13 @@ class OrderExecutor:
 			logger.warning(f"Order {order_id}: could not mark order as failed: {exc}")
 		self.active_orders.pop(order_id, None)
 
-		# 2) عودت کاملِ مبلغ پرداختی
-		refund_amount = 0.0
-		user = None
-		try:
-			user = await DatabaseManager.get_user_by_id(data.get("user_id"))
-		except Exception as exc:
-			logger.warning(f"Order {order_id}: could not load user for refund: {exc}")
-
-		price = float(data.get("price_paid") or 0)
-		if price > 0 and user:
-			try:
-				ok_refund, _balance = await DatabaseManager.update_user_credit(
-					user["id"], price, "order_refund",
-					f"عودت کامل سفارش {order_id} | لینک مقصد نامعتبر",
-					bot_id=bot_id,
-				)
-				refund_amount = price if ok_refund else 0.0
-			except Exception as exc:
-				logger.warning(f"Order {order_id}: refund of {price} failed: {exc}")
-
-		# 3) اطلاع‌رسانی به مشتری
-		try:
-			from services.bot_manager import bot_manager
-			app = bot_manager.active_bots.get(bot_id)
-			if app and user:
-				await app.bot.send_message(
-					user["telegram_id"],
-					INVALID_LINK_USER_NOTICE_FA.format(
-						order_id=order_id,
-						link=str(target)[:80],
-						refund=format_price(refund_amount),
-					),
-				)
-		except Exception as exc:
-			logger.warning(f"Order {order_id}: could not notify user about bad link: {exc}")
-
-		# 4) گزارش در کانال لاگ سفارش‌ها
-		try:
-			await self._log_to_channel(
-				"failed", order_id, data, user=user, success_cnt=0,
-				reason=f"لینک مقصد نامعتبر/غیرقابل دسترس: {reason}",
-				bot_id=bot_id, extra={"refund_amount": refund_amount},
-			)
-		except Exception:
-			pass
-
+		# 2) عودت کاملِ مبلغ (زمانِ پولی شروع نشده) + اطلاع‌رسانی + گزارش لاگ
+		await self._refund_unstarted_order(
+			order_id, data,
+			f"لینک مقصد نامعتبر/غیرقابل دسترس: {reason}",
+			notice=INVALID_LINK_USER_NOTICE_FA,
+			notice_fields={"link": str(target)[:80]},
+		)
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))

@@ -101,13 +101,30 @@ docker compose exec telegram_bot python3 tools/check_order_links.py --all --canc
 > بعد از دیپلوی این نسخه، سفارشِ در حال اجرا با کدِ قدیمی در حافظه می‌ماند؛
 > ربات را ری‌استارت کنید یا با `--cancel-invalid` آن را ببندید.
 
+## 💸 عودتِ خودکارِ سفارشِ اجرا‌نشده
+
+فقط مخصوص لینک نیست: هرجا سفارشی **هیچ خدمتی ارائه نکند** (اکانتِ فعالی در
+استخر نباشد، همهٔ اکانت‌ها خطا بدهند، یا خطای سیستمی قبل از شروع رخ بدهد)،
+`OrderExecutor._fail_order(..., refund_if_unstarted=True)`:
+
+- کل مبلغ را به کیف پول برمی‌گرداند،
+- با پیام `ORDER_UNSTARTED_REFUND_NOTICE_FA` به مشتری اطلاع می‌دهد،
+- گزارش «failed» را به کانال لاگ می‌فرستد.
+
+شرطِ عودت: زمانِ پولی شروع **نشده** باشد **و** هیچ اکانتی در مقصد حضور نداشته
+باشد. بعد از شروعِ زمانِ پولی، تسویهٔ لحظه‌ای فقط از مسیر لغو
+(`settle_and_refund_order`) انجام می‌شود.
+
 ## تست
 
 ```bash
-python3 -m unittest tests.test_link_validation -v
+python3 -m unittest tests.test_link_validation -v            # اعتبارسنجی لینک
+python3 -m unittest tests.test_order_refund_simulation -v    # سناریوهای شکست/عودت
 ```
 
-۱۸ تست آفلاین (بدون نیاز به pyrogram، telegram یا دیتابیس) که شاملِ همان
-payloadِ خرابِ سفارش ۶۹۲ است.
+- ۱۸ تست آفلاینِ اعتبارسنجی لینک (بدون نیاز به pyrogram، telegram یا دیتابیس)
+  که شاملِ همان payloadِ خرابِ سفارش ۶۹۲ است؛
+- ۵ سناریوی end-to-end روی `OrderExecutor` واقعی با دیتابیس/تلگرام/موتورِ
+  ویسِ استب‌شده (در subprocess ایزوله).
 
 </div>

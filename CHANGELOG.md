@@ -49,8 +49,20 @@ python3 tools/check_order_links.py --all
 python3 tools/check_order_links.py --all --cancel-invalid --refund-failed
 ```
 
+### 💸 عودتِ خودکارِ سفارشِ اجرا‌نشده (No-Delivery Refund)
+تا پیش از این، اگر سفارش به هر دلیلی **هیچ اکانتی** را وارد مقصد نمی‌کرد (اکانتِ فعالی در استخر نبود، همهٔ اکانت‌ها خطا می‌دادند، یا خطای سیستمی رخ می‌داد)، مبلغ مشتری کسر می‌ماند و سفارش فقط `failed` می‌شد — بدون عودت و بدون اطلاع‌رسانی. حالا `OrderExecutor._fail_order(refund_if_unstarted=True)` هرجا که سفارش وارد زمانِ پولی نشده **و** هیچ اکانتی در مقصد حضور ندارد:
+
+- کل مبلغ را به کیف پول برمی‌گرداند،
+- با پیامِ `ORDER_UNSTARTED_REFUND_NOTICE_FA` به مشتری اطلاع می‌دهد،
+- گزارش «failed» را به کانال لاگ می‌فرستد.
+
+بعد از شروعِ زمانِ پولی (پیامِ عودتِ لحظه‌ای) همچنان فقط مسیر لغو/تسویه (`settle_and_refund_order`) مسئول عودت است تا عودتِ مضاعف یا بیش‌از‌حد رخ ندهد.
+
 ### تست
-`tests/test_link_validation.py` (۱۸ تست آفلاین، بدون نیاز به pyrogram/دیتابیس).
+- `tests/test_link_validation.py` — ۱۸ تست آفلاین برای اعتبارسنجی/طبقه‌بندی خطاهای لینک (بدون نیاز به pyrogram/دیتابیس).
+- `tests/test_order_refund_simulation.py` + `tests/_order_failure_harness.py` — ۵ سناریوی end-to-end روی `OrderExecutor` واقعی با دیتابیس/تلگرام/موتورِ ویسِ استب‌شده (در subprocess ایزوله):
+  لینکِ خرابِ ذخیره‌شده، لینکِ رد‌شده توسط تلگرام، شکستِ همهٔ اکانت‌ها، سفارشِ سالم، و شکستِ بعد از شروعِ زمانِ پولی (بدون عودت).
+- `tests/test_leave_stagger.py::test_bot_version_bumped` دیگر نسخه را hard-code نمی‌کند؛ هم‌خوانیِ `BOT_VERSION` با جدیدترین مدخلِ CHANGELOG را بررسی می‌کند.
 
 </div>
 
