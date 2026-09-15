@@ -39,18 +39,25 @@ os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcde
 
 import importlib.util
 
-HAS_PYROGRAM = importlib.util.find_spec("pyrogram") is not None
+HAS_TG_STACK = (
+    importlib.util.find_spec("pyrogram") is not None and
+    importlib.util.find_spec("pytgcalls") is not None
+)
 
-if HAS_PYROGRAM:
+if HAS_TG_STACK:
     from pyrogram import Client, errors, utils
     from pyrogram.raw import functions, types
-    from pyrogram.types import ChatJoinResultSuccess
+    try:
+        from pyrogram.types import ChatJoinResultSuccess
+    except ImportError:
+        class ChatJoinResultSuccess:
+            pass
     from services.voice_call_manager import VoiceCallManager
 
 from utils.link_utils import is_permanent_link_error, validate_target_link
 
 
-@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
+@unittest.skipUnless(HAS_TG_STACK, "pyrogram and pytgcalls not installed")
 class InviteLinkNormalizationTests(unittest.TestCase):
     def setUp(self):
         self.mgr = VoiceCallManager()
@@ -102,7 +109,7 @@ class InviteLinkNormalizationTests(unittest.TestCase):
                 self.assertEqual(self.mgr._extract_join_target(raw), expected)
 
 
-@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
+@unittest.skipUnless(HAS_TG_STACK, "pyrogram and pytgcalls not installed")
 class InviteLinkResolutionTests(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()
@@ -266,7 +273,7 @@ class LinkErrorClassificationTests(unittest.TestCase):
                 )
 
 
-@unittest.skipUnless(HAS_PYROGRAM, "pyrogram not installed")
+@unittest.skipUnless(HAS_TG_STACK, "pyrogram and pytgcalls not installed")
 class TelegramClientJoinChatTests(unittest.TestCase):
     def setUp(self):
         self.loop = asyncio.new_event_loop()

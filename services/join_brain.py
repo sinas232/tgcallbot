@@ -174,9 +174,9 @@ class AdaptiveJoinBrain:
         """
         policy = self._orders.get(order_id)
         if policy is None:
-            cfg_initial = int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5))
+            cfg_initial = int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 1))
             cfg_min = int(getattr(Config, "VOICE_JOIN_MIN_CONCURRENCY", 1))
-            cfg_max = int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))
+            cfg_max = int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 1))
             policy = _OrderPolicy(
                 order_id,
                 initial=initial if initial is not None else cfg_initial,

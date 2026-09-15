@@ -109,34 +109,24 @@ class Config:
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
     # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
     # voice handshake. The Join Brain may still widen this (up to the max).
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~2 concurrent media setups is where transports start dying AND
-    # where Telegram's per-IP burst budget starts answering with FloodWait.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # Per-order ceiling: default 1 for steady, anti-flood sequential joins so
+    # each account joins the group, enters the voice call, and verifies before
+    # the next account joins.
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '1'))         # per-order hard ceiling
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
-    # Accounts of one wave do NOT fire their joins in the same millisecond:
-    # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
-    # after the previous one. This spreads the phone.JoinGroupCall RPCs AND
-    # the WebRTC media handshakes over several seconds — no "N joins in one
-    # second" bursts (FloodWait loops) and no ffmpeg/CPU spike.
-    # The wave itself still overlaps: a single join takes 30-45s, so the
-    # build speed is nearly unchanged; only the *starts* are paced.
-    # Default gap 0.5-1.0s between account starts (user-requested pacing to
-    # avoid a one-shot CPU spike while still throttling the RPC cadence).
-    # NOTE: this is much tighter than the earlier 6-10s FloodWait-safe pacing —
-    # if Telegram starts issuing FloodWait during big ramp-ups, raise these two
-    # env vars back toward 3-6s.
-    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '0.5'))
-    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '1.0'))
+    # Spacing between accounts (seconds): safe 2-4s delay so Telegram never
+    # sees burst joins on private invite links.
+    VOICE_JOIN_START_STAGGER_MIN = float(os.getenv('VOICE_JOIN_START_STAGGER_MIN', '2.0'))
+    VOICE_JOIN_START_STAGGER_MAX = float(os.getenv('VOICE_JOIN_START_STAGGER_MAX', '4.0'))
+    VOICE_JOIN_ACCOUNT_DELAY_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_DELAY_MIN', '2.0'))
+    VOICE_JOIN_ACCOUNT_DELAY_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_DELAY_MAX', '4.0'))
     # Extra small human-like jitter (seconds) added on top of the base
     # start-gap between two account client starts, to avoid a perfectly
-    # periodic RPC cadence that automated anti-spam can fingerprint. Kept at 0
-    # by default so the total gap stays within the requested 0.5-1.0s window.
+    # periodic RPC cadence that automated anti-spam can fingerprint.
     VOICE_JOIN_START_JITTER_MIN = float(os.getenv('VOICE_JOIN_START_JITTER_MIN', '0.0'))
-    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '0.0'))
+    VOICE_JOIN_START_JITTER_MAX = float(os.getenv('VOICE_JOIN_START_JITTER_MAX', '0.5'))
     # ── IN-CALL MESSAGE / REACTION PACING (anti-burst for customer chat) ──
     # When a customer sends a comment or reaction from many accounts at once,
     # the sends are NOT fired in the same millisecond. Each account's send

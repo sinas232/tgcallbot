@@ -640,10 +640,22 @@ class OrderExecutor:
 	                    warm_task = None
 
 	        if not candidates:
+	            # تازه‌سازی استخر اکانت‌ها از دیتابیس (بررسی اینکه آیا اکانت‌های جدیدی اضافه شده‌اند)
+	            await self._voice_load_pool(bot_id, order_id)
+	            pool_size = len(self._voice_pool.get(order_id) or [])
+	            target_count = min(requested, max(target_count, pool_size))
+	            candidates = self._voice_candidates(order_id, window, joined_ids, set(), now)
+
+	        if not candidates:
 	            # Nothing ready right now — wait for the earliest retry
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                pool_sz = len(self._voice_pool.get(order_id) or [])
+	                logger.info(
+	                    f"Order {order_id}: account pool exhausted (pool size: {pool_sz}, "
+	                    f"live={live}/{target_count}) — ending fill"
+	                )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -665,8 +677,8 @@ class OrderExecutor:
 	        # threshold that makes Telegram answer with FloodWait 3s loops).
 	        # The wave still overlaps: a single join takes 30-45s, so with a
 	        # window of 3-10 the build speed is nearly unchanged.
-	        stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 6.0)))
-	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 10.0)))
+	        stagger_min = max(0.5, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 2.0)))
+	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 4.0)))
 	        # Subtle human-like jitter added on top of the base gap so the RPC
 	        # cadence is never perfectly periodic (harder for anti-spam to flag).
 	        jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_JITTER_MIN", 0.5)))
@@ -911,6 +923,14 @@ class OrderExecutor:
                 f"in {wave_duration:.0f}s) | "
                 f"{join_brain.format_progress(order_id, live, target_count)}"
             )
+
+	        # وقفهٔ ایمن ضد فلود بین ورود هر اکانت/موج تا تلگرام لینک را اسپم یا منقضی نکند
+	        if self._is_order_active(order_id) and live < target_count:
+	            gap_min = max(0.5, float(getattr(Config, "VOICE_JOIN_ACCOUNT_DELAY_MIN", 2.0)))
+	            gap_max = max(gap_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_DELAY_MAX", 4.0)))
+	            gap = random.uniform(gap_min, gap_max)
+	            logger.info(f"Order {order_id}: pacing delay {gap:.1f}s before next account joins...")
+	            await asyncio.sleep(gap)
 
 	    # Return only the accounts this call newly joined; the CALLER owns
 	    # merging them into the order's running joined_accounts list (the

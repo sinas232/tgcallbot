@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
     Column, Integer, String, Boolean, Float, DateTime, Text,
-    BigInteger, func, select, update, delete, desc, text, UniqueConstraint
+    BigInteger, func, select, update, delete, desc, text, UniqueConstraint,
+    or_, and_
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -26,13 +27,15 @@ DB_URL_ASYNC = Config.get_normalized_database_url()
 if not DB_URL_ASYNC:
     raise RuntimeError("DATABASE_URL not provided")
 
-engine = create_async_engine(
-    DB_URL_ASYNC, 
-    echo=False, 
-    pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=10
-)
+engine_kwargs = {
+    "echo": False,
+    "pool_pre_ping": True,
+}
+if not DB_URL_ASYNC.startswith("sqlite"):
+    engine_kwargs["pool_size"] = 20
+    engine_kwargs["max_overflow"] = 10
+
+engine = create_async_engine(DB_URL_ASYNC, **engine_kwargs)
 AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 def to_dict(obj):
@@ -946,26 +949,40 @@ class DatabaseManager:
             return (await db_session.execute(select(func.count(TelegramAccount.id)).filter(TelegramAccount.bot_id == bot_id))).scalar() or 0
 
     @staticmethod
+    def _account_active_filter(bot_id=1):
+        """فیلتر جامع و مقاوم اکانت‌های فعال و قابل استفاده در سفارش‌ها.
+        
+        ۱. در ربات اصلی (bot_id=1)، اکانت‌هایی با bot_id=1، NULL یا 0 به عنوان اکانت‌های فعال ربات در نظر گرفته می‌شوند.
+        ۲. هر اکانتی که سشن معتبر دارد و وضعیت آن صراحتاً غیرفعال/سوخته/مسدود نشده (inactive, dead, banned, deleted)،
+           به عنوان اکانت فعال و آماده به کار شناسایی می‌شود (شامل active، Active، ready و NULL).
+        """
+        bot_clause = (
+            or_(TelegramAccount.bot_id == bot_id, TelegramAccount.bot_id.is_(None), TelegramAccount.bot_id == 0)
+            if (bot_id == 1 or not bot_id)
+            else or_(TelegramAccount.bot_id == bot_id, TelegramAccount.bot_id.is_(None))
+        )
+        status_clause = and_(
+            TelegramAccount.session_string.isnot(None),
+            func.trim(TelegramAccount.session_string) != '',
+            func.lower(func.trim(func.coalesce(TelegramAccount.account_status, 'active'))).notin_(
+                ['inactive', 'dead', 'banned', 'disabled', 'deleted']
+            )
+        )
+        return and_(bot_clause, status_clause)
+
+    @staticmethod
     async def get_all_active_accounts(bot_id=1):
         async with AsyncSessionLocal() as db_session:
-            res = await db_session.execute(
-                select(TelegramAccount).filter(
-                    func.lower(func.trim(TelegramAccount.account_status)) == 'active',
-                    TelegramAccount.bot_id == bot_id,
+            try:
+                res = await db_session.execute(
+                    select(TelegramAccount).where(
+                        DatabaseManager._account_active_filter(bot_id)
+                    ).order_by(TelegramAccount.id)
                 )
-            )
-            accounts = [to_dict(a) for a in res.scalars().all()]
-            if accounts:
-                return accounts
-
-            # Fallback for non-standard storage/encoding of active status values
-            res2 = await db_session.execute(
-                select(TelegramAccount).filter(
-                    TelegramAccount.account_status.ilike('active'),
-                    TelegramAccount.bot_id == bot_id,
-                )
-            )
-            return [to_dict(a) for a in res2.scalars().all()]
+                return [to_dict(a) for a in res.scalars().all()]
+            except Exception as e:
+                logger.error(f"Error in get_all_active_accounts: {e}")
+                return []
 
     @staticmethod
     async def count_active_accounts(bot_id=1) -> int:
@@ -977,22 +994,12 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             try:
                 q = select(func.count(TelegramAccount.id)).filter(
-                    func.lower(func.trim(TelegramAccount.account_status)) == 'active',
-                    TelegramAccount.bot_id == bot_id,
+                    DatabaseManager._account_active_filter(bot_id)
                 )
                 cnt = (await db_session.execute(q)).scalar() or 0
-                if cnt > 0:
-                    return int(cnt)
-            except Exception:
-                pass
-            # Fallback for non-standard storage/encoding of active status values
-            try:
-                q2 = select(func.count(TelegramAccount.id)).filter(
-                    TelegramAccount.account_status.ilike('active'),
-                    TelegramAccount.bot_id == bot_id,
-                )
-                return int((await db_session.execute(q2)).scalar() or 0)
-            except Exception:
+                return int(cnt)
+            except Exception as e:
+                logger.error(f"Error in count_active_accounts: {e}")
                 return 0
 
     @staticmethod
@@ -1005,35 +1012,47 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             try:
                 query = select(TelegramAccount).where(
-                    func.lower(func.trim(TelegramAccount.account_status)) == 'active',
-                    TelegramAccount.bot_id == bot_id,
+                    DatabaseManager._account_active_filter(bot_id)
                 ).order_by(TelegramAccount.id).offset(max(0, offset)).limit(max(1, limit))
                 res = await db_session.execute(query)
-                accs = [to_dict(a) for a in res.scalars().all()]
-                if accs:
-                    return accs
-            except Exception:
-                pass
-            # Fallback query
-            try:
-                query2 = select(TelegramAccount).where(
-                    TelegramAccount.account_status.ilike('active'),
-                    TelegramAccount.bot_id == bot_id,
-                ).order_by(TelegramAccount.id).offset(max(0, offset)).limit(max(1, limit))
-                res2 = await db_session.execute(query2)
-                return [to_dict(a) for a in res2.scalars().all()]
-            except Exception:
+                return [to_dict(a) for a in res.scalars().all()]
+            except Exception as e:
+                logger.error(f"Error in get_active_accounts_batch: {e}")
                 return []
 
     @staticmethod
     async def get_active_accounts_for_order(limit, bot_id=1):
         async with AsyncSessionLocal() as db_session:
-            query = select(TelegramAccount).where(
-                func.lower(func.trim(TelegramAccount.account_status)) == 'active',
-                TelegramAccount.bot_id == bot_id,
-            ).limit(limit)
-            res = await db_session.execute(query)
-            return [to_dict(a) for a in res.scalars().all()]
+            try:
+                query = select(TelegramAccount).where(
+                    DatabaseManager._account_active_filter(bot_id)
+                ).order_by(TelegramAccount.id).limit(limit)
+                res = await db_session.execute(query)
+                return [to_dict(a) for a in res.scalars().all()]
+            except Exception as e:
+                logger.error(f"Error in get_active_accounts_for_order: {e}")
+                return []
+
+    @staticmethod
+    async def reactivate_all_accounts(bot_id=1) -> int:
+        """فعال‌سازی مجدد تمام اکانت‌های موجود در دیتابیس (تبدیل inactive/dead به active)."""
+        async with AsyncSessionLocal() as db_session:
+            try:
+                bot_clause = (
+                    or_(TelegramAccount.bot_id == bot_id, TelegramAccount.bot_id.is_(None), TelegramAccount.bot_id == 0)
+                    if (bot_id == 1 or not bot_id)
+                    else or_(TelegramAccount.bot_id == bot_id, TelegramAccount.bot_id.is_(None))
+                )
+                stmt = update(TelegramAccount).where(bot_clause).values(
+                    account_status='active',
+                    spam_status='healthy',
+                )
+                res = await db_session.execute(stmt)
+                await db_session.commit()
+                return int(res.rowcount or 0)
+            except Exception as e:
+                logger.error(f"Error in reactivate_all_accounts: {e}")
+                return 0
 
     @staticmethod
     async def get_account_by_id(aid):

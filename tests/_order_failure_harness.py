@@ -197,6 +197,8 @@ import services.order_executor as oe  # noqa: E402
 for _name, _value in (
     ("VOICE_JOIN_START_STAGGER_MIN", 0.0),
     ("VOICE_JOIN_START_STAGGER_MAX", 0.0),
+    ("VOICE_JOIN_ACCOUNT_DELAY_MIN", 0.0),
+    ("VOICE_JOIN_ACCOUNT_DELAY_MAX", 0.0),
     ("VOICE_JOIN_START_JITTER_MIN", 0.0),
     ("VOICE_JOIN_START_JITTER_MAX", 0.0),
     ("VOICE_RETRY_BACKOFF_BASE", 1.0),

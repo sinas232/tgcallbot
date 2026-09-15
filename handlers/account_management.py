@@ -394,7 +394,11 @@ async def show_deleted_accounts_handler(update: Update, context: ContextTypes.DE
         )
     if len(dead_accounts) > 50: txt += f"\n... و {len(dead_accounts)-50} مورد دیگر."
         
-    kb = [[InlineKeyboardButton("🗑 حذف همه اکانت‌های دلیت شده", callback_data="confirm_delete_dead")], [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_acc_menu")]]
+    kb = [
+        [InlineKeyboardButton("🔄 فعال‌سازی مجدد همه اکانت‌ها", callback_data="confirm_reactivate_all")],
+        [InlineKeyboardButton("🗑 حذف همه اکانت‌های دلیت شده", callback_data="confirm_delete_dead")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_acc_menu")]
+    ]
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return AWAITING_DELETE_DEAD_ACCS
 
@@ -407,6 +411,11 @@ async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DE
         # اینجا چون کالبک است، نباید هندلر متنی را صدا بزنیم.
         # پس مستقیماً منو را ارسال می‌کنیم.
         await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    if data == "confirm_reactivate_all":
+        bot_id = context.bot_data.get('bot_id', 1)
+        count = await DatabaseManager.reactivate_all_accounts(bot_id=bot_id)
+        await query.edit_message_text(f"✅ <b>{count} اکانت با موفقیت فعال شدند و آماده استفاده در سفارش‌ها هستند.</b>", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     if data == "confirm_delete_dead":
         bot_id = context.bot_data.get('bot_id', 1)

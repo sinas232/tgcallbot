@@ -25,15 +25,9 @@ class HealthChecker:
         try:
             client = TelegramAccountClient(account['phone_number'], account['session_string'], account['id'])
             status, result_text = await client.check_spambot()
-        except SessionInUseError as e:
-            # The account is inside an active voice call — opening a second
-            # connection would duplicate the MTProto session and revoke it.
-            # Skip silently this cycle (NOT an error, NOT a dead account).
-            logger.info("⏭ Spam check skipped for acc %s (session in voice call)", account['id'])
-            return
-            
-            # 🔥 بررسی مرگ اکانت
-            if "SESSION_REVOKED" in result_text or "Auth Key Invalid" in result_text or "UserDeactivated" in result_text:
+
+            # بررسی مرگ اکانت
+            if any(k in (result_text or "").upper() for k in ("SESSION_REVOKED", "AUTH KEY INVALID", "USERDEACTIVATED")):
                 logger.warning(f"⚰️ Account {account['id']} is DEAD. Disabling...")
                 await DatabaseManager.update_account_status(account['id'], 'inactive')
                 # وضعیت اسپم هم روی error ست شود
@@ -41,7 +35,12 @@ class HealthChecker:
             else:
                 await DatabaseManager.update_account_spam_status(account['id'], status, result_text)
                 logger.info(f"🛡 Spam Check Acc {account['id']}: {status}")
-                
+        except SessionInUseError as e:
+            # The account is inside an active voice call — opening a second
+            # connection would duplicate the MTProto session and revoke it.
+            # Skip silently this cycle (NOT an error, NOT a dead account).
+            logger.info("⏭ Spam check skipped for acc %s (session in voice call)", account['id'])
+            return
         except Exception as e:
             logger.error(f"❌ Spam check failed for acc {account['id']}: {e}")
 
