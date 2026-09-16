@@ -366,6 +366,41 @@ VOICE_CLIENT_TOPIC_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_TOPIC_CACHE"
 VOICE_IDLE_REAPER = bool(getattr(Config, "VOICE_IDLE_REAPER", True))
 VOICE_IDLE_CLIENT_TTL = max(30, int(getattr(Config, "VOICE_IDLE_CLIENT_TTL", 300) or 300))
 
+# ─── LOG SIZE CAP (disk + I/O) ────────────────────────────────────────────
+# The JSONL diagnostics (voice_calls.log / voice_drops.log /
+# voice_telemetry.log, the last one written for EVERY account on EVERY monitor
+# cycle) used to grow without any limit — tens of MB per day of debugging data
+# that nobody ever reads twice.  They are now size-capped and rotated to
+# `<name>.1`, so disk usage stays bounded forever.  0 disables rotation.
+VOICE_LOG_MAX_BYTES = max(0, int(getattr(Config, "VOICE_LOG_MAX_MB", 25) or 0)) * 1024 * 1024
+
+
+def _append_jsonl(path: Optional[str], entry: Dict[str, Any]) -> None:
+    """Append one JSON line, rotating the file when it exceeds the size cap."""
+    if not path:
+        return
+    try:
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        if VOICE_LOG_MAX_BYTES:
+            try:
+                # Rotate BEFORE crossing the cap, so every file (live and
+                # rotated) stays within it.
+                if os.path.getsize(path) + len(line.encode("utf-8")) > VOICE_LOG_MAX_BYTES:
+                    rotated = f"{path}.1"
+                    try:
+                        os.replace(path, rotated)
+                    except OSError:
+                        # Odd filesystems: fall back to truncation so the cap
+                        # is still enforced.
+                        with open(path, "w", encoding="utf-8"):
+                            pass
+            except FileNotFoundError:
+                pass
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:
+        pass
+
 # Accepted keyword arguments of the installed Client.__init__ (cached).  Some
 # pyrogram forks do not expose every knob above; unsupported keys must be
 # dropped instead of crashing every client creation.
@@ -839,7 +874,10 @@ class VoiceCallManager:
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
 
         # Per-chat shared participant snapshot cache for the current monitor cycle
-        self._participant_snapshot: Dict[int, Tuple[float, Optional[Set[int]]]] = {}
+        # chat_id -> (cycle_ts, present_ids, authoritative)
+        # `authoritative=False` means the participant listing was not walked
+        # completely: it may confirm presence, never absence.
+        self._participant_snapshot: Dict[int, Tuple[float, Optional[Set[int]], bool]] = {}
         self._monitor_cycle_ts: float = 0.0
 
         # Cross-order, non-sensitive adaptive policy cache. It stores only
@@ -970,8 +1008,7 @@ class VoiceCallManager:
                 "event": event,
                 "details": details or {},
             }
-            with open(self._vc_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _append_jsonl(self._vc_log_path, entry)
             logger.debug(f"VCLOG {order_id}/{account_id} {event} {details or {}}")
         except Exception:
             pass
@@ -1044,8 +1081,7 @@ class VoiceCallManager:
                 "session_connected": session_connected,
                 "extra": extra or {},
             }
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _append_jsonl(path, entry)
             # Surface every INVOLUNTARY drop on the console too, so
             # `docker compose logs` alone answers "who fell out and why".
             if not deliberate:
@@ -1081,8 +1117,7 @@ class VoiceCallManager:
                 "label": label,
                 "feats": feats,
             }
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            _append_jsonl(path, row)
         except Exception:
             pass
 
@@ -2293,7 +2328,7 @@ class VoiceCallManager:
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    await self.reap_idle_clients()
+                    await self._run_sweep_once()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -2308,6 +2343,25 @@ class VoiceCallManager:
             raise
         except Exception as exc:  # never let the reaper die silently
             logger.warning("[VoiceReaper] loop stopped: %s", exc)
+
+    async def _run_sweep_once(self) -> int:
+        """One reaper pass — force-closes when the process is under RAM pressure.
+
+        Memory pressure (VOICE_RAM_SOFT_LIMIT_MB) skips the idle TTL entirely:
+        every client that no order references is closed immediately, so a
+        memory spike can never grow into an OOM kill / restart.
+        """
+        rss = _process_rss_mb()
+        soft_limit = max(0, int(getattr(Config, "VOICE_RAM_SOFT_LIMIT_MB", 0) or 0))
+        if soft_limit and (rss or 0) > soft_limit:
+            closed = await self.reap_idle_clients(force=True)
+            logger.warning(
+                "[VoiceReaper] RAM pressure: rss=%sMB > soft limit %sMB — "
+                "closed %s unreferenced client(s) immediately",
+                rss, soft_limit, closed,
+            )
+            return closed
+        return await self.reap_idle_clients()
 
     async def _log_memory_report_if_due(self) -> None:
         interval = max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600) or 600))
@@ -2896,16 +2950,26 @@ class VoiceCallManager:
         except Exception:
             pass
 
-    async def _fetch_shared_participants(self, app: Client, chat_id: int) -> Optional[Set[int]]:
-        """
-        Fetch the *full* set of non-left participant user IDs for a chat in a
-        single paginated pass, cached for the current monitor cycle.
+    async def _fetch_shared_participants(self, app: Client, chat_id: int,
+                                        wanted_ids: Optional[Set[int]] = None) -> Tuple[Optional[Set[int]], bool]:
+        """Fetch the participant user-id set for a chat in one paginated pass.
 
-        Returns:
-          Set[int] - full participant user-id set (authoritative).
-          None     - could not retrieve (API error / timeout). Callers must
-                     treat None as "unknown → assume present" to avoid rejoin
-                     storms and to avoid dropping healthy accounts.
+        Returns ``(present_ids, authoritative)``:
+
+          * ``authoritative=True``  — the whole participant list was walked, so
+            a missing id really means "not in the call".
+          * ``authoritative=False`` — the list was NOT walked completely
+            (early exit or page cap); the set may confirm PRESENCE but must
+            never be used to conclude ABSENCE. Callers fall back to
+            "unknown → assume present", which is what keeps a partial list from
+            triggering fake-disconnect rejoin storms.
+
+        CPU/network: the participant listing of a busy voice chat is huge, and
+        every monitor cycle used to walk it page by page (up to 50 × 500
+        participants = 25 000 ids, several RPCs each cycle per chat).  When the
+        caller tells us WHICH accounts it cares about, the walk stops as soon
+        as they have all been seen — for a live order that is normally the very
+        first page.
         """
         try:
             cached = self._active_call_cache.get(int(chat_id))
@@ -2921,9 +2985,15 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return set()  # no active call → nobody present
+                return set(), True  # no active call → nobody present (certain)
 
+            wanted = {int(x) for x in (wanted_ids or set())}
             present_ids: Set[int] = set()
+
+            def _wanted_seen() -> bool:
+                # Only "authoritative for the wanted ids" — the snapshot reader
+                # knows this and will not turn it into a False verdict.
+                return bool(wanted) and wanted.issubset(present_ids)
 
             # 1) First page via GetGroupCall (cheap)
             try:
@@ -2935,15 +3005,18 @@ class VoiceCallManager:
                         present_ids.add(int(uid))
             except Exception:
                 pass
+            if _wanted_seen():
+                return present_ids, False
 
             # 2) Paginate the remainder via phone.getGroupParticipants.
             # NOTE: pyrogram 2.0.106 exposes GetGroupParticipants, NOT
             # GetGroupCallParticipants — the old name raised AttributeError
             # on every cycle, so the shared snapshot always collapsed to
             # "unknown" and presence verification silently never worked.
+            max_pages = max(1, int(getattr(Config, "VOICE_PARTICIPANT_MAX_PAGES", 10)))
             try:
                 offset = ""
-                for _page in range(50):  # 50 * 500 = 25 000 participants max
+                for _page in range(max_pages):
                     res = await app.invoke(
                         functions.phone.GetGroupParticipants(
                             call=call,
@@ -2958,36 +3031,48 @@ class VoiceCallManager:
                         uid = getattr(ppeer, "user_id", None)
                         if uid is not None and not getattr(p, "left", False):
                             present_ids.add(int(uid))
+                    if _wanted_seen():
+                        return present_ids, False
                     next_offset = getattr(res, "next_offset", "") or ""
                     if not next_offset:
-                        break
+                        return present_ids, True  # whole list walked
                     offset = next_offset
-                return present_ids
+                # Page cap reached with more pages pending → ambiguous.
+                return present_ids, False
             except Exception:
                 # Ambiguous — can't produce an authoritative set. The caller
                 # will treat this as "unknown → assume present".
-                return None
+                return None, False
         except Exception:
-            return None
+            return None, False
 
     def _snapshot_contains(self, chat_id: int, my_id: int) -> Optional[bool]:
         """
         Consult the shared per-chat participant snapshot taken for the current
         monitor cycle.
 
-        Returns True/False when the snapshot exists and is authoritative for
-        this cycle, None when there is no fresh snapshot.
+        Returns:
+          True  - the account WAS seen in this cycle's participant listing.
+          False - the account was verified ABSENT (only when the listing was
+                  walked completely).
+          None  - unknown (no fresh/complete snapshot) → caller must not
+                  conclude a disconnect.
         """
         snap = self._participant_snapshot.get(chat_id)
         if not snap:
             return None
-        cycle_ts, present_ids = snap
+        cycle_ts, present_ids, authoritative = (
+            snap if len(snap) == 3 else (*snap, False)
+        )
+        if cycle_ts != self._monitor_cycle_ts:
+            return None
         if present_ids is None:
             # Non-authoritative snapshot (fetch failed) → unknown.
             return None
-        if cycle_ts != self._monitor_cycle_ts:
-            return None
-        return int(my_id) in present_ids
+        if int(my_id) in present_ids:
+            return True
+        # A partially walked listing can prove presence but never absence.
+        return False if authoritative else None
 
     async def _is_in_voice_call(self, app: Client, chat_id: int) -> Optional[bool]:
         """Check if account is actually in the voice call via Telegram API.
@@ -3551,14 +3636,32 @@ class VoiceCallManager:
                 for _aid in list(joined.keys()):
                     self._touch_client(_aid)
 
-                # Group by chat so we fetch participants once per chat.
+                # Group by chat so we fetch participants once per chat.  For
+                # every account we also resolve its OWN Telegram user id, so
+                # the shared participant fetch can stop paginating as soon as
+                # this order's accounts have all been seen (that is what keeps
+                # the monitor cheap in HUGE voice chats).
                 by_chat: Dict[int, List[int]] = {}
                 acc_info: Dict[int, Dict] = {}
+                wanted_by_chat: Dict[int, Set[int]] = {}
+                ids_partial: Set[int] = set()  # chats where some id is unknown
                 for acc_id, rec in joined.items():
                     chat_id = int((rec or {}).get("chat_id") or 0)
-                    if chat_id:
-                        by_chat.setdefault(chat_id, []).append(acc_id)
-                        acc_info[acc_id] = rec
+                    if not chat_id:
+                        continue
+                    by_chat.setdefault(chat_id, []).append(acc_id)
+                    acc_info[acc_id] = rec
+                    try:
+                        _me = getattr(self.pyrogram_clients.get(acc_id), "me", None)
+                        _my_id = int(getattr(_me, "id", 0) or 0)
+                    except Exception:
+                        _my_id = 0
+                    if _my_id:
+                        wanted_by_chat.setdefault(chat_id, set()).add(_my_id)
+                    else:
+                        # Cannot prove presence for this account from a partial
+                        # listing → this chat must be walked completely.
+                        ids_partial.add(chat_id)
 
                 # New monitor cycle → refresh the shared participant snapshot.
                 self._monitor_cycle_ts = time.time()
@@ -3575,8 +3678,15 @@ class VoiceCallManager:
                         continue
 
                     # ONE shared participant fetch per chat per cycle.
-                    present_ids = await self._fetch_shared_participants(rep_app, chat_id)
-                    self._participant_snapshot[chat_id] = (self._monitor_cycle_ts, present_ids)
+                    wanted = None if chat_id in ids_partial else wanted_by_chat.get(chat_id)
+                    present_ids, authoritative = await self._fetch_shared_participants(
+                        rep_app, chat_id, wanted_ids=wanted,
+                    )
+                    # `authoritative=False` snapshots may confirm presence but
+                    # never absence (see _snapshot_contains).
+                    self._participant_snapshot[chat_id] = (
+                        self._monitor_cycle_ts, present_ids, authoritative,
+                    )
 
                     for acc_id in acc_ids:
                         if acc_id not in self.joined_accounts_by_order.get(order_id, {}):

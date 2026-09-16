@@ -420,6 +420,166 @@ class IdleClientReaperTests(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────────────────
+# 3. Disk / CPU hygiene: JSONL log cap + participant-walk early exit
+# ────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ResourceHygieneTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp(prefix="logrot-")
+        self._orig_max = vcm_mod.VOICE_LOG_MAX_BYTES
+
+    def tearDown(self) -> None:
+        vcm_mod.VOICE_LOG_MAX_BYTES = self._orig_max
+
+    def test_jsonl_logs_are_size_capped_and_rotated(self):
+        """voice_telemetry/drops/calls must never grow without a bound."""
+        path = os.path.join(self._tmpdir, "voice_telemetry.log")
+        vcm_mod.VOICE_LOG_MAX_BYTES = 2048
+        for i in range(200):
+            vcm_mod._append_jsonl(path, {"i": i, "pad": "x" * 50})
+        self.assertLessEqual(os.path.getsize(path), 2048)
+        rotated = f"{path}.1"
+        self.assertTrue(os.path.exists(rotated), "rotated file missing")
+        self.assertLessEqual(os.path.getsize(rotated), 2048)
+
+    def test_rotation_disabled_when_max_is_zero(self):
+        path = os.path.join(self._tmpdir, "voice_calls.log")
+        vcm_mod.VOICE_LOG_MAX_BYTES = 0
+        for i in range(50):
+            vcm_mod._append_jsonl(path, {"i": i})
+        self.assertFalse(os.path.exists(f"{path}.1"))
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(len(handle.read().strip().split("\n")), 50)
+
+    def test_append_never_raises_on_bad_path(self):
+        vcm_mod._append_jsonl(None, {"a": 1})
+        vcm_mod._append_jsonl(os.path.join(self._tmpdir, "nope", "x.log"), {"a": 1})
+
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ParticipantWalkCostTests(unittest.TestCase):
+    """The monitor used to walk up to 50 pages (25 000 ids) per chat per cycle."""
+
+    class _Call:
+        pass
+
+    def setUp(self) -> None:
+        self.mgr = VoiceCallManager()
+        self.chat_id = -100999
+        self.mgr._active_call_cache[self.chat_id] = (time.time(), self._Call())
+        self.calls = []
+
+    class _App:
+        def __init__(self, owner):
+            self.owner = owner
+
+        async def invoke(self, query):
+            name = type(query).__name__
+            self.owner.calls.append(name)
+            if name == "GetGroupCall":
+                return type("R", (), {
+                    "participants": [
+                        type("P", (), {"peer": type("Peer", (), {"user_id": 1001})(), "left": False})(),
+                    ]
+                })()
+            limit = getattr(query, "limit", 500)
+            offset = getattr(query, "offset", "")
+            # page 2+ : every wanted account is here
+            participants = []
+            if offset:
+                participants = [
+                    type("P", (), {"peer": type("Peer", (), {"user_id": uid})(), "left": False})()
+                    for uid in (2001, 2002)
+                ]
+            return type("R", (), {"participants": participants, "next_offset": "more" if limit else ""})()
+
+    def test_stops_paginating_once_wanted_accounts_are_seen(self):
+        app = self._App(self)
+        present, authoritative = _run(
+            self.mgr._fetch_shared_participants(app, self.chat_id, wanted_ids={1001, 2001})
+        )
+        # First page found 1001; the second page found 2001 → walk stops.
+        self.assertIn(1001, present)
+        self.assertIn(2001, present)
+        self.assertFalse(authoritative, "partial walk must not claim authority")
+        # Two pages were enough to see both wanted ids — the walk must stop
+        # there instead of draining the whole listing (cap = 10 pages here).
+        pages = len([c for c in self.calls if c == "GetGroupParticipants"])
+        self.assertEqual(pages, 2)
+        self.assertLess(pages, max(1, int(vcm_mod.Config.VOICE_PARTICIPANT_MAX_PAGES)))
+
+    def test_partial_walk_can_confirm_presence_but_not_absence(self):
+        app = self._App(self)
+        present, authoritative = _run(
+            self.mgr._fetch_shared_participants(app, self.chat_id, wanted_ids={1001, 2001})
+        )
+        self.mgr._monitor_cycle_ts = 123.0
+        self.mgr._participant_snapshot[self.chat_id] = (
+            self.mgr._monitor_cycle_ts, present, authoritative,
+        )
+        self.assertIs(self.mgr._snapshot_contains(self.chat_id, 1001), True)
+        # Someone NOT in the partially-walked list must stay "unknown",
+        # otherwise the monitor would fire a fake-disconnect rejoin storm.
+        self.assertIsNone(self.mgr._snapshot_contains(self.chat_id, 999999))
+
+    def test_complete_walk_is_authoritative(self):
+        mgr = VoiceCallManager()
+
+        class App:
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def invoke(self, query):
+                if type(query).__name__ == "GetGroupCall":
+                    return type("R", (), {"participants": []})()
+                # One page, then next_offset empty → walk complete.
+                return type("R", (), {"participants": [], "next_offset": ""})()
+
+        mgr._active_call_cache[-1001] = (time.time(), self._Call())
+        present, authoritative = _run(mgr._fetch_shared_participants(App(mgr), -1001))
+        self.assertTrue(authoritative)
+        mgr._monitor_cycle_ts = 5.0
+        mgr._participant_snapshot[-1001] = (5.0, present, authoritative)
+        self.assertIs(mgr._snapshot_contains(-1001, 4242), False)  # verified absent
+
+    def test_page_cap_bounds_the_walk(self):
+        mgr = VoiceCallManager()
+        seen = {"pages": 0}
+
+        class App:
+            async def invoke(self, query):
+                if type(query).__name__ == "GetGroupCall":
+                    return type("R", (), {"participants": []})()
+                seen["pages"] += 1
+                return type("R", (), {"participants": [], "next_offset": "next"})()
+
+        mgr._active_call_cache[-1002] = (time.time(), self._Call())
+        _run(mgr._fetch_shared_participants(App(), -1002))
+        self.assertEqual(seen["pages"], max(1, int(vcm_mod.Config.VOICE_PARTICIPANT_MAX_PAGES)))
+
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class RamPressureTests(unittest.TestCase):
+    def test_ram_pressure_closes_unreferenced_clients_immediately(self):
+        mgr = VoiceCallManager()
+        kept_app, fresh_app = FakeApp(me_id=9001), FakeApp(me_id=9002)
+        mgr.pyrogram_clients[9001] = kept_app
+        mgr.pyrogram_clients[9002] = fresh_app
+        mgr._session_cache[9002] = "s"
+        mgr.joined_accounts_by_order[1] = {9001: {"chat_id": -1, "status": "JOINED"}}
+        mgr._client_last_used[9002] = time.time()  # fresh → TTL would keep it
+        orig_limit = vcm_mod.Config.VOICE_RAM_SOFT_LIMIT_MB
+        try:
+            vcm_mod.Config.VOICE_RAM_SOFT_LIMIT_MB = 1  # 1MB → always "under pressure"
+            closed = _run(mgr._run_sweep_once())
+        finally:
+            vcm_mod.Config.VOICE_RAM_SOFT_LIMIT_MB = orig_limit
+        self.assertEqual(closed, 1)
+        self.assertNotIn(9002, mgr.pyrogram_clients)
+        self.assertIn(9001, mgr.pyrogram_clients)  # referenced → untouched
+
+
+# ────────────────────────────────────────────────────────────────────────
 # 3. Background maintenance lifecycle
 # ────────────────────────────────────────────────────────────────────────
 @unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")

@@ -593,7 +593,8 @@ class ParticipantPaginationTests(unittest.TestCase):
             present = await self.mgr._is_in_voice_call(app, -200)
             self.assertIs(present, True)
 
-            ids = await self.mgr._fetch_shared_participants(app, -200)
+            # _fetch_shared_participants returns (ids, authoritative).
+            ids, authoritative = await self.mgr._fetch_shared_participants(app, -200)
             self.assertIn(4242, ids)
             # The FULL paginated pass must use the real pyrogram 2.x RPC name.
             self.assertIn("GetGroupParticipants", app.calls)

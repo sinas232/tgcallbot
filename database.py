@@ -9,6 +9,7 @@ database.py
 """
 import logging
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
@@ -26,12 +27,22 @@ DB_URL_ASYNC = Config.get_normalized_database_url()
 if not DB_URL_ASYNC:
     raise RuntimeError("DATABASE_URL not provided")
 
+# ── Connection pool sizing (RAM + DB load) ──────────────────────────────
+# 20+10 connections were held open permanently: every asyncpg connection keeps
+# buffers on BOTH sides (bot RAM + Postgres backend memory) and the bot's load
+# is bursty, not 30-way concurrent.  Defaults are now modest and tunable.
+DB_POOL_SIZE = max(1, int(os.getenv('DB_POOL_SIZE', '10')))
+DB_MAX_OVERFLOW = max(0, int(os.getenv('DB_MAX_OVERFLOW', '5')))
+# Recycle half-hour-old connections (also returns pool memory after idle spells).
+DB_POOL_RECYCLE = max(60, int(os.getenv('DB_POOL_RECYCLE', '1800')))
+
 engine = create_async_engine(
     DB_URL_ASYNC, 
     echo=False, 
     pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=10
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
+    pool_recycle=DB_POOL_RECYCLE,
 )
 AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=AsyncSession, expire_on_commit=False)
 

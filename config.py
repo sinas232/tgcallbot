@@ -307,6 +307,25 @@ class Config:
     # Interval (seconds) for the `[VoiceMemory]` report line (RSS, live clients,
     # engines, ffmpeg children) — makes RAM usage answerable from docker logs.
     VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    # Soft RAM ceiling (MB) for the whole bot process tree. 0 = disabled.
+    # When the process RSS crosses it, the reaper stops waiting for the idle
+    # TTL and immediately closes every client no order references (+ warns in
+    # the log), so a memory spike can never turn into an OOM kill.
+    VOICE_RAM_SOFT_LIMIT_MB = max(0, int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0')))
+
+    # ── MONITOR COST (CPU / Telegram traffic) ────────────────────────────
+    # Maximum participant-list pages (500 ids each) the monitor walks per chat
+    # and cycle. The walk stops EARLY as soon as all of the order's accounts
+    # have been seen — for a normal order that is the very first page — so this
+    # cap only bounds the pathological case (huge chat, accounts missing).
+    VOICE_PARTICIPANT_MAX_PAGES = max(1, int(os.getenv('VOICE_PARTICIPANT_MAX_PAGES', '10')))
+
+    # ── DIAGNOSTIC LOG SIZE CAP (disk + I/O) ─────────────────────────────
+    # voice_calls.log / voice_drops.log / voice_telemetry.log are size-capped
+    # and rotated to `<name>.1`; 0 disables rotation. The telemetry file is
+    # written for every account on every monitor cycle, so without a cap it
+    # grows forever (tens of MB per day).
+    VOICE_LOG_MAX_MB = max(0, int(os.getenv('VOICE_LOG_MAX_MB', '25')))
 
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
