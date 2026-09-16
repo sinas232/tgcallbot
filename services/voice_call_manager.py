@@ -321,11 +321,171 @@ def _voice_proxy_config() -> Optional[Dict[str, Any]]:
         proxy["password"] = pwd
     return proxy
 
+# ─── VOICE CLIENT PROFILE (RAM + Telegram-traffic control) ────────────────
+# What a voice client REALLY needs from Pyrogram is the raw update stream
+# (PyTgCalls/WebRTC handshake + participant sync).  Everything the library
+# does for a *chat* client is pure cost here:
+#
+#   fetch_replies=True (library default) → every incoming message that replies
+#     to another message triggers an immediate `channels.GetMessages` RPC for
+#     the quoted message.  With dozens/hundreds of accounts sitting in busy
+#     supergroups this is a continuous GetMessages storm: Telegram answers with
+#     FLOOD_WAIT — exactly the
+#         [shared_client_69] Waiting for 12 seconds before continuing
+#         (required by "channels.GetMessages")
+#     lines — and each waiting request keeps its task + parsed Message objects
+#     alive in RAM, while the client's message cache keeps filling up.
+#     (pyrogram/methods/messages/get_messages.py is invoked from
+#      Message.__parse_reply with replies=1 for live updates.)
+#   workers=N (library default) → N dispatcher worker tasks per client, i.e.
+#     N × accounts tasks that just sit there waiting for nothing.
+#   max_message_cache_size / max_topic_cache_size (1000 each by default) →
+#     up to a thousand parsed messages held alive PER client.
+#
+# All of it is disabled for the long-lived `shared_client_*` clients below.
+VOICE_CLIENT_FETCH_REPLIES = bool(getattr(Config, "VOICE_CLIENT_FETCH_REPLIES", False))
+VOICE_CLIENT_FETCH_TOPICS = bool(getattr(Config, "VOICE_CLIENT_FETCH_TOPICS", False))
+VOICE_CLIENT_FETCH_STORIES = bool(getattr(Config, "VOICE_CLIENT_FETCH_STORIES", False))
+VOICE_CLIENT_FETCH_STICKERS = bool(getattr(Config, "VOICE_CLIENT_FETCH_STICKERS", False))
+VOICE_CLIENT_WORKERS = max(1, int(getattr(Config, "VOICE_CLIENT_WORKERS", 1) or 1))
+VOICE_CLIENT_MESSAGE_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_MESSAGE_CACHE", 50) or 0))
+VOICE_CLIENT_TOPIC_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_TOPIC_CACHE", 50) or 0))
+
+# ─── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────────
+# A connected voice client is not free: session + dispatcher (+ its worker
+# tasks) + caches, and it keeps consuming Telegram updates.  Clients that no
+# order references any more (a cancelled join, a pre-warmed wave the order
+# never used, an order that already ended) therefore MUST be disconnected —
+# otherwise RAM stays full with zero active orders, which is exactly what was
+# reported.  The reaper runs for the whole process lifetime and only touches
+# clients that:
+#   * no order references (neither a live call nor the durable joined state),
+#   * have no join/rejoin in flight,
+#   * and have been idle for VOICE_IDLE_CLIENT_TTL seconds
+#     (an order-end sweep closes unreferenced clients immediately).
+VOICE_IDLE_REAPER = bool(getattr(Config, "VOICE_IDLE_REAPER", True))
+VOICE_IDLE_CLIENT_TTL = max(30, int(getattr(Config, "VOICE_IDLE_CLIENT_TTL", 300) or 300))
+
+# Accepted keyword arguments of the installed Client.__init__ (cached).  Some
+# pyrogram forks do not expose every knob above; unsupported keys must be
+# dropped instead of crashing every client creation.
+_CLIENT_INIT_PARAMS: Optional[set] = None
+_CLIENT_INIT_PARAMS_CLS: Optional[type] = None
+
+
+def _client_init_params() -> set:
+    """Accepted keyword arguments of the installed Client.__init__ (cached)."""
+    global _CLIENT_INIT_PARAMS, _CLIENT_INIT_PARAMS_CLS
+    # Recompute when the Client class itself changed (tests swap it, a fork
+    # could monkey-patch it) so the cache can never bind to a stale class.
+    if _CLIENT_INIT_PARAMS is None or _CLIENT_INIT_PARAMS_CLS is not Client:
+        try:
+            import inspect
+
+            _CLIENT_INIT_PARAMS = set(inspect.signature(Client.__init__).parameters)
+        except Exception:
+            _CLIENT_INIT_PARAMS = set()
+        _CLIENT_INIT_PARAMS_CLS = Client
+    return _CLIENT_INIT_PARAMS
+
+
+def _filter_client_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    supported = _client_init_params()
+    if not supported:
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in supported}
+
+
+def _voice_client_kwargs(account_id: int) -> Dict[str, Any]:
+    """Shared keyword arguments for every long-lived voice client.
+
+    Keeps the raw update stream ON (PyTgCalls needs it) while switching off
+    the chat-side auto-fetch machinery and the oversized per-client caches —
+    see the VOICE CLIENT PROFILE block above for why this matters.
+    """
+    return _filter_client_kwargs({
+        # PyTgCalls needs raw Telegram updates to complete the voice transport
+        # handshake and participant sync.
+        "no_updates": False,
+        "in_memory": True,
+        "proxy": _voice_proxy_config(),
+        # No automatic reply/topic/story/sticker fetching → no GetMessages
+        # per incoming reply, no extra RPCs, no extra cached objects.
+        "fetch_replies": VOICE_CLIENT_FETCH_REPLIES,
+        "fetch_topics": VOICE_CLIENT_FETCH_TOPICS,
+        "fetch_stories": VOICE_CLIENT_FETCH_STORIES,
+        "fetch_stickers": VOICE_CLIENT_FETCH_STICKERS,
+        # ONE dispatcher worker per client instead of the library default
+        # (WORKERS = min(32, cpu_count+4)) — with many accounts that default
+        # alone accounted for hundreds of idle tasks.
+        "workers": VOICE_CLIENT_WORKERS,
+        # Small caches: a voice client never reads chat history.
+        "max_message_cache_size": VOICE_CLIENT_MESSAGE_CACHE,
+        "max_topic_cache_size": VOICE_CLIENT_TOPIC_CACHE,
+        # A voice account never downloads media concurrently.
+        "max_concurrent_transmissions": 1,
+        **_client_device_fingerprint(account_id),
+    })
+
+
+def _process_rss_mb(pid: Optional[int] = None) -> Optional[float]:
+    """Resident set size (MB) of a process from /proc — no psutil needed."""
+    try:
+        target = int(pid or os.getpid())
+        with open(f"/proc/{target}/statm", "r", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+        return round(pages * (os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)), 1)
+    except Exception:
+        return None
+
+
+def _child_processes_report() -> Dict[str, Any]:
+    """Cheap /proc scan: how many media helper processes exist and how much RAM they hold.
+
+    ntgcalls spawns ONE ffmpeg child per account that has an active media
+    stream.  Those children are invisible in the bot process' own RSS but they
+    are part of the container's memory — a leftover ffmpeg (whose engine was
+    abandoned mid-join) keeps eating RAM with no order running at all.
+    """
+    report = {"ffmpeg": 0, "ffmpeg_rss_mb": 0.0, "processes": 0, "total_rss_mb": 0.0}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                    stat = handle.read()
+                cut = stat.rindex(")")
+                comm = stat[:cut].split("(", 1)[-1]
+                fields = stat[cut + 2:].split()
+                rss_mb = (int(fields[21]) * (os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)))
+            except Exception:
+                continue
+            report["processes"] += 1
+            report["total_rss_mb"] += rss_mb
+            if comm == "ffmpeg":
+                report["ffmpeg"] += 1
+                report["ffmpeg_rss_mb"] += rss_mb
+        for key in ("ffmpeg_rss_mb", "total_rss_mb"):
+            report[key] = round(report[key], 1)
+    except Exception:
+        pass
+    return report
+
+
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
     _JOIN_PENDING_TIMEOUT,
     ACTIVE_CALL_CACHE_TTL,
     os.path.abspath(__file__),
+)
+logger.info(
+    "VoiceCallManager client profile: workers=%s msg_cache=%s topic_cache=%s "
+    "fetch_replies=%s fetch_topics=%s fetch_stories=%s (chat-side auto-fetch off "
+    "prevents the channels.GetMessages flood)",
+    VOICE_CLIENT_WORKERS, VOICE_CLIENT_MESSAGE_CACHE, VOICE_CLIENT_TOPIC_CACHE,
+    VOICE_CLIENT_FETCH_REPLIES, VOICE_CLIENT_FETCH_TOPICS, VOICE_CLIENT_FETCH_STORIES,
 )
 if bool(getattr(Config, "USE_PROXY", False)):
     logger.info(
@@ -706,6 +866,20 @@ class VoiceCallManager:
         self._recent_issues = deque()
         self._recent_issues_lock = asyncio.Lock()
 
+        # ── IDLE-CLIENT BOOKKEEPING (RAM hygiene) ─────────────────────────
+        # account_id -> epoch of the last time the account was actually USED
+        # (created, joined, monitored, messaged).  The reaper only closes a
+        # client that is not referenced by any order AND has been idle for
+        # VOICE_IDLE_CLIENT_TTL seconds.
+        self._client_last_used: Dict[int, float] = {}
+        # order_id -> account ids whose client was PRE-WARMED for that order
+        # (the join brain warms the NEXT wave while the current one joins).
+        # Warmed-but-never-used clients used to survive the order forever.
+        self._warmed_by_order: Dict[int, Set[int]] = {}
+        self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._last_memory_log: float = 0.0
+        self._reaped_total: int = 0
+
     def _load_strategy_cache(self) -> None:
         try:
             with open(self._strategy_cache_path, "r", encoding="utf-8") as handle:
@@ -1030,6 +1204,7 @@ class VoiceCallManager:
         app = self.pyrogram_clients.get(account_id)
         if not app:
             return False, "اکانت انتخاب‌شده هم‌اکنون در هیچ ویس‌کالی حاضر و متصل نیست."
+        self._touch_client(account_id)
 
         payload = (reaction_emoji or text or "").strip()
         if not payload:
@@ -1215,8 +1390,29 @@ class VoiceCallManager:
                 errors.append(f"#{aid}: {msg}")
         return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
 
-    def _account_in_any_order(self, account_id: int) -> bool:
-        return any(aid == account_id for (oid, aid) in self.active_calls.keys())
+    def _account_in_any_order(self, account_id: int, exclude_order_id: Optional[int] = None) -> bool:
+        """Is this account still NEEDED by an order (live call or durable join)?
+
+        The durable (`joined_accounts_by_order`) state must be part of this
+        check: an account that is durably joined but whose `active_calls` entry
+        was already popped (a monitor-driven rejoin window, for instance) is
+        still very much in use and its client must never be closed.
+        """
+        try:
+            account_id = int(account_id)
+        except (TypeError, ValueError):
+            return False
+        for (oid, aid) in list(self.active_calls.keys()):
+            if int(aid) == account_id and (
+                exclude_order_id is None or int(oid) != int(exclude_order_id)
+            ):
+                return True
+        for oid, recs in list(self.joined_accounts_by_order.items()):
+            if exclude_order_id is not None and int(oid) == int(exclude_order_id):
+                continue
+            if account_id in (recs or {}):
+                return True
+        return False
 
     def get_in_use_account_ids(self) -> Set[int]:
         return {aid for (oid, aid) in self.active_calls.keys()}
@@ -1799,6 +1995,13 @@ class VoiceCallManager:
     # ─── Client management ───
 
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
+        # RAM hygiene: the sweep that closes clients nobody needs runs for the
+        # whole process lifetime (started here because every voice path ends up
+        # in this method at least once).
+        self.ensure_background_maintenance()
+        # Mark the account as in use so the reaper can never close a client
+        # that is being handed to a caller right now.
+        self._touch_client(account_id)
         # Database sessions are encrypted. Passing the encrypted value to
         # Pyrogram makes every account fail during client initialisation.
         decrypted_session = SecurityManager.decrypt_session(session_string)
@@ -1842,12 +2045,7 @@ class VoiceCallManager:
                             session_string=decrypted_session,
                             api_id=api_id,
                             api_hash=api_hash,
-                            # PyTgCalls needs raw Telegram updates to complete
-                            # the voice transport handshake and participant sync.
-                            no_updates=False,
-                            in_memory=True,
-                            proxy=_voice_proxy_config(),
-                            **_client_device_fingerprint(account_id),
+                            **_voice_client_kwargs(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
                     except Exception:
@@ -1897,15 +2095,16 @@ class VoiceCallManager:
 
             return pytg
 
-    async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
+    async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False,
+                              reason: str = "") -> None:
         # Only cleanup if account is not used by any other active call
         if not force:
-            still_active = any(
-                aid == account_id
-                for (oid, aid) in self.active_calls.keys()
-                if oid != order_id
-            )
-            if still_active:
+            if self._account_in_any_order(account_id, exclude_order_id=order_id):
+                return
+            # A join/rejoin for this account may be running right now — its
+            # client is in use even though the bookkeeping above is not there
+            # yet (the durable entry is only written AFTER verification).
+            if any(int(aid) == int(account_id) for (aid, _cid) in list(self._inflight_joins.keys())):
                 return
 
         pytg = self.clients.pop(account_id, None)
@@ -1938,6 +2137,202 @@ class VoiceCallManager:
             session_ownership.release_voice(account_id)
             self._session_cache.pop(account_id, None)
             self._client_locks.pop(account_id, None)
+            self._client_last_used.pop(account_id, None)
+            if reason:
+                logger.info(
+                    "[VoiceReaper] account %s client closed (%s; engine=%s)",
+                    account_id, reason, bool(pytg),
+                )
+
+    # ─── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────
+
+    def _touch_client(self, account_id: Optional[int]) -> None:
+        """Record that an account's voice client is actively in use.
+
+        The reaper may only close clients that nobody referenced for
+        VOICE_IDLE_CLIENT_TTL seconds; this timestamp is the safety net for
+        every path that uses a client WITHOUT registering it in an order
+        (client creation, warm-up, monitor cycles, in-call messaging).
+        """
+        if account_id is None:
+            return
+        try:
+            self._client_last_used[int(account_id)] = time.time()
+        except (TypeError, ValueError):
+            pass
+
+    def _referenced_account_ids(self) -> Set[int]:
+        """Accounts some part of the system still needs RIGHT NOW."""
+        referenced: Set[int] = set()
+        for (_oid, aid) in list(self.active_calls.keys()):
+            try:
+                referenced.add(int(aid))
+            except (TypeError, ValueError):
+                continue
+        for recs in list(self.joined_accounts_by_order.values()):
+            for aid in list((recs or {}).keys()):
+                try:
+                    referenced.add(int(aid))
+                except (TypeError, ValueError):
+                    continue
+        for (aid, _cid) in list(self._inflight_joins.keys()):
+            try:
+                referenced.add(int(aid))
+            except (TypeError, ValueError):
+                continue
+        return referenced
+
+    async def reap_idle_clients(self, *, force: bool = False, order_id: Optional[int] = None) -> int:
+        """Disconnect voice clients that no order needs any more.
+
+        `force=False` → only clients idle for VOICE_IDLE_CLIENT_TTL seconds.
+        `force=True`  → every client that is not referenced by an order right
+                        now (used when an order ends so a finished/cancelled
+                        order cannot leave its pre-warmed clients — and their
+                        engines/ffmpeg children — connected forever).
+
+        Returns the number of clients that were closed.
+        """
+        if not VOICE_IDLE_REAPER and not force:
+            return 0
+        candidates = set(self.pyrogram_clients.keys()) | set(self.clients.keys())
+        if not candidates:
+            return 0
+        referenced = self._referenced_account_ids()
+        in_flight = {int(aid) for (aid, _cid) in list(self._inflight_joins.keys())}
+        now = time.time()
+        closed = 0
+        for account_id in sorted(candidates):
+            if account_id in referenced or account_id in in_flight:
+                continue
+            if not force:
+                idle_for = now - float(self._client_last_used.get(account_id, 0.0))
+                if idle_for < VOICE_IDLE_CLIENT_TTL:
+                    continue
+            # Never yank a client while our own code holds its account lock
+            # (a client is (re)built / an engine is rebuilt under that lock).
+            lock = self._client_locks.get(account_id)
+            if lock is not None and lock.locked():
+                continue
+            try:
+                await self._cleanup_client(account_id, order_id=order_id, force=True,
+                                           reason="idle" if not force else "unreferenced")
+                closed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[VoiceReaper] closing acc=%s failed: %s", account_id, exc)
+        if closed:
+            self._reaped_total += closed
+            logger.info(
+                "[VoiceReaper] closed %s idle voice client(s) — remaining client(s)=%s engine(s)=%s",
+                closed, len(self.pyrogram_clients), len(self.clients),
+            )
+            # Pyrogram objects (sessions, parsers, caches) are reference-cyclic;
+            # a collection right after a mass close returns that RAM promptly.
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
+        return closed
+
+    def memory_report(self) -> Dict[str, Any]:
+        """Live RAM + client/engine inventory (answerable from docker logs)."""
+        try:
+            referenced = self._referenced_account_ids()
+        except Exception:
+            referenced = set()
+        try:
+            holds = session_ownership.held_count()
+        except Exception:
+            holds = -1
+        try:
+            tasks = len(asyncio.all_tasks())
+        except Exception:
+            tasks = -1
+        report: Dict[str, Any] = {
+            "rss_mb": _process_rss_mb(),
+            "clients": len(self.pyrogram_clients),
+            "engines": len(self.clients),
+            "in_call_slots": len(self.active_calls),
+            "durable_slots": sum(len(recs or {}) for recs in self.joined_accounts_by_order.values()),
+            "unused_clients": len([a for a in self.pyrogram_clients if a not in referenced]),
+            "session_holds": holds,
+            "asyncio_tasks": tasks,
+            "reaped_total": self._reaped_total,
+        }
+        report.update(_child_processes_report())
+        return report
+
+    def ensure_background_maintenance(self) -> None:
+        """Start the idle-client reaper / memory reporter (idempotent)."""
+        if not VOICE_IDLE_REAPER:
+            return
+        task = self._idle_reaper_task
+        if task is not None and not task.done():
+            return
+        try:
+            self._idle_reaper_task = asyncio.get_running_loop().create_task(self._idle_reaper_loop())
+        except RuntimeError:
+            # No running loop (import-time call) — the next client creation
+            # inside the loop starts it.
+            self._idle_reaper_task = None
+            return
+        logger.info(
+            "[VoiceReaper] started: idle TTL=%ss sweep=%ss memory log=%ss",
+            VOICE_IDLE_CLIENT_TTL,
+            max(5, int(getattr(Config, "VOICE_IDLE_SWEEP_INTERVAL", 60) or 60)),
+            max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600) or 600)),
+        )
+
+    async def _idle_reaper_loop(self) -> None:
+        interval = max(5, int(getattr(Config, "VOICE_IDLE_SWEEP_INTERVAL", 60) or 60))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.reap_idle_clients()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("[VoiceReaper] sweep failed: %s", exc)
+                try:
+                    await self._log_memory_report_if_due()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never let the reaper die silently
+            logger.warning("[VoiceReaper] loop stopped: %s", exc)
+
+    async def _log_memory_report_if_due(self) -> None:
+        interval = max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600) or 600))
+        now = time.time()
+        if now - self._last_memory_log < interval:
+            return
+        self._last_memory_log = now
+        report = self.memory_report()
+        logger.info(
+            "[VoiceMemory] %s",
+            " ".join(f"{key}={value}" for key, value in report.items()),
+        )
+        # Media helper processes outliving their calls are the classic "RAM
+        # full with no active order" signature — surface it loudly.
+        try:
+            expected = max(2, int(report.get("in_call_slots") or 0) + 2)
+            if int(report.get("ffmpeg") or 0) > expected:
+                logger.warning(
+                    "[VoiceMemory] %s ffmpeg process(es) alive while only %s call slot(s) "
+                    "are active — leftover media from abandoned joins (≈%s MB)",
+                    report.get("ffmpeg"), report.get("in_call_slots"),
+                    report.get("ffmpeg_rss_mb"),
+                )
+        except Exception:
+            pass
 
     # ─── Protocol helpers ───
 
@@ -3151,6 +3546,11 @@ class VoiceCallManager:
                 if not joined:
                     break  # order has no durably-joined accounts → monitor exits
 
+                # Every account of a live order is in use this cycle — never
+                # let the idle reaper close one of them.
+                for _aid in list(joined.keys()):
+                    self._touch_client(_aid)
+
                 # Group by chat so we fetch participants once per chat.
                 by_chat: Dict[int, List[int]] = {}
                 acc_info: Dict[int, Dict] = {}
@@ -3464,7 +3864,8 @@ class VoiceCallManager:
         async with self._reservation_lock:
             self._reservations[order_id] = set(account_ids)
 
-    async def warmup_clients(self, accounts: List[Dict], limit: int = 0) -> int:
+    async def warmup_clients(self, accounts: List[Dict], limit: int = 0,
+                             order_id: Optional[int] = None) -> int:
         """Pre-create Pyrogram clients CONCURRENTLY (bounded) for a wave.
 
         Used by the Join Brain to warm the NEXT wave's accounts while the
@@ -3473,7 +3874,13 @@ class VoiceCallManager:
         100-500-account scale.  Every client creation is guarded by the
         account lock (no double-start races) and the global
         CLIENT_CREATE_SEMAPHORE (no startup storm).
+
+        ``order_id`` (optional) records WHICH order asked for the warm-up, so
+        a finished/cancelled order can close the clients it pre-warmed but
+        never used (they used to stay connected — with their dispatcher, caches
+        and update stream — for the rest of the process lifetime).
         """
+        self.ensure_background_maintenance()
         to_warm = accounts if limit <= 0 else accounts[:limit]
         candidates: List[Dict] = []
         for acc in to_warm:
@@ -3487,6 +3894,14 @@ class VoiceCallManager:
                 candidates.append(acc)
             except Exception:
                 continue
+
+        if order_id is not None and candidates:
+            try:
+                self._warmed_by_order.setdefault(int(order_id), set()).update(
+                    int(acc.get("id")) for acc in candidates if acc.get("id") is not None
+                )
+            except (TypeError, ValueError):
+                pass
 
         warmed = 0
 
@@ -3518,11 +3933,7 @@ class VoiceCallManager:
                                 session_string=decrypted_session,
                                 api_id=api_id,
                                 api_hash=api_hash,
-                                # Voice clients must receive raw updates from Telegram.
-                                no_updates=False,
-                                in_memory=True,
-                                proxy=_voice_proxy_config(),
-                                **_client_device_fingerprint(account_id),
+                                **_voice_client_kwargs(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)
                         except FloodWait as e:
@@ -3542,6 +3953,7 @@ class VoiceCallManager:
                             raise
                         self.pyrogram_clients[account_id] = app
                         self._session_cache[account_id] = session_string
+                        self._touch_client(account_id)
                         warmed += 1
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
@@ -3557,6 +3969,8 @@ class VoiceCallManager:
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
         """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
         key = (order_id, account_id)
+        self.ensure_background_maintenance()
+        self._touch_client(account_id)
 
         # If already durably joined & counted for this order, return success
         # (idempotent — no duplicate counting, no duplicate join).
@@ -3620,6 +4034,15 @@ class VoiceCallManager:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
+                # A revoked/dead session can never be used again: close its
+                # client immediately instead of leaving a dead connection (and
+                # its registered update stream) alive for the process lifetime.
+                if not self._account_in_any_order(account_id, exclude_order_id=order_id):
+                    try:
+                        await self._cleanup_client(account_id, order_id=order_id, force=True,
+                                                   reason="session revoked")
+                    except Exception:
+                        pass
                 return False, f"SESSION_REVOKED: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
@@ -3903,6 +4326,26 @@ class VoiceCallManager:
         self._order_timeline.pop(order_id, None)
         self._order_join_locks.pop(order_id, None)
         self._presence_reconcilers.pop(order_id, None)
+        warmed = self._warmed_by_order.pop(order_id, set())
+        # ── RAM hygiene: close everything this order no longer needs ──────
+        # This covers both the clients that just left AND the clients this
+        # order PRE-WARMED for a next wave that never happened (order finished
+        # / cancelled / wave deadline).  Those used to stay connected with
+        # their dispatcher, caches and registered update stream — the reason
+        # RAM stayed full with zero active orders.  Accounts still referenced
+        # by another order (multi-order reuse) are never touched.
+        try:
+            closed = await self.reap_idle_clients(force=True, order_id=order_id)
+            if closed:
+                logger.info(
+                    "[VoiceReaper] order %s cleanup closed %s client(s) "
+                    "(warmed-but-unused=%s)",
+                    order_id, closed, len(warmed),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[VoiceReaper] order %s cleanup failed: %s", order_id, exc)
         for key in [k for k in self._rejoin_failures if k[0] == order_id]:
             self._rejoin_failures.pop(key, None)
         for key in [k for k in self._media_restore_inflight if k[0] == order_id]:
@@ -3927,6 +4370,22 @@ class VoiceCallManager:
                 await self.stop_all_for_order(oid, leave_group=True)
             except Exception as exc:
                 logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
+
+        # Stop the background RAM sweeper too, then make sure no voice client
+        # survives the shutdown (its MTProto session would otherwise be held
+        # until the process dies).
+        task = self._idle_reaper_task
+        self._idle_reaper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        try:
+            await self.reap_idle_clients(force=True)
+        except Exception:
+            pass
 
     # ─── UNRECOVERABLE-SLOT API (executor-side replacement support) ───
 

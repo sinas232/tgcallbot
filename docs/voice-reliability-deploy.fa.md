@@ -124,7 +124,41 @@ tail -f logs/voice_drops.log           # رخدادهای خروج + علت
 - اکانت‌های FloodWait در `voice_flood_cooldown.json` دقیقاً به اندازهٔ عدد سرور از انتخاب کنار بمانند.
 - پیام «این اکانت هم‌اکنون در یک ویس‌کال فعال است…» هنگام عملیات پروفایل/کد روی اکانتِ درون کال طبیعی است و از باطل‌شدن سشن جلوگیری می‌کند.
 
-## ۷) قوانینی که نباید زیر پا گذاشته شوند
+## ۷) عیب‌یابی مصرف رم (نسخهٔ ۲.۲.۲)
+
+اگر رم کانتینر پر شد — حتی با **صفر سفارش فعال** — این ترتیب را بررسی کنید:
+
+```bash
+# ۱) مصرف کل کانتینر
+docker stats --no-stream telegram_bot_container
+
+# ۲) خط گزارش سربه‌سرِ خودِ ربات (هر VOICE_MEMORY_LOG_INTERVAL ثانیه)
+docker logs --tail 400 telegram_bot_container | grep -E "VoiceMemory|VoiceReaper"
+# نمونه:
+# [VoiceMemory] rss_mb=412 clients=6 engines=4 in_call_slots=4 durable_slots=37 \
+#   unused_clients=2 session_holds=37 asyncio_tasks=210 reaped_total=118 \
+#   ffmpeg=37 ffmpeg_rss_mb=690.0 processes=52 total_rss_mb=1204
+
+# ۳) همان گزارش به‌صورت زنده (بدون نیاز به ps/procps داخل ایمیج)
+docker exec telegram_bot_container python -c \
+ "import asyncio,json;from services.voice_call_manager import voice_call_manager as v;\
+ print(json.dumps(v.memory_report(), indent=2, ensure_ascii=False))"
+```
+
+خواندن خروجی:
+
+| نشانه | معنی | کار |
+|---|---|---|
+| `ffmpeg` زیاد + `in_call_slots=0` | پروسه‌های ffmpegِ کلاینت‌های یتیم باقی مانده‌اند | پس از اعمال این نسخه یک‌بار `docker compose restart bot` بزنید؛ از این پس reaper خودکار می‌بندد |
+| `unused_clients` بالا | کلاینتی که هیچ سفارشی به آن ارجاع نمی‌دهد | حداکثر `VOICE_IDLE_CLIENT_TTL` ثانیه بعد بسته می‌شود (پایان هر سفارش هم فوری) |
+| `clients` ≈ تعداد کل اکانت‌ها | کلاینت‌ها همه روشن مانده‌اند | `VOICE_IDLE_REAPER=true` و `VOICE_CLIENT_*` را چک کنید |
+| `session_holds` بالا ولی `clients` پایین | hold بدون کلاینت (باقی‌ماندهٔ نسخهٔ قبل) | ری‌استارت کانتینر |
+| لاگ پر از `required by "channels.GetMessages"` | `fetch_replies` روشن است | `VOICE_CLIENT_FETCH_REPLIES=false` (پیش‌فرض) و ری‌استارت |
+
+نکته: `MALLOC_ARENA_MAX=2` (در `docker-compose.yml`) باعث می‌شود بعد از اوجِ
+مصرف (موجِ join)، حافظهٔ آزادشدهٔ glibc بهتر به سیستم برگردد و RSS بالا نماند.
+
+## ۸) قوانینی که نباید زیر پا گذاشته شوند
 
 - **ریتری زودهنگام ممنوع:** عدد `FLOOD_WAIT_X` دقیقاً به معنی X ثانیه انتظار است؛ تلاش زودتر آن را طولانی‌تر می‌کند.
 - تعویض شماره، VPN، ریست روتر یا ظاهر کلاینت FloodWait را پاک نمی‌کند.

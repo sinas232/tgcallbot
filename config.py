@@ -267,6 +267,47 @@ class Config:
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
+    # ── VOICE CLIENT PROFILE (RAM + API-traffic control) ─────────────────
+    # Kurigram/Pyrogram defaults are tuned for a CHAT client, not for a fleet of
+    # voice-only accounts:
+    #   * fetch_replies=True  → EVERY incoming message that replies to another
+    #     message immediately fires a `channels.GetMessages` RPC for the quoted
+    #     message. With hundreds of accounts sitting in busy supergroups this is
+    #     a PERMANENT GetMessages storm: Telegram answers FLOOD_WAIT
+    #     ("Waiting for N seconds before continuing (required by
+    #     channels.GetMessages)") and every waiting request keeps its task +
+    #     parsed-Message objects alive in RAM.
+    #   * workers=N           → N dispatcher worker tasks per client (×N accounts).
+    #   * message/topic cache → up to 1000 parsed messages held PER CLIENT.
+    # A voice client only needs the RAW update stream (WebRTC/PyTgCalls
+    # handshake + participant sync), so all of the chat-side machinery above is
+    # switched off for the long-lived `shared_client_*` clients.
+    VOICE_CLIENT_FETCH_REPLIES = os.getenv('VOICE_CLIENT_FETCH_REPLIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_TOPICS = os.getenv('VOICE_CLIENT_FETCH_TOPICS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STORIES = os.getenv('VOICE_CLIENT_FETCH_STORIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STICKERS = os.getenv('VOICE_CLIENT_FETCH_STICKERS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_WORKERS = max(1, int(os.getenv('VOICE_CLIENT_WORKERS', '1')))
+    VOICE_CLIENT_MESSAGE_CACHE = max(0, int(os.getenv('VOICE_CLIENT_MESSAGE_CACHE', '50')))
+    VOICE_CLIENT_TOPIC_CACHE = max(0, int(os.getenv('VOICE_CLIENT_TOPIC_CACHE', '50')))
+
+    # ── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────
+    # A connected voice client costs RAM (session + dispatcher + caches) and,
+    # because it keeps receiving updates, it also keeps generating Telegram
+    # traffic. Accounts that no order references any more MUST therefore be
+    # disconnected instead of being kept "warm" forever: a cancelled join, a
+    # pre-warmed wave that was never used, or a wave that hit its deadline all
+    # used to leave the client (and sometimes its engine + ffmpeg child) alive
+    # for the whole process lifetime — that is what made RAM stay full with
+    # ZERO active orders.
+    VOICE_IDLE_REAPER = os.getenv('VOICE_IDLE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Seconds an UNREFERENCED client may stay connected before it is closed.
+    VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+    # How often the reaper sweeps (seconds).
+    VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+    # Interval (seconds) for the `[VoiceMemory]` report line (RSS, live clients,
+    # engines, ffmpeg children) — makes RAM usage answerable from docker logs.
+    VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
     # Accounts of one order join in waves of N (initial 5-10) concurrent

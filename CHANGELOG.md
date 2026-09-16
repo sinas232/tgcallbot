@@ -9,6 +9,60 @@
 
 ---
 
+## نسخهٔ ۲.۲.۲ — 🧹 فیکس مصرف رم + طوفان `channels.GetMessages`
+
+<div dir="rtl">
+
+**تاریخ:** ۱۴۰۵/۰۶/۲۵
+
+### مشکل
+با اینکه سفارش فعالی وجود نداشت، مصرف رم کانتینر پر می‌ماند و لاگ پر بود از:
+```
+[shared_client_69] Waiting for 12 seconds before continuing (required by "channels.GetMessages")
+[1] Retrying "channels.GetMessages" due to: Request timed out
+```
+دو ریشهٔ مستقل داشت:
+
+1. **طوفان `channels.GetMessages`:** کلاینت‌های بلندمدتِ ویس‌کال
+   (`shared_client_*`) با تنظیمات پیش‌فرض کتابخانه ساخته می‌شدند
+   (`fetch_replies=True`, `workers=4`, کش ۱۰۰۰تایی پیام). در Kurigram
+   با `fetch_replies=True` برای **هر پیام ریپلای** در هر گروهی که اکانت عضو
+   آن است، فوراً `channels.GetMessages` صدا زده می‌شود. با ده‌ها اکانت در
+   گروه‌های شلوغ ⇒ درخواست پیوسته + FloodWait + انبوهی از task و پیامِ
+   پارس‌شده که در رم نگه داشته می‌شوند.
+2. **کلاینت‌های یتیم (نشتی اصلی رم):** کلاینتی که هیچ سفارشی به آن ارجاع
+   نمی‌داد هیچ‌وقت بسته نمی‌شد — joinِ لغوشده/ناموفق بعد از ساخت کلاینت،
+   warm-up‌هایی که Join Brain برای موج بعدی آماده می‌کرد ولی استفاده
+   نمی‌شدند، و اکانت‌هایی که سفارششان تمام شده بود (اگر در `active_calls`
+   نبودند). هر کلاینتِ بی‌ارجاع با dispatcher + کش + سشن MTProto و
+   (در join نیمه‌کاره) انجین PyTgCalls و پروسهٔ ffmpeg، تا پایان عمر پروسه
+   زنده می‌ماند.
+
+### فیکس
+- **پروفایل کلاینت ویس‌کال** (`_voice_client_kwargs`): خاموش‌کردن
+  `fetch_replies/topics/stories/stickers`، `workers=1`، کش پیام/تاپیک = ۵۰،
+  `max_concurrent_transmissions=1`؛ `no_updates=False` حفظ شد چون PyTgCalls
+  به raw updates نیاز دارد. کلیدهای ناشناخته برای نسخه‌های قدیمی‌تر
+  کتابخانه به‌صورت خودکار حذف می‌شوند.
+- **نگهبان رم (idle-client reaper)**: کلاینت‌هایی که هیچ سفارشی به آن‌ها
+  ارجاع نمی‌دهد (نه ویس‌کال فعال، نه state پایدار `joined_accounts_by_order`،
+  نه join در حال اجرا) بعد از `VOICE_IDLE_CLIENT_TTL` ثانیه بسته می‌شوند.
+  `stop_all_for_order` هم در پایان هر سفارش، کلاینت‌های warm‌شدهٔ بی‌استفادهٔ
+  همان سفارش را فوراً می‌بندد (`_warmed_by_order`).
+- **`_account_in_any_order`** حالا state پایدار (اکانت‌های joined) و joinهای
+  در حال اجرا را هم در نظر می‌گیرد؛ بنابراین کلاینتِ اکانتی که سفارش دیگری
+  از آن استفاده می‌کند هرگز بسته نمی‌شود.
+- سشن‌های مرده (`SESSION_REVOKED`) دیگر کلاینت زنده نگه نمی‌دارند.
+- **گزارش `[VoiceMemory]`**: هر `VOICE_MEMORY_LOG_INTERVAL` ثانیه یک خط
+  لاگ با RSS، تعداد کلاینت/انجین/slot، session hold و تعداد و رمِ پروسه‌های
+  ffmpeg چاپ می‌شود تا «پر شدن رم» از روی `docker logs` قابل تشخیص باشد.
+- کلیدهای env جدید در `.env.example` و `config.py`؛ `MALLOC_ARENA_MAX=2`
+  در `docker-compose.yml` برای کاهش fragmentation حافظهٔ بومی (ffmpeg/ntgcalls).
+
+</div>
+
+---
+
 ## نسخهٔ ۲.۲.۱ — 🚪 خروج مدیریت‌شده از ویس‌کال (ضد burst)
 
 <div dir="rtl">

@@ -129,6 +129,11 @@ services:
       # پروکسی درخواست‌های درگاه پرداخت (بدون WARP، از IP ایرانی هاست).
       # اگر خالی شود، درخواست‌های پرداخت مستقیم (از WARP) می‌روند.
       - PAYMENT_HTTP_PROXY=${PAYMENT_HTTP_PROXY:-http://payproxy:8888}
+      # ── کاهش fragmentation حافظهٔ بومی (RAM) ──────────────────────────
+      # کتابخانه‌های بومی (ntgcalls + ffmpeg) ریسمان‌های خود را می‌سازند و
+      # glibc به‌ازای هر ریسمان یک arena حافظه می‌گیرد (تا ۸× تعداد هسته).
+      # با سقف ۲ arena، RSS بعد از اوجِ مصرف (موج join) خیلی کمتر بالا می‌ماند.
+      - MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2}
     depends_on:
       warp:
         condition: service_healthy
