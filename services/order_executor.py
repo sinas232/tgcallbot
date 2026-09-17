@@ -61,6 +61,7 @@ class OrderExecutor:
 		self._voice_pool: Dict[int, List[Dict]] = {}          # eligible account pool (merged/refreshed)
 		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
+		self._voice_dead: Dict[int, Set[int]] = {}            # account_id -> dead session (never retried)
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -185,7 +186,7 @@ class OrderExecutor:
 	        # previous one fully resolved.
 	        # ────────────────────────────────────────────────────────────
 	        if order_type == "voice_chat":
-	            joined_list, dead_count = await self._voice_batched_fill(
+	            joined_list, dead_count = await self._voice_fill(
 	                order_id=order_id,
 	                target=target,
 	                bot_id=bot_id,
@@ -387,6 +388,7 @@ class OrderExecutor:
 	    self._voice_pool.setdefault(order_id, [])
 	    self._voice_attempts.setdefault(order_id, {})
 	    self._voice_banned.setdefault(order_id, set())
+	    self._voice_dead.setdefault(order_id, set())
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -399,6 +401,7 @@ class OrderExecutor:
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
 	    self._voice_banned.pop(order_id, None)
+	    self._voice_dead.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -509,6 +512,333 @@ class OrderExecutor:
 	            return 0.0
 	        best = when if best is None else min(best, when)
 	    return best
+
+
+	async def _voice_fill(self, order_id: int, target: str, bot_id: int,
+	                      target_count: int, requested: int) -> Tuple[List[Dict], int]:
+	    """Voice build entry point: sequential (default) or adaptive waves."""
+	    if bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL", True)):
+	        return await self._voice_sequential_fill(
+	            order_id=order_id, target=target, bot_id=bot_id,
+	            target_count=target_count, requested=requested,
+	        )
+	    return await self._voice_batched_fill(
+	        order_id=order_id, target=target, bot_id=bot_id,
+	        target_count=target_count, requested=requested,
+	    )
+
+	async def _voice_record_failure(self, order_id: int, aid: int, res: Dict,
+	                          *, attempt_budget: int, backoff_base: float) -> str:
+	    """Book-keep ONE failed join result. Returns the failure kind:
+	    'deferred' | 'dead' | 'flood' | 'retry' | 'banned'.
+
+	    Shared by the sequential and the wave engines so retry budget,
+	    FloodWait handling and dead-session replacement behave identically.
+	    Fully guarded: a bookkeeping bug for one account must never take the
+	    whole order down.
+	    """
+	    try:
+	        msg = str(res.get("msg") or "")
+	        try:
+	            self_healing.report(msg, False, key=f"{order_id}:{aid}")
+	        except Exception:
+	            pass
+	        status = res.get("status") or "failed"
+
+	        if status == "deferred":
+	            # A deadline cancelled a still-joining account.  This is a
+	            # scheduling artifact, NOT an account fault — keep the retry
+	            # budget and retry soon.
+	            self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + 5
+	            logger.info(
+	                f"Order {order_id}: account {aid} deferred by deadline - "
+	                f"retrying in 5s (budget kept)"
+	            )
+	            return "deferred"
+
+	        upper = msg.upper()
+	        if status == "dead" or any(x in upper for x in (
+	            "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	            "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
+	        )):
+	            # Account itself is dead — mark inactive & replace.
+	            self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	            self._voice_banned.setdefault(order_id, set()).add(aid)
+	            self._voice_dead.setdefault(order_id, set()).add(aid)
+	            try:
+	                await self._mark_account_dead(aid)
+	            except Exception:
+	                pass
+	            join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	            return "dead"
+
+	        outcome = join_brain.classify_message(msg)
+	        if outcome == OUTCOME_FLOOD:
+	            # A server-directed FloodWait is system pressure, NOT a faulty
+	            # account: do NOT spend its attempt budget and do not replace
+	            # it.  The exact server timer is persisted in vcm and mirrored
+	            # here so candidate selection skips the account until it
+	            # elapses.
+	            fm = re.search(r"FLOODWAIT:(\d+)", upper)
+	            wait_s = float(fm.group(1)) if fm else float(
+	                getattr(Config, "VOICE_JOIN_FLOOD_PAUSE_SECONDS", 15)
+	            )
+	            self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + wait_s
+	            logger.warning(
+	                f"Order {order_id}: account {aid} FloodWait {wait_s:.0f}s — "
+	                f"budget kept, retry deferred (no replacement)"
+	            )
+	            join_brain.report_result(order_id, outcome, msg)
+	            return "flood"
+
+	        attempts = self._voice_attempts.setdefault(order_id, {})
+	        n_att = attempts.get(aid, 0) + 1
+	        attempts[aid] = n_att
+	        if n_att >= attempt_budget:
+	            # Retry budget exhausted → give up on this account; a fresh
+	            # pool member replaces it.
+	            self._voice_banned.setdefault(order_id, set()).add(aid)
+	            logger.warning(
+	                f"Order {order_id}: account {aid} gave up after {n_att} "
+	                f"attempt(s) ({msg[:80]}) — replaced from pool"
+	            )
+	            join_brain.report_result(order_id, outcome, msg)
+	            return "banned"
+	        delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
+	        try:
+	            _b, _fac = self_healing.pick(msg, key=f"{order_id}:{aid}")
+	            delay = min(max(delay * _fac, 1.0), 300.0)
+	        except Exception:
+	            pass
+	        self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
+	        logger.info(
+	            f"Order {order_id}: account {aid} attempt {n_att} failed "
+	            f"({msg[:60]}); retry in {delay:.0f}s"
+	        )
+	        join_brain.report_result(order_id, outcome, msg)
+	        return "retry"
+	    except Exception as _bookkeep_err:
+	        logger.error(
+	            f"Order {order_id}: bookkeeping error for account {aid}: {_bookkeep_err}",
+	            exc_info=True,
+	        )
+	        return "retry"
+
+	async def _voice_sequential_fill(
+	    self,
+	    order_id: int,
+	    target: str,
+	    bot_id: int,
+	    target_count: int,
+	    requested: int,
+	) -> Tuple[List[Dict], int]:
+	    """STRICTLY SEQUENTIAL voice fill — one account at a time.
+
+	    account #1: join group → join voice chat → verified inside the call
+	    → short human-like pause → account #2 …  There is never more than
+	    ONE join in flight for the order, so Telegram sees a calm, natural
+	    cadence (no burst → no FloodWait loops) and the host never runs N
+	    WebRTC handshakes at once.  The only overlap allowed is *pre-warming*
+	    the next account's Pyrogram client (a plain connect, no group/voice
+	    RPC) while the current account joins.
+
+	    Failures use the same retry / FloodWait / dead-replacement rules as
+	    the wave engine (``_voice_record_failure``).  After the first pass
+	    over the pool, bounded top-up passes retry accounts whose backoff
+	    elapsed so an order reaches its target whenever the pool can supply
+	    it — instead of stopping at e.g. 35/50.
+	    """
+	    joined_list: List[Dict] = []
+	    dead_count = 0
+	    self._voice_state(order_id)
+	    vcm = _get_voice_call_manager()
+	    if not vcm:
+	        logger.error(f"Order {order_id}: voice manager unavailable — cannot join")
+	        return joined_list, dead_count
+	    if not self._is_order_active(order_id):
+	        return joined_list, dead_count
+
+	    await self._voice_load_pool(bot_id, order_id)
+	    # Window pinned to 1 so any shared bookkeeping (progress, stats) is
+	    # consistent with the strictly serial cadence.
+	    join_brain.register_order(order_id, initial=1, min_window=1, max_window=1)
+
+	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 3)))
+	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+	    gap_min = max(0.0, float(getattr(Config, "VOICE_JOIN_SEQUENTIAL_GAP_MIN", 2.0)))
+	    gap_max = max(gap_min, float(getattr(Config, "VOICE_JOIN_SEQUENTIAL_GAP_MAX", 4.0)))
+	    prewarm = bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL_PREWARM", True))
+	    join_timeout = max(30.0, float(getattr(Config, "VOICE_WAVE_TIMEOUT", 120)))
+	    topup_passes = max(0, int(getattr(Config, "VOICE_BUILD_TOPUP_PASSES", 3)))
+	    topup_pause = max(0, int(getattr(Config, "VOICE_BUILD_TOPUP_PAUSE", 20)))
+
+	    live = int(vcm.get_active_count(order_id))
+	    joined_ids = set(vcm.get_active_account_ids(order_id))
+	    seq_no = 0
+	    pass_no = 0
+	    logger.info(
+	        f"Order {order_id}: SEQUENTIAL voice build — one account at a time "
+	        f"(gap={gap_min:.1f}-{gap_max:.1f}s, prewarm={'on' if prewarm else 'off'}, "
+	        f"target={target_count}, pool={len(self._voice_pool.get(order_id) or [])})"
+	    )
+
+	    while self._is_order_active(order_id) and live < target_count:
+	        await join_brain.wait_if_paused(order_id)
+	        if not self._is_order_active(order_id):
+	            break
+	        now = time.time()
+	        joined_ids |= set(vcm.get_active_account_ids(order_id))
+	        candidates = self._voice_candidates(order_id, 1, joined_ids, set(), now)
+	        try:
+	            candidates = self_healing.rank(candidates)
+	        except Exception:
+	            pass
+
+	        if not candidates:
+	            earliest = self._voice_earliest_retry(order_id, joined_ids)
+	            if earliest is None:
+	                # Pool exhausted for this pass: refresh (new/reactivated
+	                # accounts) and run a bounded top-up pass.
+	                if pass_no >= topup_passes:
+	                    logger.warning(
+	                        f"Order {order_id}: pool exhausted after {pass_no} top-up "
+	                        f"pass(es) — build ends at {live}/{target_count}"
+	                    )
+	                    break
+	                pass_no += 1
+	                logger.warning(
+	                    f"Order {order_id}: {live}/{target_count} after full pass — "
+	                    f"top-up pass {pass_no}/{topup_passes} in {topup_pause}s"
+	                )
+	                try:
+	                    await asyncio.sleep(topup_pause)
+	                except asyncio.CancelledError:
+	                    raise
+	                if not self._is_order_active(order_id):
+	                    break
+	                await self._voice_load_pool(bot_id, order_id)
+	                # Give banned-by-budget accounts one more chance per pass
+	                # (dead sessions stay banned — they were marked inactive).
+	                attempts = self._voice_attempts.setdefault(order_id, {})
+	                banned = self._voice_banned.setdefault(order_id, set())
+	                dead_ids = self._voice_dead.setdefault(order_id, set())
+	                pool_ids = {a.get("id") for a in (self._voice_pool.get(order_id) or [])}
+	                second_chance = 0
+	                for aid in list(banned):
+	                    if aid in dead_ids or aid in joined_ids or aid not in pool_ids:
+	                        continue
+	                    banned.discard(aid)
+	                    # exactly ONE more attempt in this pass
+	                    attempts[aid] = max(0, attempt_budget - 1)
+	                    second_chance += 1
+	                if second_chance:
+	                    logger.info(
+	                        f"Order {order_id}: top-up pass {pass_no} — {second_chance} "
+	                        f"account(s) get one more attempt"
+	                    )
+	                continue
+	            wait = max(0.0, min(earliest - now, 30.0))
+	            if wait <= 0:
+	                wait = 1.0
+	            logger.info(f"Order {order_id}: no ready account; waiting {wait:.0f}s for retry backoff")
+	            await asyncio.sleep(wait)
+	            continue
+
+	        acc = candidates[0]
+	        aid = acc.get("id")
+	        seq_no += 1
+	        join_brain.start_wave(order_id, 1)
+	        t0 = time.monotonic()
+	        logger.info(
+	            f"Order {order_id}: [{seq_no}] account {aid} → group + voice "
+	            f"(live={live}/{target_count})"
+	        )
+
+	        # Pre-warm ONLY the next account's client (no group/voice RPC) so
+	        # its connect latency overlaps this join instead of adding to it.
+	        warm_task: Optional[asyncio.Task] = None
+	        if prewarm:
+	            nxt = self._voice_candidates(order_id, 1, joined_ids | {aid}, set(), now)
+	            if nxt:
+	                try:
+	                    warm_task = asyncio.create_task(
+	                        vcm.warmup_clients(nxt, limit=1, order_id=order_id)
+	                    )
+	                    warm_task.add_done_callback(
+	                        lambda t: t.cancelled() or t.exception()
+	                    )
+	                except Exception:
+	                    warm_task = None
+
+	        join_task = asyncio.create_task(
+	            self._join_single_account(order_id, acc, "voice_chat", target, 0)
+	        )
+	        try:
+	            res = await asyncio.wait_for(asyncio.shield(join_task), timeout=join_timeout)
+	        except asyncio.TimeoutError:
+	            join_task.cancel()
+	            try:
+	                await asyncio.wait_for(join_task, timeout=10)
+	            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+	                pass
+	            res = {"success": False, "status": "deferred",
+	                   "msg": f"join deadline reached after {join_timeout:.0f}s; retry deferred"}
+	        except asyncio.CancelledError:
+	            join_task.cancel()
+	            raise
+	        except Exception as _exc:
+	            res = {"success": False, "status": "error", "msg": str(_exc)}
+
+	        if res is None:
+	            # Order cancelled mid-flight — do not count attempts.
+	            break
+
+	        elapsed = time.monotonic() - t0
+	        kind = ""
+	        if res.get("success"):
+	            if aid not in joined_ids:
+	                joined_list.append(res)
+	                joined_ids.add(aid)
+	            join_brain.report_result(order_id, OUTCOME_OK)
+	            try:
+	                self_healing.report("", True, key=f"{order_id}:{aid}")
+	            except Exception:
+	                pass
+	            join_brain.finish_wave(order_id, joined=1, failed=0, ok_rate=1.0, duration_s=elapsed)
+	            live = int(vcm.get_active_count(order_id))
+	            logger.info(
+	                f"Order {order_id}: [{seq_no}] account {aid} IN the call after "
+	                f"{elapsed:.0f}s | {join_brain.format_progress(order_id, live, target_count)}"
+	            )
+	        else:
+	            kind = await self._voice_record_failure(
+	                order_id, aid, res, attempt_budget=attempt_budget,
+	                backoff_base=backoff_base,
+	            )
+	            if kind == "dead":
+	                dead_count += 1
+	            join_brain.finish_wave(order_id, joined=0, failed=1, ok_rate=0.0, duration_s=elapsed)
+	            live = int(vcm.get_active_count(order_id))
+
+	        if order_id in self.active_orders:
+	            info = self.active_orders[order_id]
+	            info["live_count"] = live
+	            if kind == "dead":
+	                info["dead_accounts_count"] = (info.get("dead_accounts_count") or 0) + 1
+
+	        if live >= target_count or not self._is_order_active(order_id):
+	            break
+
+	        # Human-like pause before the NEXT account starts.  Skipped after a
+	        # FloodWait (the account-level timer already paces it) — the next
+	        # account is a different session; a small gap is still applied.
+	        gap = random.uniform(gap_min, gap_max)
+	        try:
+	            await asyncio.sleep(gap)
+	        except asyncio.CancelledError:
+	            raise
+
+	    return joined_list, dead_count
 
 	async def _voice_batched_fill(
 	    self,
@@ -701,100 +1031,15 @@ class OrderExecutor:
 	                    pass
 	                continue
 
-	            # ── failure handling (whole block guarded: a bookkeeping bug
-	            #    for ONE account must never take the entire order down) ──
-	            try:
-	                msg = str(res.get("msg") or "")
-	                try:
-	                    self_healing.report(msg, False, key=f"{order_id}:{aid}")
-	                except Exception:
-	                    pass
-	                status = res.get("status") or "failed"
-
-	                if status == "deferred":
-	                    # Wave deadline cancelled a still-joining account.  This
-	                    # is a scheduling artifact, NOT an account fault — keep
-	                    # the retry budget and retry soon in the next wave.
-	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + 5
-	                    logger.info(
-	                        f"Order {order_id}: account {aid} deferred by wave deadline - "
-	                        f"retrying in 5s (budget kept)"
-	                    )
-	                    wave_fail += 1
-	                    continue
-
-	                upper = msg.upper()
-	                if status == "dead" or any(x in upper for x in (
-	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
-	                )):
-	                    # Account itself is dead — mark inactive & replace.
-	                    dead_count += 1
-	                    wave_dead += 1
-	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
-	                    self._voice_banned.setdefault(order_id, set()).add(aid)
-	                    try:
-	                        await self._mark_account_dead(aid)
-	                    except Exception:
-	                        pass
-	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
-	                    wave_fail += 1
-	                    continue
-
-	                outcome = join_brain.classify_message(msg)
-	                if outcome == OUTCOME_FLOOD:
-	                    # A server-directed FloodWait is system pressure, NOT a
-	                    # faulty account: do NOT spend its attempt budget and do
-	                    # not replace it (replacement = more joins = even deeper
-	                    # flood). The exact server timer is persisted in vcm and
-	                    # reflected here so candidate selection skips the account
-	                    # until it elapses, whether or not this wave is cancelled.
-	                    fm = re.search(r"FLOODWAIT:(\d+)", msg.upper())
-	                    wait_s = float(fm.group(1)) if fm else float(
-	                        getattr(Config, "VOICE_JOIN_FLOOD_PAUSE_SECONDS", 15)
-	                    )
-	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + wait_s
-	                    logger.warning(
-	                        f"Order {order_id}: account {aid} FloodWait {wait_s:.0f}s — "
-	                        f"budget kept, retry deferred (no replacement)"
-	                    )
-	                    join_brain.report_result(order_id, outcome, msg)
-	                    wave_fail += 1
-	                    continue
-
-	                attempts = self._voice_attempts.setdefault(order_id, {})
-	                n_att = attempts.get(aid, 0) + 1
-	                attempts[aid] = n_att
-	                if n_att >= attempt_budget:
-	                    # Retry budget exhausted → give up on this account; the
-	                    # next wave replaces it with a fresh pool member.
-	                    self._voice_banned.setdefault(order_id, set()).add(aid)
-	                    logger.warning(
-	                        f"Order {order_id}: account {aid} gave up after {n_att} "
-	                        f"attempt(s) ({msg[:80]}) — replaced from pool"
-	                    )
-	                else:
-	                    delay = min(backoff_base * (2 ** (n_att - 1)), 60.0)
-	                    try:
-	                        _b, _fac = self_healing.pick(msg, key=f"{order_id}:{aid}")
-	                        delay = min(max(delay * _fac, 1.0), 300.0)
-	                    except Exception:
-	                        pass
-	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
-	                    logger.info(
-	                        f"Order {order_id}: account {aid} attempt {n_att} failed "
-	                        f"({msg[:60]}); retry in {delay:.0f}s"
-	                    )
-	                join_brain.report_result(order_id, outcome, msg)
-	                wave_fail += 1
-	            except Exception as _bookkeep_err:
-	                # NEVER let one account's bookkeeping kill the whole order.
-	                logger.error(
-	                    f"Order {order_id}: wave bookkeeping error for account {aid}: "
-	                    f"{_bookkeep_err}",
-	                    exc_info=True,
-	                )
-	                wave_fail += 1
+	            # ── failure handling (shared with the sequential engine) ──
+	            kind = await self._voice_record_failure(
+	                order_id, aid, res, attempt_budget=attempt_budget,
+	                backoff_base=backoff_base,
+	            )
+	            wave_fail += 1
+	            if kind == "dead":
+	                dead_count += 1
+	                wave_dead += 1
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))
@@ -878,7 +1123,7 @@ class OrderExecutor:
 	        f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
 	        f"replacing to keep presence until deadline"
 	    )
-	    more, _d2 = await self._voice_batched_fill(
+	    more, _d2 = await self._voice_fill(
 	        order_id=order_id,
 	        target=str((data or {}).get("target_link") or ""),
 	        bot_id=int((data or {}).get("bot_id", 1)),

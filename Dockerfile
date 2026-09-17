@@ -34,7 +34,8 @@ COPY . /app
 RUN pip install --upgrade pip wheel setuptools && \
     pip uninstall -y pyrogram pyrofork pyrotgfork 2>/dev/null || true && \
     pip install -r requirements.txt && \
-    python -c "import pyrogram; from pyrogram.raw import functions; assert hasattr(functions.phone, 'SendGroupCallMessage'), 'Layer too old: sendGroupCallMessage missing'; print('pyrogram', pyrogram.__version__, '- in-call messages supported')"
+    python -c "import pyrogram; from pyrogram.raw import functions; assert hasattr(functions.phone, 'SendGroupCallMessage'), 'Layer too old: sendGroupCallMessage missing'; print('pyrogram', pyrogram.__version__, '- in-call messages supported')" && \
+    python -c "import inspect, pytgcalls; from pytgcalls.mtproto import pyrogram_client as m; src = inspect.getsource(m); assert \"getattr(update, 'peer'\" in src or 'update.peer' in src, 'py-tgcalls too old for this Telegram layer (UpdateGroupCall.peer)'; print('py-tgcalls', pytgcalls.__version__, '- UpdateGroupCall.peer supported')"
 
 # تغییر مهم: اول اسکریپت انتظار دیتابیس اجرا می‌شود، سپس ربات اصلی
 # اگر این خط را به حالت ساده ["python", "main.py"] برگردانید، ربات دوباره کرش می‌کند.

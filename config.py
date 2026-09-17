@@ -104,6 +104,30 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── SEQUENTIAL JOIN (one account at a time) ─────────────────────────
+    # When enabled (default) the build is strictly ONE-BY-ONE: account #1
+    # joins the group, joins the voice chat and is VERIFIED inside the call;
+    # only then does account #2 start, after a short human-like pause
+    # (VOICE_JOIN_SEQUENTIAL_GAP_MIN..MAX seconds).  No wave, no overlap —
+    # this is the safest cadence against Telegram anti-flood and it removes
+    # the CPU/RAM spike of N simultaneous WebRTC handshakes.
+    # Set to 'false' to get the adaptive parallel waves back.
+    VOICE_JOIN_SEQUENTIAL = os.getenv('VOICE_JOIN_SEQUENTIAL', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_JOIN_SEQUENTIAL_GAP_MIN = float(os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MIN', '2.0'))
+    VOICE_JOIN_SEQUENTIAL_GAP_MAX = float(os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MAX', '4.0'))
+    # Warm the NEXT account's Pyrogram client while the current one is
+    # joining (saves the ~3-8s client-start latency per account without
+    # issuing any group/voice RPC early).  Only the next 1 client is warmed
+    # in sequential mode so RAM stays flat.
+    VOICE_JOIN_SEQUENTIAL_PREWARM = os.getenv('VOICE_JOIN_SEQUENTIAL_PREWARM', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # After the FIRST full pass over the pool, an incomplete voice build gets
+    # bounded extra passes (each one re-scans the pool, retrying accounts
+    # whose backoff elapsed and replacing dead ones).  This is what turns a
+    # "35/50" build into 50/50 whenever the pool actually has enough working
+    # accounts; 0 disables the top-up passes.
+    VOICE_BUILD_TOPUP_PASSES = int(os.getenv('VOICE_BUILD_TOPUP_PASSES', '3'))
+    # Pause between top-up passes (seconds) so retries are never a burst.
+    VOICE_BUILD_TOPUP_PAUSE = int(os.getenv('VOICE_BUILD_TOPUP_PAUSE', '20'))
     # First wave size. 2 is the safe default: combined with the staggered
     # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
@@ -159,11 +183,13 @@ class Config:
     # and can trip FloodWait / account limits.  Each leave starts
     # VOICE_LEAVE_STAGGER_MIN..MAX seconds after the previous one, with a hard
     # ceiling on concurrent leave RPCs (LeaveGroupCall + leave_chat).
-    # Defaults ~0.8–1.5s gap and max 2 concurrent leaves — finishes a 50-acc
-    # order in ~40–75s without a burst.  Raise the gap if Telegram floods.
-    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '0.8'))
-    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '1.5'))
-    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '2'))
+    # Defaults: STRICTLY ONE AT A TIME (max 1 concurrent leave) with a
+    # 1.5–3s human-like gap — a 50-account order leaves in ~2 minutes with
+    # no burst at all.  Raise the gap if Telegram floods; raise the
+    # concurrency only if you accept a faster, less natural exit.
+    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '1.5'))
+    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '3.0'))
+    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '1'))
     # Extra human-like jitter on top of the base leave gap (seconds).
     VOICE_LEAVE_JITTER_MIN = float(os.getenv('VOICE_LEAVE_JITTER_MIN', '0.0'))
     VOICE_LEAVE_JITTER_MAX = float(os.getenv('VOICE_LEAVE_JITTER_MAX', '0.4'))

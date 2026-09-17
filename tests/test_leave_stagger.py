@@ -44,6 +44,21 @@ def _read_source(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
+def _restore_modules(snapshot: dict) -> None:
+    """Undo every sys.modules mutation made since ``snapshot`` was taken.
+
+    Stubbed modules are dropped; project modules that were imported ON TOP
+    of the stubs (voice_call_manager, order_executor, config, ...) are dropped
+    too so a later test module re-imports them against the real deps.
+    """
+    for name in list(sys.modules):
+        if name not in snapshot:
+            sys.modules.pop(name, None)
+    for name, mod in snapshot.items():
+        if sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
+
+
 class ConfigLeaveKeysTests(unittest.TestCase):
     def test_config_defines_leave_pacing_keys(self):
         src = _read_source("config.py")
@@ -111,7 +126,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.1"', src)
+        self.assertRegex(src, r'BOT_VERSION = "2\.2\.[1-9]\d*"')
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -119,6 +134,10 @@ class StopAllPacingLogicTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Snapshot sys.modules so the stubs below never leak into OTHER test
+        # modules run in the same pytest process (they would replace the real
+        # database/security/voice_cooldown modules for later tests).
+        cls._modules_snapshot = dict(sys.modules)
         # Stub heavy third-party modules before importing voice_call_manager.
         stubs = {}
 
@@ -232,6 +251,10 @@ class StopAllPacingLogicTests(unittest.TestCase):
         cls.vcm_mod = vcm_mod
         cls.VoiceCallManager = vcm_mod.VoiceCallManager
 
+    @classmethod
+    def tearDownClass(cls):
+        _restore_modules(cls._modules_snapshot)
+
     def setUp(self):
         self.mgr = self.VoiceCallManager()
         self._orig = {}
@@ -326,6 +349,14 @@ class StopAllPacingLogicTests(unittest.TestCase):
 
 
 class ExecutorVoiceNoDoubleLeaveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._modules_snapshot = dict(sys.modules)
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_modules(cls._modules_snapshot)
+
     def test_eject_returns_immediately_for_voice(self):
         # Import order_executor with stubs already in place from previous class if possible.
         # Ensure dotenv stub exists.

@@ -94,7 +94,7 @@
 | زبان | Python 3.11+ |
 | ربات | `python-telegram-bot[job-queue]` |
 | کلاینت تلگرام (یوزربات) | `pyrogram` + `tgcrypto` |
-| موتور تماس صوتی | `py-tgcalls==2.2.5` (+ `ntgcalls`) + `ffmpeg` |
+| موتور تماس صوتی | `py-tgcalls==2.2.11` (+ `ntgcalls`) + `ffmpeg` |
 | پایگاه داده | PostgreSQL (`asyncpg` + SQLAlchemy async) |
 | کش | Redis |
 | وب‌سرور callback | `aiohttp` |

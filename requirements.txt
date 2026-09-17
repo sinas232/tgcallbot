@@ -27,4 +27,9 @@ python-telegram-bot[job-queue]
 # نصب، pyrogram/pyrofork را حذف می‌کند.
 kurigram>=2.2.25
 tgcrypto>=1.2.5
-py-tgcalls==2.2.5
+# py-tgcalls 2.2.11: بستهٔ 2.2.5 با Layer جدید kurigram ناسازگار بود —
+# UpdateGroupCall دیگر chat_id ندارد (peer دارد) و هر آپدیت ویس‌کال باعث
+# «AttributeError: 'UpdateGroupCall' object has no attribute 'chat_id'» در
+# RawUpdateHandler می‌شد؛ در نتیجه cache تماس/رویداد بسته‌شدن ویس‌کال گم
+# می‌شد. نسخهٔ 2.2.11 هم chat_id و هم peer را handle می‌کند (همان API عمومی).
+py-tgcalls==2.2.11

@@ -161,8 +161,14 @@ SERVER_URL=https://bot.liontm.ir
 # ── (اختیاری) کاهش مصرف CPU و لاگ ──
 # لاگِ پرتکرارِ [VoiceDiag] در حالت عادی خاموش است؛ فقط برای دیباگ عمیق روشن کنید:
 # ENABLE_VERBOSE_DIAG=false
-# فاصلهٔ ورود اکانت‌ها (ثانیه). پیش‌فرض حالا 0.5–1.0s است (کم‌ترین اسپایک CPU).
-# ⚠️ اگر تلگرام هنگام رمپ‌آپ بزرگ FloodWait داد، این‌ها را به 3–6s برگردانید:
+# ورود دونه‌دونه (پیش‌فرض از v2.2.5): اکانت بعدی فقط بعد از تأیید حضورِ اکانت
+# قبلی در ویس‌کال و یک مکث 2–4 ثانیه‌ای شروع می‌شود؛ خروج هم دونه‌دونه است.
+# VOICE_JOIN_SEQUENTIAL=true
+# VOICE_JOIN_SEQUENTIAL_GAP_MIN=2.0
+# VOICE_JOIN_SEQUENTIAL_GAP_MAX=4.0
+# VOICE_BUILD_TOPUP_PASSES=3
+# VOICE_LEAVE_MAX_CONCURRENCY=1
+# (فقط اگر VOICE_JOIN_SEQUENTIAL=false باشد، این‌ها پنجرهٔ موج‌های موازی را می‌سازند:)
 # VOICE_JOIN_START_STAGGER_MIN=0.5
 # VOICE_JOIN_START_STAGGER_MAX=1.0
 # VOICE_JOIN_MAX_CONCURRENCY=2
