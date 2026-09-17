@@ -28,6 +28,7 @@ import os
 import signal
 import time
 import asyncio
+from collections import deque
 
 # ── uvloop: drop-in, much faster asyncio loop (Linux/macOS) ──────────────
 # We do NOT call uvloop.install() here. Combined with the deprecated
@@ -54,7 +55,7 @@ from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ConversationHandler, CallbackQueryHandler, filters,
-    PicklePersistence, ContextTypes, ApplicationHandlerStop
+    PicklePersistence, ContextTypes, ApplicationHandlerStop, TypeHandler
 )
 # 🔥 تنظیمات پیشرفته شبکه برای جلوگیری از تایم‌اوت
 from telegram.request import HTTPXRequest
@@ -589,7 +590,72 @@ def register_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛠 نگهبان «حالت تعمیرات» — اولین هندلر group=-1 (قبل از همه).
+    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    #
+    # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
+    # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
+    # آپدیت‌هایش بی‌صدا دور ریخته می‌شود تا ربات برای بقیه کند نشود.
+    # گادها (ADMIN_IDS) از این محدودیت معاف‌اند.
+    # ─────────────────────────────────────────────────────────────
+    _SPAM_WINDOW_SEC = 2.0
+    _SPAM_MAX_HITS = 5
+    _SPAM_MUTE_SEC = 60
+    _SPAM_MSG = ("⏳ محدودیت موقت\n\nبه دلیل ارسال درخواست‌های پیاپی، "
+                 "به مدت ۱ دقیقه محدود شدید.\nلطفاً کمی صبر کنید و دوباره تلاش کنید.")
+    _spam_hits: dict = {}
+    _spam_muted_until: dict = {}
+
+    async def _spam_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user:
+            return
+        if user.id in Config.ADMIN_IDS:
+            return
+        try:
+            now = time.monotonic()
+            uid = user.id
+            if now < _spam_muted_until.get(uid, 0):
+                raise ApplicationHandlerStop
+            dq = _spam_hits.get(uid)
+            if dq is None:
+                dq = deque()
+                _spam_hits[uid] = dq
+            while dq and now - dq[0] > _SPAM_WINDOW_SEC:
+                dq.popleft()
+            dq.append(now)
+            if len(dq) > _SPAM_MAX_HITS:
+                _spam_muted_until[uid] = now + _SPAM_MUTE_SEC
+                dq.clear()
+                try:
+                    _q = update.callback_query
+                    if _q is not None:
+                        await asyncio.wait_for(_q.answer(_SPAM_MSG, show_alert=True), timeout=10)
+                    elif update.effective_message is not None:
+                        await asyncio.wait_for(update.effective_message.reply_text(_SPAM_MSG), timeout=10)
+                except Exception:
+                    pass
+                try:
+                    logger.warning("spam guard MUTED user=%s for %ss", uid, _SPAM_MUTE_SEC)
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
+            if len(_spam_hits) > 20000:
+                _cut = now - _SPAM_WINDOW_SEC
+                for _k in [k for k, v in _spam_hits.items() if not v or v[-1] < _cut][:5000]:
+                    _spam_hits.pop(_k, None)
+                for _k in [k for k, v in _spam_muted_until.items() if v < now][:5000]:
+                    _spam_muted_until.pop(_k, None)
+        except ApplicationHandlerStop:
+            raise
+        except Exception:
+            return
+    _spam_guard._hits = _spam_hits
+    _spam_guard._muted = _spam_muted_until
+    _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+
+    # ─────────────────────────────────────────────────────────────
+    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
     #
     # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
     # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
