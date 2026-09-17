@@ -296,7 +296,22 @@ class AdaptiveJoinBrain:
         elif outcome == OUTCOME_FLOOD:
             policy.flooded += 1
             policy.flood_waves += 1
-            if policy.window <= policy.min_window:
+            # INTERDC / X_CALL is more severe than FloodWait — pause immediately even if not at floor
+            # Check message for interdc markers (OUTCOME_FLOOD already includes them)
+            is_interdc = any(k in (message or "").upper() for k in ("INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC"))
+            if is_interdc:
+                # For INTERDC, pause waves for 60-120s regardless of window size
+                # WARP stays ON, we just stop hammering DC4
+                pause_dur = max(policy.flood_pause_seconds * 4, 90)
+                pause_dur = min(pause_dur, 180)
+                until = time.time() + pause_dur
+                if until > policy.paused_until:
+                    policy.paused_until = until
+                    logger.warning(
+                        "[JoinBrain] order=%s INTERDC detected → pause new waves %.0fs (WARP DC4 recovery)",
+                        order_id, pause_dur,
+                    )
+            elif policy.window <= policy.min_window:
                 until = time.time() + policy.flood_pause_seconds
                 if until > policy.paused_until:
                     policy.paused_until = until

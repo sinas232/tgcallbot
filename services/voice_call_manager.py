@@ -134,6 +134,101 @@ def _patch_pyrogram_channel_id_range() -> None:
 
 _patch_pyrogram_channel_id_range()
 
+
+def _patch_kurigram_interdc_retry() -> None:
+    """Patch kurigram's Session.invoke to handle INTERDC_X_CALL_ERROR with WARP-aware backoff.
+
+    Original kurigram retries InternalServerError (500) 10 times with 1s delay,
+    which hammers Telegram DC4 when WARP IP is throttled and hides the error
+    from our circuit-breaker. For INTERDC we:
+      - sleep 20-40s (let DC4 recover, let WARP edge rotate)
+      - fail fast after 2 attempts so VCM's _join_call can trigger cooldown
+      - keep original behaviour for other 500 errors
+    """
+    try:
+        from pyrogram.session.session import Session as _Session
+        if getattr(_Session.invoke, "_interdc_patched", False):
+            return
+        orig_invoke = _Session.invoke
+
+        async def _patched_invoke(self, query, retries=10, timeout=15, sleep_threshold=10, retry_delay=1):
+            # Resolve query name for logging (mirrors original)
+            try:
+                inner = query.query if hasattr(query, "query") else query
+                qname = ".".join(getattr(inner, "QUALNAME", "unknown").split(".")[1:])
+            except Exception:
+                qname = "unknown"
+
+            # For JoinGroupCall we want faster fail on INTERDC
+            is_join_call = "JoinGroupCall" in qname
+
+            for attempt in range(1, retries + 1):
+                try:
+                    return await self.send(query, timeout=timeout)
+                except Exception as e:
+                    # FloodWait handling (same as original)
+                    try:
+                        from pyrogram.errors import FloodWait as _FW, FloodPremiumWait as _FPW
+                        if isinstance(e, (_FW, _FPW)):
+                            amount = getattr(e, "seconds", None) or getattr(e, "value", None)
+                            if amount is None or amount > sleep_threshold >= 0:
+                                raise
+                            logger.warning(
+                                "[%s] FloodWait %ss for %s (kurigram patch)",
+                                getattr(self.client, "name", "?"), amount, qname,
+                            )
+                            await asyncio.sleep(amount)
+                            continue
+                    except Exception:
+                        pass
+
+                    err_str = str(e) or type(e).__name__
+                    low = err_str.lower()
+
+                    # INTERDC / X_CALL / RICH_ERROR → special handling
+                    if "interdc" in low or "x_call" in low or "rich_error" in low or ("500" in low and "inter" in low):
+                        # Log once per attempt at WARNING so docker logs -f catches it
+                        logger.warning(
+                            "[INTERDC-Patch] %s attempt %s/%s got %s — backing off 20-40s (WARP DC4 throttled)",
+                            qname, attempt, retries, err_str[:120],
+                        )
+                        # First attempt: sleep long, let DC4 recover
+                        # WARP stays ON (TUN), we just wait
+                        await asyncio.sleep(random.uniform(20.0, 40.0))
+                        if is_join_call and attempt >= 2:
+                            # Fail fast for JoinGroupCall so VCM can open circuit breaker
+                            # Don't retry 10 times hammering DC4
+                            raise
+                        if attempt >= 3:
+                            raise
+                        continue
+
+                    # Original retry for other OSError / InternalServerError / ServiceUnavailable
+                    try:
+                        from pyrogram.errors import InternalServerError as _ISE, ServiceUnavailable as _SU
+                        if isinstance(e, (OSError, _ISE, _SU)):
+                            logger.warning(
+                                "[%s] Retrying \"%s\" due to: %s (kurigram patch attempt %s)",
+                                getattr(self.client, "name", "?"), qname, err_str[:150], attempt,
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                    except Exception:
+                        pass
+                    # Not retryable → bubble up
+                    raise
+
+            raise TimeoutError(f'Failed to invoke "{qname}" after {retries} retries (interdc patch)')
+
+        _patched_invoke._interdc_patched = True
+        _Session.invoke = _patched_invoke
+        logger.info("[INTERDC-Patch] kurigram Session.invoke patched for WARP DC4 resilience")
+    except Exception as exc:
+        logger.debug(f"[INTERDC-Patch] patch skipped: {exc}")
+
+
+_patch_kurigram_interdc_retry()
+
 SILENT_AUDIO_PATH = "silence.wav"
 
 from config import Config
@@ -682,6 +777,13 @@ class VoiceCallManager:
         self._participant_snapshot: Dict[int, Tuple[float, Optional[Set[int]]]] = {}
         self._monitor_cycle_ts: float = 0.0
 
+        # Global per-chat INTERDC cooldown (in-memory, immediate) — prevents
+        # concurrent JoinGroupCall hammering DC4 when WARP IP is throttled.
+        # This is separate from the persisted strategy_cache which is per-chat
+        # but only opens after threshold. INTERDC needs instant global pause.
+        self._interdc_cooldown: Dict[int, float] = {}  # chat_id -> unix ts until
+        self._interdc_locks: Dict[int, asyncio.Lock] = {}  # per-chat lock for JoinGroupCall
+
         # Cross-order, non-sensitive adaptive policy cache. It stores only
         # bounded timing/failure metadata keyed by chat id, never sessions or
         # user data, so the next order can reuse a proven backoff policy.
@@ -731,8 +833,43 @@ class VoiceCallManager:
         except OSError as exc:
             logger.warning("[VoiceStrategy] cache write failed: %s", exc)
 
+    def _get_interdc_lock(self, chat_id: int) -> asyncio.Lock:
+        cid = int(chat_id)
+        if cid not in self._interdc_locks:
+            self._interdc_locks[cid] = asyncio.Lock()
+        return self._interdc_locks[cid]
+
+    async def _wait_for_interdc_global(self, chat_id: int) -> None:
+        """In-memory global INTERDC cooldown — blocks all JoinGroupCall for this chat."""
+        cid = int(chat_id)
+        until = self._interdc_cooldown.get(cid, 0)
+        wait_for = until - time.time()
+        if wait_for > 0:
+            logger.warning(
+                "[INTERDC-Global] chat=%s global INTERDC cooldown active; waiting %.1fs before any JoinGroupCall",
+                cid, wait_for,
+            )
+            self._vc_event_log(None, None, "interdc_global_cooldown_wait", {
+                "chat_id": cid, "wait_seconds": round(wait_for, 1),
+            })
+            await asyncio.sleep(wait_for)
+
+    def _set_interdc_global_cooldown(self, chat_id: int, seconds: float) -> None:
+        cid = int(chat_id)
+        until = time.time() + seconds
+        prev = self._interdc_cooldown.get(cid, 0)
+        if until > prev:
+            self._interdc_cooldown[cid] = until
+            logger.warning(
+                "[INTERDC-Global] chat=%s set global cooldown %.0fs (until %.0f)",
+                cid, seconds, until,
+            )
+
     async def _wait_for_join_strategy(self, chat_id: int) -> None:
         """Honor a learned cooldown before issuing another join request."""
+        # First check in-memory INTERDC global cooldown (fast, immediate)
+        await self._wait_for_interdc_global(int(chat_id))
+
         key = str(int(chat_id))
         async with self._strategy_lock:
             policy = self._strategy_cache.get(key) or {}
@@ -774,22 +911,41 @@ class VoiceCallManager:
             "updated_at": now,
         })
         threshold = max(1, int(getattr(Config, "VOICE_STRATEGY_FAILURE_THRESHOLD", 3)))
-        if failures >= threshold and failure_class in _RETRYABLE_FAILURES:
+        msg_low = str(message or "").lower()
+        is_interdc_msg = "interdc" in msg_low or "x_call" in msg_low or "rich_error" in msg_low or ("500" in msg_low and "inter" in msg_low)
+
+        # INTERDC must trigger cooldown IMMEDIATELY (first failure), not after 3
+        # because DC4 is a shared resource behind WARP — hammering it makes it worse
+        should_open_circuit = False
+        if is_interdc_msg and failure_class in _RETRYABLE_FAILURES:
+            should_open_circuit = True
+        elif failures >= threshold and failure_class in _RETRYABLE_FAILURES:
+            should_open_circuit = True
+
+        if should_open_circuit:
             base_cooldown = max(1, int(getattr(Config, "VOICE_STRATEGY_COOLDOWN_SECONDS", 60)))
             # INTERDC / X_CALL = DC4 inter-DC failure → needs much longer cooldown
             # WARP still routes via Cloudflare, but Telegram's DC4 may be temporarily
-            # unreachable for that edge IP.  120-180s lets Telegram recover.
-            msg_low = str(message or "").lower()
-            if "interdc" in msg_low or "x_call" in msg_low or "rich_error" in msg_low:
-                cooldown = max(base_cooldown * 3, 120)
-                # cap at 5 minutes to avoid freezing the order forever
+            # unreachable for that edge IP.  180-300s lets Telegram recover.
+            if is_interdc_msg:
+                cooldown = max(base_cooldown * 4, 180)
+                # cap at 5 minutes to avoid freezing the order forever, but for INTERDC allow 5 min
                 cooldown = min(cooldown, 300)
+                # For INTERDC we also set a more aggressive cooldown even on first failure
+                # and log it clearly so operator sees it in docker logs
+                logger.warning(
+                    "[VoiceStrategy] INTERDC circuit breaker OPEN for chat=%s cooldown=%ss (failures=%s, immediate)",
+                    chat_id, cooldown, failures,
+                )
+                # Also set in-memory global cooldown (instant, not just persisted)
+                self._set_interdc_global_cooldown(int(chat_id), cooldown)
             else:
                 cooldown = base_cooldown
             policy["cooldown_until"] = now + cooldown
             self._vc_event_log(None, None, "strategy_circuit_open", {
                 "chat_id": int(chat_id), "failure_class": failure_class,
                 "consecutive_failures": failures, "cooldown_seconds": cooldown,
+                "is_interdc": is_interdc_msg,
             })
         self._save_strategy_cache()
 
@@ -2739,7 +2895,12 @@ class VoiceCallManager:
         Join a single account into the voice call, with *verification* as the
         source of truth. Verification (CONFIRMED True) is what registers the
         account — never the bare join future.
+        WARP-aware: respects global INTERDC cooldown and serializes JoinGroupCall
+        per-chat when DC4 is throttled to avoid thundering herd.
         """
+        # Global INTERDC cooldown check before any work
+        await self._wait_for_interdc_global(int(chat_id))
+
         # Scope lock per (account_id, chat_id) — never a global per-account lock.
         lock_key = (account_id, int(chat_id))
         async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
@@ -2766,6 +2927,33 @@ class VoiceCallManager:
                             pass
                         return True, "Already in call"
 
+                # WARP-aware pacing: if this chat recently hit INTERDC, serialize JoinGroupCall
+                # per-chat to avoid thundering herd on DC4 behind same WARP IP.
+                # Normal chats keep parallel joins; INTERDC-affected chats get serialized + extra delay.
+                recent_interdc = False
+                try:
+                    # Check in-memory cooldown
+                    if int(chat_id) in self._interdc_cooldown:
+                        recent_interdc = True
+                    else:
+                        # Check persisted strategy cache for recent INTERDC (10 min window)
+                        sc = self._strategy_cache.get(str(int(chat_id))) or {}
+                        last_err = str(sc.get("last_error", "")).lower()
+                        upd = float(sc.get("updated_at", 0) or 0)
+                        if upd and time.time() - upd < 600 and ("interdc" in last_err or "x_call" in last_err or "rich_error" in last_err):
+                            recent_interdc = True
+                except Exception:
+                    recent_interdc = False
+
+                if recent_interdc:
+                    # Extra delay to let DC4 recover, plus log
+                    extra = random.uniform(2.0, 5.0)
+                    logger.warning(
+                        "[INTERDC-Serialize] chat=%s recent INTERDC → serializing JoinGroupCall acc=%s extra delay %.1fs",
+                        chat_id, account_id, extra,
+                    )
+                    await asyncio.sleep(extra)
+
                 # Ultra-short delay to avoid rate limits
                 await asyncio.sleep(random.uniform(JOIN_DELAY_MIN, JOIN_DELAY_MAX))
 
@@ -2777,11 +2965,27 @@ class VoiceCallManager:
                 # where the participant listing is too big to paginate (the old
                 # listing-based check made most accounts fail to "verify", so
                 # only a handful ever counted).
-                join_key = (account_id, int(chat_id))
-                join_task = self._inflight_joins.get(join_key)
-                if join_task is None or join_task.done():
-                    join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
-                    self._inflight_joins[join_key] = join_task
+
+                # For INTERDC-affected chats, serialize the actual play() via per-chat lock
+                # so only ONE JoinGroupCall hits DC4 at a time (critical behind WARP)
+                async def _do_play():
+                    join_key_local = (account_id, int(chat_id))
+                    join_task_local = self._inflight_joins.get(join_key_local)
+                    if join_task_local is None or join_task_local.done():
+                        join_task_local = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
+                        self._inflight_joins[join_key_local] = join_task_local
+                    return join_task_local
+
+                if recent_interdc:
+                    async with self._get_interdc_lock(int(chat_id)):
+                        join_task = await _do_play()
+                        join_key = (account_id, int(chat_id))
+                else:
+                    join_key = (account_id, int(chat_id))
+                    join_task = self._inflight_joins.get(join_key)
+                    if join_task is None or join_task.done():
+                        join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
+                        self._inflight_joins[join_key] = join_task
 
                 def _consume_join_task_result(task: asyncio.Task) -> None:
                     try:
@@ -2847,6 +3051,8 @@ class VoiceCallManager:
                             order_id, account_id, chat_id,
                         )
                         # رفرش کش و مدارشکن برای چت — WARP فعال می‌ماند (TUN)
+                        # Set immediate global cooldown so other accounts don't hammer DC4
+                        self._set_interdc_global_cooldown(int(chat_id), 180)
                         try:
                             await self._force_refresh_call(app, chat_id)
                         except Exception:
@@ -2854,7 +3060,7 @@ class VoiceCallManager:
                         self._record_join_strategy(int(chat_id), False, f"INTERDC:{err_str[:80]}")
                         # تأخیر طولانی‌تر برای ریکاوری DC4 — تلگرام معمولاً 30-60 ثانیه بعد برمی‌گردد
                         # با WARP، این تأخیر کمک می‌کند Cloudflare edge هم ریکاوری کند
-                        await asyncio.sleep(random.uniform(15.0, 30.0))
+                        await asyncio.sleep(random.uniform(20.0, 40.0))
                         return False, f"INTERDC transient (retrying): {err_str[:80]}"
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
