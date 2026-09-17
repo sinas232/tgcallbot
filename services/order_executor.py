@@ -64,6 +64,7 @@ class OrderExecutor:
 		self._voice_dead: Dict[int, Set[int]] = {}            # account_id -> PERMANENTLY dead (session revoked...) — never retried
 		self._voice_second_chance: Dict[int, int] = {}        # order_id -> second-chance rounds already granted
 		self._voice_conflict_warned: Dict[int, Set[int]] = {}  # order_id -> account ids already warned (session conflict)
+		self._voice_pool_refresh_ts: Dict[int, float] = {}   # order_id -> last mid-order pool refresh (epoch)
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -405,6 +406,7 @@ class OrderExecutor:
 	    self._voice_dead.setdefault(order_id, set())
 	    self._voice_second_chance.setdefault(order_id, 0)
 	    self._voice_conflict_warned.setdefault(order_id, set())
+	    self._voice_pool_refresh_ts.setdefault(order_id, 0.0)
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -420,6 +422,7 @@ class OrderExecutor:
 	    self._voice_dead.pop(order_id, None)
 	    self._voice_second_chance.pop(order_id, None)
 	    self._voice_conflict_warned.pop(order_id, None)
+	    self._voice_pool_refresh_ts.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -614,6 +617,12 @@ class OrderExecutor:
 	        return joined_list, dead_count
 
 	    await self._voice_load_pool(bot_id, order_id)
+	    self._voice_pool_refresh_ts[order_id] = time.time()
+	    _pool_sz = len(self._voice_pool.get(order_id) or [])
+	    logger.info(
+	        f"Order {order_id}: pool loaded — {_pool_sz} eligible ACTIVE account(s) "
+	        f"for bot {bot_id} (requested={requested}, target={target_count})"
+	    )
 	    sequential = bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL", True))
 	    adaptive = bool(getattr(Config, "VOICE_JOIN_ADAPTIVE", True))
 	    if sequential:
@@ -684,10 +693,44 @@ class OrderExecutor:
 	                    warm_task = None
 
 	        if not candidates:
+	            # ── MID-ORDER POOL REFRESH ───────────────────
+	            # Accounts added to the DB while this order runs (or flipped
+	            # to active) become usable RIGHT AWAY; ones that went inactive
+	            # drop out. Time-boxed to 60s so the fill loop never hammers
+	            # the database.
+	            if now - self._voice_pool_refresh_ts.get(order_id, 0.0) > 60.0:
+	                try:
+	                    await self._voice_load_pool(bot_id, order_id)
+	                    self._voice_pool_refresh_ts[order_id] = time.time()
+	                    _psz = len(self._voice_pool.get(order_id) or [])
+	                    logger.info(
+	                        f"Order {order_id}: pool refreshed mid-order — {_psz} "
+	                        f"eligible ACTIVE account(s) now in pool (bot {bot_id})"
+	                    )
+	                    continue  # recompute candidates with the fresh pool
+	                except Exception:
+	                    pass
 	            # Nothing ready right now — wait for the earliest retry
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # ── ACTIONABLE EXHAUSTION DIAGNOSTIC ────────────
+	                # The fill cannot reach target with THIS pool. Say exactly
+	                # why (pool size / joined / session-conflicted / dead) so
+	                # the operator knows which lever to pull.
+	                _psz = len(self._voice_pool.get(order_id) or [])
+	                _bn = len(joined_ids)
+	                _cn = len(self._voice_conflict_warned.get(order_id, set()))
+	                _dn = len(self._voice_dead.get(order_id, set()))
+	                logger.warning(
+	                    f"Order {order_id}: pool exhausted at live={live}/{target_count} "
+	                    f"— pool={_psz} eligible ACTIVE account(s) for bot {bot_id}, "
+	                    f"joined={_bn}, session-conflicted={_cn}, dead={_dn}. "
+	                    f"To reach {target_count}: free the conflicted sessions "
+	                    f"(stop the other connection / old server / manual login) "
+	                    f"or add >={max(0, target_count - live)} more ACTIVE accounts "
+	                    f"to bot {bot_id} — new accounts join the pool within 60s."
+	                )
 	                # Pool exhausted. Before giving up BELOW TARGET, give the
 	                # previously-failed (but alive) accounts a fresh attempt
 	                # budget so the order can still reach its full count.
@@ -854,9 +897,13 @@ class OrderExecutor:
 	                    )
 	                    fresh: List[Dict] = []
 	                    try:
-	                        fresh = self._voice_candidates(
-	                            order_id, 1, joined_ids, set(), time.time(),
+	                        _fa = self._voice_candidates(
+	                            order_id, 5, joined_ids, set(), time.time(),
 	                        )
+	                        # Never claim a replacement that is the SAME
+	                        # account (a pool with no free accounts used to
+	                        # log "replaced with fresh account <self>").
+	                        fresh = [a for a in _fa if a.get("id") != aid]
 	                    except Exception:
 	                        fresh = []
 	                    warned = self._voice_conflict_warned.setdefault(order_id, set())

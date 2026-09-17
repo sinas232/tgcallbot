@@ -637,5 +637,37 @@ class MicMuteAndPresenceCountTests(unittest.TestCase):
         self.assertIn("_effective_voice_live", live_fn)
 
 
+class PoolRefreshAndExhaustionTests(unittest.TestCase):
+    """v2.2.9: the order pool must REFRESH mid-order (new ACTIVE accounts
+    become usable without waiting for the next order), exhaustion must log
+    an actionable diagnostic (pool/joined/conflicted/dead + fix), and a
+    conflict must never be 'replaced' by itself."""
+
+    def test_pool_load_logged_with_size_and_bot(self):
+        src = _read_source("services/order_executor.py")
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn("pool loaded", fill)
+        self.assertIn("eligible ACTIVE account(s)", fill)
+
+    def test_mid_order_pool_refresh(self):
+        src = _read_source("services/order_executor.py")
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn("pool refreshed mid-order", fill)
+        self.assertIn("_voice_pool_refresh_ts", fill)
+        self.assertGreaterEqual(fill.count("_voice_load_pool(bot_id, order_id)"), 1)
+
+    def test_exhaustion_diagnostic_logs_counts_and_fix(self):
+        src = _read_source("services/order_executor.py")
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn("pool exhausted at live=", fill)
+        self.assertIn("session-conflicted=", fill)
+        self.assertIn("more ACTIVE accounts", fill)
+
+    def test_conflict_never_replaced_by_itself(self):
+        src = _read_source("services/order_executor.py")
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn("a for a in _fa if a.get(\"id\") != aid", fill)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
