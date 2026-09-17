@@ -104,18 +104,66 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── STRICT SEQUENTIAL VOICE JOIN (user-requested behavior) ───────────
+    # دونه‌دونه: اکانت اول وارد گروه می‌شود، وارد ویس‌کال می‌شود و بعد
+    # (با یک تأخیر کم) اکانت بعدی می‌آید. هیچ دو اکانت هم‌زمان داخل
+    # JoinGroupCall نیستند.
+    #  * windowِ Join Brain برای همیشه روی 1 قفل می‌شود (یک account در
+    #    هر wave؛ wave بعدی فقط بعد از verify کاملِ اکانت قبل شروع می‌شود).
+    #  * بین تکمیلِ اکانتِ جاری و شروعِ اکانتِ بعدی یک تأخیر انسانی
+    #    کوچک (VOICE_JOIN_ACCOUNT_GAP_*) در می‌گیرد.
+    # اگر بخواهید به مود موازی/adaptive برگردید: VOICE_JOIN_SEQUENTIAL=false
+    VOICE_JOIN_SEQUENTIAL = os.getenv('VOICE_JOIN_SEQUENTIAL', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # First wave size. 2 is the safe default: combined with the staggered
     # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
     # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
     # voice handshake. The Join Brain may still widen this (up to the max).
+    # (In sequential mode the window is pinned to 1 and these are ignored.)
     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
     # Per-order ceiling kept LOW on purpose: every simultaneous voice
     # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
     # than ~2 concurrent media setups is where transports start dying AND
     # where Telegram's per-IP burst budget starts answering with FloodWait.
+    # (In sequential mode this ceiling is overridden to 1.)
     VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # ── SEQUENTIAL GAP: تأخیر کوتاه بین «تکمیل اکانت جاری» و «شروع
+    # اکانت بعدی» (ثانیه). اکانت بعدی فقط بعد از آنکه اکانت قبلی وارد
+    # گروه + ویس‌کال شده و verify شده، وارد می‌شود — این gap فقط فاصلهٔ
+    # انسانی اضافی است تا cadence دور از burst بماند.
+    VOICE_JOIN_ACCOUNT_GAP_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MIN', '1.0'))
+    VOICE_JOIN_ACCOUNT_GAP_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MAX', '2.0'))
+    # جیتر کوچکی روی gap برای دوری از cadence کاملاً منظم (ثانیه).
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN', '0.0'))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX', '0.5'))
+    # ── SECOND CHANCE: تکمیل سفارش تا هدف (رفع «سفارش ۵۰ تایی → ۳۵») ──
+    # وقتی کل استخر اکانت‌ها مصرف شده و حسابِ attempt بعضی‌ها (خاموشی
+    # موقت / FloodWait / خطای گذری) تمام شده ولی سفارش به target نرسیده،
+    # به همان اکانت‌های زنده (NEVER اکانت‌های مرده/revoked) بودجهٔ attempt
+    # تازه می‌دهد تا چند دور بعدی را امتحان کنند.
+    VOICE_SECOND_CHANCE_ROUNDS = int(os.getenv('VOICE_SECOND_CHANCE_ROUNDS', '2'))
+    VOICE_SECOND_CHANCE_COOLDOWN_SECONDS = int(os.getenv('VOICE_SECOND_CHANCE_COOLDOWN_SECONDS', '60'))
+    # —— SESSION CONFLICT (AUTH_KEY_DUPLICATED) ——
+    # When an account's session is actively held by ANOTHER connection
+    # (stale bot container/process, a previous server, or a manual phone
+    # login), the join fails with 406 AUTH_KEY_DUPLICATED. That is NOT an
+    # account fault: the attempt budget is preserved and the account is
+    # retried every N seconds until the other connection drops.
+    VOICE_SESSION_CONFLICT_RETRY_SECONDS = float(os.getenv('VOICE_SESSION_CONFLICT_RETRY_SECONDS', '60'))
+    # ── BOUNDED CLIENT-CREATION WAITS (v2.2.11) ───────────────────────────
+    # A stuck client creation must never queue every later attempt behind
+    # it (the 120s 'creating Pyrogram client' stalls). Lock = per-account
+    # creation lock; slot = the parallel-creation semaphore.
+    VOICE_CLIENT_LOCK_WAIT_SECONDS = float(os.getenv('VOICE_CLIENT_LOCK_WAIT_SECONDS', '60'))
+    VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS = float(os.getenv('VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS', '90'))
+    # ── OPEN-ENDED PLAN BILLING (تسویهٔ طرح‌های «تکمیل و خروج») ──────────
+    # طرح‌هایی که مدت‌زمان ثابت ندارند (duration_minutes = 0، یعنی «تا
+    # توقف/خروج») بدون مرجع زمانی قابل تسویهٔ ثانیه‌ای نیستند. برای
+    # لغوی در میانه، زمان کارکرد واقعی روی همین مرجع محاسبه می‌شود
+    # (نرخ ثانیه‌ای = قیمت ÷ مرجع) — پیش از v2.2.11 این حالت کل مبلغ
+    # را عودت می‌زد حتی اگر تماس ساعت‌ها کار کرده باشد.
+    VOICE_OPEN_ENDED_BILLING_MINUTES = int(os.getenv('VOICE_OPEN_ENDED_BILLING_MINUTES', '60'))
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -156,14 +204,15 @@ class Config:
     # ── ORDER END / CANCEL LEAVE PACING (anti-burst mass-exit) ────────────
     # When an order finishes or is cancelled, accounts MUST NOT all leave the
     # voice chat / group in the same millisecond — that looks like a bot dump
-    # and can trip FloodWait / account limits.  Each leave starts
-    # VOICE_LEAVE_STAGGER_MIN..MAX seconds after the previous one, with a hard
-    # ceiling on concurrent leave RPCs (LeaveGroupCall + leave_chat).
-    # Defaults ~0.8–1.5s gap and max 2 concurrent leaves — finishes a 50-acc
-    # order in ~40–75s without a burst.  Raise the gap if Telegram floods.
-    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '0.8'))
-    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '1.5'))
-    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '2'))
+    # and can trip FloodWait / account limits.
+    # STRICT SEQUENTIAL DEFAULT (user-requested): ONE account leaves at a
+    # time (concurrency 1) with a 1.5-3.0s human-like gap between leaves, so
+    # the exit visibly happens «دونه‌دونه با تاخیر» instead of a burst.
+    # A 50-account order finishes its exit in ~2-3 minutes.  If that is too
+    # slow, raise VOICE_LEAVE_MAX_CONCURRENCY (2) and lower the gaps.
+    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '1.5'))
+    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '3.0'))
+    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '1'))
     # Extra human-like jitter on top of the base leave gap (seconds).
     VOICE_LEAVE_JITTER_MIN = float(os.getenv('VOICE_LEAVE_JITTER_MIN', '0.0'))
     VOICE_LEAVE_JITTER_MAX = float(os.getenv('VOICE_LEAVE_JITTER_MAX', '0.4'))
@@ -199,6 +248,31 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── MEDIA MODE: listener (zero-ffmpeg) vs. silence stream ────────────
+    # 'listener' : join the voice chat WITHOUT publishing any media. A listener
+    #              needs no ffmpeg process and no Opus encoder at all — the
+    #              per-account cost drops from ~15-30MB RAM + a big share of a
+    #              CPU core (ffmpeg looping the silence file as fast as the pipe
+    #              allows: ~148% of a core measured) to a few MB and ~0% CPU.
+    #              Telegram counts listeners as participants exactly like
+    #              publishers.
+    # 'media'    : the classic behaviour — publish a looping silence stream
+    #              (needed only when a chat/Telegram build refuses listeners).
+    # 'auto'     : start in listener mode; if an account is dropped shortly
+    #              after a listener join (or the join is rejected) the mode is
+    #              disabled for the whole process and every later join uses the
+    #              silence stream, so a bad guess can never break orders.
+    VOICE_SILENCE_MODE = os.getenv('VOICE_SILENCE_MODE', 'auto').strip().lower()
+    # How long a listener join must survive to be considered "proven good".
+    VOICE_LISTENER_PROBE_SECONDS = int(os.getenv('VOICE_LISTENER_PROBE_SECONDS', '60'))
+    # Listener-join failures/drops tolerated in auto mode before permanently
+    # falling back to the silence stream.  Rejections (and drops right after a
+    # listener join) count as failures; drops that happen LATER — i.e. a
+    # listener mode that works but is not held forever — are counted
+    # separately by VOICE_LISTENER_MAX_DROPS so a chat that silently evicts
+    # listeners still ends up on the proven silence stream.
+    VOICE_LISTENER_MAX_FAILURES = int(os.getenv('VOICE_LISTENER_MAX_FAILURES', '2'))
+    VOICE_LISTENER_MAX_DROPS = int(os.getenv('VOICE_LISTENER_MAX_DROPS', '3'))
     # ── Stay-alive audio format (CPU) ────────────────────────────────────
     # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
     # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo, and a
@@ -266,6 +340,66 @@ class Config:
     # Session guard: if an account's MTProto session silently died, reconnect it
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    # ── VOICE CLIENT PROFILE (RAM + API-traffic control) ─────────────────
+    # Kurigram/Pyrogram defaults are tuned for a CHAT client, not for a fleet of
+    # voice-only accounts:
+    #   * fetch_replies=True  → EVERY incoming message that replies to another
+    #     message immediately fires a `channels.GetMessages` RPC for the quoted
+    #     message. With hundreds of accounts sitting in busy supergroups this is
+    #     a PERMANENT GetMessages storm: Telegram answers FLOOD_WAIT
+    #     ("Waiting for N seconds before continuing (required by
+    #     channels.GetMessages)") and every waiting request keeps its task +
+    #     parsed-Message objects alive in RAM.
+    #   * workers=N           → N dispatcher worker tasks per client (×N accounts).
+    #   * message/topic cache → up to 1000 parsed messages held PER CLIENT.
+    # A voice client only needs the RAW update stream (WebRTC/PyTgCalls
+    # handshake + participant sync), so all of the chat-side machinery above is
+    # switched off for the long-lived `shared_client_*` clients.
+    VOICE_CLIENT_FETCH_REPLIES = os.getenv('VOICE_CLIENT_FETCH_REPLIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_TOPICS = os.getenv('VOICE_CLIENT_FETCH_TOPICS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STORIES = os.getenv('VOICE_CLIENT_FETCH_STORIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STICKERS = os.getenv('VOICE_CLIENT_FETCH_STICKERS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_WORKERS = max(1, int(os.getenv('VOICE_CLIENT_WORKERS', '1')))
+    VOICE_CLIENT_MESSAGE_CACHE = max(0, int(os.getenv('VOICE_CLIENT_MESSAGE_CACHE', '50')))
+    VOICE_CLIENT_TOPIC_CACHE = max(0, int(os.getenv('VOICE_CLIENT_TOPIC_CACHE', '50')))
+
+    # ── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────
+    # A connected voice client costs RAM (session + dispatcher + caches) and,
+    # because it keeps receiving updates, it also keeps generating Telegram
+    # traffic. Accounts that no order references any more MUST therefore be
+    # disconnected instead of being kept "warm" forever: a cancelled join, a
+    # pre-warmed wave that was never used, or a wave that hit its deadline all
+    # used to leave the client (and sometimes its engine + ffmpeg child) alive
+    # for the whole process lifetime — that is what made RAM stay full with
+    # ZERO active orders.
+    VOICE_IDLE_REAPER = os.getenv('VOICE_IDLE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Seconds an UNREFERENCED client may stay connected before it is closed.
+    VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+    # How often the reaper sweeps (seconds).
+    VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+    # Interval (seconds) for the `[VoiceMemory]` report line (RSS, live clients,
+    # engines, ffmpeg children) — makes RAM usage answerable from docker logs.
+    VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    # Soft RAM ceiling (MB) for the whole bot process tree. 0 = disabled.
+    # When the process RSS crosses it, the reaper stops waiting for the idle
+    # TTL and immediately closes every client no order references (+ warns in
+    # the log), so a memory spike can never turn into an OOM kill.
+    VOICE_RAM_SOFT_LIMIT_MB = max(0, int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0')))
+
+    # ── MONITOR COST (CPU / Telegram traffic) ────────────────────────────
+    # Maximum participant-list pages (500 ids each) the monitor walks per chat
+    # and cycle. The walk stops EARLY as soon as all of the order's accounts
+    # have been seen — for a normal order that is the very first page — so this
+    # cap only bounds the pathological case (huge chat, accounts missing).
+    VOICE_PARTICIPANT_MAX_PAGES = max(1, int(os.getenv('VOICE_PARTICIPANT_MAX_PAGES', '10')))
+
+    # ── DIAGNOSTIC LOG SIZE CAP (disk + I/O) ─────────────────────────────
+    # voice_calls.log / voice_drops.log / voice_telemetry.log are size-capped
+    # and rotated to `<name>.1`; 0 disables rotation. The telemetry file is
+    # written for every account on every monitor cycle, so without a cap it
+    # grows forever (tens of MB per day).
+    VOICE_LOG_MAX_MB = max(0, int(os.getenv('VOICE_LOG_MAX_MB', '25')))
 
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).

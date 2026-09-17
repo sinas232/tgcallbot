@@ -988,7 +988,18 @@ async def main_loop():
         from telegram_client import TelegramAccountClient
         await TelegramAccountClient.preload_all_clients()
     except: pass
-    
+
+    # ── نگهبان مصرف رم (idle-client reaper) ─────────────────────────────
+    # از لحظهٔ استارت (حتی بدون هیچ سفارش فعال) کلاینت‌های ویس‌کالی که هیچ
+    # سفارشی به آن‌ها ارجاع نمی‌دهد بسته می‌شوند و یک خط گزارش [VoiceMemory]
+    # (RSS، تعداد کلاینت/انجین/ffmpeg) در لاگ ثبت می‌شود تا «پر شدن رم»
+    # از روی لاگ قابل تشخیص باشد.
+    try:
+        from services.voice_call_manager import voice_call_manager as _vcm
+        _vcm.ensure_background_maintenance()
+    except Exception as _reaper_exc:
+        logger.warning(f"voice idle-reaper start skipped: {_reaper_exc}")
+
     # راه‌اندازی وب‌سرور پرداخت
     await start_web_server()
     

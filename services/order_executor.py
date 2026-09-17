@@ -13,7 +13,7 @@ from database import DatabaseManager
 from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
-from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
+from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD, OUTCOME_FAIL
 from services.session_ownership import SessionInUseError
 from services import self_healing
 
@@ -60,7 +60,11 @@ class OrderExecutor:
 		# duration-maintenance calls of the same order.
 		self._voice_pool: Dict[int, List[Dict]] = {}          # eligible account pool (merged/refreshed)
 		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
-		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
+		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> temporarily dropped (budget exhausted OR dead)
+		self._voice_dead: Dict[int, Set[int]] = {}            # account_id -> PERMANENTLY dead (session revoked...) — never retried
+		self._voice_second_chance: Dict[int, int] = {}        # order_id -> second-chance rounds already granted
+		self._voice_conflict_warned: Dict[int, Set[int]] = {}  # order_id -> account ids already warned (session conflict)
+		self._voice_pool_refresh_ts: Dict[int, float] = {}   # order_id -> last mid-order pool refresh (epoch)
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -82,12 +86,24 @@ class OrderExecutor:
 		info = self.active_orders.get(order_id)
 		return bool(info) and not info.get("cancel_requested")
 
+	def _effective_voice_live(self, vcm, order_id: int) -> int:
+		"""Truthful live count: durably joined minus slots the monitor marked
+		UNRECOVERABLE (gone from the call, being replaced by fresh accounts).
+		This is the number that matches the participant list."""
+		try:
+			return int(vcm.get_effective_active_count(order_id))
+		except Exception:
+			try:
+				return int(vcm.get_active_count(order_id))
+			except Exception:
+				return 0
+
 	def _live_count(self, order_id: int, order_type: str, joined_list: List[Dict]) -> int:
 		if order_type == "voice_chat":
 			vcm = _get_voice_call_manager()
 			if vcm:
 				try:
-					return int(vcm.get_active_count(order_id))
+					return self._effective_voice_live(vcm, order_id)
 				except Exception:
 					pass
 		return len(joined_list)
@@ -387,6 +403,10 @@ class OrderExecutor:
 	    self._voice_pool.setdefault(order_id, [])
 	    self._voice_attempts.setdefault(order_id, {})
 	    self._voice_banned.setdefault(order_id, set())
+	    self._voice_dead.setdefault(order_id, set())
+	    self._voice_second_chance.setdefault(order_id, 0)
+	    self._voice_conflict_warned.setdefault(order_id, set())
+	    self._voice_pool_refresh_ts.setdefault(order_id, 0.0)
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -399,6 +419,10 @@ class OrderExecutor:
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
 	    self._voice_banned.pop(order_id, None)
+	    self._voice_dead.pop(order_id, None)
+	    self._voice_second_chance.pop(order_id, None)
+	    self._voice_conflict_warned.pop(order_id, None)
+	    self._voice_pool_refresh_ts.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -510,6 +534,59 @@ class OrderExecutor:
 	        best = when if best is None else min(best, when)
 	    return best
 
+	def _voice_second_chance_refresh(self, order_id: int, joined_ids: Set[int]) -> int:
+	    """Second-chance rounds: bring the order all the way to target.
+
+	    Fallback for «سفارش ۵۰ تایی فقط ۳۵ تایش می‌رود»: when the whole pool
+	    has been swept and some accounts burned their attempt budget on
+	    TRANSIENT faults (FloodWait, transport, Telegram hiccups) — but the
+	    account itself is fine — the fill used to stop below target because
+	    those accounts were banned and (in a tight pool) no replacements
+	    remained.  This method hands a FRESH attempt budget to every
+	    non-dead, non-joined pool account that is exhausted or backoff-parked.
+
+	    Rules:
+	      * accounts proven DEAD (session revoked / deactivated) are NEVER
+	        re-tried — they live in `_voice_dead`;
+	      * accounts still inside a scheduled backoff are left alone (the
+	        earliest-retry path already handles them);
+	      * bounded by VOICE_SECOND_CHANCE_ROUNDS (default 2) so a truly
+	        broken pool cannot spin forever.
+
+	    Returns the number of revived accounts (0 = nothing left to do).
+	    """
+	    max_rounds = max(0, int(getattr(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2)))
+	    rounds = self._voice_second_chance.get(order_id, 0)
+	    if rounds >= max_rounds:
+	        return 0
+	    pool = self._voice_pool.get(order_id) or []
+	    attempts = self._voice_attempts.get(order_id, {})
+	    banned = self._voice_banned.get(order_id, set())
+	    dead = self._voice_dead.get(order_id, set())
+	    retry_after = self._voice_retry_after.get(order_id, {})
+	    budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    now = time.time()
+	    revived = 0
+	    for acc in pool:
+	        aid = acc.get("id")
+	        if not aid or aid in joined_ids or aid in dead:
+	            continue
+	        exhausted = attempts.get(aid, 0) >= budget or aid in banned
+	        if not exhausted:
+	            # Not exhausted → the earliest-retry path will pick it up;
+	            # nothing to revive here.
+	            continue
+	        if retry_after.get(aid, 0.0) > now:
+	            # Still inside a scheduled backoff — leave it to that path.
+	            continue
+	        attempts[aid] = 0
+	        banned.discard(aid)
+	        retry_after.pop(aid, None)
+	        revived += 1
+	    if revived:
+	        self._voice_second_chance[order_id] = rounds + 1
+	    return revived
+
 	async def _voice_batched_fill(
 	    self,
 	    order_id: int,
@@ -540,8 +617,20 @@ class OrderExecutor:
 	        return joined_list, dead_count
 
 	    await self._voice_load_pool(bot_id, order_id)
+	    self._voice_pool_refresh_ts[order_id] = time.time()
+	    _pool_sz = len(self._voice_pool.get(order_id) or [])
+	    logger.info(
+	        f"Order {order_id}: pool loaded — {_pool_sz} eligible ACTIVE account(s) "
+	        f"for bot {bot_id} (requested={requested}, target={target_count})"
+	    )
+	    sequential = bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL", True))
 	    adaptive = bool(getattr(Config, "VOICE_JOIN_ADAPTIVE", True))
-	    if adaptive:
+	    if sequential:
+	        # دونه‌دونه (strictly sequential): the window is PINNED to 1 —
+	        # one account at a time; the next account starts only after the
+	        # current one is verified inside the group + voice call.
+	        join_brain.register_order(order_id, initial=1, min_window=1, max_window=1)
+	    elif adaptive:
 	        join_brain.register_order(order_id)
 	    else:
 	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
@@ -549,8 +638,14 @@ class OrderExecutor:
 
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+	    # Sequential-mode small human-like gap between the COMPLETION of one
+	    # account and the START of the next (default 1.0-2.0s + 0-0.5s jitter).
+	    gap_min = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MIN", 1.0)))
+	    gap_max = max(gap_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MAX", 2.0)))
+	    gap_jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN", 0.0)))
+	    gap_jitter_max = max(gap_jitter_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX", 0.5)))
 	    wave_no = 0
-	    live = int(vcm.get_active_count(order_id))
+	    live = self._effective_voice_live(vcm, order_id)
 
 	    while self._is_order_active(order_id) and live < target_count:
 	        await join_brain.wait_if_paused(order_id)
@@ -579,7 +674,13 @@ class OrderExecutor:
 	            )
 	            if lookahead:
 	                try:
-	                    warm_task = asyncio.create_task(vcm.warmup_clients(lookahead))
+	                    # order_id lets the manager close these pre-warmed clients
+	                    # when the order ends/cancels (a warm-up that never turned
+	                    # into a join used to keep a full Pyrogram client — and its
+	                    # update stream — connected forever).
+	                    warm_task = asyncio.create_task(
+	                        vcm.warmup_clients(lookahead, order_id=order_id)
+	                    )
 
 	                    def _consume_warm(_t: asyncio.Task) -> None:
 	                        try:
@@ -592,10 +693,69 @@ class OrderExecutor:
 	                    warm_task = None
 
 	        if not candidates:
+	            # ── MID-ORDER POOL REFRESH ───────────────────
+	            # Accounts added to the DB while this order runs (or flipped
+	            # to active) become usable RIGHT AWAY; ones that went inactive
+	            # drop out. Time-boxed to 60s so the fill loop never hammers
+	            # the database.
+	            if now - self._voice_pool_refresh_ts.get(order_id, 0.0) > 60.0:
+	                try:
+	                    await self._voice_load_pool(bot_id, order_id)
+	                    self._voice_pool_refresh_ts[order_id] = time.time()
+	                    _psz = len(self._voice_pool.get(order_id) or [])
+	                    logger.info(
+	                        f"Order {order_id}: pool refreshed mid-order — {_psz} "
+	                        f"eligible ACTIVE account(s) now in pool (bot {bot_id})"
+	                    )
+	                    continue  # recompute candidates with the fresh pool
+	                except Exception:
+	                    pass
 	            # Nothing ready right now — wait for the earliest retry
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # ── ACTIONABLE EXHAUSTION DIAGNOSTIC ────────────
+	                # The fill cannot reach target with THIS pool. Say exactly
+	                # why (pool size / joined / session-conflicted / dead) so
+	                # the operator knows which lever to pull.
+	                _psz = len(self._voice_pool.get(order_id) or [])
+	                _bn = len(joined_ids)
+	                _cn = len(self._voice_conflict_warned.get(order_id, set()))
+	                _dn = len(self._voice_dead.get(order_id, set()))
+	                logger.warning(
+	                    f"Order {order_id}: pool exhausted at live={live}/{target_count} "
+	                    f"— pool={_psz} eligible ACTIVE account(s) for bot {bot_id}, "
+	                    f"joined={_bn}, session-conflicted={_cn}, dead={_dn}. "
+	                    f"To reach {target_count}: free the conflicted sessions "
+	                    f"(stop the other connection / old server / manual login) "
+	                    f"or add >={max(0, target_count - live)} more ACTIVE accounts "
+	                    f"to bot {bot_id} — new accounts join the pool within 60s."
+	                )
+	                # Pool exhausted. Before giving up BELOW TARGET, give the
+	                # previously-failed (but alive) accounts a fresh attempt
+	                # budget so the order can still reach its full count.
+	                revived = self._voice_second_chance_refresh(order_id, joined_ids)
+	                if revived:
+	                    cooldown = max(
+	                        5.0,
+	                        float(getattr(Config, "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS", 60)),
+	                    )
+	                    max_rounds = max(1, int(getattr(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2)))
+	                    logger.warning(
+	                        f"Order {order_id}: pool exhausted at live={live}/{target_count} — "
+	                        f"{revived} previously-failed account(s) get a fresh attempt "
+	                        f"(second-chance round {self._voice_second_chance.get(order_id, 0)}/{max_rounds}, "
+	                        f"cooldown {cooldown:.0f}s)"
+	                    )
+	                    try:
+	                        await asyncio.sleep(cooldown)
+	                    except asyncio.CancelledError:
+	                        raise
+	                    continue
+	                logger.warning(
+	                    f"Order {order_id}: pool exhausted at live={live}/{target_count} "
+	                    f"(no retryable accounts left) — fill ends"
+	                )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -718,6 +878,83 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
+	                # ── SESSION CONFLICT (AUTH_KEY_DUPLICATED) ───────────────
+	                # The account's session is actively held by ANOTHER
+	                # connection (a stale bot container/process, a previous
+	                # order on another server, or a manual phone login).
+	                # This is NOT an account fault: the attempt budget is
+	                # NEVER spent. Two outcomes:
+	                #   a) the pool still has FRESH eligible accounts →
+	                #      replace this one (like a give-up) so the order
+	                #      keeps filling to target;
+	                #   b) the pool is exhausted → keep this account on a
+	                #      VOICE_SESSION_CONFLICT_RETRY_SECONDS retry until
+	                #      the other connection drops.
+	                if "AUTH_KEY_DUPLICATED" in upper:
+	                    conflict_wait = max(
+	                        30.0,
+	                        float(getattr(Config, "VOICE_SESSION_CONFLICT_RETRY_SECONDS", 60)),
+	                    )
+	                    fresh: List[Dict] = []
+	                    try:
+	                        _fa = self._voice_candidates(
+	                            order_id, 5, joined_ids, set(), time.time(),
+	                        )
+	                        # Never claim a replacement that is the SAME
+	                        # account (a pool with no free accounts used to
+	                        # log "replaced with fresh account <self>").
+	                        fresh = [a for a in _fa if a.get("id") != aid]
+	                    except Exception:
+	                        fresh = []
+	                    warned = self._voice_conflict_warned.setdefault(order_id, set())
+	                    first_warn = aid not in warned
+	                    if first_warn:
+	                        warned.add(aid)
+	                    if fresh:
+	                        self._voice_banned.setdefault(order_id, set()).add(aid)
+	                        if first_warn:
+	                            logger.warning(
+	                                f"Order {order_id}: account {aid} SESSION CONFLICT "
+	                                "(AUTH_KEY_DUPLICATED) — its session is actively "
+	                                "held by another connection (old bot container/"
+	                                "process, previous server, or manual device "
+	                                "login). Replaced with fresh account "
+	                                f"{fresh[0].get('id')} so the order keeps filling "
+	                                "to target. To use THIS account again: stop the "
+	                                "other connection (docker ps -a / old server) "
+	                                "or log it out from that device."
+	                            )
+	                        else:
+	                            logger.info(
+	                                f"Order {order_id}: account {aid} still "
+	                                "session-conflicted — replaced with a fresh "
+	                                "account"
+	                            )
+	                        join_brain.report_result(order_id, OUTCOME_FAIL, msg)
+	                        wave_fail += 1
+	                        continue
+	                    # Pool exhausted — keep trying, no budget loss.
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + conflict_wait
+	                    if first_warn:
+	                        logger.warning(
+	                            f"Order {order_id}: account {aid} SESSION CONFLICT "
+	                            "(AUTH_KEY_DUPLICATED) — this account's session is "
+	                            "actively used by another connection (old bot "
+	                            "container/process, previous server, or manual "
+	                            "device login). Pool exhausted — NOT counted as an "
+	                            f"attempt; retrying in {conflict_wait:.0f}s until the "
+	                            "session is freed. Fix: stop the other connection "
+	                            "(docker ps -a / old server) or log the account out "
+	                            "from that device."
+	                        )
+	                    else:
+	                        logger.info(
+	                            f"Order {order_id}: account {aid} still session-"
+	                            f"conflicted; retrying in {conflict_wait:.0f}s"
+	                        )
+	                    join_brain.report_result(order_id, OUTCOME_FAIL, msg)
+	                    wave_fail += 1
+	                    continue
 	                if status == "dead" or any(x in upper for x in (
 	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
 	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
@@ -727,6 +964,7 @@ class OrderExecutor:
 	                    wave_dead += 1
 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    self._voice_dead.setdefault(order_id, set()).add(aid)
 	                    try:
 	                        await self._mark_account_dead(aid)
 	                    except Exception:
@@ -791,7 +1029,10 @@ class OrderExecutor:
 	                wave_fail += 1
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
-	        live = int(vcm.get_active_count(order_id))
+	        # Effective = durably joined − unrecoverable slots, so slots the
+	        # monitor gave up on are TOPPED UP with fresh accounts and the
+	        # reported number matches the real participant list.
+	        live = self._effective_voice_live(vcm, order_id)
 	        wave_duration = time.monotonic() - wave_started
 	        wave_total = wave_ok + wave_fail
 	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0
@@ -811,6 +1052,26 @@ class OrderExecutor:
                 f"in {wave_duration:.0f}s) | "
                 f"{join_brain.format_progress(order_id, live, target_count)}"
             )
+
+	        # ── SEQUENTIAL PACING (دونه‌دونه) ──────────────────────────────
+	        # Only after this account fully joined & was verified inside the
+	        # call do we let the NEXT account start — with a short human-like
+	        # gap on top, so the entry cadence is clearly one-by-one with a
+	        # small delay, never a burst.
+	        if sequential and self._is_order_active(order_id) and live < target_count:
+	            gap = (
+	                random.uniform(gap_min, gap_max)
+	                + random.uniform(gap_jitter_min, gap_jitter_max)
+	            )
+	            if gap > 0:
+	                logger.info(
+	                    f"Order {order_id}: sequential mode — next account in "
+	                    f"{gap:.1f}s (live={live}/{target_count})"
+	                )
+	                try:
+	                    await asyncio.sleep(gap)
+	                except asyncio.CancelledError:
+	                    raise
 
 	    # Return only the accounts this call newly joined; the CALLER owns
 	    # merging them into the order's running joined_accounts list (the
@@ -1337,21 +1598,38 @@ class OrderExecutor:
 		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
 
 		خروجی: (used_cost, refund_amount, elapsed_seconds)
-		  Rs = total_price / (duration_minutes*60)         نرخ ثانیه‌ای
+		  Rs = total_price / (مرجع*۶۰)                     نرخ ثانیه‌ای
 		  C_used = RoundUp(Δt × Rs)  ← سقف = total_price، کف = 0
 		  refund = total_price − C_used
-		اگر started_at موجود نباشد یا مدت ۰ باشد، هیچ زمان قابل‌محاسبه‌ای
-		مصرف نشده و کل مبلغ عودت می‌شود.
+
+		مرجع زمانی:
+		  • طرح با مدت ثابت (duration > ۰): خودِ مدت طرح.
+		  • طرح «تکمیل و خروج» (duration = ۰): مرجع
+		    VOICE_OPEN_ENDED_BILLING_MINUTES (پیش‌فرض ۶۰ دقیقه).
+		    پیش از v2.2.11، طرح‌های duration=۰ بدون توجه به مدت
+		    کارکردِ واقعی، کل مبلغ را عودت می‌کردند.
+		  • بدون started_at (سفارش هرگز شروع نشده): هیچ مصرفی →
+		    کل مبلغ عودت می‌شود (درست است — سرویسی داده نشده).
 		"""
 		try:
 			total_price = float(total_price or 0)
 		except Exception:
 			total_price = 0.0
 		duration_minutes = int(duration_minutes or 0)
-		if duration_minutes <= 0 or not started_at:
+		if not started_at:
+			# سفارش شروع نشده — هیچ زمانی مصرف نشده است.
 			return 0.0, total_price, 0.0
+		if duration_minutes <= 0:
+			# طرح بدون مدت (تکمیل و خروج): تسویه روی مرجع زمانی.
+			try:
+				from config import Config as _Config
+				ref_minutes = max(1, int(getattr(_Config, "VOICE_OPEN_ENDED_BILLING_MINUTES", 60)))
+			except Exception:
+				ref_minutes = 60
+			total_seconds = ref_minutes * 60
+		else:
+			total_seconds = duration_minutes * 60
 		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
-		total_seconds = duration_minutes * 60
 		if elapsed_seconds >= total_seconds:
 			used = total_price
 		else:

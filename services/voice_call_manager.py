@@ -134,6 +134,18 @@ def _patch_pyrogram_channel_id_range() -> None:
 
 _patch_pyrogram_channel_id_range()
 
+# ─── py-tgcalls UpdateGroupCall crash fix (runtime patch) ────────────
+# py-tgcalls <= 2.2.5 (نسخهٔ قفل‌شده در requirements) روی هر اپدیت خام
+# UpdateGroupCall کرش می‌کند:
+#   AttributeError: 'UpdateGroupCall' object has no attribute 'chat_id'
+# وصلهٔ runtime دقیقاً رفتار درست‌شدهٔ upstream (2.3.3) را اعمال می‌کند
+# بدون نیاز به rebuild ایمیج — جزئیات در services/pytgcalls_compat.py.
+try:
+    from services.pytgcalls_compat import patch_pytgcalls_raw_updates
+    patch_pytgcalls_raw_updates()
+except Exception as _compat_exc:
+    logger.debug("pytgcalls compat patch skipped: %s", _compat_exc)
+
 SILENT_AUDIO_PATH = "silence.wav"
 
 from config import Config
@@ -181,15 +193,18 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # seconds after joining (this was the primary "joins then immediately gets
 # kicked" bug). The correct section selector is the double-dash form.
 #
-# CPU: ``---start -threads 1`` is placed as an INPUT option (before ``-i``) so
-# each ffmpeg helper decodes the silence on a SINGLE thread. With dozens of
-# accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
-# per core multiplies context-switching and pins every CPU core; pinning to 1
-# thread keeps the (trivial) silence decode cheap and bounded.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+# CPU: ``-re`` is the single most important flag here.  Without it ffmpeg
+# loops the silence file AS FAST AS THE PIPE ALLOWS: measured on a real box the
+# helper process burned ~148% of a CPU core PER ACCOUNT (the "one ffmpeg at
+# 76% CPU while all cores sit at 20-30%" picture).  ``-re`` paces the input to
+# real time and the same process costs ~0.3% of a core — a ~400x reduction —
+# while ``-stream_loop -1`` still loops forever across iterations.
+# ``-threads 1`` is placed as an INPUT option too so each helper decodes the
+# silence on a SINGLE thread instead of one thread per core.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -re -threads 1 -stream_loop -1"
 
-# Same single-thread cap for the non-looping fallback (short file, plays once).
-_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
+# Same realtime cap for the non-looping fallback (short file, plays once).
+_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -re -threads 1"
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -202,6 +217,30 @@ VOICE_FLOOD_INLINE_WAIT_MAX = max(
 CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
+# ── Bounded acquisitions (v2.2.11) ─────────────────────────────────────────
+# A single stuck client creation (a non-cancellable app.start() or a
+# half-dead client) must never queue every later attempt behind it: the
+# 120s 'creating Pyrogram client' stalls in the order-752 logs came from
+# unbounded waits on the per-account lock / create semaphore. Every
+# acquisition below is bounded — on timeout the join fails FAST and the
+# scheduler defers/retries (or replaces the account) instead of burning
+# a whole wave deadline.
+CLIENT_CREATE_SLOT_WAIT = max(10.0, float(getattr(Config, 'VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS', 90)))
+CLIENT_LOCK_WAIT = max(10.0, float(getattr(Config, 'VOICE_CLIENT_LOCK_WAIT_SECONDS', 60)))
+
+
+async def _acquire_client_create_slot() -> bool:
+    """Acquire a client-creation slot with a hard bound (v2.2.11).
+
+    Returns False on timeout — callers must fail fast (the scheduler
+    defers the account with its retry budget intact and tries again).
+    """
+    try:
+        await asyncio.wait_for(CLIENT_CREATE_SEMAPHORE.acquire(),
+                               timeout=CLIENT_CREATE_SLOT_WAIT)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -321,11 +360,230 @@ def _voice_proxy_config() -> Optional[Dict[str, Any]]:
         proxy["password"] = pwd
     return proxy
 
+# ─── VOICE CLIENT PROFILE (RAM + Telegram-traffic control) ────────────────
+# What a voice client REALLY needs from Pyrogram is the raw update stream
+# (PyTgCalls/WebRTC handshake + participant sync).  Everything the library
+# does for a *chat* client is pure cost here:
+#
+#   fetch_replies=True (library default) → every incoming message that replies
+#     to another message triggers an immediate `channels.GetMessages` RPC for
+#     the quoted message.  With dozens/hundreds of accounts sitting in busy
+#     supergroups this is a continuous GetMessages storm: Telegram answers with
+#     FLOOD_WAIT — exactly the
+#         [shared_client_69] Waiting for 12 seconds before continuing
+#         (required by "channels.GetMessages")
+#     lines — and each waiting request keeps its task + parsed Message objects
+#     alive in RAM, while the client's message cache keeps filling up.
+#     (pyrogram/methods/messages/get_messages.py is invoked from
+#      Message.__parse_reply with replies=1 for live updates.)
+#   workers=N (library default) → N dispatcher worker tasks per client, i.e.
+#     N × accounts tasks that just sit there waiting for nothing.
+#   max_message_cache_size / max_topic_cache_size (1000 each by default) →
+#     up to a thousand parsed messages held alive PER client.
+#
+# All of it is disabled for the long-lived `shared_client_*` clients below.
+VOICE_CLIENT_FETCH_REPLIES = bool(getattr(Config, "VOICE_CLIENT_FETCH_REPLIES", False))
+VOICE_CLIENT_FETCH_TOPICS = bool(getattr(Config, "VOICE_CLIENT_FETCH_TOPICS", False))
+VOICE_CLIENT_FETCH_STORIES = bool(getattr(Config, "VOICE_CLIENT_FETCH_STORIES", False))
+VOICE_CLIENT_FETCH_STICKERS = bool(getattr(Config, "VOICE_CLIENT_FETCH_STICKERS", False))
+VOICE_CLIENT_WORKERS = max(1, int(getattr(Config, "VOICE_CLIENT_WORKERS", 1) or 1))
+VOICE_CLIENT_MESSAGE_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_MESSAGE_CACHE", 50) or 0))
+VOICE_CLIENT_TOPIC_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_TOPIC_CACHE", 50) or 0))
+
+# ─── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────────
+# A connected voice client is not free: session + dispatcher (+ its worker
+# tasks) + caches, and it keeps consuming Telegram updates.  Clients that no
+# order references any more (a cancelled join, a pre-warmed wave the order
+# never used, an order that already ended) therefore MUST be disconnected —
+# otherwise RAM stays full with zero active orders, which is exactly what was
+# reported.  The reaper runs for the whole process lifetime and only touches
+# clients that:
+#   * no order references (neither a live call nor the durable joined state),
+#   * have no join/rejoin in flight,
+#   * and have been idle for VOICE_IDLE_CLIENT_TTL seconds
+#     (an order-end sweep closes unreferenced clients immediately).
+# ─── MEDIA MODE: listener (zero-ffmpeg) vs. silence stream ────────────────
+# A LISTENER joins the group call without publishing any media: ntgcalls then
+# needs no ffmpeg child and no Opus encoder.  Per account that is the
+# difference between ~15-30MB RAM + a fat share of a CPU core (see the `-re`
+# note above) and a few MB with ~0% CPU.  Telegram counts listeners as
+# participants exactly like publishers, which is all these orders sell.
+# 'media' keeps the classic silence stream; 'auto' starts as listener and
+# permanently falls back to the silence stream if listeners get dropped.
+VOICE_SILENCE_MODE = str(getattr(Config, "VOICE_SILENCE_MODE", "auto") or "auto").strip().lower()
+if VOICE_SILENCE_MODE not in ("auto", "listener", "media"):
+    VOICE_SILENCE_MODE = "auto"
+VOICE_LISTENER_PROBE_SECONDS = max(10, int(getattr(Config, "VOICE_LISTENER_PROBE_SECONDS", 60) or 60))
+VOICE_LISTENER_MAX_FAILURES = max(1, int(getattr(Config, "VOICE_LISTENER_MAX_FAILURES", 2) or 2))
+# Late drops (a listener that DID work but was later evicted) — a chat that
+# silently evicts listeners must also end up on the silence stream.
+VOICE_LISTENER_MAX_DROPS = max(1, int(getattr(Config, "VOICE_LISTENER_MAX_DROPS", 3) or 3))
+
+VOICE_IDLE_REAPER = bool(getattr(Config, "VOICE_IDLE_REAPER", True))
+VOICE_IDLE_CLIENT_TTL = max(30, int(getattr(Config, "VOICE_IDLE_CLIENT_TTL", 300) or 300))
+
+# ─── LOG SIZE CAP (disk + I/O) ────────────────────────────────────────────
+# The JSONL diagnostics (voice_calls.log / voice_drops.log /
+# voice_telemetry.log, the last one written for EVERY account on EVERY monitor
+# cycle) used to grow without any limit — tens of MB per day of debugging data
+# that nobody ever reads twice.  They are now size-capped and rotated to
+# `<name>.1`, so disk usage stays bounded forever.  0 disables rotation.
+VOICE_LOG_MAX_BYTES = max(0, int(getattr(Config, "VOICE_LOG_MAX_MB", 25) or 0)) * 1024 * 1024
+
+
+def _append_jsonl(path: Optional[str], entry: Dict[str, Any]) -> None:
+    """Append one JSON line, rotating the file when it exceeds the size cap."""
+    if not path:
+        return
+    try:
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        if VOICE_LOG_MAX_BYTES:
+            try:
+                # Rotate BEFORE crossing the cap, so every file (live and
+                # rotated) stays within it.
+                if os.path.getsize(path) + len(line.encode("utf-8")) > VOICE_LOG_MAX_BYTES:
+                    rotated = f"{path}.1"
+                    try:
+                        os.replace(path, rotated)
+                    except OSError:
+                        # Odd filesystems: fall back to truncation so the cap
+                        # is still enforced.
+                        with open(path, "w", encoding="utf-8"):
+                            pass
+            except FileNotFoundError:
+                pass
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:
+        pass
+
+# Accepted keyword arguments of the installed Client.__init__ (cached).  Some
+# pyrogram forks do not expose every knob above; unsupported keys must be
+# dropped instead of crashing every client creation.
+_CLIENT_INIT_PARAMS: Optional[set] = None
+_CLIENT_INIT_PARAMS_CLS: Optional[type] = None
+
+
+def _client_init_params() -> set:
+    """Accepted keyword arguments of the installed Client.__init__ (cached)."""
+    global _CLIENT_INIT_PARAMS, _CLIENT_INIT_PARAMS_CLS
+    # Recompute when the Client class itself changed (tests swap it, a fork
+    # could monkey-patch it) so the cache can never bind to a stale class.
+    if _CLIENT_INIT_PARAMS is None or _CLIENT_INIT_PARAMS_CLS is not Client:
+        try:
+            import inspect
+
+            _CLIENT_INIT_PARAMS = set(inspect.signature(Client.__init__).parameters)
+        except Exception:
+            _CLIENT_INIT_PARAMS = set()
+        _CLIENT_INIT_PARAMS_CLS = Client
+    return _CLIENT_INIT_PARAMS
+
+
+def _filter_client_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    supported = _client_init_params()
+    if not supported:
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in supported}
+
+
+def _voice_client_kwargs(account_id: int) -> Dict[str, Any]:
+    """Shared keyword arguments for every long-lived voice client.
+
+    Keeps the raw update stream ON (PyTgCalls needs it) while switching off
+    the chat-side auto-fetch machinery and the oversized per-client caches —
+    see the VOICE CLIENT PROFILE block above for why this matters.
+    """
+    return _filter_client_kwargs({
+        # PyTgCalls needs raw Telegram updates to complete the voice transport
+        # handshake and participant sync.
+        "no_updates": False,
+        "in_memory": True,
+        "proxy": _voice_proxy_config(),
+        # No automatic reply/topic/story/sticker fetching → no GetMessages
+        # per incoming reply, no extra RPCs, no extra cached objects.
+        "fetch_replies": VOICE_CLIENT_FETCH_REPLIES,
+        "fetch_topics": VOICE_CLIENT_FETCH_TOPICS,
+        "fetch_stories": VOICE_CLIENT_FETCH_STORIES,
+        "fetch_stickers": VOICE_CLIENT_FETCH_STICKERS,
+        # ONE dispatcher worker per client instead of the library default
+        # (WORKERS = min(32, cpu_count+4)) — with many accounts that default
+        # alone accounted for hundreds of idle tasks.
+        "workers": VOICE_CLIENT_WORKERS,
+        # Small caches: a voice client never reads chat history.
+        "max_message_cache_size": VOICE_CLIENT_MESSAGE_CACHE,
+        "max_topic_cache_size": VOICE_CLIENT_TOPIC_CACHE,
+        # A voice account never downloads media concurrently.
+        "max_concurrent_transmissions": 1,
+        **_client_device_fingerprint(account_id),
+    })
+
+
+def _process_rss_mb(pid: Optional[int] = None) -> Optional[float]:
+    """Resident set size (MB) of a process from /proc — no psutil needed."""
+    try:
+        target = int(pid or os.getpid())
+        with open(f"/proc/{target}/statm", "r", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+        return round(pages * (os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)), 1)
+    except Exception:
+        return None
+
+
+def _child_processes_report() -> Dict[str, Any]:
+    """Cheap /proc scan: how many media helper processes exist and how much RAM they hold.
+
+    ntgcalls spawns ONE ffmpeg child per account that has an active media
+    stream.  Those children are invisible in the bot process' own RSS but they
+    are part of the container's memory — a leftover ffmpeg (whose engine was
+    abandoned mid-join) keeps eating RAM with no order running at all.
+    """
+    report = {"ffmpeg": 0, "ffmpeg_rss_mb": 0.0, "processes": 0, "total_rss_mb": 0.0}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                    stat = handle.read()
+                cut = stat.rindex(")")
+                comm = stat[:cut].split("(", 1)[-1]
+                fields = stat[cut + 2:].split()
+                rss_mb = (int(fields[21]) * (os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)))
+            except Exception:
+                continue
+            report["processes"] += 1
+            report["total_rss_mb"] += rss_mb
+            if comm == "ffmpeg":
+                report["ffmpeg"] += 1
+                report["ffmpeg_rss_mb"] += rss_mb
+        for key in ("ffmpeg_rss_mb", "total_rss_mb"):
+            report[key] = round(report[key], 1)
+    except Exception:
+        pass
+    return report
+
+
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
     _JOIN_PENDING_TIMEOUT,
     ACTIVE_CALL_CACHE_TTL,
     os.path.abspath(__file__),
+)
+logger.info(
+    "VoiceCallManager client profile: workers=%s msg_cache=%s topic_cache=%s "
+    "fetch_replies=%s fetch_topics=%s fetch_stories=%s (chat-side auto-fetch off "
+    "prevents the channels.GetMessages flood)",
+    VOICE_CLIENT_WORKERS, VOICE_CLIENT_MESSAGE_CACHE, VOICE_CLIENT_TOPIC_CACHE,
+    VOICE_CLIENT_FETCH_REPLIES, VOICE_CLIENT_FETCH_TOPICS, VOICE_CLIENT_FETCH_STORIES,
+)
+logger.info(
+    "VoiceCallManager media mode=%s (listener = join without publishing media: "
+    "no ffmpeg per account; 'auto' falls back to the silence stream if listeners "
+    "are rejected; probe=%ss, max_failures=%s). Silence-stream ffmpeg is "
+    "realtime-paced (-re) — ~0.3%% of a core instead of ~150%%.",
+    VOICE_SILENCE_MODE, VOICE_LISTENER_PROBE_SECONDS, VOICE_LISTENER_MAX_FAILURES,
 )
 if bool(getattr(Config, "USE_PROXY", False)):
     logger.info(
@@ -679,7 +937,10 @@ class VoiceCallManager:
         self._monitor_tasks: Dict[int, asyncio.Task] = {}
 
         # Per-chat shared participant snapshot cache for the current monitor cycle
-        self._participant_snapshot: Dict[int, Tuple[float, Optional[Set[int]]]] = {}
+        # chat_id -> (cycle_ts, present_ids, authoritative)
+        # `authoritative=False` means the participant listing was not walked
+        # completely: it may confirm presence, never absence.
+        self._participant_snapshot: Dict[int, Tuple[float, Optional[Set[int]], bool]] = {}
         self._monitor_cycle_ts: float = 0.0
 
         # Cross-order, non-sensitive adaptive policy cache. It stores only
@@ -705,6 +966,32 @@ class VoiceCallManager:
             self._telemetry_log_path = None
         self._recent_issues = deque()
         self._recent_issues_lock = asyncio.Lock()
+
+        # ── IDLE-CLIENT BOOKKEEPING (RAM hygiene) ─────────────────────────
+        # account_id -> epoch of the last time the account was actually USED
+        # (created, joined, monitored, messaged).  The reaper only closes a
+        # client that is not referenced by any order AND has been idle for
+        # VOICE_IDLE_CLIENT_TTL seconds.
+        self._client_last_used: Dict[int, float] = {}
+        # order_id -> account ids whose client was PRE-WARMED for that order
+        # (the join brain warms the NEXT wave while the current one joins).
+        # Warmed-but-never-used clients used to survive the order forever.
+        self._warmed_by_order: Dict[int, Set[int]] = {}
+        # ── MEDIA MODE STATE (listener vs. silence stream) ────────────────
+        # `_listener_disabled` is the process-wide kill switch for listener
+        # mode; once listener joins prove unreliable we never use them again
+        # (set from config, or flipped at runtime by _note_listener_failure).
+        self._listener_disabled = VOICE_SILENCE_MODE == "media"
+        self._listener_user_forced = VOICE_SILENCE_MODE == "listener"
+        self._listener_proven = False
+        self._listener_failures = 0
+        self._listener_late_drops = 0
+        # Accounts currently inside a call as LISTENERS (no media published).
+        self._listener_accounts: Set[int] = set()
+        self._listener_joined_at: Dict[int, float] = {}
+        self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._last_memory_log: float = 0.0
+        self._reaped_total: int = 0
 
     def _load_strategy_cache(self) -> None:
         try:
@@ -796,8 +1083,7 @@ class VoiceCallManager:
                 "event": event,
                 "details": details or {},
             }
-            with open(self._vc_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _append_jsonl(self._vc_log_path, entry)
             logger.debug(f"VCLOG {order_id}/{account_id} {event} {details or {}}")
         except Exception:
             pass
@@ -824,6 +1110,12 @@ class VoiceCallManager:
         return self._client_locks[account_id]
 
     def _record_drop(self, order_id, account_id, chat_id, event, deliberate=False, reason="", extra=None) -> None:
+        # Listener-mode safety net — see _note_listener_drop().
+        try:
+            if not deliberate and account_id is not None and self.is_listener_account(account_id):
+                self._note_listener_drop(account_id, str(event))
+        except (TypeError, ValueError):
+            pass
         """Structured drop ledger → logs/voice_drops.log (JSONL).
 
         EVERY involuntary (or order-managed) leave from a voice call lands here
@@ -870,8 +1162,7 @@ class VoiceCallManager:
                 "session_connected": session_connected,
                 "extra": extra or {},
             }
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _append_jsonl(path, entry)
             # Surface every INVOLUNTARY drop on the console too, so
             # `docker compose logs` alone answers "who fell out and why".
             if not deliberate:
@@ -907,8 +1198,7 @@ class VoiceCallManager:
                 "label": label,
                 "feats": feats,
             }
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            _append_jsonl(path, row)
         except Exception:
             pass
 
@@ -1030,6 +1320,7 @@ class VoiceCallManager:
         app = self.pyrogram_clients.get(account_id)
         if not app:
             return False, "اکانت انتخاب‌شده هم‌اکنون در هیچ ویس‌کالی حاضر و متصل نیست."
+        self._touch_client(account_id)
 
         payload = (reaction_emoji or text or "").strip()
         if not payload:
@@ -1215,8 +1506,29 @@ class VoiceCallManager:
                 errors.append(f"#{aid}: {msg}")
         return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
 
-    def _account_in_any_order(self, account_id: int) -> bool:
-        return any(aid == account_id for (oid, aid) in self.active_calls.keys())
+    def _account_in_any_order(self, account_id: int, exclude_order_id: Optional[int] = None) -> bool:
+        """Is this account still NEEDED by an order (live call or durable join)?
+
+        The durable (`joined_accounts_by_order`) state must be part of this
+        check: an account that is durably joined but whose `active_calls` entry
+        was already popped (a monitor-driven rejoin window, for instance) is
+        still very much in use and its client must never be closed.
+        """
+        try:
+            account_id = int(account_id)
+        except (TypeError, ValueError):
+            return False
+        for (oid, aid) in list(self.active_calls.keys()):
+            if int(aid) == account_id and (
+                exclude_order_id is None or int(oid) != int(exclude_order_id)
+            ):
+                return True
+        for oid, recs in list(self.joined_accounts_by_order.items()):
+            if exclude_order_id is not None and int(oid) == int(exclude_order_id):
+                continue
+            if account_id in (recs or {}):
+                return True
+        return False
 
     def get_in_use_account_ids(self) -> Set[int]:
         return {aid for (oid, aid) in self.active_calls.keys()}
@@ -1253,6 +1565,29 @@ class VoiceCallManager:
 
     def get_active_count(self, order_id: Optional[int] = None) -> int:
         return len(self.get_active_account_ids(order_id))
+
+    def get_unrecoverable_account_ids(self, order_id: int) -> Set[int]:
+        """Accounts whose slots the monitor marked UNRECOVERABLE (confirmed
+        disconnect + exhausted rejoin attempts). They are NOT in the call any
+        more, so they must not count toward the live presence / fill target —
+        the executor replaces them with fresh accounts while the paid
+        duration is still running."""
+        inner = self.joined_accounts_by_order.get(order_id) or {}
+        return {
+            aid for aid, rec in inner.items()
+            if isinstance(rec, dict) and rec.get("unrecoverable")
+        }
+
+    def get_effective_active_count(self, order_id: int) -> int:
+        """Truthful presence count: durably joined minus unrecoverable
+        slots. This is the number that matches what the participant list
+        actually shows (once the monitor's bounded confirmation window
+        has classified a slot as unrecoverable)."""
+        return max(
+            0,
+            self.get_active_count(order_id)
+            - len(self.get_unrecoverable_account_ids(order_id)),
+        )
 
     def register_join(self, order_id: int, account_id: int, chat_id: int, target: str) -> bool:
         """
@@ -1799,6 +2134,13 @@ class VoiceCallManager:
     # ─── Client management ───
 
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
+        # RAM hygiene: the sweep that closes clients nobody needs runs for the
+        # whole process lifetime (started here because every voice path ends up
+        # in this method at least once).
+        self.ensure_background_maintenance()
+        # Mark the account as in use so the reaper can never close a client
+        # that is being handed to a caller right now.
+        self._touch_client(account_id)
         # Database sessions are encrypted. Passing the encrypted value to
         # Pyrogram makes every account fail during client initialisation.
         decrypted_session = SecurityManager.decrypt_session(session_string)
@@ -1806,7 +2148,21 @@ class VoiceCallManager:
             raise ValueError(f"Invalid encrypted session for account {account_id}")
         self._session_cache[account_id] = session_string
 
-        async with self._lock(account_id):
+        # Bounded lock acquisition (v2.2.11): if another attempt for this
+        # account is stuck holding the lock, fail fast (the scheduler
+        # defers the account / spends one cheap retry) instead of queueing
+        # behind it until the 120s wave deadline.
+        lock = self._lock(account_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=CLIENT_LOCK_WAIT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[VoiceScheduler] client lock busy for account {account_id} "
+                f"for {CLIENT_LOCK_WAIT:.0f}s — failing fast instead of "
+                f"queueing behind a stuck attempt"
+            )
+            raise RuntimeError(f"client lock busy (account {account_id})")
+        try:
             # Check existing pyrogram client
             app = self.pyrogram_clients.get(account_id)
             if app:
@@ -1832,7 +2188,9 @@ class VoiceCallManager:
                     session_ownership.release_voice(account_id)
 
             if not app:
-                async with CLIENT_CREATE_SEMAPHORE:
+                if not await _acquire_client_create_slot():
+                    raise RuntimeError("client-create slot busy (timed out)")
+                try:
                     held = await session_ownership.acquire_voice(account_id)
                     try:
                         helper = TelegramAccountClient("temp", session_string, account_id)
@@ -1842,12 +2200,7 @@ class VoiceCallManager:
                             session_string=decrypted_session,
                             api_id=api_id,
                             api_hash=api_hash,
-                            # PyTgCalls needs raw Telegram updates to complete
-                            # the voice transport handshake and participant sync.
-                            no_updates=False,
-                            in_memory=True,
-                            proxy=_voice_proxy_config(),
-                            **_client_device_fingerprint(account_id),
+                            **_voice_client_kwargs(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
                     except Exception:
@@ -1855,6 +2208,8 @@ class VoiceCallManager:
                             session_ownership.release_voice(account_id)
                         raise
                     self.pyrogram_clients[account_id] = app
+                finally:
+                    CLIENT_CREATE_SEMAPHORE.release()
 
             # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
             pytg = self.clients.get(account_id)
@@ -1889,23 +2244,30 @@ class VoiceCallManager:
                     self.clients.pop(account_id, None)
 
             if not pytg:
-                async with CLIENT_CREATE_SEMAPHORE:
+                if not await _acquire_client_create_slot():
+                    raise RuntimeError("client-create slot busy (timed out)")
+                try:
                     pytg = PyTgCalls(app)
                     self._attach_engine_handlers(pytg, account_id)
                     await asyncio.wait_for(pytg.start(), timeout=15)
                     self.clients[account_id] = pytg
+                finally:
+                    CLIENT_CREATE_SEMAPHORE.release()
 
             return pytg
+        finally:
+            lock.release()
 
-    async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
+    async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False,
+                              reason: str = "") -> None:
         # Only cleanup if account is not used by any other active call
         if not force:
-            still_active = any(
-                aid == account_id
-                for (oid, aid) in self.active_calls.keys()
-                if oid != order_id
-            )
-            if still_active:
+            if self._account_in_any_order(account_id, exclude_order_id=order_id):
+                return
+            # A join/rejoin for this account may be running right now — its
+            # client is in use even though the bookkeeping above is not there
+            # yet (the durable entry is only written AFTER verification).
+            if any(int(aid) == int(account_id) for (aid, _cid) in list(self._inflight_joins.keys())):
                 return
 
         pytg = self.clients.pop(account_id, None)
@@ -1938,6 +2300,228 @@ class VoiceCallManager:
             session_ownership.release_voice(account_id)
             self._session_cache.pop(account_id, None)
             self._client_locks.pop(account_id, None)
+            self._client_last_used.pop(account_id, None)
+            self._listener_accounts.discard(int(account_id))
+            self._listener_joined_at.pop(int(account_id), None)
+            if reason:
+                logger.info(
+                    "[VoiceReaper] account %s client closed (%s; engine=%s)",
+                    account_id, reason, bool(pytg),
+                )
+
+    # ─── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────
+
+    def _touch_client(self, account_id: Optional[int]) -> None:
+        """Record that an account's voice client is actively in use.
+
+        The reaper may only close clients that nobody referenced for
+        VOICE_IDLE_CLIENT_TTL seconds; this timestamp is the safety net for
+        every path that uses a client WITHOUT registering it in an order
+        (client creation, warm-up, monitor cycles, in-call messaging).
+        """
+        if account_id is None:
+            return
+        try:
+            self._client_last_used[int(account_id)] = time.time()
+        except (TypeError, ValueError):
+            pass
+
+    def _referenced_account_ids(self) -> Set[int]:
+        """Accounts some part of the system still needs RIGHT NOW."""
+        referenced: Set[int] = set()
+        for (_oid, aid) in list(self.active_calls.keys()):
+            try:
+                referenced.add(int(aid))
+            except (TypeError, ValueError):
+                continue
+        for recs in list(self.joined_accounts_by_order.values()):
+            for aid in list((recs or {}).keys()):
+                try:
+                    referenced.add(int(aid))
+                except (TypeError, ValueError):
+                    continue
+        for (aid, _cid) in list(self._inflight_joins.keys()):
+            try:
+                referenced.add(int(aid))
+            except (TypeError, ValueError):
+                continue
+        return referenced
+
+    async def reap_idle_clients(self, *, force: bool = False, order_id: Optional[int] = None) -> int:
+        """Disconnect voice clients that no order needs any more.
+
+        `force=False` → only clients idle for VOICE_IDLE_CLIENT_TTL seconds.
+        `force=True`  → every client that is not referenced by an order right
+                        now (used when an order ends so a finished/cancelled
+                        order cannot leave its pre-warmed clients — and their
+                        engines/ffmpeg children — connected forever).
+
+        Returns the number of clients that were closed.
+        """
+        if not VOICE_IDLE_REAPER and not force:
+            return 0
+        candidates = set(self.pyrogram_clients.keys()) | set(self.clients.keys())
+        if not candidates:
+            return 0
+        referenced = self._referenced_account_ids()
+        in_flight = {int(aid) for (aid, _cid) in list(self._inflight_joins.keys())}
+        now = time.time()
+        closed = 0
+        for account_id in sorted(candidates):
+            if account_id in referenced or account_id in in_flight:
+                continue
+            if not force:
+                idle_for = now - float(self._client_last_used.get(account_id, 0.0))
+                if idle_for < VOICE_IDLE_CLIENT_TTL:
+                    continue
+            # Never yank a client while our own code holds its account lock
+            # (a client is (re)built / an engine is rebuilt under that lock).
+            lock = self._client_locks.get(account_id)
+            if lock is not None and lock.locked():
+                continue
+            try:
+                await self._cleanup_client(account_id, order_id=order_id, force=True,
+                                           reason="idle" if not force else "unreferenced")
+                closed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[VoiceReaper] closing acc=%s failed: %s", account_id, exc)
+        if closed:
+            self._reaped_total += closed
+            logger.info(
+                "[VoiceReaper] closed %s idle voice client(s) — remaining client(s)=%s engine(s)=%s",
+                closed, len(self.pyrogram_clients), len(self.clients),
+            )
+            # Pyrogram objects (sessions, parsers, caches) are reference-cyclic;
+            # a collection right after a mass close returns that RAM promptly.
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
+        return closed
+
+    def memory_report(self) -> Dict[str, Any]:
+        """Live RAM + client/engine inventory (answerable from docker logs)."""
+        try:
+            referenced = self._referenced_account_ids()
+        except Exception:
+            referenced = set()
+        try:
+            holds = session_ownership.held_count()
+        except Exception:
+            holds = -1
+        try:
+            tasks = len(asyncio.all_tasks())
+        except Exception:
+            tasks = -1
+        report: Dict[str, Any] = {
+            "rss_mb": _process_rss_mb(),
+            "clients": len(self.pyrogram_clients),
+            "engines": len(self.clients),
+            "in_call_slots": len(self.active_calls),
+            "durable_slots": sum(len(recs or {}) for recs in self.joined_accounts_by_order.values()),
+            "unused_clients": len([a for a in self.pyrogram_clients if a not in referenced]),
+            "session_holds": holds,
+            "asyncio_tasks": tasks,
+            "reaped_total": self._reaped_total,
+            # media/listener accounting — the single biggest cost driver
+            "media_mode": self._media_mode_label(),
+            "listeners": len(self._listener_accounts),
+            "listener_failures": self._listener_failures,
+            "listener_late_drops": self._listener_late_drops,
+        }
+        report.update(_child_processes_report())
+        return report
+
+    def ensure_background_maintenance(self) -> None:
+        """Start the idle-client reaper / memory reporter (idempotent)."""
+        if not VOICE_IDLE_REAPER:
+            return
+        task = self._idle_reaper_task
+        if task is not None and not task.done():
+            return
+        try:
+            self._idle_reaper_task = asyncio.get_running_loop().create_task(self._idle_reaper_loop())
+        except RuntimeError:
+            # No running loop (import-time call) — the next client creation
+            # inside the loop starts it.
+            self._idle_reaper_task = None
+            return
+        logger.info(
+            "[VoiceReaper] started: idle TTL=%ss sweep=%ss memory log=%ss",
+            VOICE_IDLE_CLIENT_TTL,
+            max(5, int(getattr(Config, "VOICE_IDLE_SWEEP_INTERVAL", 60) or 60)),
+            max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600) or 600)),
+        )
+
+    async def _idle_reaper_loop(self) -> None:
+        interval = max(5, int(getattr(Config, "VOICE_IDLE_SWEEP_INTERVAL", 60) or 60))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._run_sweep_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("[VoiceReaper] sweep failed: %s", exc)
+                try:
+                    await self._log_memory_report_if_due()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never let the reaper die silently
+            logger.warning("[VoiceReaper] loop stopped: %s", exc)
+
+    async def _run_sweep_once(self) -> int:
+        """One reaper pass — force-closes when the process is under RAM pressure.
+
+        Memory pressure (VOICE_RAM_SOFT_LIMIT_MB) skips the idle TTL entirely:
+        every client that no order references is closed immediately, so a
+        memory spike can never grow into an OOM kill / restart.
+        """
+        rss = _process_rss_mb()
+        soft_limit = max(0, int(getattr(Config, "VOICE_RAM_SOFT_LIMIT_MB", 0) or 0))
+        if soft_limit and (rss or 0) > soft_limit:
+            closed = await self.reap_idle_clients(force=True)
+            logger.warning(
+                "[VoiceReaper] RAM pressure: rss=%sMB > soft limit %sMB — "
+                "closed %s unreferenced client(s) immediately",
+                rss, soft_limit, closed,
+            )
+            return closed
+        return await self.reap_idle_clients()
+
+    async def _log_memory_report_if_due(self) -> None:
+        interval = max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600) or 600))
+        now = time.time()
+        if now - self._last_memory_log < interval:
+            return
+        self._last_memory_log = now
+        report = self.memory_report()
+        logger.info(
+            "[VoiceMemory] %s",
+            " ".join(f"{key}={value}" for key, value in report.items()),
+        )
+        # Media helper processes outliving their calls are the classic "RAM
+        # full with no active order" signature — surface it loudly.
+        try:
+            expected = max(2, int(report.get("in_call_slots") or 0) + 2)
+            if int(report.get("ffmpeg") or 0) > expected:
+                logger.warning(
+                    "[VoiceMemory] %s ffmpeg process(es) alive while only %s call slot(s) "
+                    "are active — leftover media from abandoned joins (≈%s MB)",
+                    report.get("ffmpeg"), report.get("in_call_slots"),
+                    report.get("ffmpeg_rss_mb"),
+                )
+        except Exception:
+            pass
 
     # ─── Protocol helpers ───
 
@@ -2010,6 +2594,10 @@ class VoiceCallManager:
         """One best-effort silence restart after a StreamEnded event."""
         try:
             await asyncio.sleep(0.5)
+            # A LISTENER publishes no media by design — nothing to restart
+            # (re-publishing silence would defeat the whole optimisation).
+            if self.is_listener_account(account_id):
+                return
             # NOTE: valid Telegram chat ids are NEGATIVE (e.g. -1001234567890);
             # only zero/unset means "no call at all".
             if not chat_id:
@@ -2027,7 +2615,7 @@ class VoiceCallManager:
             if int(chat_id) not in calls:
                 # Binding is gone; monitor recovery/rejoin owns this now.
                 return
-            await self._play_silence(pytg, int(chat_id))
+            await self._play_silence(pytg, int(chat_id), account_id)
             order_id = self._order_id_for_account(account_id, chat_id)
             self._vc_event_log(order_id, account_id, "silence_restarted", {"chat_id": chat_id})
             logger.info(
@@ -2136,6 +2724,10 @@ class VoiceCallManager:
             loops on invalid client instances
         """
         key = (order_id, account_id)
+        # A LISTENER intentionally has no media binding — restoring "silence"
+        # for it would spawn an ffmpeg child and defeat the optimisation.
+        if self.is_listener_account(account_id):
+            return
         if not self._media_restore_due(key):
             return
         pytg = self.clients.get(account_id)
@@ -2156,7 +2748,7 @@ class VoiceCallManager:
             async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
                 try:
                     # ── L1: fast path — re-stream on the existing engine ──
-                    await self._play_silence(pytg, cid)
+                    await self._play_silence(pytg, cid, account_id)
                     result = "restored"
                 except Exception:
                     _e1 = sys.exc_info()[1]
@@ -2180,7 +2772,7 @@ class VoiceCallManager:
                             str(e_leave)[:80] or type(e_leave).__name__,
                         )
                     try:
-                        await self._play_silence(pytg, cid)
+                        await self._play_silence(pytg, cid, account_id)
                         result = "restored_after_leave"
                     except Exception:
                         _e2 = sys.exc_info()[1]
@@ -2206,7 +2798,7 @@ class VoiceCallManager:
                                 if fresh is None:
                                     result = "rebuild_failed:no_client"
                                 else:
-                                    await self._play_silence(fresh, cid)
+                                    await self._play_silence(fresh, cid, account_id)
                                     result = "restored_after_engine_rebuild"
                             except Exception:
                                 _e3 = sys.exc_info()[1]
@@ -2278,7 +2870,109 @@ class VoiceCallManager:
         except Exception:
             return 0.0
 
-    async def _play_silence(self, pytg: PyTgCalls, chat_id: int) -> None:
+    # ─── MEDIA MODE (listener vs. silence stream) ─────────────────────────
+
+    def _media_mode_label(self) -> str:
+        """Human-readable current mode (for logs / memory report)."""
+        if self._listener_disabled:
+            return "media"
+        if self._listener_proven:
+            return "listener"
+        return "listener?" if not self._listener_user_forced else "listener"
+
+    def listener_mode_active(self) -> bool:
+        """Should new joins use the zero-ffmpeg LISTENER mode?"""
+        return not self._listener_disabled
+
+    def is_listener_account(self, account_id: int) -> bool:
+        """Is this account currently inside a call without publishing media?"""
+        try:
+            return int(account_id) in self._listener_accounts
+        except (TypeError, ValueError):
+            return False
+
+    def _note_listener_failure(self, account_id: Optional[int], reason: str) -> None:
+        """A listener join failed / was dropped → count it and give up on it.
+
+        In 'auto' mode this is the safety net that makes the optimisation
+        risk-free: after VOICE_LISTENER_MAX_FAILURES the whole process goes
+        back to the proven silence stream and never tries a listener again.
+        """
+        try:
+            self._listener_failures += 1
+            if account_id is not None:
+                self._listener_accounts.discard(int(account_id))
+                self._listener_joined_at.pop(int(account_id), None)
+        except (TypeError, ValueError):
+            pass
+        if self._listener_user_forced:
+            return  # explicit configuration wins; keep trying
+        if self._listener_disabled:
+            return
+        if self._listener_failures >= VOICE_LISTENER_MAX_FAILURES:
+            self._listener_disabled = True
+            logger.warning(
+                "[VoiceMedia] LISTENER mode disabled after %s failure(s) (last: %s) — "
+                "every later join publishes the silence stream (VOICE_SILENCE_MODE=media)",
+                self._listener_failures, reason[:120],
+            )
+            self._vc_event_log(None, account_id, "listener_mode_disabled",
+                               {"failures": self._listener_failures, "reason": reason[:120]})
+
+    def _note_listener_drop(self, account_id: int, event: str) -> None:
+        """A listener account disappeared from the call.
+
+        Early drop (inside the probe window)  → the join was not really
+        accepted; counts as a failure and, after
+        VOICE_LISTENER_MAX_FAILURES, listener mode is switched off.
+        Late drop (after the window)          → listener mode did work; it is
+        counted by VOICE_LISTENER_MAX_DROPS so a chat that evicts listeners
+        after a while still converges on the silence stream.
+        """
+        try:
+            aid = int(account_id)
+        except (TypeError, ValueError):
+            return
+        joined_at = self._listener_joined_at.get(aid, 0.0)
+        dwell = (time.time() - joined_at) if joined_at else 0.0
+        if not joined_at or dwell < VOICE_LISTENER_PROBE_SECONDS:
+            self._note_listener_failure(
+                aid, f"listener dropped {dwell:.0f}s after join ({event})",
+            )
+            return
+        self._listener_accounts.discard(aid)
+        self._listener_joined_at.pop(aid, None)
+        if self._listener_user_forced or self._listener_disabled:
+            return
+        self._listener_late_drops += 1
+        if self._listener_late_drops >= VOICE_LISTENER_MAX_DROPS:
+            self._listener_disabled = True
+            logger.warning(
+                "[VoiceMedia] LISTENER mode disabled: %s listener(s) were evicted "
+                "after working for a while (last: acc %s, %.0fs, %s) — switching to "
+                "the silence stream",
+                self._listener_late_drops, aid, dwell, event,
+            )
+            self._vc_event_log(None, aid, "listener_mode_disabled",
+                               {"reason": "late drops", "drops": self._listener_late_drops})
+
+    def _note_listener_ok(self, account_id: int) -> None:
+        """A listener account survived the probe window → the mode is proven."""
+        if self._listener_proven:
+            return
+        joined_at = self._listener_joined_at.get(int(account_id), 0.0)
+        if time.time() - joined_at < VOICE_LISTENER_PROBE_SECONDS:
+            return
+        self._listener_proven = True
+        logger.info(
+            "[VoiceMedia] LISTENER mode proven (acc %s held the call for %.0fs) — "
+            "no ffmpeg/Opus per account; RAM and CPU stay flat",
+            account_id, time.time() - joined_at,
+        )
+        self._vc_event_log(None, int(account_id), "listener_mode_proven", {})
+
+    async def _play_silence(self, pytg: PyTgCalls, chat_id: int,
+                            account_id: Optional[int] = None) -> None:
         """Join + play the LOOPING silence stream (stay-alive media).
 
         ``pytg.play()`` COMPLETING is the authoritative "the account is inside
@@ -2287,6 +2981,32 @@ class VoiceCallManager:
         account is already in the call).  The silence is looped forever with
         ``-stream_loop -1`` so the transport can never die of EOF.
         """
+        # ── LISTENER MODE (default): join with NO media at all ───────────
+        # `pytg.play(chat_id)` with no stream sends an empty MediaDescription:
+        # joinGroupCall is still issued (so Telegram registers the account as a
+        # participant) but nothing is published — no ffmpeg child, no Opus
+        # encoder, no media pipe. This is what keeps RAM/CPU flat per account.
+        if account_id is not None and self.listener_mode_active():
+            try:
+                await pytg.play(int(chat_id))
+                self._listener_accounts.add(int(account_id))
+                self._listener_joined_at[int(account_id)] = time.time()
+                self._vc_event_log(None, int(account_id), "listener_join",
+                                   {"chat_id": int(chat_id)})
+                logger.info(
+                    "[VoiceMedia] acc=%s joined chat=%s as LISTENER (no media, zero ffmpeg)",
+                    account_id, chat_id,
+                )
+                return
+            except Exception as e:
+                # Rejected listener join → remember and fall through to the
+                # silence-stream path for THIS account right away.
+                self._note_listener_failure(account_id, f"listener join failed: {e}")
+                logger.warning(
+                    "[VoiceMedia] acc=%s listener join rejected (%s) — using the silence stream",
+                    account_id, str(e)[:100],
+                )
+
         # Always cap ffmpeg at a single decode thread (CPU). When looping is on
         # we also add ``-stream_loop -1``; otherwise fall back to the
         # threads-only input options so the non-loop path is still bounded.
@@ -2397,6 +3117,47 @@ class VoiceCallManager:
             logger.debug(f"_protocol_mute failed: {e}")
             return False
 
+    async def _ensure_mic_muted(self, app: Client, account_id: int, chat_id: int) -> None:
+        """Best-effort server-side mute of the account's OWN mic in the call.
+
+        The UI mic icon follows the server-side participant flag, which only
+        changes via phone.EditGroupCallParticipant — the local ntgcalls
+        transport mute (pytg.mute) does NOT flip it. So after EVERY join
+        (listener or silence stream, first join or recovery rejoin) we
+        explicitly set muted=True. Never raises: a mute failure must never
+        block or fail a join.
+        """
+        if not getattr(Config, "VOICE_JOIN_MUTED", True):
+            return
+        try:
+            if await self._protocol_mute(app, int(chat_id)):
+                return
+        except Exception:
+            pass
+        try:
+            pytg = self.clients.get(account_id)
+            if pytg is not None:
+                await pytg.mute(int(chat_id))
+        except Exception:
+            pass
+
+    def _schedule_mute(self, app: Client, account_id: int, chat_id: int) -> None:
+        """Fire-and-forget mute (never delays the join hot path)."""
+        try:
+            task = asyncio.create_task(self._ensure_mic_muted(app, account_id, int(chat_id)))
+
+            def _swallow(_t: asyncio.Task) -> None:
+                try:
+                    _t.exception()
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    pass
+                except Exception:
+                    pass
+
+            task.add_done_callback(_swallow)
+        except Exception:
+            pass
+
     async def force_mute_now(self, account_id: int, chat_id: int, order_id: Optional[int] = None) -> bool:
         """Mute via protocol — only called on demand, NOT in keepalive loop."""
         pytg = self.clients.get(account_id)
@@ -2449,6 +3210,32 @@ class VoiceCallManager:
         except Exception as exc:
             raise RuntimeError(f"Group membership not confirmed: {str(exc)[:100]}") from exc
 
+    @staticmethod
+    def _chat_id_from_join_result(r) -> Optional[int]:
+        """Extract a chat id from whatever ``Client.join_chat`` returns.
+
+        Kurigram changed this return type between releases:
+          * older releases return a ``types.Chat``            -> ``.id``
+          * newer releases return a ``ChatJoinResult``        -> ``.chat.id``
+            (``ChatJoinResultSuccess`` only — ``RequestSent`` /
+            ``GuardBotApprovalRequired`` / ``Declined`` carry no chat).
+
+        Accepting both shapes keeps the join path working across library
+        upgrades.  (Production regression, order 751: the new-style result
+        has no ``.id`` -> AttributeError -> 0/N joined.)
+        """
+        if r is None:
+            return None
+        chat = getattr(r, "chat", None)
+        if chat is not None:
+            cid = getattr(chat, "id", None)
+            if isinstance(cid, int) and cid:
+                return cid
+        cid = getattr(r, "id", None)
+        if isinstance(cid, int) and cid:
+            return cid
+        return None
+
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
             return self.order_chat_ids[order_id]
@@ -2456,8 +3243,12 @@ class VoiceCallManager:
         try:
             if target.startswith("https"):
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = self._chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
+                    chat_id = None
+                if not chat_id:
+                    # Already a member (or the join result carried no chat
+                    # id): resolve the chat WITHOUT re-joining.
                     try:
                         chat_id = (await app.get_chat(target)).id
                     except Exception:
@@ -2465,15 +3256,15 @@ class VoiceCallManager:
                             invite = target.split("+")[-1].split("/")[-1]
                             inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
                             if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
+                                chat_id = getattr(inv.chat, "id", None)
                         except Exception:
                             pass
             else:
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = self._chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
-                    chat_id = (await app.get_chat(target)).id
-                except Exception:
+                    chat_id = None
+                if not chat_id:
                     chat_id = (await app.get_chat(target)).id
         except RPCError as e:
             msg = str(e)
@@ -2501,16 +3292,26 @@ class VoiceCallManager:
         except Exception:
             pass
 
-    async def _fetch_shared_participants(self, app: Client, chat_id: int) -> Optional[Set[int]]:
-        """
-        Fetch the *full* set of non-left participant user IDs for a chat in a
-        single paginated pass, cached for the current monitor cycle.
+    async def _fetch_shared_participants(self, app: Client, chat_id: int,
+                                        wanted_ids: Optional[Set[int]] = None) -> Tuple[Optional[Set[int]], bool]:
+        """Fetch the participant user-id set for a chat in one paginated pass.
 
-        Returns:
-          Set[int] - full participant user-id set (authoritative).
-          None     - could not retrieve (API error / timeout). Callers must
-                     treat None as "unknown → assume present" to avoid rejoin
-                     storms and to avoid dropping healthy accounts.
+        Returns ``(present_ids, authoritative)``:
+
+          * ``authoritative=True``  — the whole participant list was walked, so
+            a missing id really means "not in the call".
+          * ``authoritative=False`` — the list was NOT walked completely
+            (early exit or page cap); the set may confirm PRESENCE but must
+            never be used to conclude ABSENCE. Callers fall back to
+            "unknown → assume present", which is what keeps a partial list from
+            triggering fake-disconnect rejoin storms.
+
+        CPU/network: the participant listing of a busy voice chat is huge, and
+        every monitor cycle used to walk it page by page (up to 50 × 500
+        participants = 25 000 ids, several RPCs each cycle per chat).  When the
+        caller tells us WHICH accounts it cares about, the walk stops as soon
+        as they have all been seen — for a live order that is normally the very
+        first page.
         """
         try:
             cached = self._active_call_cache.get(int(chat_id))
@@ -2526,9 +3327,15 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return set()  # no active call → nobody present
+                return set(), True  # no active call → nobody present (certain)
 
+            wanted = {int(x) for x in (wanted_ids or set())}
             present_ids: Set[int] = set()
+
+            def _wanted_seen() -> bool:
+                # Only "authoritative for the wanted ids" — the snapshot reader
+                # knows this and will not turn it into a False verdict.
+                return bool(wanted) and wanted.issubset(present_ids)
 
             # 1) First page via GetGroupCall (cheap)
             try:
@@ -2540,15 +3347,18 @@ class VoiceCallManager:
                         present_ids.add(int(uid))
             except Exception:
                 pass
+            if _wanted_seen():
+                return present_ids, False
 
             # 2) Paginate the remainder via phone.getGroupParticipants.
             # NOTE: pyrogram 2.0.106 exposes GetGroupParticipants, NOT
             # GetGroupCallParticipants — the old name raised AttributeError
             # on every cycle, so the shared snapshot always collapsed to
             # "unknown" and presence verification silently never worked.
+            max_pages = max(1, int(getattr(Config, "VOICE_PARTICIPANT_MAX_PAGES", 10)))
             try:
                 offset = ""
-                for _page in range(50):  # 50 * 500 = 25 000 participants max
+                for _page in range(max_pages):
                     res = await app.invoke(
                         functions.phone.GetGroupParticipants(
                             call=call,
@@ -2563,36 +3373,48 @@ class VoiceCallManager:
                         uid = getattr(ppeer, "user_id", None)
                         if uid is not None and not getattr(p, "left", False):
                             present_ids.add(int(uid))
+                    if _wanted_seen():
+                        return present_ids, False
                     next_offset = getattr(res, "next_offset", "") or ""
                     if not next_offset:
-                        break
+                        return present_ids, True  # whole list walked
                     offset = next_offset
-                return present_ids
+                # Page cap reached with more pages pending → ambiguous.
+                return present_ids, False
             except Exception:
                 # Ambiguous — can't produce an authoritative set. The caller
                 # will treat this as "unknown → assume present".
-                return None
+                return None, False
         except Exception:
-            return None
+            return None, False
 
     def _snapshot_contains(self, chat_id: int, my_id: int) -> Optional[bool]:
         """
         Consult the shared per-chat participant snapshot taken for the current
         monitor cycle.
 
-        Returns True/False when the snapshot exists and is authoritative for
-        this cycle, None when there is no fresh snapshot.
+        Returns:
+          True  - the account WAS seen in this cycle's participant listing.
+          False - the account was verified ABSENT (only when the listing was
+                  walked completely).
+          None  - unknown (no fresh/complete snapshot) → caller must not
+                  conclude a disconnect.
         """
         snap = self._participant_snapshot.get(chat_id)
         if not snap:
             return None
-        cycle_ts, present_ids = snap
+        cycle_ts, present_ids, authoritative = (
+            snap if len(snap) == 3 else (*snap, False)
+        )
+        if cycle_ts != self._monitor_cycle_ts:
+            return None
         if present_ids is None:
             # Non-authoritative snapshot (fetch failed) → unknown.
             return None
-        if cycle_ts != self._monitor_cycle_ts:
-            return None
-        return int(my_id) in present_ids
+        if int(my_id) in present_ids:
+            return True
+        # A partially walked listing can prove presence but never absence.
+        return False if authoritative else None
 
     async def _is_in_voice_call(self, app: Client, chat_id: int) -> Optional[bool]:
         """Check if account is actually in the voice call via Telegram API.
@@ -2748,12 +3570,14 @@ class VoiceCallManager:
                         # create a JoinGroupCall burst.
                         try:
                             group_calls = await pytg.group_calls
-                            if int(chat_id) not in group_calls:
+                            if int(chat_id) not in group_calls and not self.is_listener_account(account_id):
                                 asyncio.create_task(
                                     self._schedule_media_restore(order_id, account_id, int(chat_id))
                                 )
                         except Exception:
                             pass
+                        # Mute the account's mic (server flag = UI icon).
+                        self._schedule_mute(app, account_id, int(chat_id))
                         return True, "Already in call"
 
                 # Ultra-short delay to avoid rate limits
@@ -2770,7 +3594,9 @@ class VoiceCallManager:
                 join_key = (account_id, int(chat_id))
                 join_task = self._inflight_joins.get(join_key)
                 if join_task is None or join_task.done():
-                    join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
+                    join_task = asyncio.create_task(
+                        self._play_silence(pytg, int(chat_id), account_id)
+                    )
                     self._inflight_joins[join_key] = join_task
 
                 def _consume_join_task_result(task: asyncio.Task) -> None:
@@ -2849,6 +3675,8 @@ class VoiceCallManager:
                     # longer flooded — clear any stale cooldown.
                     voice_cooldown.clear(account_id)
                     self._vc_event_log(order_id, account_id, "joined_media_confirmed", {"chat_id": int(chat_id)})
+                    # Mute the account's mic (server flag = UI icon).
+                    self._schedule_mute(app, account_id, int(chat_id))
                     return True, "Joined"
 
                 transport_warning = True
@@ -2864,6 +3692,8 @@ class VoiceCallManager:
                     if status is True:
                         if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=status):
                             self._set_state(order_id, account_id, JOINED, "presence confirmed", {"voice_chat_id": chat_id})
+                            # Mute the account's mic (server flag = UI icon).
+                            self._schedule_mute(app, account_id, int(chat_id))
                             if transport_warning:
                                 self._vc_event_log(order_id, account_id, "confirmed_joined_after_transport_warning", {
                                     "chat_id": int(chat_id),
@@ -2896,6 +3726,8 @@ class VoiceCallManager:
                                     "pending_timeout_s": _JOIN_PENDING_TIMEOUT,
                                 })
                                 self._inflight_joins.pop(join_key, None)
+                                # Mute the account's mic (server flag = UI icon).
+                                self._schedule_mute(app, account_id, int(chat_id))
                                 return True, "Joined"
                         await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
                     if not join_task.done():
@@ -3151,14 +3983,37 @@ class VoiceCallManager:
                 if not joined:
                     break  # order has no durably-joined accounts → monitor exits
 
-                # Group by chat so we fetch participants once per chat.
+                # Every account of a live order is in use this cycle — never
+                # let the idle reaper close one of them.
+                for _aid in list(joined.keys()):
+                    self._touch_client(_aid)
+
+                # Group by chat so we fetch participants once per chat.  For
+                # every account we also resolve its OWN Telegram user id, so
+                # the shared participant fetch can stop paginating as soon as
+                # this order's accounts have all been seen (that is what keeps
+                # the monitor cheap in HUGE voice chats).
                 by_chat: Dict[int, List[int]] = {}
                 acc_info: Dict[int, Dict] = {}
+                wanted_by_chat: Dict[int, Set[int]] = {}
+                ids_partial: Set[int] = set()  # chats where some id is unknown
                 for acc_id, rec in joined.items():
                     chat_id = int((rec or {}).get("chat_id") or 0)
-                    if chat_id:
-                        by_chat.setdefault(chat_id, []).append(acc_id)
-                        acc_info[acc_id] = rec
+                    if not chat_id:
+                        continue
+                    by_chat.setdefault(chat_id, []).append(acc_id)
+                    acc_info[acc_id] = rec
+                    try:
+                        _me = getattr(self.pyrogram_clients.get(acc_id), "me", None)
+                        _my_id = int(getattr(_me, "id", 0) or 0)
+                    except Exception:
+                        _my_id = 0
+                    if _my_id:
+                        wanted_by_chat.setdefault(chat_id, set()).add(_my_id)
+                    else:
+                        # Cannot prove presence for this account from a partial
+                        # listing → this chat must be walked completely.
+                        ids_partial.add(chat_id)
 
                 # New monitor cycle → refresh the shared participant snapshot.
                 self._monitor_cycle_ts = time.time()
@@ -3175,8 +4030,15 @@ class VoiceCallManager:
                         continue
 
                     # ONE shared participant fetch per chat per cycle.
-                    present_ids = await self._fetch_shared_participants(rep_app, chat_id)
-                    self._participant_snapshot[chat_id] = (self._monitor_cycle_ts, present_ids)
+                    wanted = None if chat_id in ids_partial else wanted_by_chat.get(chat_id)
+                    present_ids, authoritative = await self._fetch_shared_participants(
+                        rep_app, chat_id, wanted_ids=wanted,
+                    )
+                    # `authoritative=False` snapshots may confirm presence but
+                    # never absence (see _snapshot_contains).
+                    self._participant_snapshot[chat_id] = (
+                        self._monitor_cycle_ts, present_ids, authoritative,
+                    )
 
                     for acc_id in acc_ids:
                         if acc_id not in self.joined_accounts_by_order.get(order_id, {}):
@@ -3241,10 +4103,15 @@ class VoiceCallManager:
                         # stops healthy accounts from being mis-detected as gone
                         # and then force-left around the 1-minute mark.
                         media_alive = None
-                        try:
-                            media_alive = await self._is_media_call_active(pytg, cid)
-                        except Exception:
-                            media_alive = None  # unknown → rely on the listing
+                        if self.is_listener_account(acc_id):
+                            # Listener accounts publish no media on purpose:
+                            # the engine binding is the JOIN, not a stream.
+                            media_alive = True
+                        else:
+                            try:
+                                media_alive = await self._is_media_call_active(pytg, cid)
+                            except Exception:
+                                media_alive = None  # unknown → rely on the listing
 
                         media_known = media_alive is not None
                         if media_alive is True:
@@ -3336,6 +4203,11 @@ class VoiceCallManager:
 
                         if present is True:
                             # JOINED — confirmed present (or media transport alive).
+                            if self.is_listener_account(acc_id):
+                                # A listener that keeps showing up in the
+                                # participant listing after the probe window is
+                                # proof the zero-ffmpeg mode works.
+                                self._note_listener_ok(acc_id)
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
@@ -3464,7 +4336,8 @@ class VoiceCallManager:
         async with self._reservation_lock:
             self._reservations[order_id] = set(account_ids)
 
-    async def warmup_clients(self, accounts: List[Dict], limit: int = 0) -> int:
+    async def warmup_clients(self, accounts: List[Dict], limit: int = 0,
+                             order_id: Optional[int] = None) -> int:
         """Pre-create Pyrogram clients CONCURRENTLY (bounded) for a wave.
 
         Used by the Join Brain to warm the NEXT wave's accounts while the
@@ -3473,7 +4346,13 @@ class VoiceCallManager:
         100-500-account scale.  Every client creation is guarded by the
         account lock (no double-start races) and the global
         CLIENT_CREATE_SEMAPHORE (no startup storm).
+
+        ``order_id`` (optional) records WHICH order asked for the warm-up, so
+        a finished/cancelled order can close the clients it pre-warmed but
+        never used (they used to stay connected — with their dispatcher, caches
+        and update stream — for the rest of the process lifetime).
         """
+        self.ensure_background_maintenance()
         to_warm = accounts if limit <= 0 else accounts[:limit]
         candidates: List[Dict] = []
         for acc in to_warm:
@@ -3488,6 +4367,14 @@ class VoiceCallManager:
             except Exception:
                 continue
 
+        if order_id is not None and candidates:
+            try:
+                self._warmed_by_order.setdefault(int(order_id), set()).update(
+                    int(acc.get("id")) for acc in candidates if acc.get("id") is not None
+                )
+            except (TypeError, ValueError):
+                pass
+
         warmed = 0
 
         async def _warm_one(acc: Dict) -> None:
@@ -3495,7 +4382,14 @@ class VoiceCallManager:
             account_id = acc.get("id")
             session_string = acc.get("session_string")
             try:
-                async with self._lock(account_id):
+                lock = self._lock(account_id)
+                try:
+                    await asyncio.wait_for(lock.acquire(), timeout=CLIENT_LOCK_WAIT)
+                except asyncio.TimeoutError:
+                    # A stuck attempt holds the lock — skip this prewarm;
+                    # the join path will fail fast and retry next wave.
+                    return
+                try:
                     # Re-check under the lock (a concurrent join may have
                     # already created this client).
                     if account_id in self.pyrogram_clients:
@@ -3508,7 +4402,9 @@ class VoiceCallManager:
                     decrypted_session = SecurityManager.decrypt_session(session_string)
                     if not decrypted_session:
                         return
-                    async with CLIENT_CREATE_SEMAPHORE:
+                    if not await _acquire_client_create_slot():
+                        return
+                    try:
                         held = await session_ownership.acquire_voice(account_id)
                         try:
                             helper = TelegramAccountClient("temp", session_string, account_id)
@@ -3518,11 +4414,7 @@ class VoiceCallManager:
                                 session_string=decrypted_session,
                                 api_id=api_id,
                                 api_hash=api_hash,
-                                # Voice clients must receive raw updates from Telegram.
-                                no_updates=False,
-                                in_memory=True,
-                                proxy=_voice_proxy_config(),
-                                **_client_device_fingerprint(account_id),
+                                **_voice_client_kwargs(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)
                         except FloodWait as e:
@@ -3542,7 +4434,12 @@ class VoiceCallManager:
                             raise
                         self.pyrogram_clients[account_id] = app
                         self._session_cache[account_id] = session_string
+                        self._touch_client(account_id)
                         warmed += 1
+                    finally:
+                        CLIENT_CREATE_SEMAPHORE.release()
+                finally:
+                    lock.release()
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
             except asyncio.CancelledError:
@@ -3557,6 +4454,8 @@ class VoiceCallManager:
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
         """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
         key = (order_id, account_id)
+        self.ensure_background_maintenance()
+        self._touch_client(account_id)
 
         # If already durably joined & counted for this order, return success
         # (idempotent — no duplicate counting, no duplicate join).
@@ -3620,6 +4519,15 @@ class VoiceCallManager:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
+                # A revoked/dead session can never be used again: close its
+                # client immediately instead of leaving a dead connection (and
+                # its registered update stream) alive for the process lifetime.
+                if not self._account_in_any_order(account_id, exclude_order_id=order_id):
+                    try:
+                        await self._cleanup_client(account_id, order_id=order_id, force=True,
+                                                   reason="session revoked")
+                    except Exception:
+                        pass
                 return False, f"SESSION_REVOKED: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
@@ -3628,6 +4536,21 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
             except Exception as e:
+                if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                    # The session is actively held by ANOTHER connection.
+                    # Not a dead session: the scheduler must retry WITHOUT
+                    # spending the attempt budget (see order_executor).
+                    self._set_state(
+                        order_id, account_id, FAILED,
+                        "session held by another connection (AUTH_KEY_DUPLICATED)",
+                    )
+                    logger.warning(
+                        "[VoiceSession] acc=%s AUTH_KEY_DUPLICATED — session is "
+                        "actively used by another connection (stale process / "
+                        "another server / phone). Retrying without budget loss.",
+                        account_id,
+                    )
+                    return False, f"AUTH_KEY_DUPLICATED: {str(e)[:120]}", 0
                 self._set_state(order_id, account_id, FAILED, f"client init error: {e}")
                 return False, f"Client Init Error: {e}", 0
 
@@ -3752,6 +4675,10 @@ class VoiceCallManager:
         if chat_id <= 0 and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
             return True, "Not active"
 
+        # The account is leaving: it is no longer a listener anywhere.
+        self._listener_accounts.discard(int(account_id))
+        self._listener_joined_at.pop(int(account_id), None)
+
         # Remove from persistent joined state (order is ending / cancelling).
         removed = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
         if removed is not None:
@@ -3850,11 +4777,15 @@ class VoiceCallManager:
         self._stop_monitor(order_id)
 
         if keys:
-            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+            # STRICT SEQUENTIAL LEAVES BY DEFAULT: one account at a time
+            # (concurrency 1) with a 1.5-3.0s human-like gap, so the mass
+            # exit reads as "accounts leaving one by one" — never a burst
+            # of N LeaveGroupCall RPCs in the same window.
+            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 1.5)))
+            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 3.0)))
             jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
             jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 1)))
             # Shuffle so the leave order is not the same join order every time
             # (harder for anti-spam fingerprinting of a fixed sequence).
             random.shuffle(keys)
@@ -3903,6 +4834,26 @@ class VoiceCallManager:
         self._order_timeline.pop(order_id, None)
         self._order_join_locks.pop(order_id, None)
         self._presence_reconcilers.pop(order_id, None)
+        warmed = self._warmed_by_order.pop(order_id, set())
+        # ── RAM hygiene: close everything this order no longer needs ──────
+        # This covers both the clients that just left AND the clients this
+        # order PRE-WARMED for a next wave that never happened (order finished
+        # / cancelled / wave deadline).  Those used to stay connected with
+        # their dispatcher, caches and registered update stream — the reason
+        # RAM stayed full with zero active orders.  Accounts still referenced
+        # by another order (multi-order reuse) are never touched.
+        try:
+            closed = await self.reap_idle_clients(force=True, order_id=order_id)
+            if closed:
+                logger.info(
+                    "[VoiceReaper] order %s cleanup closed %s client(s) "
+                    "(warmed-but-unused=%s)",
+                    order_id, closed, len(warmed),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[VoiceReaper] order %s cleanup failed: %s", order_id, exc)
         for key in [k for k in self._rejoin_failures if k[0] == order_id]:
             self._rejoin_failures.pop(key, None)
         for key in [k for k in self._media_restore_inflight if k[0] == order_id]:
@@ -3927,6 +4878,22 @@ class VoiceCallManager:
                 await self.stop_all_for_order(oid, leave_group=True)
             except Exception as exc:
                 logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
+
+        # Stop the background RAM sweeper too, then make sure no voice client
+        # survives the shutdown (its MTProto session would otherwise be held
+        # until the process dies).
+        task = self._idle_reaper_task
+        self._idle_reaper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        try:
+            await self.reap_idle_clients(force=True)
+        except Exception:
+            pass
 
     # ─── UNRECOVERABLE-SLOT API (executor-side replacement support) ───
 

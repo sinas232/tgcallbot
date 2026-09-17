@@ -87,6 +87,16 @@ def _run(coro):
 HAS_TG = importlib.util.find_spec("pytgcalls") is not None and \
     importlib.util.find_spec("pyrogram") is not None
 
+# stdlib-only services — import UNCONDITIONALLY: their test classes
+# (VoiceCooldownTests / SessionOwnershipTests) run even without
+# pyrogram/pytgcalls installed (a NameError otherwise).
+from services.voice_cooldown import VoiceCooldown  # noqa: E402
+from services.session_ownership import (  # noqa: E402
+    SessionOwnership,
+    SessionInUseError,
+    session_ownership,
+)
+
 if HAS_TG:
     from pyrogram.raw import functions  # noqa: E402
     from pytgcalls import PyTgCalls  # noqa: E402
@@ -106,12 +116,6 @@ if HAS_TG:
 
     import services.voice_call_manager as vcm_mod  # noqa: E402
     from services.voice_call_manager import VoiceCallManager  # noqa: E402
-    from services.voice_cooldown import VoiceCooldown  # noqa: E402
-    from services.session_ownership import (  # noqa: E402
-        SessionOwnership,
-        SessionInUseError,
-        session_ownership,
-    )
     import services.order_executor as order_executor_mod  # noqa: E402
     from config import Config  # noqa: E402
 
@@ -158,14 +162,24 @@ class SilenceStreamCommandTests(unittest.TestCase):
         self.assertIn("-audio", cmd)  # unrecognised ffmpeg flag -> instant exit
 
     def test_silence_file_format(self):
+        # The file is generated with the CONFIGURED wire format (24 kHz mono by
+        # default: the cheapest Opus path for pure silence) and the SAME values
+        # are handed to ntgcalls/ffmpeg, so play time is a pure pass-through
+        # with no resampling.  (This test used to hard-code the old 48 kHz
+        # STEREO format and failed ever since the CPU optimisation landed.)
         path = os.path.join(_TMP, "silence_check.wav")
         vcm_mod.SILENT_AUDIO_PATH = path
         vcm_mod._ensure_silence_file()
+        rate = int(Config.VOICE_AUDIO_SAMPLE_RATE)
+        channels = int(Config.VOICE_AUDIO_CHANNELS)
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), rate)
+            self.assertEqual(r.getnchannels(), channels)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(r.getnframes(), rate * 30)
+        # ntgcalls must be told exactly the same rate/channel count.
+        self.assertEqual(vcm_mod._SILENCE_AUDIO_PARAMS.bitrate, rate)
+        self.assertEqual(vcm_mod._SILENCE_AUDIO_PARAMS.channels, channels)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).
@@ -473,7 +487,9 @@ class EngineLifecycleTests(unittest.TestCase):
             self.mgr.clients[1] = engine
             got = await self.mgr._get_or_create_client(901, 1, "fake-session")
             self.assertIsNot(got, engine)
-            self.assertEqual(engine.stopped, 1)
+            # PyTgCalls 2.x has no stop(): an unhealthy engine is simply
+            # dropped (its poisoned WebRTC state dies with the object) and a
+            # FRESH instance is built + started.
             self.assertEqual(got.started, 1)
             # stream-end + chat-update handlers attached on the fresh engine
             self.assertEqual(len(got.handlers), 2)
@@ -581,7 +597,8 @@ class ParticipantPaginationTests(unittest.TestCase):
             present = await self.mgr._is_in_voice_call(app, -200)
             self.assertIs(present, True)
 
-            ids = await self.mgr._fetch_shared_participants(app, -200)
+            # _fetch_shared_participants returns (ids, authoritative).
+            ids, authoritative = await self.mgr._fetch_shared_participants(app, -200)
             self.assertIn(4242, ids)
             # The FULL paginated pass must use the real pyrogram 2.x RPC name.
             self.assertIn("GetGroupParticipants", app.calls)

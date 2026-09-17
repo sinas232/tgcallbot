@@ -111,7 +111,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.1"', src)
+        self.assertIn('BOT_VERSION = "2.2.11"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -338,6 +338,7 @@ class ExecutorVoiceNoDoubleLeaveTests(unittest.TestCase):
             ("services.join_brain", {
                 "join_brain": SimpleNamespace(),
                 "OUTCOME_OK": "ok", "OUTCOME_DEAD": "dead", "OUTCOME_FLOOD": "flood",
+                "OUTCOME_FAIL": "fail",
             }),
             ("services.session_ownership", {
                 "SessionInUseError": type("SessionInUseError", (Exception,), {}),

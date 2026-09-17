@@ -143,6 +143,15 @@ class SessionOwnership:
     def voice_held_accounts(self) -> Set[int]:
         return {aid for aid, refs in self._voice_refs.items() if refs > 0}
 
+    def held_count(self) -> int:
+        """How many accounts currently hold the session for a voice client.
+
+        Used by the voice memory report: a voice hold that outlives its order
+        is the fingerprint of a leaked client (the account then also refuses
+        every short-lived admin operation with SessionInUseError).
+        """
+        return len(self.voice_held_accounts())
+
 
 # Process-wide singleton.
 session_ownership = SessionOwnership()
