@@ -2,6 +2,7 @@
 handlers/admin_handlers.py
 مدیریت ادمین، نمایندگی‌ها و گزارشات
 """
+import asyncio
 import logging
 import os
 import json
@@ -196,7 +197,8 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     _is_super_maint = is_god
     if not _is_super_maint and update.effective_user:
         try:
-            _me = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+            _me = await asyncio.wait_for(
+                DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id), timeout=10)
             _is_super_maint = bool(_me and _me.get('admin_role') == 'super_admin')
         except Exception:
             _is_super_maint = False
@@ -266,7 +268,8 @@ async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         on = context.bot_data.get('maintenance_mode')
         if on is None:
-            on = (await DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id)) == "1"
+            on = (await asyncio.wait_for(DatabaseManager.get_setting(
+                "maintenance_mode", "0", bot_id=bot_id), timeout=10)) == "1"
             context.bot_data['maintenance_mode'] = on
     except Exception:
         on = False
@@ -294,9 +297,14 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
         return AWAITING_SETTINGS_ACTION
     on = (query.data == "maint_on")
     try:
-        await DatabaseManager.set_setting("maintenance_mode", "1" if on else "0", bot_id=bot_id)
+        await asyncio.wait_for(DatabaseManager.set_setting(
+            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
     except Exception:
-        pass
+        try:
+            await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
     context.bot_data['maintenance_mode'] = on
     try:
         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")

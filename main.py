@@ -610,7 +610,11 @@ def register_handlers(application: Application) -> None:
             if user.id in Config.ADMIN_IDS:
                 return True
             bot_id = context.bot_data.get('bot_id', 1)
-            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            try:
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
+            except Exception:
+                return False
             return bool(db_user and db_user.get('admin_role') == 'super_admin')
         except Exception:
             return False
@@ -627,16 +631,10 @@ def register_handlers(application: Application) -> None:
         except Exception:
             pass
         try:
-            flag = context.bot_data.get('maintenance_mode', None)
-            if flag is None:
-                # تنبل: فقط یک‌بار از دیتابیس خوانده و کش می‌شود. هندلر
-                # تاگل، هم کش و هم دیتابیس را با هم به‌روز می‌کند.
-                try:
-                    bot_id = context.bot_data.get('bot_id', 1)
-                    flag = (await DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id)) == "1"
-                except Exception:
-                    flag = False
-                context.bot_data['maintenance_mode'] = flag
+            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
+            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
+            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
+            flag = context.bot_data.get('maintenance_mode', False)
             if not flag:
                 return
             if await _is_super_admin_user(update, context):
@@ -753,7 +751,11 @@ def register_handlers(application: Application) -> None:
             if user.id in Config.ADMIN_IDS:
                 return True
             bot_id = context.bot_data.get('bot_id', 1)
-            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            try:
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
+            except Exception:
+                return False
             return bool(db_user and db_user.get('is_admin'))
         except Exception:
             return False
@@ -841,7 +843,8 @@ def register_handlers(application: Application) -> None:
         is_admin = user.id in Config.ADMIN_IDS
         if not is_admin:
             try:
-                db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
                 is_admin = bool(db_user and db_user.get('is_admin'))
             except Exception:
                 is_admin = False
@@ -1301,6 +1304,13 @@ async def main_loop():
     
     main_app.bot_data['bot_id'] = 1
     main_app.bot_data['owner_id'] = 0
+    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
+    try:
+        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
+            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
+    except Exception as e:
+        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
+        main_app.bot_data['maintenance_mode'] = False
     
     register_handlers(main_app)
     await main_app.initialize()

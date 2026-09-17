@@ -31,7 +31,13 @@ engine = create_async_engine(
     echo=False, 
     pool_pre_ping=True,
     pool_size=20,
-    max_overflow=10
+    max_overflow=10,
+    # DB awaits must never hang forever: one stuck await in the update
+    # guard once silenced the whole bot. Caps are generous (normal
+    # queries take <1s) but close the hang-forever hole.
+    pool_timeout=15,
+    pool_recycle=300,
+    connect_args={"timeout": 10, "command_timeout": 30},
 )
 AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=AsyncSession, expire_on_commit=False)
 
