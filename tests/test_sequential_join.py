@@ -594,5 +594,48 @@ class SessionConflictTests(unittest.TestCase):
         self.assertIn("VOICE_SESSION_CONFLICT_RETRY_SECONDS", _read_source(".env.example"))
 
 
+class MicMuteAndPresenceCountTests(unittest.TestCase):
+    """v2.2.8: (1) every successful join server-side mutes the account's mic
+    (the UI mic icon follows the server flag, not the local transport mute);
+    (2) the reported live count is the EFFECTIVE presence (durable minus
+    unrecoverable slots) and the fill loop tops those slots up."""
+
+    def test_mute_scheduled_on_every_join_success_path(self):
+        src = _read_source("services/voice_call_manager.py")
+        join = src[src.index("async def _join_call"):]
+        join = join[:join.index("async def _join_with_retries")]
+        # four success paths: already-in-call, media-confirmed,
+        # presence-verified, join-while-transport-pending
+        self.assertEqual(join.count("self._schedule_mute("), 4)
+
+    def test_ensure_mic_muted_uses_server_flag(self):
+        src = _read_source("services/voice_call_manager.py")
+        fn = src[src.index("async def _ensure_mic_muted"):]
+        fn = fn[:fn.index("def _schedule_mute")]
+        self.assertIn("_protocol_mute", fn)  # server-side muted flag
+        self.assertIn("VOICE_JOIN_MUTED", fn)
+        self.assertIn("pytg.mute" if "pytg" in fn else "mute", fn)
+
+    def test_effective_count_excludes_unrecoverable(self):
+        src = _read_source("services/voice_call_manager.py")
+        self.assertIn("def get_effective_active_count", src)
+        self.assertIn("def get_unrecoverable_account_ids", src)
+        fn = src[src.index("def get_effective_active_count"):]
+        fn = fn[:fn.index("def register_join")]
+        self.assertIn("get_unrecoverable_account_ids", fn)
+        self.assertIn("get_active_count", fn)
+
+    def test_executor_uses_effective_live(self):
+        src = _read_source("services/order_executor.py")
+        self.assertIn("def _effective_voice_live", src)
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn("live = self._effective_voice_live(vcm, order_id)", fill)
+        # the per-wave recompute must also use it
+        self.assertGreaterEqual(fill.count("_effective_voice_live"), 2)
+        live_fn = src[src.index("def _live_count"):]
+        live_fn = live_fn[:live_fn.index("def _prune_joined")]
+        self.assertIn("_effective_voice_live", live_fn)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

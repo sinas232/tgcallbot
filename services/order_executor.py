@@ -85,12 +85,24 @@ class OrderExecutor:
 		info = self.active_orders.get(order_id)
 		return bool(info) and not info.get("cancel_requested")
 
+	def _effective_voice_live(self, vcm, order_id: int) -> int:
+		"""Truthful live count: durably joined minus slots the monitor marked
+		UNRECOVERABLE (gone from the call, being replaced by fresh accounts).
+		This is the number that matches the participant list."""
+		try:
+			return int(vcm.get_effective_active_count(order_id))
+		except Exception:
+			try:
+				return int(vcm.get_active_count(order_id))
+			except Exception:
+				return 0
+
 	def _live_count(self, order_id: int, order_type: str, joined_list: List[Dict]) -> int:
 		if order_type == "voice_chat":
 			vcm = _get_voice_call_manager()
 			if vcm:
 				try:
-					return int(vcm.get_active_count(order_id))
+					return self._effective_voice_live(vcm, order_id)
 				except Exception:
 					pass
 		return len(joined_list)
@@ -624,7 +636,7 @@ class OrderExecutor:
 	    gap_jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN", 0.0)))
 	    gap_jitter_max = max(gap_jitter_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX", 0.5)))
 	    wave_no = 0
-	    live = int(vcm.get_active_count(order_id))
+	    live = self._effective_voice_live(vcm, order_id)
 
 	    while self._is_order_active(order_id) and live < target_count:
 	        await join_brain.wait_if_paused(order_id)
@@ -970,7 +982,10 @@ class OrderExecutor:
 	                wave_fail += 1
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
-	        live = int(vcm.get_active_count(order_id))
+	        # Effective = durably joined − unrecoverable slots, so slots the
+	        # monitor gave up on are TOPPED UP with fresh accounts and the
+	        # reported number matches the real participant list.
+	        live = self._effective_voice_live(vcm, order_id)
 	        wave_duration = time.monotonic() - wave_started
 	        wave_total = wave_ok + wave_fail
 	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0

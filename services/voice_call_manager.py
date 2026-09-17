@@ -1542,6 +1542,29 @@ class VoiceCallManager:
     def get_active_count(self, order_id: Optional[int] = None) -> int:
         return len(self.get_active_account_ids(order_id))
 
+    def get_unrecoverable_account_ids(self, order_id: int) -> Set[int]:
+        """Accounts whose slots the monitor marked UNRECOVERABLE (confirmed
+        disconnect + exhausted rejoin attempts). They are NOT in the call any
+        more, so they must not count toward the live presence / fill target —
+        the executor replaces them with fresh accounts while the paid
+        duration is still running."""
+        inner = self.joined_accounts_by_order.get(order_id) or {}
+        return {
+            aid for aid, rec in inner.items()
+            if isinstance(rec, dict) and rec.get("unrecoverable")
+        }
+
+    def get_effective_active_count(self, order_id: int) -> int:
+        """Truthful presence count: durably joined minus unrecoverable
+        slots. This is the number that matches what the participant list
+        actually shows (once the monitor's bounded confirmation window
+        has classified a slot as unrecoverable)."""
+        return max(
+            0,
+            self.get_active_count(order_id)
+            - len(self.get_unrecoverable_account_ids(order_id)),
+        )
+
     def register_join(self, order_id: int, account_id: int, chat_id: int, target: str) -> bool:
         """
         Idempotently register an account as durably JOINED for a specific order.
@@ -3046,6 +3069,47 @@ class VoiceCallManager:
             logger.debug(f"_protocol_mute failed: {e}")
             return False
 
+    async def _ensure_mic_muted(self, app: Client, account_id: int, chat_id: int) -> None:
+        """Best-effort server-side mute of the account's OWN mic in the call.
+
+        The UI mic icon follows the server-side participant flag, which only
+        changes via phone.EditGroupCallParticipant — the local ntgcalls
+        transport mute (pytg.mute) does NOT flip it. So after EVERY join
+        (listener or silence stream, first join or recovery rejoin) we
+        explicitly set muted=True. Never raises: a mute failure must never
+        block or fail a join.
+        """
+        if not getattr(Config, "VOICE_JOIN_MUTED", True):
+            return
+        try:
+            if await self._protocol_mute(app, int(chat_id)):
+                return
+        except Exception:
+            pass
+        try:
+            pytg = self.clients.get(account_id)
+            if pytg is not None:
+                await pytg.mute(int(chat_id))
+        except Exception:
+            pass
+
+    def _schedule_mute(self, app: Client, account_id: int, chat_id: int) -> None:
+        """Fire-and-forget mute (never delays the join hot path)."""
+        try:
+            task = asyncio.create_task(self._ensure_mic_muted(app, account_id, int(chat_id)))
+
+            def _swallow(_t: asyncio.Task) -> None:
+                try:
+                    _t.exception()
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    pass
+                except Exception:
+                    pass
+
+            task.add_done_callback(_swallow)
+        except Exception:
+            pass
+
     async def force_mute_now(self, account_id: int, chat_id: int, order_id: Optional[int] = None) -> bool:
         """Mute via protocol — only called on demand, NOT in keepalive loop."""
         pytg = self.clients.get(account_id)
@@ -3434,6 +3498,8 @@ class VoiceCallManager:
                                 )
                         except Exception:
                             pass
+                        # Mute the account's mic (server flag = UI icon).
+                        self._schedule_mute(app, account_id, int(chat_id))
                         return True, "Already in call"
 
                 # Ultra-short delay to avoid rate limits
@@ -3531,6 +3597,8 @@ class VoiceCallManager:
                     # longer flooded — clear any stale cooldown.
                     voice_cooldown.clear(account_id)
                     self._vc_event_log(order_id, account_id, "joined_media_confirmed", {"chat_id": int(chat_id)})
+                    # Mute the account's mic (server flag = UI icon).
+                    self._schedule_mute(app, account_id, int(chat_id))
                     return True, "Joined"
 
                 transport_warning = True
@@ -3546,6 +3614,8 @@ class VoiceCallManager:
                     if status is True:
                         if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=status):
                             self._set_state(order_id, account_id, JOINED, "presence confirmed", {"voice_chat_id": chat_id})
+                            # Mute the account's mic (server flag = UI icon).
+                            self._schedule_mute(app, account_id, int(chat_id))
                             if transport_warning:
                                 self._vc_event_log(order_id, account_id, "confirmed_joined_after_transport_warning", {
                                     "chat_id": int(chat_id),
@@ -3578,6 +3648,8 @@ class VoiceCallManager:
                                     "pending_timeout_s": _JOIN_PENDING_TIMEOUT,
                                 })
                                 self._inflight_joins.pop(join_key, None)
+                                # Mute the account's mic (server flag = UI icon).
+                                self._schedule_mute(app, account_id, int(chat_id))
                                 return True, "Joined"
                         await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
                     if not join_task.done():
