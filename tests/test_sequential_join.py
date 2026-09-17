@@ -569,14 +569,18 @@ class SessionConflictTests(unittest.TestCase):
         src = _read_source("services/order_executor.py")
         fill = src[src.index("async def _voice_batched_fill"):]
         self.assertIn('if "AUTH_KEY_DUPLICATED" in upper:', fill)
-        # the conflict branch must schedule a retry WITHOUT touching
-        # _voice_attempts / _voice_banned (budget preserved)
+        # The conflict branch must NEVER spend the attempt budget...
         branch = fill[fill.index('if "AUTH_KEY_DUPLICATED" in upper:'):
                       fill.index("if status == \"dead\"")]
-        self.assertIn("retry_after", branch)
         self.assertNotIn("_voice_attempts", branch)
-        self.assertNotIn("_voice_banned", branch)
-        self.assertIn("_mark_account_dead" if False else "conflict_wait", branch)
+        self.assertNotIn("_mark_account_dead", branch)
+        # ...and must offer BOTH escape paths:
+        #  a) replace-with-fresh when the pool still has eligible accounts
+        self.assertIn("_voice_candidates", branch)
+        self.assertIn("_voice_banned", branch)
+        #  b) budget-preserving retry when the pool is exhausted
+        self.assertIn("retry_after", branch)
+        self.assertIn("conflict_wait", branch)
 
     def test_vcm_returns_clean_conflict_message(self):
         src = _read_source("services/voice_call_manager.py")

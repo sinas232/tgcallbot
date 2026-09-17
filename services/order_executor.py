@@ -827,29 +827,66 @@ class OrderExecutor:
 	                # The account's session is actively held by ANOTHER
 	                # connection (a stale bot container/process, a previous
 	                # order on another server, or a manual phone login).
-	                # This is NOT an account fault: never spend the attempt
-	                # budget — wait for the other connection to drop, then
-	                # retry. (This is the root cause of سفارش 50 ≠ 35: the accounts
-	                # whose sessions were held elsewhere used to burn their
-	                # budget and get banned, so the fill stopped below target.)
+	                # This is NOT an account fault: the attempt budget is
+	                # NEVER spent. Two outcomes:
+	                #   a) the pool still has FRESH eligible accounts →
+	                #      replace this one (like a give-up) so the order
+	                #      keeps filling to target;
+	                #   b) the pool is exhausted → keep this account on a
+	                #      VOICE_SESSION_CONFLICT_RETRY_SECONDS retry until
+	                #      the other connection drops.
 	                if "AUTH_KEY_DUPLICATED" in upper:
 	                    conflict_wait = max(
 	                        30.0,
 	                        float(getattr(Config, "VOICE_SESSION_CONFLICT_RETRY_SECONDS", 60)),
 	                    )
-	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + conflict_wait
+	                    fresh: List[Dict] = []
+	                    try:
+	                        fresh = self._voice_candidates(
+	                            order_id, 1, joined_ids, set(), time.time(),
+	                        )
+	                    except Exception:
+	                        fresh = []
 	                    warned = self._voice_conflict_warned.setdefault(order_id, set())
-	                    if aid not in warned:
+	                    first_warn = aid not in warned
+	                    if first_warn:
 	                        warned.add(aid)
+	                    if fresh:
+	                        self._voice_banned.setdefault(order_id, set()).add(aid)
+	                        if first_warn:
+	                            logger.warning(
+	                                f"Order {order_id}: account {aid} SESSION CONFLICT "
+	                                "(AUTH_KEY_DUPLICATED) — its session is actively "
+	                                "held by another connection (old bot container/"
+	                                "process, previous server, or manual device "
+	                                "login). Replaced with fresh account "
+	                                f"{fresh[0].get('id')} so the order keeps filling "
+	                                "to target. To use THIS account again: stop the "
+	                                "other connection (docker ps -a / old server) "
+	                                "or log it out from that device."
+	                            )
+	                        else:
+	                            logger.info(
+	                                f"Order {order_id}: account {aid} still "
+	                                "session-conflicted — replaced with a fresh "
+	                                "account"
+	                            )
+	                        join_brain.report_result(order_id, OUTCOME_FAIL, msg)
+	                        wave_fail += 1
+	                        continue
+	                    # Pool exhausted — keep trying, no budget loss.
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + conflict_wait
+	                    if first_warn:
 	                        logger.warning(
 	                            f"Order {order_id}: account {aid} SESSION CONFLICT "
 	                            "(AUTH_KEY_DUPLICATED) — this account's session is "
 	                            "actively used by another connection (old bot "
 	                            "container/process, previous server, or manual "
-	                            f"device login). NOT counted as an attempt; retrying "
-	                            f"in {conflict_wait:.0f}s. Fix: stop the other "
-	                            "connection (docker ps -a / old server) or log the "
-	                            "account out from that device."
+	                            "device login). Pool exhausted — NOT counted as an "
+	                            f"attempt; retrying in {conflict_wait:.0f}s until the "
+	                            "session is freed. Fix: stop the other connection "
+	                            "(docker ps -a / old server) or log the account out "
+	                            "from that device."
 	                        )
 	                    else:
 	                        logger.info(
