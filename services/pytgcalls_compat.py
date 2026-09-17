@@ -41,6 +41,15 @@ handler با این خطا کرش می‌کند:
     تمام اپدیت‌های دیگر بدون هیچ تغییری به callback اصلی هدایت
     می‌شوند.
 
+  * **لایهٔ دوم (v2.2.11)** — wrap در سطح کلاس ``RawUpdateHandler``:
+    در kurigram ≥ ۲.۲.۲۵ (و ۲.۲.۲۶) ``Dispatcher.add_handler``
+    ناهم‌زمان است (افزودن handler در یک task مؤخّر با ``create_task``)
+    و لایهٔ اول در عمل handler را پیش از ثبتش می‌بیند و نمی‌یابد
+    (کرش در لاگ سفارش ۷۵۲). این لایه ``RawUpdateHandler.__init__`` را
+    در سطح کلاس wrap می‌کند: هر handler که در closure‌اش یک نمونهٔ
+    ``PyrogramClient`` از pytgcalls داشته باشد، همان لحظهٔ ساخت —
+    مستقل از زمان‌بندی ثبت توسط Dispatcher — callback امن می‌گیرد.
+
 وصله کاملاً defensive است: اگر ایمپورت‌ها ناموفق باشند (لایبریری
 متفاوت، ساختار متفاوت در نسخه‌های آتی pytgcalls) هیچ اتفاقی نمی‌افتد و
 اپلیکیشن دقیقاً مثل قبل کار می‌کند.
@@ -190,6 +199,79 @@ def _wrap_raw_handler(bind_client, app) -> bool:
     return wrapped
 
 
+def _find_pytgcalls_bind(callback):
+    """نمونهٔ PyrogramClientِ pytgcalls را از closure callback پیدا کند.
+
+    `on_update` در `PyrogramClient.__init__` تعریف می‌شود و `self`
+    (نمونهٔ PyrogramClient) در cell‌های closure آن حبس است. هر closure
+    دیگری (handlerهای کاربردی خودِ ما) چنین cell‌ای ندارد و بازگشت
+    None یعنی «این handler متعلق به pytgcalls نیست» → دست‌نخورده بماند.
+    """
+    try:
+        from pytgcalls.mtproto.pyrogram_client import PyrogramClient
+    except Exception:
+        return None
+    cells = getattr(callback, "__closure__", None) or ()
+    for cell in cells:
+        try:
+            content = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(content, PyrogramClient):
+            return content
+    return None
+
+
+def patch_raw_update_handler_class() -> bool:
+    """لایهٔ دوم: wrap در سطح کلاس `RawUpdateHandler` (ثبت ناهم‌زمان‌سنج).
+
+    kurigram ≥ ۲.۲.۲۵ (و ۲.۲.۲۶) `Dispatcher.add_handler` را ناهم‌زمان
+    پیاده‌سازی کرده (افزودن handler در یک task مؤخّر با `create_task`)،
+    پس wrap بعد از `PyrogramClient.__init__` (لایهٔ اول) در عمل handler
+    را نمی‌بیند. wrap در `__init__` خودِ class از زمان‌بندی ثبت
+    بی‌تأثیر است: handler همان لحظهٔ ساخت (داخل دکوریتور
+    `on_raw_update`، به‌صورت هم‌زمان) callback امن می‌گیرد.
+
+    فقط handlerهایی wrap می‌شوند که closure‌شان PyrogramClientِ
+    pytgcalls را داراست؛ بقیهٔ RawUpdateHandlerها (احتمالاً متعلق به
+    اپلیکیشن) دست‌نخورده باقی می‌مانند.
+    """
+    try:
+        from pyrogram.handlers import RawUpdateHandler
+    except Exception:
+        return False
+    if getattr(RawUpdateHandler, _PATCH_FLAG, False):
+        return True
+
+    original_init = RawUpdateHandler.__init__
+
+    def patched_init(self, *args, **kwargs):
+        # امضای tolerant: نسخه‌های pyrogram/kurigram `RawUpdateHandler`
+        # را با (callback, filters) و گاهی با کلمه‌کلیدهای اضافه
+        # (مثل group در برخی stubهای تست) می‌سازند.
+        original_init(self, *args, **kwargs)
+        try:
+            callback = args[0] if args else kwargs.get("callback")
+            if callback is None or getattr(callback, _PATCH_FLAG, False):
+                return
+            bind = _find_pytgcalls_bind(callback)
+            if bind is None:
+                return  # handler متعلق به pytgcalls نیست
+            self.callback = _make_safe_callback(callback, bind)
+        except Exception as exc:
+            logger.warning(
+                "[PycallsCompat] RawUpdateHandler wrap failed: %s", exc
+            )
+
+    setattr(patched_init, _PATCH_FLAG, True)
+    try:
+        RawUpdateHandler.__init__ = patched_init
+    except Exception:
+        return False
+    setattr(RawUpdateHandler, _PATCH_FLAG, True)
+    return True
+
+
 def patch_pytgcalls_raw_updates() -> bool:
     """وصلهٔ UpdateGroupCall را به py-tgcalls اعمال می‌کند (idempotent).
 
@@ -202,8 +284,11 @@ def patch_pytgcalls_raw_updates() -> bool:
     except Exception:
         return False
 
+    # لایهٔ دوم (اصلی): نمی‌تواند به‌خاطر زمان‌بندی ثبت نادیده گرفته شود.
+    layer2 = patch_raw_update_handler_class()
+
     if getattr(PyrogramClient, _PATCH_FLAG, False):
-        return True
+        return layer2
 
     original_init = PyrogramClient.__init__
 
@@ -223,4 +308,4 @@ def patch_pytgcalls_raw_updates() -> bool:
     setattr(patched_init, _PATCH_FLAG, True)
     PyrogramClient.__init__ = patched_init
     setattr(PyrogramClient, _PATCH_FLAG, True)
-    return True
+    return True or layer2

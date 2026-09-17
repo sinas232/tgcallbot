@@ -415,29 +415,17 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         msg_prefix = "✅ سفارش زمان‌بندی شده با موفقیت لغو شد."
         # گزارش لغو در انتهای تابع (به‌همراه جزئیات مالی) یک‌بار ارسال می‌شود.
     else:
-        # سفارش در حال اجرا → محاسبه مدت مصرف‌شده
-        duration_minutes = int(order.get('duration_minutes') or 0)
-        # If the build phase is still running, service time has not started.
-        started_at = order.get('started_at')
-
-        if duration_minutes > 0 and started_at:
-            # تسویه ثانیه‌ای دقیق (Precision Pro-Rated Billing):
-            #   Δt = ثانیهٔ کارکرد واقعی
-            #   Rs = هزینه کل ÷ کل ثانیه‌های پلن  (نرخ ثانیه‌ای)
-            #   C_used = RoundUp(Δt × Rs)  ← به نفع مجموعه، سقف = هزینه کل
-            now_utc = datetime.utcnow()
-            elapsed_seconds = max(0, (now_utc - started_at).total_seconds())
-            total_seconds = duration_minutes * 60
-
-            if elapsed_seconds >= total_seconds:
-                spent_amount = total_price
-            else:
-                rate_per_second = total_price / total_seconds
-                spent_amount = math.ceil(elapsed_seconds * rate_per_second)
-                spent_amount = min(float(spent_amount), total_price)
-        else:
-            # No duration start means no billable service time was consumed.
-            spent_amount = 0.0
+        # سفارش در حال اجرا → تسویهٔ ثانیه‌ای دقیق با همین تابع مشترکی
+        # که مسیر ادمین و «مسیر واحد تسویه» استفاده می‌کنند (v2.2.11):
+        #   • طرح با مدت ثابت: نرخ = قیمت ÷ مدت طرح
+        #   • طرح «تکمیل و خروج» (بدون مدت): نرخ = قیمت ÷ مرجع
+        #     VOICE_OPEN_ENDED_BILLING_MINUTES
+        # پیش از v2.2.11، طرح‌های بدون مدت در لحظهٔ لغو کل مبلغ را
+        # عودت می‌کردند حتی اگر تماس ساعت‌ها کار کرده باشد.
+        _used_cost, refund_amount, _elapsed = order_executor.compute_prorated_settlement(
+            total_price, order.get('duration_minutes'), order.get('started_at'),
+        )
+        spent_amount = _used_cost
 
         if not await DatabaseManager.cancel_order_once(order_id):
             await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")

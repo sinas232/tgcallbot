@@ -217,6 +217,30 @@ VOICE_FLOOD_INLINE_WAIT_MAX = max(
 CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
+# ── Bounded acquisitions (v2.2.11) ─────────────────────────────────────────
+# A single stuck client creation (a non-cancellable app.start() or a
+# half-dead client) must never queue every later attempt behind it: the
+# 120s 'creating Pyrogram client' stalls in the order-752 logs came from
+# unbounded waits on the per-account lock / create semaphore. Every
+# acquisition below is bounded — on timeout the join fails FAST and the
+# scheduler defers/retries (or replaces the account) instead of burning
+# a whole wave deadline.
+CLIENT_CREATE_SLOT_WAIT = max(10.0, float(getattr(Config, 'VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS', 90)))
+CLIENT_LOCK_WAIT = max(10.0, float(getattr(Config, 'VOICE_CLIENT_LOCK_WAIT_SECONDS', 60)))
+
+
+async def _acquire_client_create_slot() -> bool:
+    """Acquire a client-creation slot with a hard bound (v2.2.11).
+
+    Returns False on timeout — callers must fail fast (the scheduler
+    defers the account with its retry budget intact and tries again).
+    """
+    try:
+        await asyncio.wait_for(CLIENT_CREATE_SEMAPHORE.acquire(),
+                               timeout=CLIENT_CREATE_SLOT_WAIT)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -2124,7 +2148,21 @@ class VoiceCallManager:
             raise ValueError(f"Invalid encrypted session for account {account_id}")
         self._session_cache[account_id] = session_string
 
-        async with self._lock(account_id):
+        # Bounded lock acquisition (v2.2.11): if another attempt for this
+        # account is stuck holding the lock, fail fast (the scheduler
+        # defers the account / spends one cheap retry) instead of queueing
+        # behind it until the 120s wave deadline.
+        lock = self._lock(account_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=CLIENT_LOCK_WAIT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[VoiceScheduler] client lock busy for account {account_id} "
+                f"for {CLIENT_LOCK_WAIT:.0f}s — failing fast instead of "
+                f"queueing behind a stuck attempt"
+            )
+            raise RuntimeError(f"client lock busy (account {account_id})")
+        try:
             # Check existing pyrogram client
             app = self.pyrogram_clients.get(account_id)
             if app:
@@ -2150,7 +2188,9 @@ class VoiceCallManager:
                     session_ownership.release_voice(account_id)
 
             if not app:
-                async with CLIENT_CREATE_SEMAPHORE:
+                if not await _acquire_client_create_slot():
+                    raise RuntimeError("client-create slot busy (timed out)")
+                try:
                     held = await session_ownership.acquire_voice(account_id)
                     try:
                         helper = TelegramAccountClient("temp", session_string, account_id)
@@ -2168,6 +2208,8 @@ class VoiceCallManager:
                             session_ownership.release_voice(account_id)
                         raise
                     self.pyrogram_clients[account_id] = app
+                finally:
+                    CLIENT_CREATE_SEMAPHORE.release()
 
             # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
             pytg = self.clients.get(account_id)
@@ -2202,13 +2244,19 @@ class VoiceCallManager:
                     self.clients.pop(account_id, None)
 
             if not pytg:
-                async with CLIENT_CREATE_SEMAPHORE:
+                if not await _acquire_client_create_slot():
+                    raise RuntimeError("client-create slot busy (timed out)")
+                try:
                     pytg = PyTgCalls(app)
                     self._attach_engine_handlers(pytg, account_id)
                     await asyncio.wait_for(pytg.start(), timeout=15)
                     self.clients[account_id] = pytg
+                finally:
+                    CLIENT_CREATE_SEMAPHORE.release()
 
             return pytg
+        finally:
+            lock.release()
 
     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False,
                               reason: str = "") -> None:
@@ -4334,7 +4382,14 @@ class VoiceCallManager:
             account_id = acc.get("id")
             session_string = acc.get("session_string")
             try:
-                async with self._lock(account_id):
+                lock = self._lock(account_id)
+                try:
+                    await asyncio.wait_for(lock.acquire(), timeout=CLIENT_LOCK_WAIT)
+                except asyncio.TimeoutError:
+                    # A stuck attempt holds the lock — skip this prewarm;
+                    # the join path will fail fast and retry next wave.
+                    return
+                try:
                     # Re-check under the lock (a concurrent join may have
                     # already created this client).
                     if account_id in self.pyrogram_clients:
@@ -4347,7 +4402,9 @@ class VoiceCallManager:
                     decrypted_session = SecurityManager.decrypt_session(session_string)
                     if not decrypted_session:
                         return
-                    async with CLIENT_CREATE_SEMAPHORE:
+                    if not await _acquire_client_create_slot():
+                        return
+                    try:
                         held = await session_ownership.acquire_voice(account_id)
                         try:
                             helper = TelegramAccountClient("temp", session_string, account_id)
@@ -4379,6 +4436,10 @@ class VoiceCallManager:
                         self._session_cache[account_id] = session_string
                         self._touch_client(account_id)
                         warmed += 1
+                    finally:
+                        CLIENT_CREATE_SEMAPHORE.release()
+                finally:
+                    lock.release()
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
             except asyncio.CancelledError:

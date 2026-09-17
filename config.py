@@ -151,6 +151,19 @@ class Config:
     # account fault: the attempt budget is preserved and the account is
     # retried every N seconds until the other connection drops.
     VOICE_SESSION_CONFLICT_RETRY_SECONDS = float(os.getenv('VOICE_SESSION_CONFLICT_RETRY_SECONDS', '60'))
+    # ── BOUNDED CLIENT-CREATION WAITS (v2.2.11) ───────────────────────────
+    # A stuck client creation must never queue every later attempt behind
+    # it (the 120s 'creating Pyrogram client' stalls). Lock = per-account
+    # creation lock; slot = the parallel-creation semaphore.
+    VOICE_CLIENT_LOCK_WAIT_SECONDS = float(os.getenv('VOICE_CLIENT_LOCK_WAIT_SECONDS', '60'))
+    VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS = float(os.getenv('VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS', '90'))
+    # ── OPEN-ENDED PLAN BILLING (تسویهٔ طرح‌های «تکمیل و خروج») ──────────
+    # طرح‌هایی که مدت‌زمان ثابت ندارند (duration_minutes = 0، یعنی «تا
+    # توقف/خروج») بدون مرجع زمانی قابل تسویهٔ ثانیه‌ای نیستند. برای
+    # لغوی در میانه، زمان کارکرد واقعی روی همین مرجع محاسبه می‌شود
+    # (نرخ ثانیه‌ای = قیمت ÷ مرجع) — پیش از v2.2.11 این حالت کل مبلغ
+    # را عودت می‌زد حتی اگر تماس ساعت‌ها کار کرده باشد.
+    VOICE_OPEN_ENDED_BILLING_MINUTES = int(os.getenv('VOICE_OPEN_ENDED_BILLING_MINUTES', '60'))
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds

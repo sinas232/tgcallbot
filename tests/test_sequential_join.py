@@ -724,5 +724,396 @@ class ResolveChatIdTests(unittest.TestCase):
         self.assertIn("CheckChatInvite", fn)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 4) v2.2.11 — compat LAYER 2: kurigram's async Dispatcher.add_handler
+# ═══════════════════════════════════════════════════════════════════
+
+class CompatLayer2SourceTests(unittest.TestCase):
+    """Layer 2 must exist (source-level — no libraries needed).
+
+    kurigram >= 2.2.25 (and 2.2.26) register raw-update handlers
+    ASYNCHRONOUSLY (dispatcher.add_handler defers the append via
+    client.loop.create_task), so the layer-1 post-init wrap never
+    sees the handler and the UpdateGroupCall crash returns in
+    production (order 752 logs). Layer 2 wraps at handler CREATION
+    time (RawUpdateHandler.__init__, class level) where no deferral
+    can hide the handler.
+    """
+
+    def test_layer2_functions_exist(self):
+        src = _read_source("services/pytgcalls_compat.py")
+        self.assertIn("def patch_raw_update_handler_class", src)
+        self.assertIn("def _find_pytgcalls_bind", src)
+        self.assertIn("__closure__", src)
+
+    def test_layer2_installed_from_public_entrypoint(self):
+        src = _read_source("services/pytgcalls_compat.py")
+        tail = src[src.index("def patch_pytgcalls_raw_updates"):]
+        self.assertIn("patch_raw_update_handler_class()", tail)
+
+    def test_layer2_wraps_at_creation_via_class_init(self):
+        src = _read_source("services/pytgcalls_compat.py")
+        seg = src[src.index("def patch_raw_update_handler_class"):]
+        seg = seg[:seg.index("def patch_pytgcalls_raw_updates")]
+        self.assertIn("RawUpdateHandler.__init__ = patched_init", seg)
+        self.assertIn("_make_safe_callback(callback, bind)", seg)
+
+
+class CompatLayer2DeferredRegistrationTests(unittest.TestCase):
+    """Hermetic repro of kurigram >= 2.2.25 registration:
+
+    Dispatcher.add_handler defers the handler append (create_task),
+    so immediately after PyrogramClient.__init__ the dispatcher has
+    NO handler yet. The LANDING handler must still carry the safe
+    wrapper — that is exactly what layer 2 guarantees.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if REAL_PYROGRAM_INSTALLED:
+            raise unittest.SkipTest(
+                "real pyrogram installed — hermetic fake-module test skipped"
+            )
+
+        cls._created_modules = []
+
+        def _get_or_create(name):
+            mod = sys.modules.get(name)
+            if mod is None:
+                mod = types.ModuleType(name)
+                sys.modules[name] = mod
+                cls._created_modules.append(name)
+            return mod
+
+        pyro = _get_or_create("pyrogram")
+        handlers_mod = _get_or_create("pyrogram.handlers")
+        raw_mod = _get_or_create("pyrogram.raw")
+        raw_types = _get_or_create("pyrogram.raw.types")
+        if not hasattr(pyro, "handlers"):
+            pyro.handlers = handlers_mod
+        if not hasattr(raw_mod, "types"):
+            raw_mod.types = raw_types
+
+        class ContinuePropagation(Exception):
+            pass
+
+        class RawUpdateHandler:
+            def __init__(self, callback, filters=None, group=0):
+                self.callback = callback
+                self.filters = filters
+                self.group = group
+
+        class UpdateGroupCall:
+            """Raw TL update — NO chat_id attribute (the bug source)."""
+            def __init__(self, call, prev_id=0, version=0):
+                self.call = call
+                self.prev_id = prev_id
+                self.version = version
+
+        class GroupCall:
+            def __init__(self, id=111, access_hash=1, schedule_date=None):
+                self.id = id
+                self.access_hash = access_hash
+                self.schedule_date = schedule_date
+
+        class GroupCallDiscarded:
+            def __init__(self, id=111):
+                self.id = id
+
+        class InputGroupCall:
+            def __init__(self, id=0, access_hash=0):
+                self.id = id
+                self.access_hash = access_hash
+
+        pyro.ContinuePropagation = ContinuePropagation
+        handlers_mod.RawUpdateHandler = RawUpdateHandler
+        raw_types.UpdateGroupCall = UpdateGroupCall
+        raw_types.GroupCall = GroupCall
+        raw_types.GroupCallDiscarded = GroupCallDiscarded
+        raw_types.InputGroupCall = InputGroupCall
+
+        tgcalls_mod = _get_or_create("pytgcalls")
+        tgcalls_types = _get_or_create("pytgcalls.types")
+        if not hasattr(tgcalls_mod, "types"):
+            tgcalls_mod.types = tgcalls_types
+
+        class ChatUpdate:
+            class Status:
+                CLOSED_VOICE_CHAT = "CLOSED_VOICE_CHAT"
+
+            def __init__(self, chat_id, status, *args):
+                self.chat_id = chat_id
+                self.status = status
+
+        tgcalls_types.ChatUpdate = ChatUpdate
+
+        class FakeClientCache:
+            def __init__(self):
+                self._calls = {}
+
+            def get_chat_id(self, call_id):
+                for chat_id, call in self._calls.items():
+                    if getattr(call, "id", None) == call_id:
+                        return chat_id
+                return None
+
+            def set_cache(self, chat_id, input_call):
+                self._calls[chat_id] = input_call
+
+            def drop_cache(self, chat_id):
+                self._calls.pop(chat_id, None)
+
+        class FakeBuggyPyrogramClient:
+            """Reproduces py-tgcalls 2.2.5's crashing branch."""
+
+            def __init__(self, cache_duration, client):
+                self._app = client
+                self._cache = FakeClientCache()
+                self.propagated = []
+
+                def chat_id_of(obj):
+                    return -1000000000000 - obj.id
+
+                @client.on_raw_update(group=-9999)
+                async def on_update(_, update, __, chats):
+                    if isinstance(update, raw_types.UpdateGroupCall):
+                        chat_id = chat_id_of(chats[update.chat_id])  # ← CRASH
+                        self._cache.set_cache(chat_id, raw_types.InputGroupCall())
+                    raise pyro.ContinuePropagation()
+
+        # kurigram >= 2.2.25 dispatcher: the append happens in a
+        # deferred loop task, NOT synchronously in add_handler().
+        class FakeDeferredDispatcher:
+            def __init__(self):
+                self.groups = OrderedDict()
+                self._pending = []
+
+            def add_handler(self, handler, group):
+                self._pending.append((handler, group))
+
+            def flush(self):
+                for h, g in self._pending:
+                    self.groups.setdefault(g, []).append(h)
+                self._pending.clear()
+
+        class FakeAsyncAddHandlerApp:
+            def __init__(self):
+                self.dispatcher = FakeDeferredDispatcher()
+
+            def on_raw_update(self, group=0):
+                def decorator(func):
+                    self.dispatcher.add_handler(
+                        RawUpdateHandler(func, group=group), group
+                    )
+                    return func
+                return decorator
+
+        cls.ContinuePropagation = ContinuePropagation
+        cls.RawUpdateHandler = RawUpdateHandler
+        cls.UpdateGroupCall = UpdateGroupCall
+        cls.GroupCall = GroupCall
+        cls.InputGroupCall = InputGroupCall
+        cls.FakeAsyncAddHandlerApp = FakeAsyncAddHandlerApp
+
+        tgc_mod = _get_or_create("pytgcalls.mtproto")
+        if not hasattr(tgc_mod, "__path__"):
+            tgc_mod.__path__ = []
+        pyro_client_mod = _get_or_create("pytgcalls.mtproto.pyrogram_client")
+        pyro_client_mod.PyrogramClient = FakeBuggyPyrogramClient
+        tgc_mod.pyrogram_client = pyro_client_mod
+
+        sys.modules.pop("services.pytgcalls_compat", None)
+        cls.compat = importlib.import_module("services.pytgcalls_compat")
+
+    @classmethod
+    def tearDownClass(cls):
+        for name in reversed(getattr(cls, "_created_modules", [])):
+            sys.modules.pop(name, None)
+        sys.modules.pop("services.pytgcalls_compat", None)
+
+    def test_layer1_misses_handler_before_deferred_landing(self):
+        """Proof of the production failure mode: right after
+        PyrogramClient.__init__ the dispatcher holds nothing, so the
+        old post-init wrap found no handler to wrap."""
+        self.assertTrue(self.compat.patch_pytgcalls_raw_updates())
+
+        from pytgcalls.mtproto.pyrogram_client import PyrogramClient
+
+        app = self.FakeAsyncAddHandlerApp()
+        client = PyrogramClient(30, app)
+        self.assertIsNone(app.dispatcher.groups.get(-9999))
+        self.assertFalse(self.compat._wrap_raw_handler(client, app))
+
+    def test_landed_handler_carries_safe_wrapper(self):
+        self.assertTrue(self.compat.patch_pytgcalls_raw_updates())
+
+        from pytgcalls.mtproto.pyrogram_client import PyrogramClient
+
+        app = self.FakeAsyncAddHandlerApp()
+        client = PyrogramClient(30, app)
+        # the deferred registration task runs
+        app.dispatcher.flush()
+
+        landed = app.dispatcher.groups[-9999][0]
+        self.assertTrue(
+            getattr(landed.callback, self.compat._PATCH_FLAG, False),
+            "landed handler must carry the safe wrapper (layer 2)",
+        )
+
+        # Drive a real-shape UpdateGroupCall (no chat_id attr) through
+        # the LANDED handler: the buggy original would raise
+        # AttributeError — the safe wrapper must not.
+        update = self.UpdateGroupCall(self.GroupCall(id=424242))
+        with self.assertRaises(self.ContinuePropagation):
+            _run(landed.callback(app, update, {}, {}))
+
+    def test_foreign_raw_handler_left_untouched(self):
+        self.assertTrue(self.compat.patch_pytgcalls_raw_updates())
+
+        def plain_cb(client, update, users, chats):
+            return "ok"
+
+        h = self.RawUpdateHandler(plain_cb, group=5)
+        self.assertFalse(getattr(h.callback, self.compat._PATCH_FLAG, False))
+        self.assertIs(h.callback, plain_cb)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5) v2.2.11 — refund proration on mid-order cancellation
+# ═══════════════════════════════════════════════════════════════════
+
+class RefundProrationTests(unittest.TestCase):
+    """CANCEL must prorate: deduct exact elapsed-time cost, refund the
+    remainder. Regression: open-ended plans (duration_minutes=0,
+    «تکمیل و خروج») used to refund the FULL amount no matter how long
+    the call had run."""
+
+    @classmethod
+    def setUpClass(cls):
+        if "dotenv" not in sys.modules:
+            dotenv = types.ModuleType("dotenv")
+            dotenv.load_dotenv = lambda *a, **k: None
+            sys.modules["dotenv"] = dotenv
+
+        for name, attrs in (
+            ("services.join_brain", {
+                "join_brain": SimpleNamespace(forget_order=lambda *a, **k: None),
+                "OUTCOME_OK": "ok", "OUTCOME_DEAD": "dead", "OUTCOME_FLOOD": "flood",
+                "OUTCOME_FAIL": "fail", "OUTCOME_PERMANENT": "permanent",
+            }),
+            ("services.session_ownership", {
+                "SessionInUseError": type("SessionInUseError", (Exception,), {}),
+            }),
+            ("services.self_healing", {}),
+            ("utils.helpers", {"format_jalali_datetime": lambda *a, **k: ""}),
+            ("database", {"DatabaseManager": SimpleNamespace()}),
+            ("telegram_client", {"TelegramAccountClient": type("TAC", (), {})}),
+        ):
+            if name not in sys.modules:
+                m = types.ModuleType(name)
+                for k, v in attrs.items():
+                    setattr(m, k, v)
+                sys.modules[name] = m
+
+        sys.modules.pop("services.order_executor", None)
+        cls.oe = importlib.import_module("services.order_executor")
+
+    @staticmethod
+    def _started_minutes_ago(minutes):
+        from datetime import datetime, timedelta
+        return datetime.utcnow() - timedelta(minutes=minutes)
+
+    def test_fixed_duration_prorates_per_second(self):
+        used, refund, elapsed = self.oe.OrderExecutor.compute_prorated_settlement(
+            6000, 60, self._started_minutes_ago(10)
+        )
+        self.assertAlmostEqual(elapsed, 600, delta=5)
+        # 10 min of a 60 min plan ≈ 1/6 of the price (RoundUp: ±1)
+        self.assertAlmostEqual(used, 1000.0, delta=1.0)
+        self.assertAlmostEqual(refund, 6000.0 - used, delta=0.001)
+
+    def test_fixed_duration_fully_consumed(self):
+        used, refund, _ = self.oe.OrderExecutor.compute_prorated_settlement(
+            6000, 30, self._started_minutes_ago(45)
+        )
+        self.assertEqual(used, 6000.0)
+        self.assertEqual(refund, 0.0)
+
+    def test_open_ended_plan_prorates_against_reference(self):
+        # THE regression: duration=0 used to return (0, full_price).
+        import config as _config_mod
+        ref_min = int(getattr(_config_mod.Config, "VOICE_OPEN_ENDED_BILLING_MINUTES", 60))
+        used, refund, _ = self.oe.OrderExecutor.compute_prorated_settlement(
+            6000, 0, self._started_minutes_ago(10)
+        )
+        self.assertGreater(used, 0.0, "open-ended plan must consume elapsed time")
+        self.assertAlmostEqual(used, 6000.0 * 10 / ref_min, delta=1.0)
+        self.assertAlmostEqual(refund, 6000.0 - used, delta=0.001)
+
+    def test_open_ended_plan_fully_consumed_after_reference(self):
+        import config as _config_mod
+        ref_min = int(getattr(_config_mod.Config, "VOICE_OPEN_ENDED_BILLING_MINUTES", 60))
+        used, refund, _ = self.oe.OrderExecutor.compute_prorated_settlement(
+            6000, 0, self._started_minutes_ago(ref_min + 60)
+        )
+        self.assertEqual(used, 6000.0)
+        self.assertEqual(refund, 0.0)
+
+    def test_never_started_order_refunds_in_full(self):
+        # started_at missing → no service time consumed → full refund
+        used, refund, _ = self.oe.OrderExecutor.compute_prorated_settlement(
+            6000, 60, None
+        )
+        self.assertEqual(used, 0.0)
+        self.assertEqual(refund, 6000.0)
+
+    def test_customer_cancel_uses_shared_settlement(self):
+        src = _read_source("handlers/order_handlers.py")
+        fn = src[src.index("async def cancel_order_callback"):]
+        self.assertIn("order_executor.compute_prorated_settlement(", fn)
+        # the old buggy branch (duration=0 → full refund) is gone
+        self.assertNotIn(
+            "No duration start means no billable service time", src
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6) v2.2.11 — bounded client-creation waits (no 120s stalls)
+# ═══════════════════════════════════════════════════════════════════
+
+class BoundedClientCreationTests(unittest.TestCase):
+    """A stuck client creation must fail FAST instead of queueing
+    every later attempt behind it (the order-752 120s 'creating
+    Pyrogram client' stalls)."""
+
+    def test_config_keys_exist(self):
+        # classes run alphabetically — this one may run before any
+        # other class stubbed dotenv, so stub it here if needed.
+        if "dotenv" not in sys.modules:
+            dotenv = types.ModuleType("dotenv")
+            dotenv.load_dotenv = lambda *a, **k: None
+            sys.modules["dotenv"] = dotenv
+        import config as _config_mod
+        self.assertGreaterEqual(
+            float(_config_mod.Config.VOICE_CLIENT_LOCK_WAIT_SECONDS), 10.0
+        )
+        self.assertGreaterEqual(
+            float(_config_mod.Config.VOICE_CLIENT_CREATE_SLOT_WAIT_SECONDS), 10.0
+        )
+
+    def test_vcm_uses_bounded_acquisitions(self):
+        src = _read_source("services/voice_call_manager.py")
+        self.assertIn("def _acquire_client_create_slot", src)
+        self.assertIn("CLIENT_CREATE_SEMAPHORE.acquire()", src)
+        self.assertIn("timeout=CLIENT_CREATE_SLOT_WAIT", src)
+        self.assertIn("timeout=CLIENT_LOCK_WAIT", src)
+        # join path fails fast on a stuck per-account lock
+        self.assertIn('raise RuntimeError(f"client lock busy (account {account_id})")', src)
+        # no unbounded per-account lock acquisition remains
+        self.assertNotIn("async with self._lock(account_id):", src)
+        # every bounded slot acquisition has a matching release
+        self.assertGreaterEqual(src.count("CLIENT_CREATE_SEMAPHORE.release()"), 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

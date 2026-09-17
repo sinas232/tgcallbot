@@ -1598,21 +1598,38 @@ class OrderExecutor:
 		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
 
 		خروجی: (used_cost, refund_amount, elapsed_seconds)
-		  Rs = total_price / (duration_minutes*60)         نرخ ثانیه‌ای
+		  Rs = total_price / (مرجع*۶۰)                     نرخ ثانیه‌ای
 		  C_used = RoundUp(Δt × Rs)  ← سقف = total_price، کف = 0
 		  refund = total_price − C_used
-		اگر started_at موجود نباشد یا مدت ۰ باشد، هیچ زمان قابل‌محاسبه‌ای
-		مصرف نشده و کل مبلغ عودت می‌شود.
+
+		مرجع زمانی:
+		  • طرح با مدت ثابت (duration > ۰): خودِ مدت طرح.
+		  • طرح «تکمیل و خروج» (duration = ۰): مرجع
+		    VOICE_OPEN_ENDED_BILLING_MINUTES (پیش‌فرض ۶۰ دقیقه).
+		    پیش از v2.2.11، طرح‌های duration=۰ بدون توجه به مدت
+		    کارکردِ واقعی، کل مبلغ را عودت می‌کردند.
+		  • بدون started_at (سفارش هرگز شروع نشده): هیچ مصرفی →
+		    کل مبلغ عودت می‌شود (درست است — سرویسی داده نشده).
 		"""
 		try:
 			total_price = float(total_price or 0)
 		except Exception:
 			total_price = 0.0
 		duration_minutes = int(duration_minutes or 0)
-		if duration_minutes <= 0 or not started_at:
+		if not started_at:
+			# سفارش شروع نشده — هیچ زمانی مصرف نشده است.
 			return 0.0, total_price, 0.0
+		if duration_minutes <= 0:
+			# طرح بدون مدت (تکمیل و خروج): تسویه روی مرجع زمانی.
+			try:
+				from config import Config as _Config
+				ref_minutes = max(1, int(getattr(_Config, "VOICE_OPEN_ENDED_BILLING_MINUTES", 60)))
+			except Exception:
+				ref_minutes = 60
+			total_seconds = ref_minutes * 60
+		else:
+			total_seconds = duration_minutes * 60
 		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
-		total_seconds = duration_minutes * 60
 		if elapsed_seconds >= total_seconds:
 			used = total_price
 		else:
