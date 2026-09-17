@@ -1331,6 +1331,13 @@ async def main_loop():
     
     bot_manager.active_bots[1] = main_app
     logger.info(f"🚀 Main Bot Started. (version {BOT_VERSION})")
+    try:
+        import subprocess as _sp
+        _commit = _sp.check_output(['git', 'rev-parse', '--short', 'HEAD'],
+                                   stderr=_sp.DEVNULL, timeout=5).decode().strip()
+        logger.info("🔖 running commit: %s", _commit)
+    except Exception:
+        pass
     
     # راه‌اندازی ربات‌های نمایندگی
     await bot_manager.start_all_active_bots()
