@@ -78,6 +78,33 @@ class MaintenanceWiringTests(unittest.TestCase):
             src,
         )
 
+    def test_maintenance_button_label_matches_its_regex(self):
+        """Regression: the settings-menu button label (with LITERAL
+        parentheses) must actually match the Regex wired in main.py.
+        Unescaped parens became a capture group and silently never
+        matched, so the button gave no response."""
+        import ast
+        import re
+
+        adm = _read_source("handlers/admin_handlers.py")
+        m = re.search(r'\["(🛠[^\]]*بروزرسانی[^\]]*)"', adm)
+        self.assertIsNotNone(m, "maintenance button label not found in settings menu")
+        label = m.group(1)
+
+        main_src = _read_source("main.py")
+        line = [l for l in main_src.splitlines()
+                if "بروزرسانی" in l and "filters.Regex" in l]
+        self.assertTrue(line, "maintenance MessageHandler not wired in main.py")
+        lm = re.search(r'filters\.Regex\((".*?")\)', line[0])
+        self.assertIsNotNone(lm, "could not extract Regex literal")
+        pattern = ast.literal_eval(lm.group(1))  # exactly as Python parses it at runtime
+
+        self.assertIsNotNone(
+            re.match(pattern, label),
+            f"maintenance button label {label!r} does NOT match wired regex {pattern!r} — "
+            "the button will be dead. Escape literal parentheses in the pattern.",
+        )
+
 
 class DeadAccountCleanupWiringTests(unittest.TestCase):
     def test_constant_exists(self):

@@ -713,7 +713,9 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^🔒 تنظیمات امنیتی$"), security_settings_menu),
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings"),
                 # 🛠 حالت نگه‌داری (بروزرسانی) — فقط سوپر ادمین
-                MessageHandler(filters.Regex("^🛠 حالت نگه‌داری (بروزرسانی)$"), maintenance_mode_menu),
+                # پرانتزها باید escape شوند وگرنه گروهِ regex می‌شوند و دکمهٔ
+                # دارای پرانتزِ واقعی هرگز match نمی‌شود.
+                MessageHandler(filters.Regex("^\U0001F6E0 حالت نگه\u200cداری \(بروزرسانی\)$"), maintenance_mode_menu),
                 
                 # لاگ و متن
                 MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
