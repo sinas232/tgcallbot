@@ -23,6 +23,10 @@ from services.order_executor import order_executor
 
 logger = logging.getLogger(__name__)
 
+async def safe_answer(query):
+    try: await query.answer()
+    except: pass
+
 # -------------------- ثبت سفارش جدید --------------------
 
 async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -91,7 +95,7 @@ async def show_plans_for_category(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data
     
     if data == "cancel_order":
@@ -161,7 +165,7 @@ async def handle_calendar_selection(update: Update, context: ContextTypes.DEFAUL
     
     # حتما باید answer شود تا لودینگ دکمه قطع شود
     try:
-        await query.answer()
+        await safe_answer(query)
     except Exception as e:
         logger.warning(f"Callback answer failed: {e}")
 
@@ -293,7 +297,7 @@ async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data
     
     if data == "cancel_order":
@@ -374,7 +378,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     - برای سفارش در حال اجرا: محاسبه مصرف بر اساس ثانیه و عودت مانده
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     data = query.data or ""
     try:
@@ -506,7 +510,7 @@ async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_order_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مدیریت دکمه‌های تاریخچه"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data
     
     user_id = update.effective_user.id
@@ -564,7 +568,7 @@ async def handle_order_history_callback(update: Update, context: ContextTypes.DE
 async def handle_back_to_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """بازگشت به منوی انتخاب نوع تاریخچه"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     kb = [
         [InlineKeyboardButton("3️⃣ سفارش آخر", callback_data="history_3"), 
          InlineKeyboardButton("🔟 سفارش آخر", callback_data="history_10")],

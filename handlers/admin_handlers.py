@@ -791,7 +791,7 @@ async def stop_order_execute(update, context):
 async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data or ""
     bot_id = context.bot_data.get('bot_id', 1)
     try:
