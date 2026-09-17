@@ -736,9 +736,9 @@ class OrderExecutor:
                         continue
 
                     outcome = join_brain.classify_message(msg)
-                    # INTERDC / X_CALL is DC-interconnect transient — same handling as FloodWait:
+                    # INTERDC / X_CALL / ADD_PARTICIPANTS_FAILED is DC-interconnect transient — same handling as FloodWait:
                     # system pressure, not account fault. Keep budget, retry later.
-                    is_interdc = any(k in msg.upper() for k in ("INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC"))
+                    is_interdc = any(k in msg.upper() for k in ("INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC", "ADD_PARTICIPANTS_FAILED", "GROUPCALL_ADD"))
                     if outcome == OUTCOME_FLOOD or is_interdc:
                         fm = re.search(r"FLOODWAIT:(\d+)", msg.upper())
                         if fm:

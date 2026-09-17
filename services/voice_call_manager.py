@@ -185,8 +185,10 @@ def _patch_kurigram_interdc_retry() -> None:
                     err_str = str(e) or type(e).__name__
                     low = err_str.lower()
 
-                    # INTERDC / X_CALL / RICH_ERROR → special handling
-                    if "interdc" in low or "x_call" in low or "rich_error" in low or ("500" in low and "inter" in low):
+                    # INTERDC / X_CALL / RICH_ERROR / GROUPCALL_ADD_PARTICIPANTS_FAILED → special handling
+                    # All are 500 internal Telegram DC failures, common behind WARP
+                    is_500 = "500" in low or "groupcall_add_participants_failed" in low
+                    if "interdc" in low or "x_call" in low or "rich_error" in low or (is_500 and "inter" in low) or "add_participants_failed" in low:
                         # Log once per attempt at WARNING so docker logs -f catches it
                         logger.warning(
                             "[INTERDC-Patch] %s attempt %s/%s got %s — backing off 20-40s (WARP DC4 throttled)",
@@ -228,6 +230,155 @@ def _patch_kurigram_interdc_retry() -> None:
 
 
 _patch_kurigram_interdc_retry()
+
+
+def _patch_pytgcalls_updategroupcall() -> None:
+    """Patch py-tgcalls PyrogramClient for new Telegram layer where UpdateGroupCall has no chat_id.
+
+    Old py-tgcalls did:
+        chat_id = self.chat_id(chats[update.chat_id])
+    which crashes with AttributeError when update is UpdateGroupCall without chat_id
+    (new layer uses peer or call.id). This floods logs with
+    'UpdateGroupCall object has no attribute chat_id' but doesn't break join.
+
+    Fix mirrors latest pytgcalls master (Aug 2026):
+        if getattr(update, 'chat_id', None) is not None: ...
+        elif getattr(update, 'peer', None) is not None: ...
+        else: chat_id = self._cache.get_chat_id(update.call.id)
+
+    We try file-patch first (site-packages is writable as root), then runtime monkey-patch fallback.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("pytgcalls.mtproto.pyrogram_client")
+        if spec is None or not spec.origin:
+            return
+        path = spec.origin
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        # If already fixed, skip
+        if "getattr(update, 'chat_id'" in content and "getattr(update, 'peer'" in content:
+            logger.info("[PyTgCalls-Patch] UpdateGroupCall handling already fixed in installed package")
+            return
+        # Old buggy pattern detection
+        if "chats[update.chat_id]" in content and "class PyrogramClient" in content:
+            # Replace the specific block for UpdateGroupCall
+            # We do a careful replacement of the 2-line old block with the 7-line fixed block
+            old_block = "            if isinstance(\n                update,\n                UpdateGroupCall,\n            ):\n                chat_id = self.chat_id(\n                    chats[update.chat_id],\n                )"
+            # New fixed block from master
+            new_block = """            if isinstance(
+                update,
+                UpdateGroupCall,
+            ):
+                if getattr(update, 'chat_id', None) is not None:
+                    # noinspection PyUnresolvedReferences
+                    chat_id = self.chat_id(
+                        chats[update.chat_id],
+                    )
+                elif getattr(update, 'peer', None) is not None:
+                    # noinspection PyUnresolvedReferences
+                    chat_id = self.chat_id(update.peer)
+                else:
+                    chat_id = self._cache.get_chat_id(update.call.id)"""
+            if old_block in content:
+                content = content.replace(old_block, new_block)
+                with open(path, "w", encoding="utf-8") as out:
+                    out.write(content)
+                logger.warning(f"[PyTgCalls-Patch] Patched {path} for UpdateGroupCall compatibility (file edit)")
+                return
+            # Fallback: try more lenient replacement (single line version)
+            if "chat_id = self.chat_id(\n                    chats[update.chat_id]," in content:
+                content = content.replace(
+                    "                chat_id = self.chat_id(\n                    chats[update.chat_id],\n                )",
+                    "                if getattr(update, 'chat_id', None) is not None:\n                    chat_id = self.chat_id(chats[update.chat_id])\n                elif getattr(update, 'peer', None) is not None:\n                    chat_id = self.chat_id(update.peer)\n                else:\n                    chat_id = self._cache.get_chat_id(update.call.id)",
+                )
+                with open(path, "w", encoding="utf-8") as out:
+                    out.write(content)
+                logger.warning(f"[PyTgCalls-Patch] Patched {path} (lenient) for UpdateGroupCall")
+                return
+    except Exception as exc:
+        logger.debug(f"[PyTgCalls-Patch] file patch skipped: {exc}")
+
+    # Runtime fallback: monkey-patch PyrogramClient to swallow the specific error
+    try:
+        from pytgcalls.mtproto.pyrogram_client import PyrogramClient as _PClient
+        orig_init = _PClient.__init__
+
+        def _patched_init(self, cache_duration, client):
+            orig_init(self, cache_duration, client)
+            # The original handler is already registered via decorator inside orig_init.
+            # We can't easily remove it, but we can add a wrapper that catches the error
+            # by patching the dispatcher's handler_worker? Instead, we patch self.chat_id
+            # to be safe, and also wrap the raw update handler by replacing _app's handlers.
+            # Simplest: override the method that would crash by ensuring chat_id handles any input.
+            # For UpdateGroupCall without chat_id, we return None early in a custom wrapper.
+            try:
+                # Find and wrap the raw update callback registered with group -9999
+                # Pyrogram stores handlers in self._app.dispatcher.raw_update_handlers
+                # We'll patch the callback to catch AttributeError for UpdateGroupCall
+                from pyrogram.raw.types import UpdateGroupCall as _UGC
+                handlers = getattr(self._app.dispatcher, "raw_update_handlers", None) or getattr(self._app, "raw_update_handlers", [])
+                # raw_update_handlers is a dict group -> list
+                if isinstance(handlers, dict):
+                    for group_handlers in handlers.values():
+                        for handler in list(group_handlers):
+                            cb = getattr(handler, "callback", None)
+                            if cb and "on_update" in getattr(cb, "__name__", ""):
+                                orig_cb = cb
+
+                                async def _safe_cb(client, update, users, chats, _orig=orig_cb):
+                                    try:
+                                        if isinstance(update, _UGC):
+                                            # Safe handling mirrors master fix
+                                            try:
+                                                if getattr(update, 'chat_id', None) is not None:
+                                                    # let original handle it
+                                                    return await _orig(client, update, users, chats)
+                                                elif getattr(update, 'peer', None) is not None:
+                                                    return await _orig(client, update, users, chats)
+                                                else:
+                                                    # No chat_id/peer, try cache path directly to avoid crash
+                                                    # We manually propagate CLOSED etc if needed
+                                                    # For safety, just skip crash
+                                                    chat_id = None
+                                                    try:
+                                                        chat_id = self._cache.get_chat_id(update.call.id)
+                                                    except Exception:
+                                                        pass
+                                                    if chat_id is None:
+                                                        return
+                                                    # If it's discarded, propagate closed
+                                                    try:
+                                                        from pyrogram.raw.types import GroupCallDiscarded
+                                                        if isinstance(update.call, GroupCallDiscarded):
+                                                            from ..types import ChatUpdate
+                                                            self._cache.drop_cache(chat_id)
+                                                            await self._propagate(ChatUpdate(chat_id, ChatUpdate.Status.CLOSED_VOICE_CHAT))
+                                                    except Exception:
+                                                        pass
+                                                    return
+                                            except AttributeError:
+                                                return
+                                    except Exception:
+                                        pass
+                                    try:
+                                        return await _orig(client, update, users, chats)
+                                    except AttributeError as ae:
+                                        if "chat_id" in str(ae) and "UpdateGroupCall" in str(type(update)):
+                                            return
+                                        raise
+
+                                handler.callback = _safe_cb
+            except Exception as e:
+                logger.debug(f"[PyTgCalls-Patch] runtime wrapper failed: {e}")
+
+        _PClient.__init__ = _patched_init
+        logger.info("[PyTgCalls-Patch] Runtime patch applied for UpdateGroupCall")
+    except Exception as exc:
+        logger.debug(f"[PyTgCalls-Patch] runtime patch skipped: {exc}")
+
+
+_patch_pytgcalls_updategroupcall()
 
 SILENT_AUDIO_PATH = "silence.wav"
 
@@ -2615,32 +2766,75 @@ class VoiceCallManager:
         except Exception as exc:
             raise RuntimeError(f"Group membership not confirmed: {str(exc)[:100]}") from exc
 
+    def _extract_id_from_joined(self, result) -> Optional[int]:
+        """Extract chat id from any join_chat result shape (kurigram compatibility)."""
+        if result is None:
+            return None
+        try:
+            # Direct Chat object
+            if hasattr(result, "id") and isinstance(getattr(result, "id"), int):
+                return int(result.id)
+            # ChatJoinResultSuccess / result.chat
+            if hasattr(result, "chat") and getattr(result, "chat") is not None:
+                ch = getattr(result, "chat")
+                if hasattr(ch, "id") and isinstance(ch.id, int):
+                    return int(ch.id)
+            # Some forks return list of chats
+            if hasattr(result, "chats") and getattr(result, "chats"):
+                for c in getattr(result, "chats"):
+                    if hasattr(c, "id"):
+                        return int(c.id)
+        except Exception:
+            pass
+        return None
+
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
             return self.order_chat_ids[order_id]
         chat_id = None
         try:
             if target.startswith("https"):
+                # First try to join, but don't rely on its return value for id
+                # (kurigram may return ChatJoinResultSuccess without .id)
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    joined = await app.join_chat(target)
+                    chat_id = self._extract_id_from_joined(joined)
                 except UserAlreadyParticipant:
-                    try:
-                        chat_id = (await app.get_chat(target)).id
-                    except Exception:
-                        try:
-                            invite = target.split("+")[-1].split("/")[-1]
-                            inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
-                            if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
-                        except Exception:
-                            pass
-            else:
-                try:
-                    chat_id = (await app.join_chat(target)).id
-                except UserAlreadyParticipant:
-                    chat_id = (await app.get_chat(target)).id
+                    pass
                 except Exception:
-                    chat_id = (await app.get_chat(target)).id
+                    # join may fail but chat may still be resolvable via get_chat
+                    pass
+                # Authoritative resolve via get_chat (works for invite links too)
+                if not chat_id:
+                    try:
+                        chat = await app.get_chat(target)
+                        if hasattr(chat, "id"):
+                            chat_id = int(chat.id)
+                    except Exception:
+                        pass
+                if not chat_id:
+                    try:
+                        invite = target.split("+")[-1].split("/")[-1]
+                        inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
+                        if getattr(inv, "chat", None):
+                            chat_id = int(inv.chat.id)
+                    except Exception:
+                        pass
+            else:
+                # username / @username path
+                try:
+                    joined = await app.join_chat(target)
+                    chat_id = self._extract_id_from_joined(joined)
+                except UserAlreadyParticipant:
+                    pass
+                except Exception:
+                    pass
+                if not chat_id:
+                    try:
+                        chat = await app.get_chat(target)
+                        chat_id = int(chat.id)
+                    except Exception:
+                        pass
         except RPCError as e:
             msg = str(e)
             if "FROZEN_METHOD_INVALID" in msg or "PEER_FLOOD" in msg or "420" in msg:
@@ -2650,12 +2844,16 @@ class VoiceCallManager:
             raise
         except UserAlreadyParticipant:
             try:
-                chat_id = (await app.get_chat(target)).id
+                chat = await app.get_chat(target)
+                chat_id = int(chat.id)
             except Exception:
                 pass
 
         if chat_id:
-            self.order_chat_ids[order_id] = int(chat_id)
+            try:
+                self.order_chat_ids[order_id] = int(chat_id)
+            except Exception:
+                pass
         return chat_id
 
     async def _force_refresh_call(self, app: Client, chat_id: int) -> None:
@@ -3040,11 +3238,11 @@ class VoiceCallManager:
                         # and misclassified as non-retryable UNKNOWN.
                         err_str = type(e).__name__
                     self._inflight_joins.pop(join_key, None)
-                    # 🔧 فیکس INTERDC_X_CALL_RICH_ERROR / X_CALL_ERROR - خطای داخلی DC4 تلگرام
+                    # 🔧 فیکس INTERDC_X_CALL_RICH_ERROR / X_CALL_ERROR / GROUPCALL_ADD_PARTICIPANTS_FAILED
                     # این خطا موقتی است و معمولاً با رفرش کش و تأخیر بیشتر حل می‌شود
-                    # هر دو واریانت را پوشش می‌دهد: RICH_ERROR و X_CALL_ERROR
+                    # هر دو واریانت را پوشش می‌دهد: RICH_ERROR و X_CALL_ERROR و ADD_PARTICIPANTS_FAILED
                     low = err_str.lower()
-                    if "interdc" in low or "rich_error" in low or "x_call" in low or "x_call_error" in low or ("500" in low and "inter" in low):
+                    if "interdc" in low or "rich_error" in low or "x_call" in low or "x_call_error" in low or "add_participants_failed" in low or ("500" in low and "inter" in low) or ("500" in low and "groupcall" in low):
                         self._vc_event_log(order_id, account_id, "interdc_error", {"chat_id": chat_id, "error": err_str[:150]})
                         logger.warning(
                             "[VoiceCall] INTERDC_X_CALL_ERROR order=%s acc=%s chat=%s — DC4 inter-DC failure (WARP IP may be temporarily throttled), refreshing and backing off",

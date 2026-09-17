@@ -70,6 +70,7 @@ def classify_message(msg: str) -> str:
     if any(k in text for k in (
         "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
         "INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC", "500 INTERDC",
+        "ADD_PARTICIPANTS_FAILED", "GROUPCALL_ADD",
     )):
         return OUTCOME_FLOOD
     if any(k in text for k in (
