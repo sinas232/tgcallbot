@@ -60,7 +60,9 @@ class OrderExecutor:
 		# duration-maintenance calls of the same order.
 		self._voice_pool: Dict[int, List[Dict]] = {}          # eligible account pool (merged/refreshed)
 		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
-		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
+		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> temporarily dropped (budget exhausted OR dead)
+		self._voice_dead: Dict[int, Set[int]] = {}            # account_id -> PERMANENTLY dead (session revoked...) — never retried
+		self._voice_second_chance: Dict[int, int] = {}        # order_id -> second-chance rounds already granted
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -387,6 +389,8 @@ class OrderExecutor:
 	    self._voice_pool.setdefault(order_id, [])
 	    self._voice_attempts.setdefault(order_id, {})
 	    self._voice_banned.setdefault(order_id, set())
+	    self._voice_dead.setdefault(order_id, set())
+	    self._voice_second_chance.setdefault(order_id, 0)
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -399,6 +403,8 @@ class OrderExecutor:
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
 	    self._voice_banned.pop(order_id, None)
+	    self._voice_dead.pop(order_id, None)
+	    self._voice_second_chance.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -510,6 +516,59 @@ class OrderExecutor:
 	        best = when if best is None else min(best, when)
 	    return best
 
+	def _voice_second_chance_refresh(self, order_id: int, joined_ids: Set[int]) -> int:
+	    """Second-chance rounds: bring the order all the way to target.
+
+	    Fallback for «سفارش ۵۰ تایی فقط ۳۵ تایش می‌رود»: when the whole pool
+	    has been swept and some accounts burned their attempt budget on
+	    TRANSIENT faults (FloodWait, transport, Telegram hiccups) — but the
+	    account itself is fine — the fill used to stop below target because
+	    those accounts were banned and (in a tight pool) no replacements
+	    remained.  This method hands a FRESH attempt budget to every
+	    non-dead, non-joined pool account that is exhausted or backoff-parked.
+
+	    Rules:
+	      * accounts proven DEAD (session revoked / deactivated) are NEVER
+	        re-tried — they live in `_voice_dead`;
+	      * accounts still inside a scheduled backoff are left alone (the
+	        earliest-retry path already handles them);
+	      * bounded by VOICE_SECOND_CHANCE_ROUNDS (default 2) so a truly
+	        broken pool cannot spin forever.
+
+	    Returns the number of revived accounts (0 = nothing left to do).
+	    """
+	    max_rounds = max(0, int(getattr(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2)))
+	    rounds = self._voice_second_chance.get(order_id, 0)
+	    if rounds >= max_rounds:
+	        return 0
+	    pool = self._voice_pool.get(order_id) or []
+	    attempts = self._voice_attempts.get(order_id, {})
+	    banned = self._voice_banned.get(order_id, set())
+	    dead = self._voice_dead.get(order_id, set())
+	    retry_after = self._voice_retry_after.get(order_id, {})
+	    budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    now = time.time()
+	    revived = 0
+	    for acc in pool:
+	        aid = acc.get("id")
+	        if not aid or aid in joined_ids or aid in dead:
+	            continue
+	        exhausted = attempts.get(aid, 0) >= budget or aid in banned
+	        if not exhausted:
+	            # Not exhausted → the earliest-retry path will pick it up;
+	            # nothing to revive here.
+	            continue
+	        if retry_after.get(aid, 0.0) > now:
+	            # Still inside a scheduled backoff — leave it to that path.
+	            continue
+	        attempts[aid] = 0
+	        banned.discard(aid)
+	        retry_after.pop(aid, None)
+	        revived += 1
+	    if revived:
+	        self._voice_second_chance[order_id] = rounds + 1
+	    return revived
+
 	async def _voice_batched_fill(
 	    self,
 	    order_id: int,
@@ -540,8 +599,14 @@ class OrderExecutor:
 	        return joined_list, dead_count
 
 	    await self._voice_load_pool(bot_id, order_id)
+	    sequential = bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL", True))
 	    adaptive = bool(getattr(Config, "VOICE_JOIN_ADAPTIVE", True))
-	    if adaptive:
+	    if sequential:
+	        # دونه‌دونه (strictly sequential): the window is PINNED to 1 —
+	        # one account at a time; the next account starts only after the
+	        # current one is verified inside the group + voice call.
+	        join_brain.register_order(order_id, initial=1, min_window=1, max_window=1)
+	    elif adaptive:
 	        join_brain.register_order(order_id)
 	    else:
 	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
@@ -549,6 +614,12 @@ class OrderExecutor:
 
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+	    # Sequential-mode small human-like gap between the COMPLETION of one
+	    # account and the START of the next (default 1.0-2.0s + 0-0.5s jitter).
+	    gap_min = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MIN", 1.0)))
+	    gap_max = max(gap_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MAX", 2.0)))
+	    gap_jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN", 0.0)))
+	    gap_jitter_max = max(gap_jitter_min, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX", 0.5)))
 	    wave_no = 0
 	    live = int(vcm.get_active_count(order_id))
 
@@ -596,6 +667,31 @@ class OrderExecutor:
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # Pool exhausted. Before giving up BELOW TARGET, give the
+	                # previously-failed (but alive) accounts a fresh attempt
+	                # budget so the order can still reach its full count.
+	                revived = self._voice_second_chance_refresh(order_id, joined_ids)
+	                if revived:
+	                    cooldown = max(
+	                        5.0,
+	                        float(getattr(Config, "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS", 60)),
+	                    )
+	                    max_rounds = max(1, int(getattr(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2)))
+	                    logger.warning(
+	                        f"Order {order_id}: pool exhausted at live={live}/{target_count} — "
+	                        f"{revived} previously-failed account(s) get a fresh attempt "
+	                        f"(second-chance round {self._voice_second_chance.get(order_id, 0)}/{max_rounds}, "
+	                        f"cooldown {cooldown:.0f}s)"
+	                    )
+	                    try:
+	                        await asyncio.sleep(cooldown)
+	                    except asyncio.CancelledError:
+	                        raise
+	                    continue
+	                logger.warning(
+	                    f"Order {order_id}: pool exhausted at live={live}/{target_count} "
+	                    f"(no retryable accounts left) — fill ends"
+	                )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -727,6 +823,7 @@ class OrderExecutor:
 	                    wave_dead += 1
 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    self._voice_dead.setdefault(order_id, set()).add(aid)
 	                    try:
 	                        await self._mark_account_dead(aid)
 	                    except Exception:
@@ -811,6 +908,26 @@ class OrderExecutor:
                 f"in {wave_duration:.0f}s) | "
                 f"{join_brain.format_progress(order_id, live, target_count)}"
             )
+
+	        # ── SEQUENTIAL PACING (دونه‌دونه) ──────────────────────────────
+	        # Only after this account fully joined & was verified inside the
+	        # call do we let the NEXT account start — with a short human-like
+	        # gap on top, so the entry cadence is clearly one-by-one with a
+	        # small delay, never a burst.
+	        if sequential and self._is_order_active(order_id) and live < target_count:
+	            gap = (
+	                random.uniform(gap_min, gap_max)
+	                + random.uniform(gap_jitter_min, gap_jitter_max)
+	            )
+	            if gap > 0:
+	                logger.info(
+	                    f"Order {order_id}: sequential mode — next account in "
+	                    f"{gap:.1f}s (live={live}/{target_count})"
+	                )
+	                try:
+	                    await asyncio.sleep(gap)
+	                except asyncio.CancelledError:
+	                    raise
 
 	    # Return only the accounts this call newly joined; the CALLER owns
 	    # merging them into the order's running joined_accounts list (the

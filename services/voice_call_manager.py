@@ -134,6 +134,18 @@ def _patch_pyrogram_channel_id_range() -> None:
 
 _patch_pyrogram_channel_id_range()
 
+# ─── py-tgcalls UpdateGroupCall crash fix (runtime patch) ────────────
+# py-tgcalls <= 2.2.5 (نسخهٔ قفل‌شده در requirements) روی هر اپدیت خام
+# UpdateGroupCall کرش می‌کند:
+#   AttributeError: 'UpdateGroupCall' object has no attribute 'chat_id'
+# وصلهٔ runtime دقیقاً رفتار درست‌شدهٔ upstream (2.3.3) را اعمال می‌کند
+# بدون نیاز به rebuild ایمیج — جزئیات در services/pytgcalls_compat.py.
+try:
+    from services.pytgcalls_compat import patch_pytgcalls_raw_updates
+    patch_pytgcalls_raw_updates()
+except Exception as _compat_exc:
+    logger.debug("pytgcalls compat patch skipped: %s", _compat_exc)
+
 SILENT_AUDIO_PATH = "silence.wav"
 
 from config import Config
@@ -3850,11 +3862,15 @@ class VoiceCallManager:
         self._stop_monitor(order_id)
 
         if keys:
-            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+            # STRICT SEQUENTIAL LEAVES BY DEFAULT: one account at a time
+            # (concurrency 1) with a 1.5-3.0s human-like gap, so the mass
+            # exit reads as "accounts leaving one by one" — never a burst
+            # of N LeaveGroupCall RPCs in the same window.
+            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 1.5)))
+            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 3.0)))
             jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
             jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 1)))
             # Shuffle so the leave order is not the same join order every time
             # (harder for anti-spam fingerprinting of a fixed sequence).
             random.shuffle(keys)

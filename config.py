@@ -104,18 +104,46 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── STRICT SEQUENTIAL VOICE JOIN (user-requested behavior) ───────────
+    # دونه‌دونه: اکانت اول وارد گروه می‌شود، وارد ویس‌کال می‌شود و بعد
+    # (با یک تأخیر کم) اکانت بعدی می‌آید. هیچ دو اکانت هم‌زمان داخل
+    # JoinGroupCall نیستند.
+    #  * windowِ Join Brain برای همیشه روی 1 قفل می‌شود (یک account در
+    #    هر wave؛ wave بعدی فقط بعد از verify کاملِ اکانت قبل شروع می‌شود).
+    #  * بین تکمیلِ اکانتِ جاری و شروعِ اکانتِ بعدی یک تأخیر انسانی
+    #    کوچک (VOICE_JOIN_ACCOUNT_GAP_*) در می‌گیرد.
+    # اگر بخواهید به مود موازی/adaptive برگردید: VOICE_JOIN_SEQUENTIAL=false
+    VOICE_JOIN_SEQUENTIAL = os.getenv('VOICE_JOIN_SEQUENTIAL', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # First wave size. 2 is the safe default: combined with the staggered
     # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
     # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
     # voice handshake. The Join Brain may still widen this (up to the max).
+    # (In sequential mode the window is pinned to 1 and these are ignored.)
     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
     # Per-order ceiling kept LOW on purpose: every simultaneous voice
     # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
     # than ~2 concurrent media setups is where transports start dying AND
     # where Telegram's per-IP burst budget starts answering with FloodWait.
+    # (In sequential mode this ceiling is overridden to 1.)
     VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # ── SEQUENTIAL GAP: تأخیر کوتاه بین «تکمیل اکانت جاری» و «شروع
+    # اکانت بعدی» (ثانیه). اکانت بعدی فقط بعد از آنکه اکانت قبلی وارد
+    # گروه + ویس‌کال شده و verify شده، وارد می‌شود — این gap فقط فاصلهٔ
+    # انسانی اضافی است تا cadence دور از burst بماند.
+    VOICE_JOIN_ACCOUNT_GAP_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MIN', '1.0'))
+    VOICE_JOIN_ACCOUNT_GAP_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MAX', '2.0'))
+    # جیتر کوچکی روی gap برای دوری از cadence کاملاً منظم (ثانیه).
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN', '0.0'))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX', '0.5'))
+    # ── SECOND CHANCE: تکمیل سفارش تا هدف (رفع «سفارش ۵۰ تایی → ۳۵») ──
+    # وقتی کل استخر اکانت‌ها مصرف شده و حسابِ attempt بعضی‌ها (خاموشی
+    # موقت / FloodWait / خطای گذری) تمام شده ولی سفارش به target نرسیده،
+    # به همان اکانت‌های زنده (NEVER اکانت‌های مرده/revoked) بودجهٔ attempt
+    # تازه می‌دهد تا چند دور بعدی را امتحان کنند.
+    VOICE_SECOND_CHANCE_ROUNDS = int(os.getenv('VOICE_SECOND_CHANCE_ROUNDS', '2'))
+    VOICE_SECOND_CHANCE_COOLDOWN_SECONDS = int(os.getenv('VOICE_SECOND_CHANCE_COOLDOWN_SECONDS', '60'))
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -156,14 +184,15 @@ class Config:
     # ── ORDER END / CANCEL LEAVE PACING (anti-burst mass-exit) ────────────
     # When an order finishes or is cancelled, accounts MUST NOT all leave the
     # voice chat / group in the same millisecond — that looks like a bot dump
-    # and can trip FloodWait / account limits.  Each leave starts
-    # VOICE_LEAVE_STAGGER_MIN..MAX seconds after the previous one, with a hard
-    # ceiling on concurrent leave RPCs (LeaveGroupCall + leave_chat).
-    # Defaults ~0.8–1.5s gap and max 2 concurrent leaves — finishes a 50-acc
-    # order in ~40–75s without a burst.  Raise the gap if Telegram floods.
-    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '0.8'))
-    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '1.5'))
-    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '2'))
+    # and can trip FloodWait / account limits.
+    # STRICT SEQUENTIAL DEFAULT (user-requested): ONE account leaves at a
+    # time (concurrency 1) with a 1.5-3.0s human-like gap between leaves, so
+    # the exit visibly happens «دونه‌دونه با تاخیر» instead of a burst.
+    # A 50-account order finishes its exit in ~2-3 minutes.  If that is too
+    # slow, raise VOICE_LEAVE_MAX_CONCURRENCY (2) and lower the gaps.
+    VOICE_LEAVE_STAGGER_MIN = float(os.getenv('VOICE_LEAVE_STAGGER_MIN', '1.5'))
+    VOICE_LEAVE_STAGGER_MAX = float(os.getenv('VOICE_LEAVE_STAGGER_MAX', '3.0'))
+    VOICE_LEAVE_MAX_CONCURRENCY = int(os.getenv('VOICE_LEAVE_MAX_CONCURRENCY', '1'))
     # Extra human-like jitter on top of the base leave gap (seconds).
     VOICE_LEAVE_JITTER_MIN = float(os.getenv('VOICE_LEAVE_JITTER_MIN', '0.0'))
     VOICE_LEAVE_JITTER_MAX = float(os.getenv('VOICE_LEAVE_JITTER_MAX', '0.4'))

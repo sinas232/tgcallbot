@@ -87,6 +87,16 @@ def _run(coro):
 HAS_TG = importlib.util.find_spec("pytgcalls") is not None and \
     importlib.util.find_spec("pyrogram") is not None
 
+# stdlib-only services — import UNCONDITIONALLY: their test classes
+# (VoiceCooldownTests / SessionOwnershipTests) run even without
+# pyrogram/pytgcalls installed (a NameError otherwise).
+from services.voice_cooldown import VoiceCooldown  # noqa: E402
+from services.session_ownership import (  # noqa: E402
+    SessionOwnership,
+    SessionInUseError,
+    session_ownership,
+)
+
 if HAS_TG:
     from pyrogram.raw import functions  # noqa: E402
     from pytgcalls import PyTgCalls  # noqa: E402
@@ -106,12 +116,6 @@ if HAS_TG:
 
     import services.voice_call_manager as vcm_mod  # noqa: E402
     from services.voice_call_manager import VoiceCallManager  # noqa: E402
-    from services.voice_cooldown import VoiceCooldown  # noqa: E402
-    from services.session_ownership import (  # noqa: E402
-        SessionOwnership,
-        SessionInUseError,
-        session_ownership,
-    )
     import services.order_executor as order_executor_mod  # noqa: E402
     from config import Config  # noqa: E402
 
