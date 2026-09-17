@@ -34,7 +34,9 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 async def safe_answer(query):
-    try: await query.answer()
+    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+    try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
 def clean_chat_id(chat_id_str: str) -> str:

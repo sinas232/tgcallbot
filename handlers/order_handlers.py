@@ -6,6 +6,7 @@ handlers/order_handlers.py
 2. دریافت ساعت دقیق و اعتبارسنجی
 3. رفع مشکل عدم واکنش دکمه‌های تقویم
 """
+import asyncio
 import logging
 import math
 import re
@@ -24,7 +25,9 @@ from services.order_executor import order_executor
 logger = logging.getLogger(__name__)
 
 async def safe_answer(query):
-    try: await query.answer()
+    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+    try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
 # -------------------- ثبت سفارش جدید --------------------

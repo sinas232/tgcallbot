@@ -650,9 +650,9 @@ def register_handlers(application: Application) -> None:
             if query:
                 try:
                     if fresh:
-                        await query.answer(_MAINT_MSG, show_alert=True)
+                        await asyncio.wait_for(query.answer(_MAINT_MSG, show_alert=True), timeout=35)
                     else:
-                        await query.answer()
+                        await asyncio.wait_for(query.answer(), timeout=35)
                 except Exception:
                     pass
             elif update.message:

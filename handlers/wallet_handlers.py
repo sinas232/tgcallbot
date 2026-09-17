@@ -2,6 +2,7 @@
 handlers/wallet_handlers.py
 مدیریت کیف پول + احراز هویت هوشمند + معافیت ادمین‌ها
 """
+import asyncio
 import logging
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
@@ -16,7 +17,9 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 async def safe_answer(query):
-    try: await query.answer()
+    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+    try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
 async def check_permissions_and_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, bot_id: int) -> tuple[bool, str]:
