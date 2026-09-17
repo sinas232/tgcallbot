@@ -9,7 +9,7 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 from database import DatabaseManager
-from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS
+from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS, is_back_text, is_cancel_text
 from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
@@ -37,8 +37,8 @@ def account_display_name(acc: dict) -> str:
 
 @require_admin
 async def account_management_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # بررسی دکمه بازگشت (فقط اگر پیام متنی باشد)
-    if update.message and update.message.text == BTN_BACK: 
+    # بررسی دکمه بازگشت (فقط اگر پیام متنی باشد) - فیکس باگ: حالا «بازگشت» بدون ایموجی هم کار می‌کند
+    if update.message and is_back_text(update.message.text):
         from handlers.admin_handlers import admin_panel_start
         return await admin_panel_start(update, context)
     

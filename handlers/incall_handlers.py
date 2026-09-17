@@ -18,7 +18,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler
 
 from database import DatabaseManager
-from constants import USER_MAIN_MENU, CANCEL_KB, BTN_CANCEL, AWAITING_INCALL_TEXT
+from constants import USER_MAIN_MENU, CANCEL_KB, BTN_CANCEL, AWAITING_INCALL_TEXT, is_cancel_text
 from helpers.message_utils import send_safe
 
 logger = logging.getLogger(__name__)
@@ -437,7 +437,7 @@ async def incall_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def incall_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """دریافت متن و ارسال گروهی، سپس بازگشت به پنل ارسال (قابل تکرار)."""
     text = (update.message.text or "").strip()
-    if BTN_CANCEL in text:
+    if is_cancel_text(text):
         await send_safe(context.bot, update.effective_chat.id, "بازگشت به پنل ارسال.",
                         reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
         await _render_compose_panel(update, context, edit=False)

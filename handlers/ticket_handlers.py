@@ -152,7 +152,7 @@ async def handle_user_ticket_message(update: Update, context: ContextTypes.DEFAU
     bot_id = context.bot_data.get("bot_id", 1)
 
     # ── دکمه‌های منوی پشتیبانی ──
-    if text == BTN_BACK_MAIN:
+    if is_back_text(text):
         from handlers.general_handlers import start_command
         return await start_command(update, context)
 
@@ -209,7 +209,7 @@ async def handle_ticket_subject(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     bot_id = context.bot_data.get("bot_id", 1)
 
-    if text == BTN_BACK_MAIN or not text:
+    if is_back_text(text) or not text:
         return await start_ticket_support(update, context)
 
     subject = _short(text, 120)
@@ -230,7 +230,7 @@ async def handle_ticket_body(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     bot_id = context.bot_data.get("bot_id", 1)
 
-    if text == BTN_BACK_MAIN:
+    if is_back_text(text):
         return await start_ticket_support(update, context)
 
     user_db = await DatabaseManager.get_user(user_id, bot_id=bot_id)
@@ -545,7 +545,7 @@ async def _send_media_attachments(context, chat_id, messages):
 async def handle_admin_reply_message(update, context):
     """ثبت و ارسال پاسخ ادمین به کاربر."""
     msg = update.message
-    if msg.text and BTN_CANCEL in msg.text:
+    if msg.text and is_cancel_text(msg.text):
         from handlers.admin_handlers import admin_panel_start
         return await admin_panel_start(update, context)
 

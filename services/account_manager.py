@@ -51,7 +51,7 @@ async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if BTN_CANCEL in text: return await cancel_handler(update, context)
+    if is_cancel_text(text): return await cancel_handler(update, context)
     
     try:
         input_num = int(text)
@@ -94,7 +94,7 @@ async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
-    if BTN_CANCEL in phone: return await cancel_handler(update, context)
+    if is_cancel_text(phone): return await cancel_handler(update, context)
     context.user_data['phone'] = phone
     await send_safe(context.bot, update.effective_chat.id, "⏳ <b>ارسال کد...</b>", parse_mode=ParseMode.HTML)
 
@@ -117,7 +117,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code = update.message.text
-    if BTN_CANCEL in code: return await cancel_handler(update, context)
+    if is_cancel_text(code): return await cancel_handler(update, context)
     client = context.user_data.get('temp_client')
     try:
         await client.sign_in(context.user_data['phone'], context.user_data['phone_code_hash'], code)
@@ -131,7 +131,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pw = update.message.text
-    if BTN_CANCEL in pw: return await cancel_handler(update, context)
+    if is_cancel_text(pw): return await cancel_handler(update, context)
     try:
         await context.user_data['temp_client'].check_password(pw)
         return await finalize_session(update, context, context.user_data['temp_client'])
@@ -212,7 +212,7 @@ async def delete_account_start(update, context):
     return AWAITING_ACCOUNT_ID_DELETE
 
 async def handle_delete_account_input(update, context):
-    if BTN_CANCEL in update.message.text: return await cancel_handler(update, context)
+    if is_cancel_text(update.message.text): return await cancel_handler(update, context)
     
     try:
         input_val = int(update.message.text)

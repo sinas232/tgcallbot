@@ -215,7 +215,7 @@ async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if update.message and update.message.text:
         choice = update.message.text
-        if BTN_BACK_MAIN in choice: return await start_command(update, context)
+        if is_back_text(choice): return await start_command(update, context)
         if "تراکنش" in choice: return await show_recent_transactions(update, context, is_callback=False)
         elif "شارژ" in choice:
             # دکمهٔ کیبورد پایین «💳 شارژ حساب» → مستقیماً جریان شارژ را شروع کن.
@@ -278,7 +278,7 @@ async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if BTN_BACK_MAIN in text: return await start_command(update, context)
+    if is_back_text(text): return await start_command(update, context)
     bot_id = context.bot_data.get('bot_id', 1)
     
     try:

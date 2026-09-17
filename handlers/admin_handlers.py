@@ -289,14 +289,14 @@ async def create_plan_start(update, context):
 
 async def receive_plan_name(update, context):
     text = update.message.text
-    if BTN_CANCEL in text: return await plan_management_menu(update, context)
+    if is_cancel_text(text): return await plan_management_menu(update, context)
     context.user_data['new_plan_name'] = text
     await send_safe(context.bot, update.effective_chat.id, "📝 **توضیحات پلن را وارد کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_PLAN_DESC
 
 async def receive_plan_desc(update, context):
     text = update.message.text
-    if BTN_CANCEL in text: return await plan_management_menu(update, context)
+    if is_cancel_text(text): return await plan_management_menu(update, context)
     context.user_data['new_plan_desc'] = text
     kb = [["🎙 ویس‌کال", "👥 عضویت گروه"], ["📢 عضویت کانال", BTN_CANCEL]]
     await send_safe(context.bot, update.effective_chat.id, "📦 **نوع سرویس را انتخاب کنید:**", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
@@ -304,7 +304,7 @@ async def receive_plan_desc(update, context):
 
 async def receive_plan_type(update, context):
     text = update.message.text
-    if BTN_CANCEL in text: return await plan_management_menu(update, context)
+    if is_cancel_text(text): return await plan_management_menu(update, context)
     type_map = {"🎙 ویس‌کال": "voice_chat", "👥 عضویت گروه": "group_join", "📢 عضویت کانال": "channel_join"}
     if text not in type_map:
         await update.message.reply_text("❌ نامعتبر. لطفاً از منو انتخاب کنید.")
@@ -315,7 +315,7 @@ async def receive_plan_type(update, context):
 
 async def receive_plan_count(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await plan_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await plan_management_menu(update, context)
     if not text.isdigit(): 
         await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
         return AWAITING_PLAN_COUNT
@@ -325,7 +325,7 @@ async def receive_plan_count(update, context):
 
 async def receive_plan_duration(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await plan_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await plan_management_menu(update, context)
     if not text.isdigit(): 
         await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
         return AWAITING_PLAN_DURATION
@@ -335,7 +335,7 @@ async def receive_plan_duration(update, context):
 
 async def receive_plan_price(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await plan_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await plan_management_menu(update, context)
     if not text.isdigit(): 
         await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
         return AWAITING_PLAN_PRICE
@@ -370,7 +370,7 @@ async def delete_plan_start(update, context):
 
 async def perform_delete_plan(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in text: return await plan_management_menu(update, context)
+    if is_cancel_text(text): return await plan_management_menu(update, context)
     try:
         idx = int(text)
         pid = context.user_data['del_map'][idx]
@@ -428,7 +428,7 @@ async def receive_plan_edit_value(update, context):
         await send_safe(context.bot, update.effective_chat.id, "منو:", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
         return AWAITING_SETTINGS_ACTION
     text = update.message.text
-    if BTN_CANCEL in text: return await plan_management_menu(update, context)
+    if is_cancel_text(text): return await plan_management_menu(update, context)
     pid = context.user_data.get('edit_pid')
     field = context.user_data.get('edit_field')
     try:
@@ -477,7 +477,7 @@ async def set_log_channel_start(update, context):
 async def set_log_channel_finish(update, context):
     text = update.message.text.strip()
     key = context.user_data.get('log_target_key')
-    if BTN_CANCEL in text or not key: return await settings_menu_handler(update, context)
+    if is_cancel_text(text): return await settings_menu_handler(update, context)
     val = clean_chat_id(text) if text != "0" else ""
     bot_id = context.bot_data.get('bot_id', 1)
     await DatabaseManager.set_setting(key, val, bot_id=bot_id)
@@ -510,7 +510,7 @@ async def admin_orders_menu(update, context):
 async def manage_orders_user_search(update, context):
     """دریافت آیدی کاربر برای نمایش سفارشات او"""
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await admin_panel_start(update, context)
+    if is_cancel_text(update.message.text): return await admin_panel_start(update, context)
     
     if not text.isdigit():
         await update.message.reply_text("❌ لطفاً عدد (ID) وارد کنید.")
@@ -608,7 +608,7 @@ async def stop_order_execute(update, context):
     text = clean_number(update.message.text)
     
     # 🔙 بازگشت هوشمند در صورت انصراف
-    if BTN_CANCEL in update.message.text:
+    if is_cancel_text(update.message.text):
         return_to = context.user_data.get('stop_order_return_to')
         if return_to == 'profile':
             uid = context.user_data.get('target_uid')
@@ -753,7 +753,7 @@ async def add_admin_start(update, context):
 
 async def perform_add_admin(update, context):
     text = update.message.text
-    if BTN_CANCEL in text: return await admin_panel_start(update, context)
+    if is_cancel_text(text): return await admin_panel_start(update, context)
     if text == "👤 ادمین عادی" or text == "⭐️ سوپر ادمین":
         role = "super_admin" if "سوپر" in text else "admin"
         context.user_data['new_admin_role'] = role
@@ -784,7 +784,7 @@ async def remove_admin_start(update, context):
 
 async def perform_remove_admin(update, context):
     text = update.message.text
-    if BTN_CANCEL in text: return await admin_panel_start(update, context)
+    if is_cancel_text(text): return await admin_panel_start(update, context)
     try: 
         uid = int(clean_number(text))
         bot_id = context.bot_data.get('bot_id', 1)
@@ -819,7 +819,7 @@ async def user_search_start(update, context):
 
 async def user_search_result(update, context):
     q = clean_number(update.message.text.strip())
-    if BTN_CANCEL in update.message.text: return await admin_panel_start(update, context)
+    if is_cancel_text(update.message.text): return await admin_panel_start(update, context)
     if not q.isdigit():
         await update.message.reply_text("❌ عدد وارد کنید.")
         return AWAITING_USER_SEARCH
@@ -1079,7 +1079,7 @@ async def private_message_start(update, context):
 
 async def private_message_confirm_user(update, context):
     text = update.message.text.strip()
-    if BTN_CANCEL in text: return await admin_panel_start(update, context)
+    if is_cancel_text(text): return await admin_panel_start(update, context)
     try: user_id = int(clean_number(text))
     except: return AWAITING_PM_ID
     bot_id = context.bot_data.get('bot_id', 1)
@@ -1093,7 +1093,7 @@ async def private_message_confirm_user(update, context):
     return AWAITING_PM_MSG
 
 async def private_message_send(update, context):
-    if update.message.text and BTN_CANCEL in update.message.text: return await admin_panel_start(update, context)
+    if update.message.text and is_cancel_text(update.message.text): return await admin_panel_start(update, context)
     target_id = context.user_data.get('pm_target_id')
     try:
         await update.message.copy(chat_id=target_id)
@@ -1109,7 +1109,7 @@ async def broadcast_start(update, context):
     return AWAITING_BROADCAST_MSG
 
 async def broadcast_confirm(update, context):
-    if update.message.text and BTN_CANCEL in update.message.text: return await admin_panel_start(update, context)
+    if update.message.text and is_cancel_text(update.message.text): return await admin_panel_start(update, context)
     context.user_data['broadcast_msg_id'] = update.message.message_id
     context.user_data['broadcast_chat_id'] = update.message.chat_id
     kb = [[InlineKeyboardButton("✅ ارسال", callback_data="confirm_broadcast"), InlineKeyboardButton("❌ لغو", callback_data="cancel_broadcast")]]
@@ -1153,7 +1153,7 @@ async def gateway_management_menu(update, context):
 async def handle_gateway_selection(update, context, gateway_name=None):
     if gateway_name: text = gateway_name
     else: text = update.message.text
-    if BTN_BACK in text: return await settings_menu_handler(update, context)
+    if is_back_text(text): return await settings_menu_handler(update, context)
     bot_id = context.bot_data.get('bot_id', 1)
     gateways = await DatabaseManager.get_all_gateways(bot_id=bot_id)
     selected_gw = None
@@ -1181,7 +1181,7 @@ async def handle_gateway_action(update, context):
     text = update.message.text
     slug = context.user_data.get('selected_gateway_slug')
     bot_id = context.bot_data.get('bot_id', 1)
-    if BTN_BACK in text: return await gateway_management_menu(update, context)
+    if is_back_text(text): return await gateway_management_menu(update, context)
     gw = await DatabaseManager.get_gateway(slug, bot_id=bot_id)
     config = json.loads(gw['config_json'])
     if "تغییر وضعیت" in text:
@@ -1205,7 +1205,7 @@ async def handle_gateway_action(update, context):
 
 async def set_gateway_config_input(update, context):
     val = update.message.text.strip()
-    if BTN_CANCEL in val: return await gateway_management_menu(update, context)
+    if is_cancel_text(val): return await gateway_management_menu(update, context)
     slug = context.user_data.get('selected_gateway_slug')
     mode = context.user_data.get('config_mode', 'main_id')
     bot_id = context.bot_data.get('bot_id', 1)
@@ -1298,7 +1298,7 @@ async def set_force_join_link(update, context):
     msg = update.message
     bot_id = context.bot_data.get('bot_id', 1)
     
-    if BTN_CANCEL in msg.text: 
+    if is_cancel_text(msg.text): 
         context.user_data.pop('temp_security_toggle', None)
         return await security_settings_menu(update, context)
         
@@ -1338,7 +1338,7 @@ async def add_reseller_start(update, context):
 
 async def receive_reseller_token(update, context):
     token = update.message.text.strip()
-    if BTN_CANCEL in token: return await reseller_management_menu(update, context)
+    if is_cancel_text(token): return await reseller_management_menu(update, context)
     if ":" not in token or len(token) < 20:
         await update.message.reply_text("❌ فرمت توکن نامعتبر است.")
         return AWAITING_RESELLER_TOKEN
@@ -1352,7 +1352,7 @@ async def receive_reseller_token(update, context):
 
 async def receive_reseller_admin(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await reseller_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await reseller_management_menu(update, context)
     if not text.isdigit():
         await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
         return AWAITING_RESELLER_ADMIN
@@ -1362,21 +1362,21 @@ async def receive_reseller_admin(update, context):
 
 async def receive_reseller_api_id(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await reseller_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await reseller_management_menu(update, context)
     context.user_data['new_reseller_api_id'] = int(text) if text.isdigit() and text != "0" else None
     await send_safe(context.bot, update.effective_chat.id, "🔌 **لطفاً API HASH را وارد کنید:**\n(اگر مرحله قبل 0 زدید، اینجا هم 0 بزنید)", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_RESELLER_API_HASH
 
 async def receive_reseller_api_hash(update, context):
     text = update.message.text.strip()
-    if BTN_CANCEL in text: return await reseller_management_menu(update, context)
+    if is_cancel_text(text): return await reseller_management_menu(update, context)
     context.user_data['new_reseller_api_hash'] = text if text != "0" and len(text) > 5 else None
     await send_safe(context.bot, update.effective_chat.id, "⏳ **تعداد روزهای اعتبار (شارژ) را وارد کنید:**\n(مثلاً 30)", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_RESELLER_CHARGE
 
 async def receive_reseller_charge(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await reseller_management_menu(update, context)
+    if is_cancel_text(update.message.text): return await reseller_management_menu(update, context)
     if not text.isdigit():
         await update.message.reply_text("❌ عدد وارد کنید.")
         return AWAITING_RESELLER_CHARGE
@@ -1532,7 +1532,7 @@ async def handle_reseller_action(update, context):
 
 async def receive_reseller_edit_value(update, context):
     text = update.message.text.strip()
-    if BTN_CANCEL in text: return await reseller_management_menu(update, context)
+    if is_cancel_text(text): return await reseller_management_menu(update, context)
     rid = context.user_data.get('edit_reseller_id')
     mode = context.user_data.get('edit_reseller_mode')
     if not rid: return await reseller_management_menu(update, context)
@@ -1581,7 +1581,7 @@ async def receive_reseller_edit_value(update, context):
 
 async def receive_reseller_renew_days(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in text: return await reseller_management_menu(update, context)
+    if is_cancel_text(text): return await reseller_management_menu(update, context)
     if not text.isdigit():
         await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
         return AWAITING_RESELLER_RENEW_DAYS
@@ -1618,7 +1618,7 @@ async def set_start_text_start(update, context):
 
 async def handle_setting_text_input(update, context):
     txt = update.message.text
-    if BTN_CANCEL in txt: return await settings_menu_handler(update, context)
+    if is_cancel_text(txt): return await settings_menu_handler(update, context)
     key = context.user_data.get('setting_type', 'support_text')
     bot_id = context.bot_data.get('bot_id', 1)
     await DatabaseManager.set_setting(key, txt, bot_id=bot_id)
@@ -1656,7 +1656,7 @@ async def spam_settings_callback(update, context):
 
 async def set_spam_interval_handler(update, context):
     text = clean_number(update.message.text)
-    if BTN_CANCEL in update.message.text: return await settings_menu_handler(update, context)
+    if is_cancel_text(update.message.text): return await settings_menu_handler(update, context)
     if not text.isdigit():
         await update.message.reply_text("❌ عدد نامعتبر.")
         return AWAITING_SPAM_INTERVAL
@@ -1877,7 +1877,7 @@ async def backup_action_callback(update, context):
 async def receive_restore_file(update, context):
     """دریافت فایل پشتیبان آپلودشده و اجرای بازیابی."""
     msg = update.message
-    if msg.text and BTN_CANCEL in (msg.text or ""):
+    if msg.text and is_cancel_text(msg.text):
         return await settings_menu_handler(update, context)
 
     doc = msg.document
@@ -1921,7 +1921,7 @@ async def receive_restore_file(update, context):
 async def receive_backup_channel(update, context):
     """ذخیره آیدی کانال پشتیبان."""
     text = (update.message.text or "").strip()
-    if BTN_CANCEL in text:
+    if is_cancel_text(text):
         return await settings_menu_handler(update, context)
     bot_id = context.bot_data.get('bot_id', 1)
     val = "" if text == "0" else clean_chat_id(text)
@@ -1934,7 +1934,7 @@ async def receive_backup_channel(update, context):
 async def receive_backup_interval(update, context):
     """ذخیره بازه زمانی پشتیبان‌گیری خودکار (ساعت)."""
     raw = update.message.text or ""
-    if BTN_CANCEL in raw:
+    if is_cancel_text(raw):
         return await settings_menu_handler(update, context)
     text = clean_number(raw)
     if not text.isdigit() or int(text) < 1:

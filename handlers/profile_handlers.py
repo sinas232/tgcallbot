@@ -91,7 +91,7 @@ def _display_name(acc: dict) -> str:
 
 async def select_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if BTN_BACK in text: return await admin_panel_start(update, context)
+    if is_back_text(text): return await admin_panel_start(update, context)
     
     try:
         aid = int(text)
@@ -158,7 +158,7 @@ async def get_client(context):
     return TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
 
 async def set_name_handler(update, context):
-    if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if is_cancel_text(update.message.text): return await back_to_menu(update, context)
     cl = await get_client(context)
     new_val = update.message.text
     res = await cl.update_profile(first_name=new_val)
@@ -169,7 +169,7 @@ async def set_name_handler(update, context):
     return AWAITING_PROFILE_ACTION
 
 async def set_last_name_handler(update, context):
-    if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if is_cancel_text(update.message.text): return await back_to_menu(update, context)
     cl = await get_client(context)
     new_val = update.message.text
     res = await cl.update_profile(last_name=new_val)
@@ -180,14 +180,14 @@ async def set_last_name_handler(update, context):
     return AWAITING_PROFILE_ACTION
 
 async def set_bio_handler(update, context):
-    if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if is_cancel_text(update.message.text): return await back_to_menu(update, context)
     cl = await get_client(context)
     res = await cl.update_profile(bio=update.message.text)
     await send_result(update, context, res)
     return AWAITING_PROFILE_ACTION
 
 async def set_username_handler(update, context):
-    if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if is_cancel_text(update.message.text): return await back_to_menu(update, context)
     cl = await get_client(context)
     new_val = update.message.text.lstrip('@').strip()
     res, msg = await cl.set_username(new_val)
@@ -198,7 +198,7 @@ async def set_username_handler(update, context):
     return AWAITING_PROFILE_ACTION
 
 async def set_photo_handler(update, context):
-    if update.message.text and BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if update.message.text and is_cancel_text(update.message.text): return await back_to_menu(update, context)
     if not update.message.photo: return AWAITING_PROFILE_PHOTO
     f = await update.message.photo[-1].get_file()
     path = f"temp_{f.file_unique_id}.jpg"
@@ -210,7 +210,7 @@ async def set_photo_handler(update, context):
     return AWAITING_PROFILE_ACTION
 
 async def receive_story_media(update, context):
-    if update.message.text and BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if update.message.text and is_cancel_text(update.message.text): return await back_to_menu(update, context)
     media = update.message.photo or update.message.video
     if not media: return AWAITING_STORY_MEDIA
     f_obj = media[-1] if isinstance(media, list) else media
@@ -223,7 +223,7 @@ async def receive_story_media(update, context):
     return AWAITING_STORY_CAPTION
 
 async def post_story_finish(update, context):
-    if BTN_CANCEL in update.message.text: return await back_to_menu(update, context)
+    if is_cancel_text(update.message.text): return await back_to_menu(update, context)
     path = context.user_data.get('story_path')
     cl = await get_client(context)
     res, msg = await cl.post_story(path, update.message.text)

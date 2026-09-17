@@ -126,10 +126,26 @@ BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضا
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
 BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
 
-REGEX_BACK = r".*بازگشت.*" 
+REGEX_BACK = r".*بازگشت.*"
 REGEX_CANCEL = r".*انصراف.*"
 REGEX_MAIN_MENU = r".*منوی اصلی.*"
 REGEX_EXIT_ADMIN = r".*خروج از پنل.*"
+
+# 🔧 فیکس باگ دکمه لغو/انصراف - تابع کمکی برای تشخیص متن انصراف
+# چون لایهٔ ایموجی پریمیوم ایموجی 🔙 را از متن جدا می‌کند، متن دریافتی ممکن است فقط «انصراف» باشد
+# بدون 🔙. این تابع هر دو حالت را پوشش می‌دهد
+def is_cancel_text(text: str) -> bool:
+    if not text:
+        return False
+    return "انصراف" in text or BTN_CANCEL in text or "لغو" in text
+
+def is_back_text(text: str) -> bool:
+    if not text:
+        return False
+    return "بازگشت" in text or BTN_BACK in text or BTN_BACK_MAIN in text or "منوی اصلی" in text
+
+def is_back_or_cancel(text: str) -> bool:
+    return is_cancel_text(text) or is_back_text(text)
 
 # ===================== MENUS =====================
 

@@ -48,7 +48,7 @@ async def show_plans_for_category(update: Update, context: ContextTypes.DEFAULT_
     type_map = {"🎙 ویس‌کال": "voice_chat", "👥 عضویت گروه": "group_join", "📢 عضویت کانال": "channel_join"}
     
     if text not in type_map:
-        if BTN_CANCEL in text: 
+        if is_cancel_text(text): 
             from handlers.general_handlers import start_command
             return await start_command(update, context)
         return AWAITING_SELECT_PLAN
@@ -91,13 +91,26 @@ async def show_plans_for_category(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
-    data = query.data
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data or ""
     
     if data == "cancel_order":
-        await query.delete_message()
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text("❌ سفارش لغو شد.")
+        except Exception:
+            pass
         from handlers.general_handlers import start_command
-        return await start_command(update, context)
+        # پاکسازی حافظه مکالمه و بازگشت به منوی اصلی - فیکس باگ دکمه لغو
+        context.user_data.clear()
+        await send_safe(context.bot, update.effective_chat.id, "🚫 عملیات لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+        return ConversationHandler.END
         
     try: plan_id = int(data.split("_")[2])
     except: return AWAITING_SELECT_PLAN
@@ -121,7 +134,7 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     link = update.message.text
-    if BTN_CANCEL in link:
+    if is_cancel_text(link):
         from handlers.general_handlers import start_command
         return await start_command(update, context)
         
@@ -134,7 +147,7 @@ async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_timing_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if BTN_CANCEL in text:
+    if is_cancel_text(text):
         from handlers.general_handlers import start_command
         return await start_command(update, context)
         
@@ -216,7 +229,7 @@ async def handle_calendar_selection(update: Update, context: ContextTypes.DEFAUL
 async def handle_time_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """دریافت ساعت و نهایی کردن زمان‌بندی"""
     text = clean_number(update.message.text).strip()
-    if BTN_CANCEL in update.message.text:
+    if is_cancel_text(update.message.text):
         from handlers.general_handlers import start_command
         return await start_command(update, context)
     
@@ -293,12 +306,27 @@ async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
-    data = query.data
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    data = query.data or ""
     
     if data == "cancel_order":
-        await query.delete_message()
-        await query.message.reply_text("❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text("❌ سفارش لغو شد.")
+        except Exception:
+            pass
+        # فیکس باگ دکمه لغو - اطمینان از ارسال پیام بازگشت حتی اگر delete_message یا edit شکست خورد
+        try:
+            await send_safe(context.bot, update.effective_chat.id, "❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+        except Exception:
+            pass
+        context.user_data.clear()
         return ConversationHandler.END
         
     if data == "confirm_order_pay":
@@ -374,7 +402,10 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     - برای سفارش در حال اجرا: محاسبه مصرف بر اساس ثانیه و عودت مانده
     """
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     data = query.data or ""
     try:

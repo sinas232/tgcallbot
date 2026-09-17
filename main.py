@@ -143,7 +143,11 @@ logger = logging.getLogger(__name__)
 # فیلترهای عمومی برای ناوبری
 REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
-FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
+# 🔧 فیکس باگ دکمه لغو/انصراف: قبلاً فقط بازگشت و ^🔙 را می‌گرفت، حالا انصراف هم می‌گیرد
+# تا وقتی ایموجی پریمیوم متن را به «انصراف» بدون 🔙 تبدیل می‌کند، دکمه همچنان کار کند
+FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex(REGEX_CANCEL) | filters.Regex("^🔙")
+FILTER_CANCEL = filters.Regex(REGEX_CANCEL) | filters.Regex(f"^{BTN_CANCEL}$") | filters.Regex("انصراف")
+FILTER_BACK_OR_CANCEL = FILTER_BACK | FILTER_CANCEL
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
 STD_TEXT = filters.TEXT & ~filters.COMMAND & ~FILTER_NAV_BUTTONS & ~FILTER_BACK
 # فیلتر ورودی‌های امنیتی (شامل فوروارد)
@@ -582,6 +586,25 @@ def register_handlers(application: Application) -> None:
         CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
         group=-1,
     )
+    # 🔧 فیکس باگ دکمه لغو بدون آیدی (در مرحله تایید سفارش یا لیست پلن‌ها)
+    # اگر کاربر خارج از مکالمه باشد یا persistence خراب باشد، این هندلر نجات می‌دهد
+    async def global_cancel_order_noid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        await start_command(update, context)
+        return ConversationHandler.END
+
+    application.add_handler(
+        CallbackQueryHandler(global_cancel_order_noid, pattern=r"^cancel_order$"),
+        group=0,
+    )
     
     # هندلرهای عمومی
     application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
@@ -596,11 +619,11 @@ def register_handlers(application: Application) -> None:
         return ConversationHandler.END
 
     async def global_back_safety_net(update, context):
-        """شبکه ایمنی سراسری برای دکمه‌های بازگشت.
+        """شبکه ایمنی سراسری برای دکمه‌های بازگشت و انصراف/لغو.
 
         وقتی کاربر در منویی است که هیچ مکالمه‌ای فعال نیست (مثلاً منوی
         «مدیریت اکانت‌های ربات» که بعد از پایان مکالمهٔ ادمین نمایش داده
-        می‌شود) و دکمهٔ بازگشت را می‌زند، این هندلر آن را می‌گیرد و به منوی
+        می‌شود) و دکمهٔ بازگشت/انصراف را می‌زند، این هندلر آن را می‌گیرد و به منوی
         مناسب برمی‌گرداند. چون در گروه ۰ و پس از تمام مکالمه‌ها ثبت می‌شود،
         فقط زمانی اجرا می‌شود که هیچ مکالمهٔ فعالی این آپدیت را مصرف نکرده
         باشد (مکالمه‌های فعال، بازگشت را از طریق fallback خودشان می‌گیرند).
@@ -612,8 +635,8 @@ def register_handlers(application: Application) -> None:
             return
         bot_id = context.bot_data.get('bot_id', 1)
 
-        # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
-        if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
+        # بازگشت صریح به منوی اصلی / خروج از پنل ادمین / انصراف
+        if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text or "انصراف" in text or BTN_CANCEL in text:
             return await start_command(update, context)
 
         # تشخیص ادمین بودن
@@ -635,7 +658,7 @@ def register_handlers(application: Application) -> None:
         CommandHandler("start", start_command),
         CommandHandler("cancel", start_command),
         MessageHandler(filters.CONTACT, handle_contact),
-        MessageHandler(FILTER_BACK, global_cancel_and_restart)
+        MessageHandler(FILTER_BACK_OR_CANCEL, global_cancel_and_restart)
     ]
 
     # --- 1. سیستم تیکتینگ ---
@@ -643,11 +666,18 @@ def register_handlers(application: Application) -> None:
         entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
         states={
             AWAITING_TICKET_MESSAGE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
                 CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
                 MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_ticket_message),
             ],
-            AWAITING_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_subject)],
-            AWAITING_TICKET_BODY: [MessageHandler(filters.ALL & ~filters.COMMAND, handle_ticket_body)],
+            AWAITING_TICKET_SUBJECT: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_subject)
+            ],
+            AWAITING_TICKET_BODY: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(filters.ALL & ~filters.COMMAND, handle_ticket_body)
+            ],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="support_ticket", persistent=True,
@@ -663,9 +693,15 @@ def register_handlers(application: Application) -> None:
     kyc_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_kyc_process, pattern="^start_kyc_process$")],
         states={
-            AWAITING_KYC_CARD: [MessageHandler(STD_TEXT, handle_kyc_card)],
+            AWAITING_KYC_CARD: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, handle_kyc_card)
+            ],
             # دریافت ویدیو، عکس یا داکیومنت در مرحله دوم
-            AWAITING_KYC_VIDEO: [MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)],
+            AWAITING_KYC_VIDEO: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)
+            ],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="kyc", persistent=True,
@@ -678,7 +714,7 @@ def register_handlers(application: Application) -> None:
         CommandHandler("start", start_command),
         CommandHandler("cancel", start_command),
         MessageHandler(filters.CONTACT, handle_contact),
-        MessageHandler(FILTER_BACK, admin_panel_start),
+        MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
     ]
     admin_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
@@ -828,8 +864,15 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet")
         ],
         states={
-            AWAITING_WALLET_ACTION: [MessageHandler(STD_TEXT, handle_wallet_action), CallbackQueryHandler(handle_wallet_action)],
-            AWAITING_CHARGE_AMOUNT: [MessageHandler(STD_TEXT, handle_charge_amount)],
+            AWAITING_WALLET_ACTION: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, handle_wallet_action),
+                CallbackQueryHandler(handle_wallet_action)
+            ],
+            AWAITING_CHARGE_AMOUNT: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, handle_charge_amount)
+            ],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="wallet", persistent=True,
@@ -850,14 +893,14 @@ def register_handlers(application: Application) -> None:
             MessageHandler(filters.Regex(f"^{BTN_LEAVE_ALL_CHATS}$"), leave_all_chats_start),
         ],
         states={
-            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, admin_panel_start)],
+            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
+            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start)],
             # 🔥 وضعیت تایید برای خروج همگانی
             AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
         },
@@ -876,18 +919,54 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_")
         ],
         states={
-            AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account)],
-            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)],
-            AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler)],
-            AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler)],
-            AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler)],
-            AWAITING_NEW_LAST_NAME: [MessageHandler(STD_TEXT, set_last_name_handler)],
-            AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler)],
-            AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)],
-            AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish)],
-            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)],
-            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
-            AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
+            AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, select_account)
+            ],
+            AWAITING_PROFILE_ACTION: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)
+            ],
+            AWAITING_NEW_NAME: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, set_name_handler)
+            ],
+            AWAITING_NEW_BIO: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, set_bio_handler)
+            ],
+            AWAITING_NEW_USERNAME: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, set_username_handler)
+            ],
+            AWAITING_NEW_LAST_NAME: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, set_last_name_handler)
+            ],
+            AWAITING_PROFILE_PHOTO: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(filters.PHOTO, set_photo_handler)
+            ],
+            AWAITING_STORY_MEDIA: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)
+            ],
+            AWAITING_STORY_CAPTION: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(STD_TEXT, post_story_finish)
+            ],
+            AWAITING_PRIVACY_CHOICE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)
+            ],
+            AWAITING_PRIVACY_VALUE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)
+            ],
+            AWAITING_PHOTO_NAVIGATION: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, admin_panel_start),
+                CallbackQueryHandler(photo_slider_callback)
+            ]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="prof", persistent=True,
@@ -904,7 +983,7 @@ def register_handlers(application: Application) -> None:
         ],
         states={
             AWAITING_INCALL_TEXT: [
-                MessageHandler(FILTER_BACK, incall_receive_text),
+                MessageHandler(FILTER_BACK_OR_CANCEL, incall_receive_text),
                 MessageHandler(STD_TEXT, incall_receive_text),
             ],
         },
@@ -933,15 +1012,30 @@ def register_handlers(application: Application) -> None:
         entry_points=[MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start)],
         states={
             AWAITING_SELECT_PLAN: [
-                MessageHandler(FILTER_BACK, start_command),
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
                 MessageHandler(filters.Regex("^(🎙|👥|📢)"), show_plans_for_category),
-                CallbackQueryHandler(handle_plan_callback, pattern="^buy_|^cancel")
+                CallbackQueryHandler(handle_plan_callback, pattern=r"^buy_plan_\d+$|^cancel_order$")
             ],
-            AWAITING_ORDER_TIMING_TYPE: [MessageHandler(STD_TEXT, handle_timing_type)],
-            AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection)],
-            AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
-            AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation)]
+            AWAITING_ORDER_TIMING_TYPE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, handle_timing_type)
+            ],
+            AWAITING_SCHEDULE_DATE: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                CallbackQueryHandler(handle_calendar_selection)
+            ],
+            AWAITING_SCHEDULE_TIME: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, handle_time_selection)
+            ],
+            AWAITING_ORDER_LINK: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                MessageHandler(STD_TEXT, receive_order_link)
+            ],
+            AWAITING_ORDER_CONFIRMATION: [
+                MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                CallbackQueryHandler(handle_order_confirmation)
+            ]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
@@ -968,7 +1062,7 @@ def register_handlers(application: Application) -> None:
     # اولویت دارند و این هندلر فقط زمانی اجرا می‌شود که هیچ مکالمه‌ای این
     # آپدیت را مصرف نکرده باشد (یعنی دکمهٔ بازگشتِ منویِ بی‌مکالمه).
     application.add_handler(
-        MessageHandler(FILTER_BACK | filters.Regex(REGEX_MAIN_MENU) | filters.Regex(f"^{BTN_EXIT_ADMIN}$"), global_back_safety_net),
+        MessageHandler(FILTER_BACK_OR_CANCEL | filters.Regex(REGEX_MAIN_MENU) | filters.Regex(f"^{BTN_EXIT_ADMIN}$"), global_back_safety_net),
         group=0,
     )
 

@@ -63,7 +63,7 @@ async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    if BTN_CANCEL in text: return await cancel_handler(update, context)
+    if is_cancel_text(text): return await cancel_handler(update, context)
     try:
         input_num = int(text)
         mapping = context.user_data.get('account_map_code', {})
@@ -97,7 +97,7 @@ async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
-    if BTN_CANCEL in phone: return await cancel_handler(update, context)
+    if is_cancel_text(phone): return await cancel_handler(update, context)
     context.user_data['phone'] = phone
     
     await send_safe(context.bot, update.effective_chat.id, "⏳ <b>در حال ارسال کد...</b>", parse_mode=ParseMode.HTML)
@@ -131,7 +131,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code = update.message.text
-    if BTN_CANCEL in code: return await cancel_handler(update, context)
+    if is_cancel_text(code): return await cancel_handler(update, context)
     client = context.user_data.get('temp_client')
     try:
         await client.sign_in(context.user_data['phone'], context.user_data['phone_code_hash'], code)
@@ -145,7 +145,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pw = update.message.text
-    if BTN_CANCEL in pw: return await cancel_handler(update, context)
+    if is_cancel_text(pw): return await cancel_handler(update, context)
     try:
         await context.user_data['temp_client'].check_password(pw)
         return await finalize_session(update, context, context.user_data['temp_client'])
@@ -160,21 +160,21 @@ async def import_session_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_import_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if BTN_CANCEL in text: return await cancel_handler(update, context)
+    if is_cancel_text(text): return await cancel_handler(update, context)
     context.user_data['import_api_id'] = int(text) if text.isdigit() and text != "0" else None
     await send_safe(context.bot, update.effective_chat.id, "🔌 **لطفاً API HASH را وارد کنید:**\n(اگر مرحله قبل 0 زدید، اینجا هم 0 بزنید)", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_SESSION_API_HASH
 
 async def handle_import_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if BTN_CANCEL in text: return await cancel_handler(update, context)
+    if is_cancel_text(text): return await cancel_handler(update, context)
     context.user_data['import_api_hash'] = text if text != "0" and len(text) > 5 else None
     await send_safe(context.bot, update.effective_chat.id, "📥 **لطفاً سشن استرینگ (Session String) را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_SESSION_STRING
 
 async def handle_import_session_string(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     sess_str = update.message.text.strip()
-    if BTN_CANCEL in sess_str: return await cancel_handler(update, context)
+    if is_cancel_text(sess_str): return await cancel_handler(update, context)
     if len(sess_str) < 50:
         await update.message.reply_text("❌ فرمت سشن نامعتبر است.")
         return AWAITING_SESSION_STRING
@@ -291,7 +291,7 @@ async def delete_account_start(update, context):
     return AWAITING_ACCOUNT_ID_DELETE
 
 async def handle_delete_account_input(update, context):
-    if BTN_CANCEL in update.message.text: return await cancel_handler(update, context)
+    if is_cancel_text(update.message.text): return await cancel_handler(update, context)
     try:
         input_val = int(update.message.text)
         target_aid = input_val

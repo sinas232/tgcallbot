@@ -96,7 +96,7 @@ async def handle_kyc_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = clean_number(update.message.text.strip())
     
     # دکمه انصراف
-    if BTN_CANCEL in update.message.text: 
+    if is_cancel_text(update.message.text): 
         return await start_kyc_process(update, context)
         
     if not text.isdigit() or len(text) != 16:
@@ -133,7 +133,7 @@ async def handle_kyc_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_kyc_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت ویدیو یا عکس (مرحله دوم) و ارسال نهایی به ادمین"""
     msg = update.message
-    if msg.text and BTN_CANCEL in msg.text: 
+    if msg.text and is_cancel_text(msg.text): 
         return await start_kyc_process(update, context)
     
     # پشتیبانی از ویدیو، ویدیو نوت، عکس و فایل (اگر عکس باشد)
@@ -302,7 +302,7 @@ async def set_kyc_step2_text_start(update, context):
 
 async def set_kyc_text_finish(update, context):
     txt = update.message.text
-    if BTN_CANCEL in txt:
+    if is_cancel_text(txt):
         from handlers.admin_handlers import settings_menu_handler
         return await settings_menu_handler(update, context)
 
