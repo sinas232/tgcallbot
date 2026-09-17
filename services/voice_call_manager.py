@@ -3162,6 +3162,32 @@ class VoiceCallManager:
         except Exception as exc:
             raise RuntimeError(f"Group membership not confirmed: {str(exc)[:100]}") from exc
 
+    @staticmethod
+    def _chat_id_from_join_result(r) -> Optional[int]:
+        """Extract a chat id from whatever ``Client.join_chat`` returns.
+
+        Kurigram changed this return type between releases:
+          * older releases return a ``types.Chat``            -> ``.id``
+          * newer releases return a ``ChatJoinResult``        -> ``.chat.id``
+            (``ChatJoinResultSuccess`` only — ``RequestSent`` /
+            ``GuardBotApprovalRequired`` / ``Declined`` carry no chat).
+
+        Accepting both shapes keeps the join path working across library
+        upgrades.  (Production regression, order 751: the new-style result
+        has no ``.id`` -> AttributeError -> 0/N joined.)
+        """
+        if r is None:
+            return None
+        chat = getattr(r, "chat", None)
+        if chat is not None:
+            cid = getattr(chat, "id", None)
+            if isinstance(cid, int) and cid:
+                return cid
+        cid = getattr(r, "id", None)
+        if isinstance(cid, int) and cid:
+            return cid
+        return None
+
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
             return self.order_chat_ids[order_id]
@@ -3169,8 +3195,12 @@ class VoiceCallManager:
         try:
             if target.startswith("https"):
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = self._chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
+                    chat_id = None
+                if not chat_id:
+                    # Already a member (or the join result carried no chat
+                    # id): resolve the chat WITHOUT re-joining.
                     try:
                         chat_id = (await app.get_chat(target)).id
                     except Exception:
@@ -3178,15 +3208,15 @@ class VoiceCallManager:
                             invite = target.split("+")[-1].split("/")[-1]
                             inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
                             if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
+                                chat_id = getattr(inv.chat, "id", None)
                         except Exception:
                             pass
             else:
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = self._chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
-                    chat_id = (await app.get_chat(target)).id
-                except Exception:
+                    chat_id = None
+                if not chat_id:
                     chat_id = (await app.get_chat(target)).id
         except RPCError as e:
             msg = str(e)

@@ -669,5 +669,60 @@ class PoolRefreshAndExhaustionTests(unittest.TestCase):
         self.assertIn("a for a in _fa if a.get(\"id\") != aid", fill)
 
 
+class ResolveChatIdTests(unittest.TestCase):
+    """v2.2.10: order 751 joined 0/50 with
+    ``'ChatJoinResultSuccess' object has no attribute 'id'``.
+
+    Newer kurigram versions changed ``Client.join_chat`` to return a
+    ``ChatJoinResult`` (``.chat.id``) instead of a ``Chat`` (``.id``).
+    The old code only worked while the UserAlreadyParticipant exception
+    path masked the bug (accounts already in the group). Any NEW group —
+    or an invite-link group — hit the Ok result and crashed for EVERY
+    account. The helper must accept both return shapes, and
+    ``_resolve_chat_id`` must never read ``.id`` off the join result.
+    """
+
+    @staticmethod
+    def _load_helper():
+        import textwrap
+        import typing
+        src = _read_source("services/voice_call_manager.py")
+        fn = src[src.index("def _chat_id_from_join_result"):]
+        fn = fn[:fn.index("async def _resolve_chat_id")]
+        fn = textwrap.dedent(fn)
+        ns: dict = {"Optional": typing.Optional}
+        exec(compile(fn, "voice_call_manager_helper", "exec"), ns)
+        return ns["_chat_id_from_join_result"]
+
+    def test_new_style_chatjoinresult_success(self):
+        h = self._load_helper()
+        # ChatJoinResultSuccess: has .chat (a Chat), NO .id on the result
+        r = SimpleNamespace(chat=SimpleNamespace(id=-1001956513128))
+        self.assertEqual(h(r), -1001956513128)
+
+    def test_old_style_chat_result(self):
+        h = self._load_helper()
+        r = SimpleNamespace(id=-1001234567890)
+        self.assertEqual(h(r), -1001234567890)
+
+    def test_result_without_chat_returns_none(self):
+        h = self._load_helper()
+        # ChatJoinResultRequestSent / Declined / GuardBot: no chat, no id
+        self.assertIsNone(h(SimpleNamespace()))
+        self.assertIsNone(h(None))
+
+    def test_resolve_chat_id_never_reads_dot_id_off_join_result(self):
+        src = _read_source("services/voice_call_manager.py")
+        fn = src[src.index("async def _resolve_chat_id"):]
+        fn = fn[:fn.index("async def _force_refresh_call")]
+        self.assertNotIn("(await app.join_chat(target)).id", fn)
+        self.assertIn("self._chat_id_from_join_result(await app.join_chat(target))", fn)
+        # both target shapes (invite link / username) go through the helper
+        self.assertGreaterEqual(fn.count("self._chat_id_from_join_result("), 2)
+        # and the no-chat fallback still resolves via get_chat / CheckChatInvite
+        self.assertIn("app.get_chat(target)", fn)
+        self.assertIn("CheckChatInvite", fn)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
