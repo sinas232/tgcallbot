@@ -4373,6 +4373,21 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
             except Exception as e:
+                if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                    # The session is actively held by ANOTHER connection.
+                    # Not a dead session: the scheduler must retry WITHOUT
+                    # spending the attempt budget (see order_executor).
+                    self._set_state(
+                        order_id, account_id, FAILED,
+                        "session held by another connection (AUTH_KEY_DUPLICATED)",
+                    )
+                    logger.warning(
+                        "[VoiceSession] acc=%s AUTH_KEY_DUPLICATED — session is "
+                        "actively used by another connection (stale process / "
+                        "another server / phone). Retrying without budget loss.",
+                        account_id,
+                    )
+                    return False, f"AUTH_KEY_DUPLICATED: {str(e)[:120]}", 0
                 self._set_state(order_id, account_id, FAILED, f"client init error: {e}")
                 return False, f"Client Init Error: {e}", 0
 

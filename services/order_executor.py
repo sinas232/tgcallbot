@@ -13,7 +13,7 @@ from database import DatabaseManager
 from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
-from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
+from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD, OUTCOME_FAIL
 from services.session_ownership import SessionInUseError
 from services import self_healing
 
@@ -63,6 +63,7 @@ class OrderExecutor:
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> temporarily dropped (budget exhausted OR dead)
 		self._voice_dead: Dict[int, Set[int]] = {}            # account_id -> PERMANENTLY dead (session revoked...) — never retried
 		self._voice_second_chance: Dict[int, int] = {}        # order_id -> second-chance rounds already granted
+		self._voice_conflict_warned: Dict[int, Set[int]] = {}  # order_id -> account ids already warned (session conflict)
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -391,6 +392,7 @@ class OrderExecutor:
 	    self._voice_banned.setdefault(order_id, set())
 	    self._voice_dead.setdefault(order_id, set())
 	    self._voice_second_chance.setdefault(order_id, 0)
+	    self._voice_conflict_warned.setdefault(order_id, set())
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -405,6 +407,7 @@ class OrderExecutor:
 	    self._voice_banned.pop(order_id, None)
 	    self._voice_dead.pop(order_id, None)
 	    self._voice_second_chance.pop(order_id, None)
+	    self._voice_conflict_warned.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -820,6 +823,42 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
+	                # ── SESSION CONFLICT (AUTH_KEY_DUPLICATED) ───────────────
+	                # The account's session is actively held by ANOTHER
+	                # connection (a stale bot container/process, a previous
+	                # order on another server, or a manual phone login).
+	                # This is NOT an account fault: never spend the attempt
+	                # budget — wait for the other connection to drop, then
+	                # retry. (This is the root cause of سفارش 50 ≠ 35: the accounts
+	                # whose sessions were held elsewhere used to burn their
+	                # budget and get banned, so the fill stopped below target.)
+	                if "AUTH_KEY_DUPLICATED" in upper:
+	                    conflict_wait = max(
+	                        30.0,
+	                        float(getattr(Config, "VOICE_SESSION_CONFLICT_RETRY_SECONDS", 60)),
+	                    )
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + conflict_wait
+	                    warned = self._voice_conflict_warned.setdefault(order_id, set())
+	                    if aid not in warned:
+	                        warned.add(aid)
+	                        logger.warning(
+	                            f"Order {order_id}: account {aid} SESSION CONFLICT "
+	                            "(AUTH_KEY_DUPLICATED) — this account's session is "
+	                            "actively used by another connection (old bot "
+	                            "container/process, previous server, or manual "
+	                            f"device login). NOT counted as an attempt; retrying "
+	                            f"in {conflict_wait:.0f}s. Fix: stop the other "
+	                            "connection (docker ps -a / old server) or log the "
+	                            "account out from that device."
+	                        )
+	                    else:
+	                        logger.info(
+	                            f"Order {order_id}: account {aid} still session-"
+	                            f"conflicted; retrying in {conflict_wait:.0f}s"
+	                        )
+	                    join_brain.report_result(order_id, OUTCOME_FAIL, msg)
+	                    wave_fail += 1
+	                    continue
 	                if status == "dead" or any(x in upper for x in (
 	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
 	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",

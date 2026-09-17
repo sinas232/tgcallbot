@@ -363,6 +363,7 @@ class SecondChanceTests(unittest.TestCase):
             ("services.join_brain", {
                 "join_brain": SimpleNamespace(forget_order=lambda *a, **k: None),
                 "OUTCOME_OK": "ok", "OUTCOME_DEAD": "dead", "OUTCOME_FLOOD": "flood",
+                "OUTCOME_FAIL": "fail", "OUTCOME_PERMANENT": "permanent",
             }),
             ("services.session_ownership", {
                 "SessionInUseError": type("SessionInUseError", (Exception,), {}),
@@ -541,6 +542,52 @@ class SequentialConfigTests(unittest.TestCase):
             "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS",
         ):
             self.assertIn(key, src, f"missing {key} in .env.example")
+
+
+class SessionConflictTests(unittest.TestCase):
+    """AUTH_KEY_DUPLICATED must NOT be treated as an account failure:
+    it is a session held by ANOTHER connection — the attempt budget has
+    to survive so the account re-joins as soon as the other connection
+    drops (root cause of the 50-order stopping at 35)."""
+
+    def test_classification_is_not_dead(self):
+        # Drop any test stub so the REAL classifier is exercised.
+        if "dotenv" not in sys.modules:
+            dotenv = types.ModuleType("dotenv")
+            dotenv.load_dotenv = lambda *a, **k: None
+            sys.modules["dotenv"] = dotenv
+        sys.modules.pop("services.join_brain", None)
+        from services.join_brain import classify_message, OUTCOME_DEAD
+        msg = "AUTH_KEY_DUPLICATED: Telegram says: [406 AUTH_KEY_DUPLICATED] - The same authorization key has been used for another active connection."
+        self.assertNotEqual(classify_message(msg), OUTCOME_DEAD)
+        msg2 = "Client Init Error: Telegram says: [406 AUTH_KEY_DUPLICATED]"
+        self.assertNotEqual(classify_message(msg2), OUTCOME_DEAD)
+        # ...while real dead markers still classify dead
+        self.assertEqual(classify_message("SESSION_REVOKED: bye"), OUTCOME_DEAD)
+
+    def test_executor_preserves_budget_on_conflict(self):
+        src = _read_source("services/order_executor.py")
+        fill = src[src.index("async def _voice_batched_fill"):]
+        self.assertIn('if "AUTH_KEY_DUPLICATED" in upper:', fill)
+        # the conflict branch must schedule a retry WITHOUT touching
+        # _voice_attempts / _voice_banned (budget preserved)
+        branch = fill[fill.index('if "AUTH_KEY_DUPLICATED" in upper:'):
+                      fill.index("if status == \"dead\"")]
+        self.assertIn("retry_after", branch)
+        self.assertNotIn("_voice_attempts", branch)
+        self.assertNotIn("_voice_banned", branch)
+        self.assertIn("_mark_account_dead" if False else "conflict_wait", branch)
+
+    def test_vcm_returns_clean_conflict_message(self):
+        src = _read_source("services/voice_call_manager.py")
+        self.assertIn('f"AUTH_KEY_DUPLICATED: {str(e)[:120]}"', src)
+
+    def test_config_default_60s(self):
+        from config import Config
+        v = float(getattr(Config, "VOICE_SESSION_CONFLICT_RETRY_SECONDS", -1))
+        self.assertGreaterEqual(v, 30.0)
+        self.assertLessEqual(v, 300.0)
+        self.assertIn("VOICE_SESSION_CONFLICT_RETRY_SECONDS", _read_source(".env.example"))
 
 
 if __name__ == "__main__":

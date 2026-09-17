@@ -144,6 +144,13 @@ class Config:
     # تازه می‌دهد تا چند دور بعدی را امتحان کنند.
     VOICE_SECOND_CHANCE_ROUNDS = int(os.getenv('VOICE_SECOND_CHANCE_ROUNDS', '2'))
     VOICE_SECOND_CHANCE_COOLDOWN_SECONDS = int(os.getenv('VOICE_SECOND_CHANCE_COOLDOWN_SECONDS', '60'))
+    # —— SESSION CONFLICT (AUTH_KEY_DUPLICATED) ——
+    # When an account's session is actively held by ANOTHER connection
+    # (stale bot container/process, a previous server, or a manual phone
+    # login), the join fails with 406 AUTH_KEY_DUPLICATED. That is NOT an
+    # account fault: the attempt budget is preserved and the account is
+    # retried every N seconds until the other connection drops.
+    VOICE_SESSION_CONFLICT_RETRY_SECONDS = float(os.getenv('VOICE_SESSION_CONFLICT_RETRY_SECONDS', '60'))
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
