@@ -528,7 +528,7 @@ def _classify_error(err: Exception, message: str = "") -> str:
     if "timeout" in s or "timed out" in s or "connection" in s or "transport" in s or \
        "network" in s or "500" in s or "502" in s or "503" in s or "retries exhausted" in s or \
        "internal server" in s or "internal problems" in s or "server is having" in s or \
-         "interdc" in s or "in flight" in s or "retry deferred" in s:
+         "interdc" in s or "x_call" in s or "rich_error" in s or "in flight" in s or "retry deferred" in s:
         return FAILURE_NETWORK
     if "invalid link" in s or "username_invalid" in s or "account restricted" in s or \
        "cannot find" in s or "could not resolve" in s or "membership" in s or \
@@ -556,7 +556,7 @@ def _is_transient(err: Exception) -> bool:
         x in s
         for x in (
             "cancelled", "internal server", "internal problems", "server is having",
-            "retries exhausted", "telegramservererror", "interdc", "timeout", "timed out",
+            "retries exhausted", "telegramservererror", "interdc", "x_call", "rich_error", "timeout", "timed out",
             "network", "connection", "temporary", "try again", "flood", "groupcall", "transport",
             "no active", "500", "502", "503",
         )
@@ -2826,14 +2826,18 @@ class VoiceCallManager:
                         # and misclassified as non-retryable UNKNOWN.
                         err_str = type(e).__name__
                     self._inflight_joins.pop(join_key, None)
-                    # 🔧 فیکس INTERDC_X_CALL_RICH_ERROR - خطای داخلی DC4 تلگرام
-                    # این خطا موقتی است و معمولاً با رفرش کش و تأخیر حل می‌شود
+                    # 🔧 فیکس INTERDC_X_CALL_RICH_ERROR / X_CALL_ERROR - خطای داخلی DC4 تلگرام
+                    # این خطا موقتی است و معمولاً با رفرش کش و تأخیر بیشتر حل می‌شود
+                    # هر دو واریانت را پوشش می‌دهد: RICH_ERROR و X_CALL_ERROR
                     low = err_str.lower()
-                    if "interdc" in low or "rich_error" in low or "x_call_rich" in low or ("500" in low and "join" in low):
-                        self._vc_event_log(order_id, account_id, "interdc_rich_error", {"chat_id": chat_id, "error": err_str[:120]})
+                    if "interdc" in low or "rich_error" in low or "x_call" in low or "x_call_error" in low or ("500" in low and "inter" in low):
+                        self._vc_event_log(order_id, account_id, "interdc_error", {"chat_id": chat_id, "error": err_str[:150]})
+                        # رفرش کش و مدارشکن برای چت
                         await self._force_refresh_call(app, chat_id)
-                        await asyncio.sleep(random.uniform(2.0, 5.0))
-                        return False, f"INTERDC transient (retrying): {err_str[:60]}"
+                        self._record_join_strategy(int(chat_id), False, f"INTERDC:{err_str[:80]}")
+                        # تأخیر طولانی‌تر برای ریکاوری DC
+                        await asyncio.sleep(random.uniform(5.0, 12.0))
+                        return False, f"INTERDC transient (retrying): {err_str[:80]}"
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
                         self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
