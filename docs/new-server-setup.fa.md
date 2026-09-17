@@ -71,8 +71,8 @@ git clone https://github.com/sinas232/tgcallbot.git
 cd tgcallbot
 
 # روی برنچی که تغییرات پایداری ویس روی آن است:
-git checkout arena/01a08f7a-tgcallbot
-git pull origin arena/01a08f7a-tgcallbot
+git checkout arena/01a0aeae-tgcallbot
+git pull origin arena/01a0aeae-tgcallbot
 ```
 
 ---

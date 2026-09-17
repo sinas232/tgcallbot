@@ -192,10 +192,21 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     if is_god and bot_id == 1: kb.insert(5, ["🛠 مدیریت سرویس‌ها"])
     if is_god and bot_id == 1: kb.insert(6, [BTN_BACKUP_RESTORE])
+    # 🛠 حالت تعمیرات: فقط سوپرادمین (گاد یا نقش super_admin)
+    _is_super_maint = is_god
+    if not _is_super_maint and update.effective_user:
+        try:
+            _me = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+            _is_super_maint = bool(_me and _me.get('admin_role') == 'super_admin')
+        except Exception:
+            _is_super_maint = False
+    if _is_super_maint:
+        kb.insert(5, ["🛠 حالت تعمیرات"])
     
     if update.message:
         text = update.message.text
         if "مدیریت سفارشات" in text: return await admin_orders_menu(update, context)
+        if "حالت تعمیرات" in text: return await maintenance_menu(update, context)
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
@@ -230,6 +241,73 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     return AWAITING_SETTINGS_ACTION
+
+def _maintenance_text(on):
+    status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
+    return (
+        "🛠 **حالت تعمیرات (Maintenance)**\\n\\n"
+        f"وضعیت فعلی: {status}\\n\\n"
+        "وقتی فعال باشد، هیچ کاربری (حتی ادمین عادی) نمی‌تواند با ربات "
+        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\\n"
+        "برای آپدیت امن: اول فعال کنید، آپدیت کنید، بعد خاموش کنید."
+    )
+
+
+def _maintenance_kb(on):
+    if on:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🟢 خاموش کردن (بازگشت به حالت عادی)", callback_data="maint_off")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔴 فعال‌سازی حالت تعمیرات", callback_data="maint_on")]])
+
+
+@require_super_admin
+async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """منوی حالت تعمیرات — فقط سوپرادمین."""
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        on = context.bot_data.get('maintenance_mode')
+        if on is None:
+            on = (await DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id)) == "1"
+            context.bot_data['maintenance_mode'] = on
+    except Exception:
+        on = False
+    await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
+    return AWAITING_SETTINGS_ACTION
+
+
+async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """روشن/خاموش کردن حالت تعمیرات — فقط سوپرادمین (دکمهٔ شیشه‌ای)."""
+    query = update.callback_query
+    user = update.effective_user
+    bot_id = context.bot_data.get('bot_id', 1)
+    allowed = bool(user and user.id in Config.ADMIN_IDS)
+    if not allowed and user:
+        try:
+            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            allowed = bool(db_user and db_user.get('admin_role') == 'super_admin')
+        except Exception:
+            allowed = False
+    if not allowed:
+        try:
+            await query.answer("⛔️ مخصوص سوپرادمین.", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+    on = (query.data == "maint_on")
+    try:
+        await DatabaseManager.set_setting("maintenance_mode", "1" if on else "0", bot_id=bot_id)
+    except Exception:
+        pass
+    context.bot_data['maintenance_mode'] = on
+    try:
+        await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(_maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
+    except Exception:
+        pass
+    return AWAITING_SETTINGS_ACTION
+
 
 @require_admin
 async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

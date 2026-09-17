@@ -53,7 +53,7 @@ from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ConversationHandler, CallbackQueryHandler, filters,
-    PicklePersistence, ContextTypes
+    PicklePersistence, ContextTypes, ApplicationHandlerStop
 )
 # 🔥 تنظیمات پیشرفته شبکه برای جلوگیری از تایم‌اوت
 from telegram.request import HTTPXRequest
@@ -587,6 +587,93 @@ def register_handlers(application: Application) -> None:
     """ثبت تمام هندلرهای ربات"""
     application.add_error_handler(error_handler)
 
+    # ─────────────────────────────────────────────────────────────
+    # 🛠 نگهبان «حالت تعمیرات» — اولین هندلر group=-1 (قبل از همه).
+    #
+    # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
+    # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
+    # با ApplicationHandlerStop جلوی رسیدن آپدیت به بقیهٔ هندلرها گرفته
+    # می‌شود. پرچم در دیتابیس ذخیره و در bot_data کش می‌شود تا با ری‌استارت
+    # (حین آپدیت) از بین نرود.
+    # ─────────────────────────────────────────────────────────────
+    _MAINT_MSG = (
+        "🔧 ربات در حال بروزرسانی است...\n\n"
+        "لطفاً چند دقیقهٔ دیگر تلاش کنید. 🙏"
+    )
+
+    async def _is_super_admin_user(update, context) -> bool:
+        try:
+            user = update.effective_user
+            if not user:
+                return False
+            if user.id in Config.ADMIN_IDS:
+                return True
+            bot_id = context.bot_data.get('bot_id', 1)
+            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            return bool(db_user and db_user.get('admin_role') == 'super_admin')
+        except Exception:
+            return False
+
+    async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user:
+            return
+        try:
+            flag = context.bot_data.get('maintenance_mode', None)
+            if flag is None:
+                # تنبل: فقط یک‌بار از دیتابیس خوانده و کش می‌شود. هندلر
+                # تاگل، هم کش و هم دیتابیس را با هم به‌روز می‌کند.
+                try:
+                    bot_id = context.bot_data.get('bot_id', 1)
+                    flag = (await DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id)) == "1"
+                except Exception:
+                    flag = False
+                context.bot_data['maintenance_mode'] = flag
+            if not flag:
+                return
+            if await _is_super_admin_user(update, context):
+                return
+            # کاربر غیرسوپر در حالت تعمیرات → پیام (تراتل ۶۰ ثانیه‌ای) + توقف انتشار.
+            now = time.time()
+            try:
+                last = float((context.user_data or {}).get('maint_notice_ts', 0))
+            except Exception:
+                last = 0.0
+            fresh = (now - last) >= 60
+            query = update.callback_query
+            if query:
+                try:
+                    if fresh:
+                        await query.answer(_MAINT_MSG, show_alert=True)
+                    else:
+                        await query.answer()
+                except Exception:
+                    pass
+            elif update.message:
+                if fresh:
+                    try:
+                        await update.message.reply_text(_MAINT_MSG)
+                    except Exception:
+                        pass
+            if fresh:
+                try:
+                    context.user_data['maint_notice_ts'] = now
+                except Exception:
+                    pass
+            raise ApplicationHandlerStop
+        except ApplicationHandlerStop:
+            raise
+        except Exception:
+            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
+            return
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
+        group=-1,
+    )
+    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+
+
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
     application.add_handler(
         CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
@@ -626,7 +713,7 @@ def register_handlers(application: Application) -> None:
         r"^(🤖 مدیریت نمایندگی‌ها|➕ افزودن نماینده جدید|📋 لیست نمایندگان"
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
-        r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت"
+        r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
@@ -819,7 +906,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
             CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
             CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
-            CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\\d+$"),
+            CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
             CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
             CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
             CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
@@ -830,6 +917,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
             CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+            CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
         ],
         states={
             AWAITING_SETTINGS_ACTION: [
@@ -864,7 +952,7 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
@@ -903,6 +991,7 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
                 # ── مدیریت اکانت‌ها (قبلاً acc_conv جدا بود؛ حالا داخل ادمین) ──
@@ -1247,6 +1336,5 @@ if __name__ == "__main__":
     else:
         loop = asyncio.new_event_loop()
         logger.info("using the default asyncio event loop (uvloop unavailable)")
-    asyncio.set_event_loop(loop)
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main_loop())
