@@ -228,6 +228,31 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── MEDIA MODE: listener (zero-ffmpeg) vs. silence stream ────────────
+    # 'listener' : join the voice chat WITHOUT publishing any media. A listener
+    #              needs no ffmpeg process and no Opus encoder at all — the
+    #              per-account cost drops from ~15-30MB RAM + a big share of a
+    #              CPU core (ffmpeg looping the silence file as fast as the pipe
+    #              allows: ~148% of a core measured) to a few MB and ~0% CPU.
+    #              Telegram counts listeners as participants exactly like
+    #              publishers.
+    # 'media'    : the classic behaviour — publish a looping silence stream
+    #              (needed only when a chat/Telegram build refuses listeners).
+    # 'auto'     : start in listener mode; if an account is dropped shortly
+    #              after a listener join (or the join is rejected) the mode is
+    #              disabled for the whole process and every later join uses the
+    #              silence stream, so a bad guess can never break orders.
+    VOICE_SILENCE_MODE = os.getenv('VOICE_SILENCE_MODE', 'auto').strip().lower()
+    # How long a listener join must survive to be considered "proven good".
+    VOICE_LISTENER_PROBE_SECONDS = int(os.getenv('VOICE_LISTENER_PROBE_SECONDS', '60'))
+    # Listener-join failures/drops tolerated in auto mode before permanently
+    # falling back to the silence stream.  Rejections (and drops right after a
+    # listener join) count as failures; drops that happen LATER — i.e. a
+    # listener mode that works but is not held forever — are counted
+    # separately by VOICE_LISTENER_MAX_DROPS so a chat that silently evicts
+    # listeners still ends up on the proven silence stream.
+    VOICE_LISTENER_MAX_FAILURES = int(os.getenv('VOICE_LISTENER_MAX_FAILURES', '2'))
+    VOICE_LISTENER_MAX_DROPS = int(os.getenv('VOICE_LISTENER_MAX_DROPS', '3'))
     # ── Stay-alive audio format (CPU) ────────────────────────────────────
     # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
     # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo, and a
@@ -295,6 +320,66 @@ class Config:
     # Session guard: if an account's MTProto session silently died, reconnect it
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    # ── VOICE CLIENT PROFILE (RAM + API-traffic control) ─────────────────
+    # Kurigram/Pyrogram defaults are tuned for a CHAT client, not for a fleet of
+    # voice-only accounts:
+    #   * fetch_replies=True  → EVERY incoming message that replies to another
+    #     message immediately fires a `channels.GetMessages` RPC for the quoted
+    #     message. With hundreds of accounts sitting in busy supergroups this is
+    #     a PERMANENT GetMessages storm: Telegram answers FLOOD_WAIT
+    #     ("Waiting for N seconds before continuing (required by
+    #     channels.GetMessages)") and every waiting request keeps its task +
+    #     parsed-Message objects alive in RAM.
+    #   * workers=N           → N dispatcher worker tasks per client (×N accounts).
+    #   * message/topic cache → up to 1000 parsed messages held PER CLIENT.
+    # A voice client only needs the RAW update stream (WebRTC/PyTgCalls
+    # handshake + participant sync), so all of the chat-side machinery above is
+    # switched off for the long-lived `shared_client_*` clients.
+    VOICE_CLIENT_FETCH_REPLIES = os.getenv('VOICE_CLIENT_FETCH_REPLIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_TOPICS = os.getenv('VOICE_CLIENT_FETCH_TOPICS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STORIES = os.getenv('VOICE_CLIENT_FETCH_STORIES', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_FETCH_STICKERS = os.getenv('VOICE_CLIENT_FETCH_STICKERS', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_CLIENT_WORKERS = max(1, int(os.getenv('VOICE_CLIENT_WORKERS', '1')))
+    VOICE_CLIENT_MESSAGE_CACHE = max(0, int(os.getenv('VOICE_CLIENT_MESSAGE_CACHE', '50')))
+    VOICE_CLIENT_TOPIC_CACHE = max(0, int(os.getenv('VOICE_CLIENT_TOPIC_CACHE', '50')))
+
+    # ── IDLE-CLIENT REAPER (RAM hygiene) ─────────────────────────────────
+    # A connected voice client costs RAM (session + dispatcher + caches) and,
+    # because it keeps receiving updates, it also keeps generating Telegram
+    # traffic. Accounts that no order references any more MUST therefore be
+    # disconnected instead of being kept "warm" forever: a cancelled join, a
+    # pre-warmed wave that was never used, or a wave that hit its deadline all
+    # used to leave the client (and sometimes its engine + ffmpeg child) alive
+    # for the whole process lifetime — that is what made RAM stay full with
+    # ZERO active orders.
+    VOICE_IDLE_REAPER = os.getenv('VOICE_IDLE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Seconds an UNREFERENCED client may stay connected before it is closed.
+    VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+    # How often the reaper sweeps (seconds).
+    VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+    # Interval (seconds) for the `[VoiceMemory]` report line (RSS, live clients,
+    # engines, ffmpeg children) — makes RAM usage answerable from docker logs.
+    VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    # Soft RAM ceiling (MB) for the whole bot process tree. 0 = disabled.
+    # When the process RSS crosses it, the reaper stops waiting for the idle
+    # TTL and immediately closes every client no order references (+ warns in
+    # the log), so a memory spike can never turn into an OOM kill.
+    VOICE_RAM_SOFT_LIMIT_MB = max(0, int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0')))
+
+    # ── MONITOR COST (CPU / Telegram traffic) ────────────────────────────
+    # Maximum participant-list pages (500 ids each) the monitor walks per chat
+    # and cycle. The walk stops EARLY as soon as all of the order's accounts
+    # have been seen — for a normal order that is the very first page — so this
+    # cap only bounds the pathological case (huge chat, accounts missing).
+    VOICE_PARTICIPANT_MAX_PAGES = max(1, int(os.getenv('VOICE_PARTICIPANT_MAX_PAGES', '10')))
+
+    # ── DIAGNOSTIC LOG SIZE CAP (disk + I/O) ─────────────────────────────
+    # voice_calls.log / voice_drops.log / voice_telemetry.log are size-capped
+    # and rotated to `<name>.1`; 0 disables rotation. The telemetry file is
+    # written for every account on every monitor cycle, so without a cap it
+    # grows forever (tens of MB per day).
+    VOICE_LOG_MAX_MB = max(0, int(os.getenv('VOICE_LOG_MAX_MB', '25')))
 
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).

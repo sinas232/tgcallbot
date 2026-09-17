@@ -650,7 +650,13 @@ class OrderExecutor:
 	            )
 	            if lookahead:
 	                try:
-	                    warm_task = asyncio.create_task(vcm.warmup_clients(lookahead))
+	                    # order_id lets the manager close these pre-warmed clients
+	                    # when the order ends/cancels (a warm-up that never turned
+	                    # into a join used to keep a full Pyrogram client — and its
+	                    # update stream — connected forever).
+	                    warm_task = asyncio.create_task(
+	                        vcm.warmup_clients(lookahead, order_id=order_id)
+	                    )
 
 	                    def _consume_warm(_t: asyncio.Task) -> None:
 	                        try:
