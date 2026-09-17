@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 import logging
 import os
+import signal
 import time
 import asyncio
 
@@ -1321,9 +1322,82 @@ async def main_loop():
             interval=3600, first=180,
         )
 
-    # زنده نگه داشتن برنامه
+    # ── graceful shutdown ──
+    # داکر برای restart/stop اول SIGTERM می‌فرستد و بعد از مهلت (stop_grace_period)
+    # با SIGKILL می‌کشد. بدون این هندلر، پروسس وسط تماس‌های فعال کشته می‌شد و
+    # سشن‌های تلگرام روی سرور نیمه‌باز می‌ماند؛ کانتینر تازه با همان سشن‌ها وصل
+    # می‌شد و AUTH_KEY_DUPLICATED می‌گرفت که اکانت‌ها را برای همیشه می‌سوزاند.
     stop_event = asyncio.Event()
+    try:
+        _loop = asyncio.get_running_loop()
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                _loop.add_signal_handler(_sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+    except Exception:
+        pass
     await stop_event.wait()
+
+    logger.info("🛑 Shutdown signal received — stopping gracefully...")
+    # ۱) اول جلوی آپدیت‌های جدید تلگرام را بگیر (اصلی + نماینده‌ها).
+    try:
+        if main_app.updater.running:
+            await main_app.updater.stop()
+    except Exception:
+        pass
+    for _bid in [b for b in list(bot_manager.active_bots.keys()) if b != 1]:
+        try:
+            await bot_manager.stop_bot(_bid)
+        except Exception:
+            pass
+    # ۲) زمان‌بندهای سفارش را فریز کن تا وسط خاموش شدن join جدید نسازند.
+    try:
+        for _oid, _info in list(order_executor.active_orders.items()):
+            try:
+                _info["cancel_requested"] = True
+                _t = _info.get("task")
+                if _t and not _t.done():
+                    _t.cancel()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ۳) قطع سریع همهٔ کلاینت‌های ویس (بدون leave مودبانهٔ کند — خود
+    # disconnect تمیز، سشن را روی سرور تلگرام آزاد می‌کند و جلوی
+    # AUTH_KEY_DUPLICATED در استارت بعدی را می‌گیرد).
+    try:
+        from services.voice_call_manager import voice_call_manager as _vcm
+        _n = await asyncio.wait_for(_vcm.shutdown_all(timeout=60.0), timeout=70.0)
+        logger.info(f"🛑 Voice shutdown: {_n} clients disconnected.")
+    except Exception as e:
+        logger.warning(f"🛑 Voice shutdown incomplete: {e}")
+    # ۴) توقف اپ اصلی (باعث flush شدن persistence هم می‌شود).
+    try:
+        if main_app.updater.running:
+            await main_app.updater.stop()
+        try:
+            await main_app.updater.shutdown()
+        except Exception:
+            pass
+        if main_app.running:
+            await main_app.stop()
+            await main_app.shutdown()
+    except Exception as e:
+        logger.warning(f"🛑 Main app stop: {e}")
+    # ۵) جاروی نهایی تسک‌های سرگردان.
+    try:
+        _pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+        for _t in _pending:
+            try:
+                _t.cancel()
+            except Exception:
+                pass
+        if _pending:
+            await asyncio.wait(_pending, timeout=5)
+    except Exception:
+        pass
+    logger.info("🛑 Shutdown complete.")
 
 if __name__ == "__main__":
     # Build the event loop explicitly. Prefer an EXPLICIT uvloop loop (fast

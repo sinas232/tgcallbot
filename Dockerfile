@@ -38,4 +38,4 @@ RUN pip install --upgrade pip wheel setuptools && \
 
 # تغییر مهم: اول اسکریپت انتظار دیتابیس اجرا می‌شود، سپس ربات اصلی
 # اگر این خط را به حالت ساده ["python", "main.py"] برگردانید، ربات دوباره کرش می‌کند.
-CMD ["sh", "-c", "python wait_for_db.py && python clock_guard.py && python main.py"]
+CMD ["sh", "-c", "python wait_for_db.py && python clock_guard.py && exec python main.py"]

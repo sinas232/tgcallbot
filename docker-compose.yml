@@ -94,6 +94,11 @@ services:
     build: .
     container_name: telegram_bot_container
     restart: always
+    # python با exec جایگزین sh می‌شود (PID 1) تا SIGTERM را بگیرد؛
+    # خاموش شدن تمیز ده‌ها کلاینت ویس چند ثانیه طول می‌کشد، پس مهلت
+    # توقف را از ۱۰ ثانیهٔ پیش‌فرض بیشتر می‌کنیم تا SIGKILL نخورد.
+    init: true
+    stop_grace_period: 90s
     # ربات فضای شبکهٔ سرویس warp را به اشتراک می‌گذارد ⇒ کل ترافیکش از WARP رد می‌شود.
     # (به همین دلیل bot خودش ports/networks/extra_hosts ندارد؛ همه از warp می‌آید.)
     network_mode: "service:warp"
