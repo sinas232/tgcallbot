@@ -9,6 +9,67 @@
 
 ---
 
+## نسخهٔ ۲.۲.۲ — ⚡ ورود/خروج دونه‌دونه + تکمیل سفارش تا هدف + فیکس کرش UpdateGroupCall
+
+<div dir="rtl">
+
+**تاریخ:** ۱۴۰۵/۰۷/۲۷
+
+### مشکل
+۱. خطای مکرر در لاگ: `AttributeError: 'UpdateGroupCall' object has no attribute 'chat_id'`
+— py-tgcalls نسخهٔ ۲.۲.۵ (قفل‌شده در requirements) روی **هر** اپدیت خام گروپ‌کال کرش می‌کرد؛
+علاوه بر اسپم لاگ، موتور رویداد «بستن ویس‌کال» را دریافت نمی‌کرد.
+۲. سفارش ویس ۵۰ اکانتی حداکثر حدود ۳۵ اکانت وارد می‌شد و سفارش کامل انجام نمی‌شد:
+وقتی اکانت‌هایی attempt‌شان روی خطای گذری (FloodWait/transport) تمام می‌شد، banned می‌شدند
+و در استخر تنگ، جایگزین باقی نمی‌ماند و fill زیر target متوقف می‌شد.
+۳. اکانت‌ها بلافاصله بعد از ثبت سفارش **یک‌جا و با سرعت زیاد** وارد ویس‌کال می‌شدند (burst).
+۴. در پایان سفارش همهٔ اکانت‌ها یهویی و هم‌زمان خارج می‌شدند (حتی با pacing نسخهٔ ۲.۲.۱).
+
+### فیکس
+- **کرش UpdateGroupCall (وصلهٔ runtime بدون rebuild):** ماژول جدید `services/pytgcalls_compat.py`
+  بلافاصله بعد از ساخت هر موتور، callbackِ raw-update کتابخانه را wrap می‌کند و branch کرش‌کنده
+  را با رفتار درست‌شدهٔ upstream (نسخهٔ ۲.۳.۳) جایگزین می‌کند: شناسایی امن chat_id
+  (`getattr` → `peer` → reverse-lookup در کش موتور)، سینک کش تماس فعال، انتشار
+  `CLOSED_VOICE_CHAT` هنگام پایان تماس؛ سایر اپدیت‌ها بدون تغییر به callback اصلی می‌روند.
+  وصله در import-time روی `services/voice_call_manager.py` اعمال می‌شود (idempotent و کاملاً
+  defensive — اگر لایبریری متفاوت باشد هیچ اتفاقی نمی‌افتد).
+- **تکمیل سفارش تا target (second-chance):** `OrderExecutor._voice_second_chance_refresh`
+  وقتی استخر اکانت تمام شده ولی live < target، به اکانت‌های **زنده** که بودجهٔ attempt‌شان
+  روی خطای گذری تمام شده بود بودجهٔ تازه می‌دهد (با cooldown ۶۰ ثانیه و سقف
+  `VOICE_SECOND_CHANCE_ROUNDS=2` دور). اکانت‌های مرده/revoked در state جدا (`_voice_dead`)
+  ردیابی می‌شوند و **هرگز** دوباره امتحان نمی‌شوند.
+- **ورود دونه‌دونه با تاخیر کم (`VOICE_JOIN_SEQUENTIAL=true` پیش‌فرض):** پنجرهٔ Join Brain
+  روی ۱ قفل می‌شود — اکانت دوم فقط بعد از **verify کامل** اکانت اول (داخل گروه + ویس‌کال)
+  شروع می‌شود، و بعد از هر join موفق یک تأخیر انسانی کوتاه
+  (`VOICE_JOIN_ACCOUNT_GAP_*` پیش‌فرض ۱–۲ ثانیه + جیتر ۰–۰.۵ ثانیه) می‌افتد.
+  برای بازگشت به مود adaptive/موازی: `VOICE_JOIN_SEQUENTIAL=false`.
+- **خروج دونه‌دونه (STRICT SEQUENTIAL):** پیش‌فرض‌های خروج حالا
+  `VOICE_LEAVE_MAX_CONCURRENCY=1` (دقیقاً یکی‌یکی) با فاصلهٔ
+  `VOICE_LEAVE_STAGGER_MIN/MAX=1.5/3.0` ثانیه. برای ۵۰ اکانت حدود ۲–۳ دقیقه.
+  اگر کند بود: `VOICE_LEAVE_MAX_CONCURRENCY=2`.
+- **تست‌ها:** `tests/test_sequential_join.py` جدید (۱۳ تست، از جمله بازسازی دقیق
+  خطای پروداکت روی handler فیک و اثبات رفعش)، به‌روزرسانی assert نسخه، و فیکس ۹
+  خطای از پیش موجود در `tests/test_voice_regressions.py` (ImportError هنگام نبود pyrogram).
+
+### کلیدهای env جدید (همه اختیاری — مقادیر پیش‌فرض بالا)
+```env
+VOICE_JOIN_SEQUENTIAL=true
+VOICE_JOIN_ACCOUNT_GAP_MIN=1.0
+VOICE_JOIN_ACCOUNT_GAP_MAX=2.0
+VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN=0.0
+VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX=0.5
+VOICE_SECOND_CHANCE_ROUNDS=2
+VOICE_SECOND_CHANCE_COOLDOWN_SECONDS=60
+# تغییر‌شده (پیش‌فرض‌های جدید):
+VOICE_LEAVE_STAGGER_MIN=1.5
+VOICE_LEAVE_STAGGER_MAX=3.0
+VOICE_LEAVE_MAX_CONCURRENCY=1
+```
+
+</div>
+
+---
+
 ## نسخهٔ ۲.۲.۱ — 🚪 خروج مدیریت‌شده از ویس‌کال (ضد burst)
 
 <div dir="rtl">
