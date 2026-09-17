@@ -417,8 +417,10 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         # سفارش در حال اجرا → محاسبه مدت مصرف‌شده
         duration_minutes = int(order.get('duration_minutes') or 0)
-        # If the build phase is still running, service time has not started.
-        started_at = order.get('started_at')
+        # اگر فاز صورتحساب هنوز شروع نشده (started_at خالی چون سفارش در فاز
+        # build گیر کرده)، مبنای کارکرد لحظهٔ ثبت سفارش است تا عودت کاملِ
+        # اشتباه (مصرف ۰) رخ ندهد.
+        started_at = order.get('started_at') or order.get('created_at')
 
         if duration_minutes > 0 and started_at:
             # تسویه ثانیه‌ای دقیق (Precision Pro-Rated Billing):
@@ -435,8 +437,15 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 rate_per_second = total_price / total_seconds
                 spent_amount = math.ceil(elapsed_seconds * rate_per_second)
                 spent_amount = min(float(spent_amount), total_price)
+        elif duration_minutes <= 0:
+            # سفارش حجمی (بدون مدت): سهم مصرف‌شده از روی پیشرفت واقعی.
+            target_count = int(order.get('target_count') or 0)
+            progress = int(order.get('progress') or 0)
+            if target_count > 0 and progress > 0:
+                spent_amount = min(float(math.ceil(total_price * progress / target_count)), total_price)
+            else:
+                spent_amount = 0.0
         else:
-            # No duration start means no billable service time was consumed.
             spent_amount = 0.0
 
         if not await DatabaseManager.cancel_order_once(order_id):

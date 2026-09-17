@@ -718,8 +718,14 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
+	                # NOTE: AUTH_KEY_DUPLICATED means Telegram INVALIDATED the
+	                # session key (used in 2 places at once) — the account is
+	                # burned until re-login, so mark it dead immediately instead
+	                # of wasting retries/backoffs on a session that can never
+	                # connect again.
 	                if status == "dead" or any(x in upper for x in (
 	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	                    "AUTH_KEY_DUPLICATED",
 	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
 	                )):
 	                    # Account itself is dead — mark inactive & replace.

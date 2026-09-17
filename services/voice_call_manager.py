@@ -1851,6 +1851,19 @@ class VoiceCallManager:
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
                     except Exception:
+                        # Best-effort teardown of the half-open client: without
+                        # this, our own lingering connection can DUPLICATE the
+                        # session key of the next retry and burn a healthy
+                        # account (AUTH_KEY_DUPLICATED invalidates the key
+                        # server-side, so the session can never be reused).
+                        try:
+                            if app is not None:
+                                try:
+                                    await asyncio.wait_for(app.disconnect(), timeout=5)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         if held:
                             session_ownership.release_voice(account_id)
                         raise
