@@ -181,15 +181,18 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # seconds after joining (this was the primary "joins then immediately gets
 # kicked" bug). The correct section selector is the double-dash form.
 #
-# CPU: ``---start -threads 1`` is placed as an INPUT option (before ``-i``) so
-# each ffmpeg helper decodes the silence on a SINGLE thread. With dozens of
-# accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
-# per core multiplies context-switching and pins every CPU core; pinning to 1
-# thread keeps the (trivial) silence decode cheap and bounded.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+# CPU: ``-re`` is the single most important flag here.  Without it ffmpeg
+# loops the silence file AS FAST AS THE PIPE ALLOWS: measured on a real box the
+# helper process burned ~148% of a CPU core PER ACCOUNT (the "one ffmpeg at
+# 76% CPU while all cores sit at 20-30%" picture).  ``-re`` paces the input to
+# real time and the same process costs ~0.3% of a core — a ~400x reduction —
+# while ``-stream_loop -1`` still loops forever across iterations.
+# ``-threads 1`` is placed as an INPUT option too so each helper decodes the
+# silence on a SINGLE thread instead of one thread per core.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -re -threads 1 -stream_loop -1"
 
-# Same single-thread cap for the non-looping fallback (short file, plays once).
-_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
+# Same realtime cap for the non-looping fallback (short file, plays once).
+_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -re -threads 1"
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -363,6 +366,23 @@ VOICE_CLIENT_TOPIC_CACHE = max(0, int(getattr(Config, "VOICE_CLIENT_TOPIC_CACHE"
 #   * have no join/rejoin in flight,
 #   * and have been idle for VOICE_IDLE_CLIENT_TTL seconds
 #     (an order-end sweep closes unreferenced clients immediately).
+# ─── MEDIA MODE: listener (zero-ffmpeg) vs. silence stream ────────────────
+# A LISTENER joins the group call without publishing any media: ntgcalls then
+# needs no ffmpeg child and no Opus encoder.  Per account that is the
+# difference between ~15-30MB RAM + a fat share of a CPU core (see the `-re`
+# note above) and a few MB with ~0% CPU.  Telegram counts listeners as
+# participants exactly like publishers, which is all these orders sell.
+# 'media' keeps the classic silence stream; 'auto' starts as listener and
+# permanently falls back to the silence stream if listeners get dropped.
+VOICE_SILENCE_MODE = str(getattr(Config, "VOICE_SILENCE_MODE", "auto") or "auto").strip().lower()
+if VOICE_SILENCE_MODE not in ("auto", "listener", "media"):
+    VOICE_SILENCE_MODE = "auto"
+VOICE_LISTENER_PROBE_SECONDS = max(10, int(getattr(Config, "VOICE_LISTENER_PROBE_SECONDS", 60) or 60))
+VOICE_LISTENER_MAX_FAILURES = max(1, int(getattr(Config, "VOICE_LISTENER_MAX_FAILURES", 2) or 2))
+# Late drops (a listener that DID work but was later evicted) — a chat that
+# silently evicts listeners must also end up on the silence stream.
+VOICE_LISTENER_MAX_DROPS = max(1, int(getattr(Config, "VOICE_LISTENER_MAX_DROPS", 3) or 3))
+
 VOICE_IDLE_REAPER = bool(getattr(Config, "VOICE_IDLE_REAPER", True))
 VOICE_IDLE_CLIENT_TTL = max(30, int(getattr(Config, "VOICE_IDLE_CLIENT_TTL", 300) or 300))
 
@@ -521,6 +541,13 @@ logger.info(
     "prevents the channels.GetMessages flood)",
     VOICE_CLIENT_WORKERS, VOICE_CLIENT_MESSAGE_CACHE, VOICE_CLIENT_TOPIC_CACHE,
     VOICE_CLIENT_FETCH_REPLIES, VOICE_CLIENT_FETCH_TOPICS, VOICE_CLIENT_FETCH_STORIES,
+)
+logger.info(
+    "VoiceCallManager media mode=%s (listener = join without publishing media: "
+    "no ffmpeg per account; 'auto' falls back to the silence stream if listeners "
+    "are rejected; probe=%ss, max_failures=%s). Silence-stream ffmpeg is "
+    "realtime-paced (-re) — ~0.3%% of a core instead of ~150%%.",
+    VOICE_SILENCE_MODE, VOICE_LISTENER_PROBE_SECONDS, VOICE_LISTENER_MAX_FAILURES,
 )
 if bool(getattr(Config, "USE_PROXY", False)):
     logger.info(
@@ -914,6 +941,18 @@ class VoiceCallManager:
         # (the join brain warms the NEXT wave while the current one joins).
         # Warmed-but-never-used clients used to survive the order forever.
         self._warmed_by_order: Dict[int, Set[int]] = {}
+        # ── MEDIA MODE STATE (listener vs. silence stream) ────────────────
+        # `_listener_disabled` is the process-wide kill switch for listener
+        # mode; once listener joins prove unreliable we never use them again
+        # (set from config, or flipped at runtime by _note_listener_failure).
+        self._listener_disabled = VOICE_SILENCE_MODE == "media"
+        self._listener_user_forced = VOICE_SILENCE_MODE == "listener"
+        self._listener_proven = False
+        self._listener_failures = 0
+        self._listener_late_drops = 0
+        # Accounts currently inside a call as LISTENERS (no media published).
+        self._listener_accounts: Set[int] = set()
+        self._listener_joined_at: Dict[int, float] = {}
         self._idle_reaper_task: Optional[asyncio.Task] = None
         self._last_memory_log: float = 0.0
         self._reaped_total: int = 0
@@ -1035,6 +1074,12 @@ class VoiceCallManager:
         return self._client_locks[account_id]
 
     def _record_drop(self, order_id, account_id, chat_id, event, deliberate=False, reason="", extra=None) -> None:
+        # Listener-mode safety net — see _note_listener_drop().
+        try:
+            if not deliberate and account_id is not None and self.is_listener_account(account_id):
+                self._note_listener_drop(account_id, str(event))
+        except (TypeError, ValueError):
+            pass
         """Structured drop ledger → logs/voice_drops.log (JSONL).
 
         EVERY involuntary (or order-managed) leave from a voice call lands here
@@ -2173,6 +2218,8 @@ class VoiceCallManager:
             self._session_cache.pop(account_id, None)
             self._client_locks.pop(account_id, None)
             self._client_last_used.pop(account_id, None)
+            self._listener_accounts.discard(int(account_id))
+            self._listener_joined_at.pop(int(account_id), None)
             if reason:
                 logger.info(
                     "[VoiceReaper] account %s client closed (%s; engine=%s)",
@@ -2297,6 +2344,11 @@ class VoiceCallManager:
             "session_holds": holds,
             "asyncio_tasks": tasks,
             "reaped_total": self._reaped_total,
+            # media/listener accounting — the single biggest cost driver
+            "media_mode": self._media_mode_label(),
+            "listeners": len(self._listener_accounts),
+            "listener_failures": self._listener_failures,
+            "listener_late_drops": self._listener_late_drops,
         }
         report.update(_child_processes_report())
         return report
@@ -2459,6 +2511,10 @@ class VoiceCallManager:
         """One best-effort silence restart after a StreamEnded event."""
         try:
             await asyncio.sleep(0.5)
+            # A LISTENER publishes no media by design — nothing to restart
+            # (re-publishing silence would defeat the whole optimisation).
+            if self.is_listener_account(account_id):
+                return
             # NOTE: valid Telegram chat ids are NEGATIVE (e.g. -1001234567890);
             # only zero/unset means "no call at all".
             if not chat_id:
@@ -2476,7 +2532,7 @@ class VoiceCallManager:
             if int(chat_id) not in calls:
                 # Binding is gone; monitor recovery/rejoin owns this now.
                 return
-            await self._play_silence(pytg, int(chat_id))
+            await self._play_silence(pytg, int(chat_id), account_id)
             order_id = self._order_id_for_account(account_id, chat_id)
             self._vc_event_log(order_id, account_id, "silence_restarted", {"chat_id": chat_id})
             logger.info(
@@ -2585,6 +2641,10 @@ class VoiceCallManager:
             loops on invalid client instances
         """
         key = (order_id, account_id)
+        # A LISTENER intentionally has no media binding — restoring "silence"
+        # for it would spawn an ffmpeg child and defeat the optimisation.
+        if self.is_listener_account(account_id):
+            return
         if not self._media_restore_due(key):
             return
         pytg = self.clients.get(account_id)
@@ -2605,7 +2665,7 @@ class VoiceCallManager:
             async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
                 try:
                     # ── L1: fast path — re-stream on the existing engine ──
-                    await self._play_silence(pytg, cid)
+                    await self._play_silence(pytg, cid, account_id)
                     result = "restored"
                 except Exception:
                     _e1 = sys.exc_info()[1]
@@ -2629,7 +2689,7 @@ class VoiceCallManager:
                             str(e_leave)[:80] or type(e_leave).__name__,
                         )
                     try:
-                        await self._play_silence(pytg, cid)
+                        await self._play_silence(pytg, cid, account_id)
                         result = "restored_after_leave"
                     except Exception:
                         _e2 = sys.exc_info()[1]
@@ -2655,7 +2715,7 @@ class VoiceCallManager:
                                 if fresh is None:
                                     result = "rebuild_failed:no_client"
                                 else:
-                                    await self._play_silence(fresh, cid)
+                                    await self._play_silence(fresh, cid, account_id)
                                     result = "restored_after_engine_rebuild"
                             except Exception:
                                 _e3 = sys.exc_info()[1]
@@ -2727,7 +2787,109 @@ class VoiceCallManager:
         except Exception:
             return 0.0
 
-    async def _play_silence(self, pytg: PyTgCalls, chat_id: int) -> None:
+    # ─── MEDIA MODE (listener vs. silence stream) ─────────────────────────
+
+    def _media_mode_label(self) -> str:
+        """Human-readable current mode (for logs / memory report)."""
+        if self._listener_disabled:
+            return "media"
+        if self._listener_proven:
+            return "listener"
+        return "listener?" if not self._listener_user_forced else "listener"
+
+    def listener_mode_active(self) -> bool:
+        """Should new joins use the zero-ffmpeg LISTENER mode?"""
+        return not self._listener_disabled
+
+    def is_listener_account(self, account_id: int) -> bool:
+        """Is this account currently inside a call without publishing media?"""
+        try:
+            return int(account_id) in self._listener_accounts
+        except (TypeError, ValueError):
+            return False
+
+    def _note_listener_failure(self, account_id: Optional[int], reason: str) -> None:
+        """A listener join failed / was dropped → count it and give up on it.
+
+        In 'auto' mode this is the safety net that makes the optimisation
+        risk-free: after VOICE_LISTENER_MAX_FAILURES the whole process goes
+        back to the proven silence stream and never tries a listener again.
+        """
+        try:
+            self._listener_failures += 1
+            if account_id is not None:
+                self._listener_accounts.discard(int(account_id))
+                self._listener_joined_at.pop(int(account_id), None)
+        except (TypeError, ValueError):
+            pass
+        if self._listener_user_forced:
+            return  # explicit configuration wins; keep trying
+        if self._listener_disabled:
+            return
+        if self._listener_failures >= VOICE_LISTENER_MAX_FAILURES:
+            self._listener_disabled = True
+            logger.warning(
+                "[VoiceMedia] LISTENER mode disabled after %s failure(s) (last: %s) — "
+                "every later join publishes the silence stream (VOICE_SILENCE_MODE=media)",
+                self._listener_failures, reason[:120],
+            )
+            self._vc_event_log(None, account_id, "listener_mode_disabled",
+                               {"failures": self._listener_failures, "reason": reason[:120]})
+
+    def _note_listener_drop(self, account_id: int, event: str) -> None:
+        """A listener account disappeared from the call.
+
+        Early drop (inside the probe window)  → the join was not really
+        accepted; counts as a failure and, after
+        VOICE_LISTENER_MAX_FAILURES, listener mode is switched off.
+        Late drop (after the window)          → listener mode did work; it is
+        counted by VOICE_LISTENER_MAX_DROPS so a chat that evicts listeners
+        after a while still converges on the silence stream.
+        """
+        try:
+            aid = int(account_id)
+        except (TypeError, ValueError):
+            return
+        joined_at = self._listener_joined_at.get(aid, 0.0)
+        dwell = (time.time() - joined_at) if joined_at else 0.0
+        if not joined_at or dwell < VOICE_LISTENER_PROBE_SECONDS:
+            self._note_listener_failure(
+                aid, f"listener dropped {dwell:.0f}s after join ({event})",
+            )
+            return
+        self._listener_accounts.discard(aid)
+        self._listener_joined_at.pop(aid, None)
+        if self._listener_user_forced or self._listener_disabled:
+            return
+        self._listener_late_drops += 1
+        if self._listener_late_drops >= VOICE_LISTENER_MAX_DROPS:
+            self._listener_disabled = True
+            logger.warning(
+                "[VoiceMedia] LISTENER mode disabled: %s listener(s) were evicted "
+                "after working for a while (last: acc %s, %.0fs, %s) — switching to "
+                "the silence stream",
+                self._listener_late_drops, aid, dwell, event,
+            )
+            self._vc_event_log(None, aid, "listener_mode_disabled",
+                               {"reason": "late drops", "drops": self._listener_late_drops})
+
+    def _note_listener_ok(self, account_id: int) -> None:
+        """A listener account survived the probe window → the mode is proven."""
+        if self._listener_proven:
+            return
+        joined_at = self._listener_joined_at.get(int(account_id), 0.0)
+        if time.time() - joined_at < VOICE_LISTENER_PROBE_SECONDS:
+            return
+        self._listener_proven = True
+        logger.info(
+            "[VoiceMedia] LISTENER mode proven (acc %s held the call for %.0fs) — "
+            "no ffmpeg/Opus per account; RAM and CPU stay flat",
+            account_id, time.time() - joined_at,
+        )
+        self._vc_event_log(None, int(account_id), "listener_mode_proven", {})
+
+    async def _play_silence(self, pytg: PyTgCalls, chat_id: int,
+                            account_id: Optional[int] = None) -> None:
         """Join + play the LOOPING silence stream (stay-alive media).
 
         ``pytg.play()`` COMPLETING is the authoritative "the account is inside
@@ -2736,6 +2898,32 @@ class VoiceCallManager:
         account is already in the call).  The silence is looped forever with
         ``-stream_loop -1`` so the transport can never die of EOF.
         """
+        # ── LISTENER MODE (default): join with NO media at all ───────────
+        # `pytg.play(chat_id)` with no stream sends an empty MediaDescription:
+        # joinGroupCall is still issued (so Telegram registers the account as a
+        # participant) but nothing is published — no ffmpeg child, no Opus
+        # encoder, no media pipe. This is what keeps RAM/CPU flat per account.
+        if account_id is not None and self.listener_mode_active():
+            try:
+                await pytg.play(int(chat_id))
+                self._listener_accounts.add(int(account_id))
+                self._listener_joined_at[int(account_id)] = time.time()
+                self._vc_event_log(None, int(account_id), "listener_join",
+                                   {"chat_id": int(chat_id)})
+                logger.info(
+                    "[VoiceMedia] acc=%s joined chat=%s as LISTENER (no media, zero ffmpeg)",
+                    account_id, chat_id,
+                )
+                return
+            except Exception as e:
+                # Rejected listener join → remember and fall through to the
+                # silence-stream path for THIS account right away.
+                self._note_listener_failure(account_id, f"listener join failed: {e}")
+                logger.warning(
+                    "[VoiceMedia] acc=%s listener join rejected (%s) — using the silence stream",
+                    account_id, str(e)[:100],
+                )
+
         # Always cap ffmpeg at a single decode thread (CPU). When looping is on
         # we also add ``-stream_loop -1``; otherwise fall back to the
         # threads-only input options so the non-loop path is still bounded.
@@ -3228,7 +3416,7 @@ class VoiceCallManager:
                         # create a JoinGroupCall burst.
                         try:
                             group_calls = await pytg.group_calls
-                            if int(chat_id) not in group_calls:
+                            if int(chat_id) not in group_calls and not self.is_listener_account(account_id):
                                 asyncio.create_task(
                                     self._schedule_media_restore(order_id, account_id, int(chat_id))
                                 )
@@ -3250,7 +3438,9 @@ class VoiceCallManager:
                 join_key = (account_id, int(chat_id))
                 join_task = self._inflight_joins.get(join_key)
                 if join_task is None or join_task.done():
-                    join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
+                    join_task = asyncio.create_task(
+                        self._play_silence(pytg, int(chat_id), account_id)
+                    )
                     self._inflight_joins[join_key] = join_task
 
                 def _consume_join_task_result(task: asyncio.Task) -> None:
@@ -3751,10 +3941,15 @@ class VoiceCallManager:
                         # stops healthy accounts from being mis-detected as gone
                         # and then force-left around the 1-minute mark.
                         media_alive = None
-                        try:
-                            media_alive = await self._is_media_call_active(pytg, cid)
-                        except Exception:
-                            media_alive = None  # unknown → rely on the listing
+                        if self.is_listener_account(acc_id):
+                            # Listener accounts publish no media on purpose:
+                            # the engine binding is the JOIN, not a stream.
+                            media_alive = True
+                        else:
+                            try:
+                                media_alive = await self._is_media_call_active(pytg, cid)
+                            except Exception:
+                                media_alive = None  # unknown → rely on the listing
 
                         media_known = media_alive is not None
                         if media_alive is True:
@@ -3846,6 +4041,11 @@ class VoiceCallManager:
 
                         if present is True:
                             # JOINED — confirmed present (or media transport alive).
+                            if self.is_listener_account(acc_id):
+                                # A listener that keeps showing up in the
+                                # participant listing after the probe window is
+                                # proof the zero-ffmpeg mode works.
+                                self._note_listener_ok(acc_id)
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
@@ -4284,6 +4484,10 @@ class VoiceCallManager:
             inflight.cancel()
         if chat_id <= 0 and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
             return True, "Not active"
+
+        # The account is leaving: it is no longer a listener anywhere.
+        self._listener_accounts.discard(int(account_id))
+        self._listener_joined_at.pop(int(account_id), None)
 
         # Remove from persistent joined state (order is ending / cancelling).
         removed = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)

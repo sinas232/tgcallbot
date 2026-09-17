@@ -363,8 +363,10 @@ class IdleClientReaperTests(unittest.TestCase):
         for aid in ids[:37]:
             self.mgr.active_calls[(700, aid)] = {"chat_id": -100555}
         # The 3 failures are the clients a cancelled/failed join left behind.
-        for aid in joined:
-            session_ownership.acquire_voice(aid)
+        async def _hold():
+            for aid in joined:
+                await session_ownership.acquire_voice(aid)
+        _run(_hold())
         # Speed up the (tested elsewhere) paced exit so this test stays quick.
         from config import Config
         saved = (Config.VOICE_LEAVE_STAGGER_MIN, Config.VOICE_LEAVE_STAGGER_MAX,
@@ -577,6 +579,190 @@ class RamPressureTests(unittest.TestCase):
         self.assertEqual(closed, 1)
         self.assertNotIn(9002, mgr.pyrogram_clients)
         self.assertIn(9001, mgr.pyrogram_clients)  # referenced → untouched
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 4. Media mode: LISTENER (zero ffmpeg) vs. silence stream
+# ────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class FakeJoinedEngine:
+    """Records play() calls and distinguishes listener vs. media joins."""
+
+    def __init__(self):
+        self.plays = []      # list of (chat_id, has_media)
+
+    async def play(self, chat_id, stream=None, config=None):
+        self.plays.append((int(chat_id), stream is not None))
+        return None
+
+    async def mute(self, chat_id):
+        return True
+
+    @property
+    async def group_calls(self):
+        return {}
+
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ListenerModeTests(unittest.TestCase):
+    CHAT = -100555
+
+    def setUp(self) -> None:
+        self.mgr = VoiceCallManager()
+        self.engine = FakeJoinedEngine()
+        # Force the auto (default) behaviour for every test.
+        self._saved = (vcm_mod.VOICE_SILENCE_MODE,
+                       self.mgr._listener_disabled,
+                       self.mgr._listener_user_forced,
+                       self.mgr._listener_failures,
+                       self.mgr._listener_proven)
+        self.mgr._listener_disabled = False
+        self.mgr._listener_user_forced = False
+        self.mgr._listener_failures = 0
+        self.mgr._listener_proven = False
+
+    def tearDown(self) -> None:
+        self.mgr._listener_accounts.clear()
+        self.mgr._listener_joined_at.clear()
+
+    def test_library_builds_an_empty_description_for_a_listener(self):
+        """The optimisation relies on py-tgcalls turning `play(chat)` into an
+        empty MediaDescription (no microphone/speaker/camera/screen). Guard it
+        against a library upgrade silently changing that."""
+        from pytgcalls.methods.utilities.stream_params import StreamParams
+
+        md = _run(StreamParams.get_stream_params(None))
+        self.assertIsNone(md.microphone)
+        self.assertIsNone(md.speaker)
+        self.assertIsNone(md.camera)
+        self.assertIsNone(md.screen)
+
+    def test_listener_join_publishes_no_media(self):
+        """The whole point: join without media → no ffmpeg child at all."""
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7001))
+        self.assertEqual(self.engine.plays, [(self.CHAT, False)])
+        self.assertTrue(self.mgr.is_listener_account(7001))
+
+    def test_listener_join_failure_falls_back_to_silence_stream(self):
+        class RejectingEngine(FakeJoinedEngine):
+            async def play(self, chat_id, stream=None, config=None):
+                self.plays.append((int(chat_id), stream is not None))
+                if stream is None:
+                    raise RuntimeError("INVALID_PARAMS: no media")
+                return None
+
+        engine = RejectingEngine()
+        _run(self.mgr._play_silence(engine, self.CHAT, account_id=7002))
+        # Rejected listener, then a real media join on the same call.
+        self.assertEqual([has for _cid, has in engine.plays], [False, True])
+        self.assertFalse(self.mgr.is_listener_account(7002))
+        self.assertEqual(self.mgr._listener_failures, 1)
+
+    def test_auto_mode_disables_listeners_after_repeated_failures(self):
+        before = vcm_mod.VOICE_LISTENER_MAX_FAILURES
+        try:
+            for i in range(before):
+                self.mgr._note_listener_failure(7000 + i, "dropped early")
+            self.assertTrue(self.mgr._listener_disabled)
+            engine = FakeJoinedEngine()
+            _run(self.mgr._play_silence(engine, self.CHAT, account_id=7050))
+            self.assertEqual([has for _cid, has in engine.plays], [True],
+                             "after the kill switch every join must publish media")
+            self.assertEqual(self.mgr._media_mode_label(), "media")
+        finally:
+            pass
+
+    def test_late_drops_also_switch_to_the_silence_stream(self):
+        """A listener that works for a while then gets evicted repeatedly must
+        still end on the proven silence stream (bounded 'auto' safety)."""
+        max_drops = vcm_mod.VOICE_LISTENER_MAX_DROPS
+        for i in range(max_drops):
+            aid = 7100 + i
+            _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=aid))
+            # Pretend it held the call well past the probe window, then dropped.
+            self.mgr._listener_joined_at[aid] = (
+                time.time() - vcm_mod.VOICE_LISTENER_PROBE_SECONDS - 120
+            )
+            self.mgr._record_drop(1, aid, self.CHAT, "chat_left_update",
+                                  reason="evicted after a long stay")
+        self.assertEqual(self.mgr._listener_late_drops, max_drops)
+        self.assertTrue(self.mgr._listener_disabled)
+        engine = FakeJoinedEngine()
+        _run(self.mgr._play_silence(engine, self.CHAT, account_id=7199))
+        self.assertEqual([has for _cid, has in engine.plays], [True])
+
+    def test_user_forced_listener_mode_never_self_disables(self):
+        self.mgr._listener_user_forced = True
+        for i in range(5):
+            self.mgr._note_listener_failure(8000 + i, "dropped")
+        self.assertFalse(self.mgr._listener_disabled)
+
+    def test_early_drop_of_a_listener_counts_as_failure(self):
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7010))
+        self.assertIn(7010, self.mgr._listener_accounts)
+        # The account is dropped 5s after a listener join → not accepted.
+        self.mgr._record_drop(1, 7010, self.CHAT, "chat_left_update",
+                              reason="dropped right after listener join")
+        self.assertEqual(self.mgr._listener_failures, 1)
+        self.assertFalse(self.mgr.is_listener_account(7010))
+
+    def test_listener_that_survives_the_probe_is_proven(self):
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7020))
+        self.mgr._listener_joined_at[7020] = time.time() - vcm_mod.VOICE_LISTENER_PROBE_SECONDS - 1
+        self.mgr._note_listener_ok(7020)
+        self.assertTrue(self.mgr._listener_proven)
+        self.assertEqual(self.mgr._media_mode_label(), "listener")
+
+    def test_no_media_restore_for_listener_accounts(self):
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7030))
+        self.mgr.clients[7030] = self.engine
+        sched = []
+        orig = self.mgr._play_silence
+
+        async def spy(pytg, chat, account_id=None):
+            sched.append(account_id)
+            return await orig(pytg, chat, account_id)
+
+        self.mgr._play_silence = spy
+        _run(self.mgr._schedule_media_restore(1, 7030, self.CHAT))
+        self.assertEqual(sched, [], "listener must never get a silence stream")
+
+    def test_no_silence_restart_for_listener_accounts(self):
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7040))
+        self.mgr.clients[7040] = self.engine
+        self.mgr.active_calls[(1, 7040)] = {"chat_id": self.CHAT}
+        _run(self.mgr._restart_silence(7040, self.CHAT))
+        self.assertEqual([has for _cid, has in self.engine.plays], [False])
+
+    def test_stop_call_forgets_listener_state(self):
+        _run(self.mgr._play_silence(self.engine, self.CHAT, account_id=7060))
+        self.mgr.active_calls[(1, 7060)] = {"chat_id": self.CHAT}
+        self.mgr.joined_accounts_by_order[1] = {7060: {"chat_id": self.CHAT, "status": "JOINED"}}
+        _run(self.mgr.stop_call(1, 7060))
+        self.assertFalse(self.mgr.is_listener_account(7060))
+        self.assertNotIn(7060, self.mgr._listener_joined_at)
+
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class SilenceStreamCpuTests(unittest.TestCase):
+    def test_ffmpeg_is_realtime_paced(self):
+        """Without -re, ffmpeg loops the silence file as fast as the pipe allows
+        (~150% of a CPU core PER ACCOUNT, measured); -re paces it to realtime
+        (~0.3%). The flag must therefore be part of the ffmpeg parameter DSL."""
+        for params in (vcm_mod._SILENCE_FFMPEG_LOOP_PARAMS,
+                       vcm_mod._SILENCE_FFMPEG_THREADS_PARAMS):
+            self.assertIn("-re", params.split())
+            self.assertIn("-threads", params.split())
+
+    def test_flags_land_before_the_input(self):
+        from pytgcalls.ffmpeg import build_command
+        from pytgcalls.types.raw import AudioParameters
+        cmd = build_command("ffmpeg", vcm_mod._SILENCE_FFMPEG_LOOP_PARAMS,
+                            "/tmp/silence-cpu.wav", AudioParameters(24000, 1))
+        i = cmd.index("-i")
+        self.assertLess(cmd.index("-re"), i, "-re must be an INPUT option")
+        self.assertLess(cmd.index("-stream_loop"), i)
+        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "-1")
 
 
 # ────────────────────────────────────────────────────────────────────────

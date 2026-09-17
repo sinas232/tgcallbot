@@ -199,6 +199,31 @@ class Config:
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── MEDIA MODE: listener (zero-ffmpeg) vs. silence stream ────────────
+    # 'listener' : join the voice chat WITHOUT publishing any media. A listener
+    #              needs no ffmpeg process and no Opus encoder at all — the
+    #              per-account cost drops from ~15-30MB RAM + a big share of a
+    #              CPU core (ffmpeg looping the silence file as fast as the pipe
+    #              allows: ~148% of a core measured) to a few MB and ~0% CPU.
+    #              Telegram counts listeners as participants exactly like
+    #              publishers.
+    # 'media'    : the classic behaviour — publish a looping silence stream
+    #              (needed only when a chat/Telegram build refuses listeners).
+    # 'auto'     : start in listener mode; if an account is dropped shortly
+    #              after a listener join (or the join is rejected) the mode is
+    #              disabled for the whole process and every later join uses the
+    #              silence stream, so a bad guess can never break orders.
+    VOICE_SILENCE_MODE = os.getenv('VOICE_SILENCE_MODE', 'auto').strip().lower()
+    # How long a listener join must survive to be considered "proven good".
+    VOICE_LISTENER_PROBE_SECONDS = int(os.getenv('VOICE_LISTENER_PROBE_SECONDS', '60'))
+    # Listener-join failures/drops tolerated in auto mode before permanently
+    # falling back to the silence stream.  Rejections (and drops right after a
+    # listener join) count as failures; drops that happen LATER — i.e. a
+    # listener mode that works but is not held forever — are counted
+    # separately by VOICE_LISTENER_MAX_DROPS so a chat that silently evicts
+    # listeners still ends up on the proven silence stream.
+    VOICE_LISTENER_MAX_FAILURES = int(os.getenv('VOICE_LISTENER_MAX_FAILURES', '2'))
+    VOICE_LISTENER_MAX_DROPS = int(os.getenv('VOICE_LISTENER_MAX_DROPS', '3'))
     # ── Stay-alive audio format (CPU) ────────────────────────────────────
     # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,
     # channels=<n>).  MONO (1) roughly halves Opus encode CPU vs stereo, and a
