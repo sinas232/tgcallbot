@@ -25,7 +25,9 @@ python-telegram-bot[job-queue]
 # سشن‌استرینگ‌های قبلی نیز معتبر می‌مانند.
 # نکته: pyrogram اصلی نباید هم‌زمان نصب باشد (تداخل پکیج). Dockerfile قبل از
 # نصب، pyrogram/pyrofork را حذف می‌کند.
-kurigram>=2.2.25
+# پین دقیق نسخه برای بیلدهای تکرارپذیر (join_chat در 2.2.26 از Chat به
+# ChatJoinResult تغییر کرد؛ کد هر دو حالت را پشتیبانی می‌کند).
+kurigram==2.2.26
 tgcrypto>=1.2.5
 # py-tgcalls 2.3.x لازم است: نسخه‌های 2.2.x روی لایه‌های جدید تلگرام
 # (kurigram) با UpdateGroupCall بدون chat_id کرش می‌کنند

@@ -92,8 +92,22 @@ async def stop_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("⚠️ لطفا آیدی سفارش را وارد کنید.\nمثال: /stop_order 123")
             return
         order_id = int(args[0])
-        await order_executor.stop_active_order(order_id)
-        await update.message.reply_text(f"✅ دستور توقف سفارش {order_id} ارسال شد.")
+        order = await DatabaseManager.get_order(order_id)
+        if not order or (order.get('status') or '').lower() not in ('running', 'scheduled'):
+            await update.message.reply_text(f"❌ سفارش {order_id} فعال نیست (یافت نشد یا قبلاً بسته شده).")
+            return
+        # مثل مسیر منوی ادمین: اول پیش‌نمایش تسویه، بعد انتخاب نوع لغو.
+        # (توقف مستقیم بدون تسویه باعث به‌هم‌ریختن حساب کاربر می‌شد.)
+        total_price = float(order.get('price_paid') or 0)
+        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)", callback_data=f"admincancel_refund_{order_id}")],
+            [InlineKeyboardButton("🚫 لغو بدون عودت وجه", callback_data=f"admincancel_norefund_{order_id}")],
+            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{order_id}")],
+        ])
+        await update.message.reply_text(
+            f"🛑 **لغو سفارش #{order_id}**\n\n💰 هزینه کل پلن: {format_price(total_price)} تومان\n📉 مصرف‌شده تا الان: {format_price(used_cost)} تومان\n💵 قابل عودت: {format_price(refund_amount)} تومان\n\nلطفاً نوع لغو را انتخاب کنید:",
+            reply_markup=kb, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {e}")
 
@@ -233,7 +247,27 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
             txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
             for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
             if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+            kb_dead = [[InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")], [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_dead))
+            return AWAITING_SETTINGS_ACTION
+        elif data == "dead_del_all":
+            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+            if not accounts:
+                await query.edit_message_text("✅ هیچ اکانت غیرفعالی (سوخته) یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+                return AWAITING_SETTINGS_ACTION
+            kb_confirm = [[InlineKeyboardButton(f"🗑 بله، حذف {len(accounts)} اکانت سوخته", callback_data="dead_del_yes")], [InlineKeyboardButton("🔙 بازگشت", callback_data="view_dead_accounts")]]
+            await query.edit_message_text(f"⚠️ **حذف {len(accounts)} اکانت سوخته؟**\n\nاین عمل غیرقابل بازگشت است.", reply_markup=InlineKeyboardMarkup(kb_confirm))
+            return AWAITING_SETTINGS_ACTION
+        elif data == "dead_del_yes":
+            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+            n = 0
+            for acc in accounts:
+                try:
+                    if await DatabaseManager.delete_account(acc['id'], update.effective_user.id):
+                        n += 1
+                except Exception:
+                    pass
+            await query.edit_message_text(f"✅ **{n} اکانت سوخته حذف شد.**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
             return AWAITING_SETTINGS_ACTION
         elif data == "view_limited_accounts":
             accounts = await DatabaseManager.get_limited_accounts(bot_id=bot_id)
@@ -643,9 +677,7 @@ async def stop_order_execute(update, context):
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
         total_price = float(order.get('price_paid') or 0)
-        used_cost, refund_amount, _elapsed = order_executor.compute_prorated_settlement(
-            total_price, order.get('duration_minutes'), order.get('started_at')
-        )
+        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",

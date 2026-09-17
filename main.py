@@ -761,7 +761,11 @@ def register_handlers(application: Application) -> None:
 
     # --- 1. سیستم تیکتینگ ---
     support_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support),
+            # دکمه‌های شیشه‌ای کهنهٔ تیکت (بعد از /start یا ری‌استارت) هم باید کار کنند.
+            CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
+        ],
         states={
             AWAITING_TICKET_MESSAGE: [
                 CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
@@ -806,7 +810,27 @@ def register_handlers(application: Application) -> None:
         MessageHandler(FILTER_BACK, admin_panel_start),
     ]
     admin_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start),
+            # دکمه‌های شیشه‌ای کهنهٔ پنل (بعد از /start یا ری‌استارت) هم باید
+            # وارد مکالمه شوند؛ وگرنه هیچ handlerای آن‌ها را نمی‌گیرد.
+            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+            CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
+            CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
+            CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+            CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+            CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\\d+$"),
+            CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
+            CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
+            CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
+            CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
+            CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+            CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
+            CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+            CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
+            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
+            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+        ],
         states={
             AWAITING_SETTINGS_ACTION: [
                 # نمایندگی
@@ -878,7 +902,7 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
-                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
                 # ── مدیریت اکانت‌ها (قبلاً acc_conv جدا بود؛ حالا داخل ادمین) ──
@@ -1004,7 +1028,9 @@ def register_handlers(application: Application) -> None:
     wallet_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^💰 کیف پول من$"), wallet_menu_handler),
-            CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet")
+            CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet"),
+            # دکمه‌های شیشه‌ای کهنهٔ کیف پول (بعد از /start یا ری‌استارت).
+            CallbackQueryHandler(handle_wallet_action, pattern="^(charge_online|recent_transactions|card_to_card|wallet_add_new_card|back_to_wallet|chg_gw_)"),
         ],
         states={
             AWAITING_WALLET_ACTION: [
@@ -1056,7 +1082,13 @@ def register_handlers(application: Application) -> None:
 
     # --- 6. خرید سرویس ---
     buy_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start),
+            # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
+            CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
+            CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
+        ],
         states={
             AWAITING_SELECT_PLAN: [
                 MessageHandler(FILTER_BACK, start_command),
@@ -1215,5 +1247,6 @@ if __name__ == "__main__":
     else:
         loop = asyncio.new_event_loop()
         logger.info("using the default asyncio event loop (uvloop unavailable)")
+    asyncio.set_event_loop(loop)
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main_loop())

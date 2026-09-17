@@ -186,7 +186,12 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
 # per core multiplies context-switching and pins every CPU core; pinning to 1
 # thread keeps the (trivial) silence decode cheap and bounded.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+# NOTE (py-tgcalls 2.3.x): the play path now runs the ffmpeg command through
+# cleanup_commands(), which treats ANY token starting with "-" as a flag and
+# drops unknown ones — including the "-1" VALUE of -stream_loop. The result
+# was instant EOF ("Reached end of the file") + an endless StreamEnded loop.
+# A huge positive loop count behaves as infinite without a negative value.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop 1000000"
 
 # Same single-thread cap for the non-looping fallback (short file, plays once).
 _SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
@@ -541,6 +546,28 @@ def _classify_error(err: Exception, message: str = "") -> str:
 
 def _failure_is_retryable(failure_class: str) -> bool:
     return failure_class in _RETRYABLE_FAILURES
+
+
+def _chat_id_from_join_result(res: object) -> Optional[int]:
+    """Extract the chat id from join_chat() across pyrogram/kurigram versions.
+
+    Classic pyrogram returns a Chat (``.id``). kurigram>=2.2.26 returns a
+    ChatJoinResult union instead: success carries ``.chat.id`` while anything
+    else (request-sent / declined / guard-bot approval) means we did NOT join
+    and must fail with a meaningful message instead of AttributeError.
+    """
+    if res is None:
+        return None
+    chat = getattr(res, "chat", res)
+    cid = getattr(chat, "id", None)
+    if cid is not None:
+        try:
+            return int(cid)
+        except (TypeError, ValueError):
+            return None
+    raise RuntimeError(
+        f"Join not completed ({type(res).__name__}); approval may be required"
+    )
 
 
 def _is_transient(err: Exception) -> bool:
@@ -2469,7 +2496,7 @@ class VoiceCallManager:
         try:
             if target.startswith("https"):
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = _chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
                     try:
                         chat_id = (await app.get_chat(target)).id
@@ -2483,7 +2510,7 @@ class VoiceCallManager:
                             pass
             else:
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = _chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
                     chat_id = (await app.get_chat(target)).id
                 except Exception:

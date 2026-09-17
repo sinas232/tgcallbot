@@ -11,3 +11,6 @@ unknown_errors.txt
 sitecustomize.py
 diag_voice.py
 .venv/
+
+# Local server env drafts (contain secrets, never commit)
+.env.newserver
