@@ -2826,6 +2826,14 @@ class VoiceCallManager:
                         # and misclassified as non-retryable UNKNOWN.
                         err_str = type(e).__name__
                     self._inflight_joins.pop(join_key, None)
+                    # 🔧 فیکس INTERDC_X_CALL_RICH_ERROR - خطای داخلی DC4 تلگرام
+                    # این خطا موقتی است و معمولاً با رفرش کش و تأخیر حل می‌شود
+                    low = err_str.lower()
+                    if "interdc" in low or "rich_error" in low or "x_call_rich" in low or ("500" in low and "join" in low):
+                        self._vc_event_log(order_id, account_id, "interdc_rich_error", {"chat_id": chat_id, "error": err_str[:120]})
+                        await self._force_refresh_call(app, chat_id)
+                        await asyncio.sleep(random.uniform(2.0, 5.0))
+                        return False, f"INTERDC transient (retrying): {err_str[:60]}"
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
                         self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
