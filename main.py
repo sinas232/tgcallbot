@@ -69,6 +69,10 @@ from aiohttp import web
 # هندلرها
 from handlers.general_handlers import *
 from handlers.admin_handlers import *
+from handlers.admin_handlers import (
+    maintenance_menu_handler, maintenance_callback_handler, receive_maintenance_message,
+    dead_accounts_menu_handler, dead_accounts_callback_handler
+)
 from handlers.order_handlers import *
 from handlers.menu_handlers import *
 from handlers.account_management import *
@@ -720,6 +724,12 @@ def register_handlers(application: Application) -> None:
         entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
         states={
             AWAITING_SETTINGS_ACTION: [
+                # 🧹 اکانت‌های سوخته + 🔧 حالت تعمیرات (NEW - سوپر ادمین)
+                MessageHandler(filters.Regex("اکانت‌های سوخته|اکانت سوخته|🧹"), dead_accounts_menu_handler),
+                MessageHandler(filters.Regex("حالت تعمیرات|تعمیرات|🔧.*تعمیرات"), maintenance_menu_handler),
+                CallbackQueryHandler(maintenance_callback_handler, pattern="^maint_"),
+                CallbackQueryHandler(dead_accounts_callback_handler, pattern="^dead_"),
+
                 # نمایندگی
                 MessageHandler(filters.Regex("^🤖 مدیریت نمایندگی‌ها$"), reseller_management_menu),
                 CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
@@ -841,6 +851,16 @@ def register_handlers(application: Application) -> None:
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
             AWAITING_BACKUP_CHANNEL: [MessageHandler(STD_TEXT, receive_backup_channel)],
             AWAITING_BACKUP_INTERVAL: [MessageHandler(STD_TEXT, receive_backup_interval)],
+
+            # 🔧 حالت تعمیرات (NEW)
+            AWAITING_MAINTENANCE_MESSAGE: [MessageHandler(STD_TEXT, receive_maintenance_message)],
+
+            # 🧹 اکانت‌های سوخته (NEW) - کالبک‌ها در AWAITING_SETTINGS_ACTION هندل می‌شوند
+            AWAITING_DEAD_ACCOUNTS_ACTION: [CallbackQueryHandler(dead_accounts_callback_handler, pattern="^dead_")],
+            AWAITING_DEAD_ACCOUNTS_DELETE_CONFIRM: [CallbackQueryHandler(dead_accounts_callback_handler, pattern="^dead_")],
+            AWAITING_DEAD_ACCOUNTS_BULK_DELETE: [CallbackQueryHandler(dead_accounts_callback_handler, pattern="^dead_")],
+            AWAITING_DEAD_SINGLE_DELETE: [CallbackQueryHandler(dead_accounts_callback_handler, pattern="^dead_")],
+
             
             # نمایندگی
             AWAITING_RESELLER_TOKEN: [MessageHandler(STD_TEXT, receive_reseller_token)],
@@ -1006,6 +1026,9 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(incall_edit_accounts, pattern=r"^ic_editaccs$"), group=0)
     application.add_handler(CallbackQueryHandler(incall_react, pattern=r"^ic_react_"), group=0)
     application.add_handler(CallbackQueryHandler(incall_close, pattern=r"^ic_close$"), group=0)
+    # 🧹 اکانت‌های سوخته + 🔧 حالت تعمیرات - global fallback (super admin)
+    application.add_handler(CallbackQueryHandler(maintenance_callback_handler, pattern=r"^maint_"), group=0)
+    application.add_handler(CallbackQueryHandler(dead_accounts_callback_handler, pattern=r"^dead_"), group=0)
 
     # --- 7. خرید سرویس ---
     buy_conv = ConversationHandler(

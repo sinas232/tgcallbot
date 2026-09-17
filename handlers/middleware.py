@@ -27,17 +27,40 @@ def clean_chat_id(chat_id_str: str) -> str:
 
 async def check_security(update: Update, context: ContextTypes.DEFAULT_TYPE, should_notify: bool = True) -> bool:
     """
-    بررسی امنیتی (بن، جوین، شماره)
+    بررسی امنیتی (بن، جوین، شماره، حالت تعمیرات)
     """
     user = update.effective_user
     if not user: return False
     
     # دریافت chat_id امن (چه پیام باشد چه دکمه)
     chat_id = update.effective_chat.id
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    # 🔧 حالت تعمیرات - فقط سوپر ادمین و گاد ادمین می‌توانند عبور کنند
+    try:
+        maint = await DatabaseManager.is_maintenance_mode(bot_id=bot_id)
+        if maint:
+            # گاد ادمین همیشه آزاد
+            if user.id in Config.ADMIN_IDS:
+                return True
+            # سوپر ادمین آزاد
+            db_u = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            if db_u and db_u.get('admin_role') == 'super_admin':
+                return True
+            # بقیه مسدود - پیام تعمیرات
+            if should_notify:
+                try:
+                    msg = await DatabaseManager.get_maintenance_message(bot_id=bot_id)
+                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                except Exception:
+                    pass
+            return False
+    except Exception as e:
+        # اگر خطا در چک تعمیرات، ادامه بده (لاگ)
+        pass
     
     if user.id in Config.ADMIN_IDS: return True
     
-    bot_id = context.bot_data.get('bot_id', 1)
     db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
     
     if not db_user: return True 

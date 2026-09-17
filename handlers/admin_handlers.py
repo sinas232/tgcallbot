@@ -147,6 +147,7 @@ async def admin_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     menu = [
         ["👤 مدیریت کاربران", "📉 آمار کل ربات"],
         ["👥 مدیریت اکانت‌های ربات", "🚑 گزارش سلامت اکانت‌ها"],
+        [BTN_DEAD_ACCOUNTS, BTN_MAINTENANCE_MODE],
         [BTN_EXIT_ADMIN]
     ]
     
@@ -1944,3 +1945,340 @@ async def receive_backup_interval(update, context):
     await DatabaseManager.set_setting("auto_backup_interval_hours", text, bot_id=bot_id)
     await update.message.reply_text(f"✅ بازه پشتیبان‌گیری خودکار تنظیم شد: هر {text} ساعت.")
     return await backup_restore_menu(update, context)
+
+# ===================== MAINTENANCE MODE (NEW) =====================
+
+@require_super_admin
+async def maintenance_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """منوی حالت تعمیرات / بروزرسانی - فقط سوپر ادمین"""
+    bot_id = context.bot_data.get('bot_id', 1)
+    is_maint = await DatabaseManager.is_maintenance_mode(bot_id=bot_id)
+    maint_msg = await DatabaseManager.get_maintenance_message(bot_id=bot_id)
+
+    status_txt = "🟢 فعال (کاربران مسدود)" if is_maint else "🔴 غیرفعال (کاربران آزاد)"
+    status_icon = "✅ فعال" if is_maint else "❌ غیرفعال"
+
+    text = (
+        f"🔧 **حالت تعمیرات / بروزرسانی**\n"
+        f"➖➖➖➖➖➖➖➖\n"
+        f"وضعیت فعلی: **{status_txt}**\n\n"
+        f"📝 پیام فعلی برای کاربران:\n"
+        f"```\n{maint_msg}\n```\n\n"
+        f"ℹ️ در حالت تعمیرات:\n"
+        f"• کاربران عادی نمی‌توانند سفارش ثبت کنند\n"
+        f"• سوپر ادمین بدون محدودیت کار می‌کند\n"
+        f"• پیام بالا به کاربران نمایش داده می‌شود\n"
+    )
+
+    kb = [
+        [InlineKeyboardButton(f"🔄 تغییر وضعیت (فعلی: {status_icon})", callback_data="maint_toggle")],
+        [InlineKeyboardButton("✏️ تنظیم پیام تعمیرات", callback_data="maint_set_msg")],
+        [InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="maint_back")],
+    ]
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await send_safe(context.bot, update.effective_chat.id, text, reply_markup=InlineKeyboardMarkup(kb))
+
+    return AWAITING_SETTINGS_ACTION
+
+
+async def maintenance_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """کالبک‌های حالت تعمیرات"""
+    query = update.callback_query
+    await safe_answer(query)
+    data = query.data
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    # فقط سوپر ادمین
+    user_id = update.effective_user.id
+    is_god = user_id in Config.ADMIN_IDS
+    is_super = is_god
+    if not is_super:
+        db_user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        if db_user and db_user.get('admin_role') == 'super_admin':
+            is_super = True
+    if not is_super:
+        await query.answer("⛔️ فقط سوپر ادمین", show_alert=True)
+        return AWAITING_SETTINGS_ACTION
+
+    if data == "maint_back":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return await admin_panel_start(update, context)
+
+    if data == "maint_toggle":
+        curr = await DatabaseManager.is_maintenance_mode(bot_id=bot_id)
+        new_val = not curr
+        await DatabaseManager.set_maintenance_mode(new_val, bot_id=bot_id)
+        status = "فعال شد ✅" if new_val else "غیرفعال شد ❌"
+        await query.answer(f"حالت تعمیرات {status}", show_alert=False)
+        return await maintenance_menu_handler(update, context)
+
+    if data == "maint_set_msg":
+        await query.message.delete()
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "✏️ **پیام جدید حالت تعمیرات را ارسال کنید:**\n\n"
+            "این پیام به کاربرانی که در حالت تعمیرات تلاش به ثبت سفارش می‌کنند نمایش داده می‌شود.\n"
+            "برای انصراف، دکمه انصراف را بزنید.",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True)
+        )
+        return AWAITING_MAINTENANCE_MESSAGE
+
+    return AWAITING_SETTINGS_ACTION
+
+
+@require_super_admin
+async def receive_maintenance_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت پیام جدید تعمیرات"""
+    text = update.message.text
+    if is_cancel_text(text):
+        return await maintenance_menu_handler(update, context)
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    await DatabaseManager.set_maintenance_message(text, bot_id=bot_id)
+    await update.message.reply_text("✅ پیام تعمیرات ذخیره شد.")
+    return await maintenance_menu_handler(update, context)
+
+
+# ===================== DEAD / BURNT ACCOUNTS MANAGEMENT (NEW) =====================
+
+@require_super_admin
+async def dead_accounts_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """منوی مدیریت اکانت‌های سوخته - فقط سوپر ادمین"""
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    stats = await DatabaseManager.get_all_accounts_detailed_stats(bot_id=bot_id)
+
+    text = (
+        f"🧹 **مدیریت اکانت‌های سوخته / دلیت شده**\n"
+        f"➖➖➖➖➖➖➖➖\n"
+        f"📊 کل اکانت‌ها: `{stats['total']}`\n"
+        f"✅ فعال: `{stats['active']}`\n"
+        f"💀 غیرفعال (سوخته): `{stats['dead']}` (inactive: {stats['inactive']})\n"
+        f"⛔️ محدود (Limited): `{stats['limited']}`\n"
+        f"🔑 سشن باطل (SESSION_REVOKED/Auth): `{stats['session_invalid']}`\n"
+        f"➖➖➖➖➖➖➖➖\n"
+        f"👇 یک گزینه را انتخاب کنید:"
+    )
+
+    kb = [
+        [InlineKeyboardButton(f"💀 لیست سوخته‌ها ({stats['dead']})", callback_data="dead_list_1"),
+         InlineKeyboardButton(f"⛔️ لیست محدودها ({stats['limited']})", callback_data="dead_limited_1")],
+        [InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_delete_all_dead"),
+         InlineKeyboardButton("🗑 حذف همه محدودها", callback_data="dead_delete_all_limited")],
+        [InlineKeyboardButton("💣 حذف همه غیرفعال‌ها (سوخته+محدود)", callback_data="dead_delete_all_nonactive")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="dead_back")],
+    ]
+
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await send_safe(context.bot, update.effective_chat.id, text, reply_markup=InlineKeyboardMarkup(kb))
+
+    return AWAITING_SETTINGS_ACTION
+
+
+async def dead_accounts_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """کالبک‌های مدیریت اکانت‌های سوخته"""
+    query = update.callback_query
+    await safe_answer(query)
+    data = query.data or ""
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    # دسترسی سوپر ادمین
+    user_id = update.effective_user.id
+    is_god = user_id in Config.ADMIN_IDS
+    is_super = is_god
+    if not is_super:
+        db_user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        if db_user and db_user.get('admin_role') == 'super_admin':
+            is_super = True
+    if not is_super:
+        await query.answer("⛔️ فقط سوپر ادمین", show_alert=True)
+        return AWAITING_SETTINGS_ACTION
+
+    if data == "dead_back":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return await admin_panel_start(update, context)
+
+    # لیست سوخته‌ها با صفحه‌بندی
+    if data.startswith("dead_list_"):
+        try:
+            page = int(data.split("_")[-1])
+        except Exception:
+            page = 1
+        limit = 5
+        offset = (page - 1) * limit
+        accounts, total = await DatabaseManager.get_dead_accounts_paginated(bot_id=bot_id, limit=limit, offset=offset)
+        if not accounts:
+            await query.edit_message_text(
+                "✅ هیچ اکانت سوخته‌ای یافت نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="dead_back_menu")]])
+            )
+            return AWAITING_SETTINGS_ACTION
+
+        total_pages = max(1, (total + limit - 1) // limit)
+        txt = f"💀 **لیست اکانت‌های سوخته (صفحه {page}/{total_pages}) - کل: {total}**\n\n"
+        kb = []
+        for acc in accounts:
+            phone = acc.get('phone_number', 'No Phone')
+            aid = acc.get('id')
+            status = acc.get('account_status', 'unknown')
+            reason = (acc.get('spam_check_result') or acc.get('account_status') or 'Unknown')[:40]
+            txt += f"🆔 `{aid}` | 📱 `{phone}` | {status} | {reason}\n"
+            kb.append([InlineKeyboardButton(f"🗑 حذف {phone} (ID:{aid})", callback_data=f"dead_del_{aid}")])
+
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"dead_list_{page-1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"dead_list_{page+1}"))
+        if nav:
+            kb.append(nav)
+        kb.append([InlineKeyboardButton("🔙 بازگشت به منو", callback_data="dead_back_menu")])
+
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith("dead_limited_"):
+        try:
+            page = int(data.split("_")[-1])
+        except Exception:
+            page = 1
+        limit = 5
+        offset = (page - 1) * limit
+        accounts, total = await DatabaseManager.get_limited_accounts_paginated(bot_id=bot_id, limit=limit, offset=offset)
+        if not accounts:
+            await query.edit_message_text(
+                "✅ هیچ اکانت محدودی یافت نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="dead_back_menu")]])
+            )
+            return AWAITING_SETTINGS_ACTION
+
+        total_pages = max(1, (total + limit - 1) // limit)
+        txt = f"⛔️ **لیست اکانت‌های محدود (صفحه {page}/{total_pages}) - کل: {total}**\n\n"
+        kb = []
+        for acc in accounts:
+            phone = acc.get('phone_number', 'No Phone')
+            aid = acc.get('id')
+            reason = (acc.get('spam_check_result') or 'Limited')[:40]
+            txt += f"🆔 `{aid}` | 📱 `{phone}` | {reason}\n"
+            kb.append([InlineKeyboardButton(f"🗑 حذف {phone} (ID:{aid})", callback_data=f"dead_del_{aid}")])
+
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"dead_limited_{page-1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"dead_limited_{page+1}"))
+        if nav:
+            kb.append(nav)
+        kb.append([InlineKeyboardButton("🔙 بازگشت به منو", callback_data="dead_back_menu")])
+
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        return AWAITING_SETTINGS_ACTION
+
+    if data == "dead_back_menu":
+        return await dead_accounts_menu_handler(update, context)
+
+    # حذف تکی
+    if data.startswith("dead_del_"):
+        try:
+            aid = int(data.split("_")[-1])
+        except Exception:
+            return AWAITING_SETTINGS_ACTION
+        acc = await DatabaseManager.get_account_by_id(aid)
+        if not acc:
+            await query.answer("❌ اکانت یافت نشد", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+
+        kb = [
+            [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"dead_confirm_del_{aid}"),
+             InlineKeyboardButton("❌ انصراف", callback_data="dead_back_menu")]
+        ]
+        await query.edit_message_text(
+            f"⚠️ **تایید حذف اکانت**\n\n"
+            f"📱 شماره: `{acc.get('phone_number')}`\n"
+            f"🆔 ID: `{aid}`\n"
+            f"وضعیت: `{acc.get('account_status')}`\n\n"
+            f"آیا مطمئن هستید؟ این عمل غیرقابل بازگشت است.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith("dead_confirm_del_"):
+        try:
+            aid = int(data.split("_")[-1])
+        except Exception:
+            return AWAITING_SETTINGS_ACTION
+        acc = await DatabaseManager.get_account_by_id(aid)
+        if acc:
+            await DatabaseManager.delete_account(aid, acc.get('user_id', 0))
+            await query.edit_message_text(
+                f"✅ اکانت `{acc.get('phone_number')}` (ID:{aid}) حذف شد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="dead_back_menu")]])
+            )
+        else:
+            await query.edit_message_text("❌ اکانت یافت نشد.")
+        return AWAITING_SETTINGS_ACTION
+
+    # حذف گروهی - با تایید
+    if data in ["dead_delete_all_dead", "dead_delete_all_limited", "dead_delete_all_nonactive"]:
+        context.user_data['dead_bulk_type'] = data
+        if data == "dead_delete_all_dead":
+            count = await DatabaseManager.get_dead_accounts_count(bot_id=bot_id)
+            label = f"{count} اکانت سوخته"
+        elif data == "dead_delete_all_limited":
+            stats = await DatabaseManager.get_all_accounts_detailed_stats(bot_id=bot_id)
+            count = stats['limited']
+            label = f"{count} اکانت محدود"
+        else:
+            stats = await DatabaseManager.get_all_accounts_detailed_stats(bot_id=bot_id)
+            count = stats['dead']
+            label = f"{count} اکانت غیرفعال (کل سوخته‌ها)"
+
+        if count == 0:
+            await query.answer("✅ هیچ اکانتی برای حذف وجود ندارد", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+
+        kb = [
+            [InlineKeyboardButton(f"✅ بله، حذف {label}", callback_data="dead_confirm_bulk"),
+             InlineKeyboardButton("❌ انصراف", callback_data="dead_back_menu")]
+        ]
+        await query.edit_message_text(
+            f"⚠️ **تایید حذف گروهی**\n\n"
+            f"آیا از حذف **{label}** مطمئن هستید؟\n\n"
+            f"این عمل غیرقابل بازگشت است و تمام سشن‌های مربوطه پاک می‌شود.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    if data == "dead_confirm_bulk":
+        bulk_type = context.user_data.get('dead_bulk_type', 'dead_delete_all_dead')
+        if bulk_type == "dead_delete_all_dead":
+            deleted = await DatabaseManager.delete_all_dead_accounts(bot_id=bot_id)
+        elif bulk_type == "dead_delete_all_limited":
+            deleted = await DatabaseManager.delete_all_limited_accounts(bot_id=bot_id)
+        else:
+            deleted = await DatabaseManager.delete_all_dead_accounts(bot_id=bot_id)
+
+        await query.edit_message_text(
+            f"✅ **{deleted} اکانت با موفقیت حذف شد.**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منو", callback_data="dead_back_menu")]])
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    return AWAITING_SETTINGS_ACTION
+

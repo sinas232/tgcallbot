@@ -1342,3 +1342,154 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
         async with AsyncSessionLocal() as db_session:
             count = await db_session.execute(select(func.count(User.id)).filter(User.bot_id == bot_id))
             return count.scalar() or 0
+
+    # ================= DEAD / BURNT ACCOUNTS MANAGEMENT (NEW) =================
+
+    @staticmethod
+    async def get_dead_accounts_paginated(bot_id=1, limit=10, offset=0):
+        """لیست اکانت‌های سوخته با صفحه‌بندی"""
+        async with AsyncSessionLocal() as db_session:
+            q = select(TelegramAccount).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.account_status != 'active'
+            ).order_by(desc(TelegramAccount.id)).limit(limit).offset(offset)
+            res = await db_session.execute(q)
+            accounts = [to_dict(a) for a in res.scalars().all()]
+            q_count = select(func.count(TelegramAccount.id)).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.account_status != 'active'
+            )
+            total = (await db_session.execute(q_count)).scalar() or 0
+            return accounts, total
+
+    @staticmethod
+    async def get_limited_accounts_paginated(bot_id=1, limit=10, offset=0):
+        async with AsyncSessionLocal() as db_session:
+            q = select(TelegramAccount).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.spam_status == 'limited'
+            ).order_by(desc(TelegramAccount.id)).limit(limit).offset(offset)
+            res = await db_session.execute(q)
+            accounts = [to_dict(a) for a in res.scalars().all()]
+            q_count = select(func.count(TelegramAccount.id)).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.spam_status == 'limited'
+            )
+            total = (await db_session.execute(q_count)).scalar() or 0
+            return accounts, total
+
+    @staticmethod
+    async def get_session_invalid_accounts(bot_id=1):
+        """اکانت‌هایی که سشن آنها باطل شده"""
+        async with AsyncSessionLocal() as db_session:
+            q = select(TelegramAccount).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.account_status != 'active'
+            )
+            res = await db_session.execute(q)
+            return [to_dict(a) for a in res.scalars().all()]
+
+    @staticmethod
+    async def delete_all_dead_accounts(bot_id=1):
+        """حذف همه اکانت‌های غیرفعال (سوخته)"""
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                delete(TelegramAccount).where(
+                    TelegramAccount.bot_id == bot_id,
+                    TelegramAccount.account_status != 'active'
+                )
+            )
+            await db_session.commit()
+            return result.rowcount or 0
+
+    @staticmethod
+    async def delete_all_limited_accounts(bot_id=1):
+        """حذف همه اکانت‌های محدود شده"""
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                delete(TelegramAccount).where(
+                    TelegramAccount.bot_id == bot_id,
+                    TelegramAccount.spam_status == 'limited'
+                )
+            )
+            await db_session.commit()
+            return result.rowcount or 0
+
+    @staticmethod
+    async def delete_accounts_by_ids(account_ids: List[int], bot_id=1):
+        """حذف چند اکانت با لیست ID"""
+        if not account_ids:
+            return 0
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                delete(TelegramAccount).where(
+                    TelegramAccount.bot_id == bot_id,
+                    TelegramAccount.id.in_(account_ids)
+                )
+            )
+            await db_session.commit()
+            return result.rowcount or 0
+
+    @staticmethod
+    async def get_dead_accounts_count(bot_id=1):
+        async with AsyncSessionLocal() as db_session:
+            q = select(func.count(TelegramAccount.id)).filter(
+                TelegramAccount.bot_id == bot_id,
+                TelegramAccount.account_status != 'active'
+            )
+            return (await db_session.execute(q)).scalar() or 0
+
+    @staticmethod
+    async def get_all_accounts_detailed_stats(bot_id=1):
+        """آمار کامل اکانت‌ها برای پنل سوخته‌ها"""
+        async with AsyncSessionLocal() as db_session:
+            total = (await db_session.execute(select(func.count(TelegramAccount.id)).filter(TelegramAccount.bot_id == bot_id))).scalar() or 0
+            active = (await db_session.execute(select(func.count(TelegramAccount.id)).filter(TelegramAccount.account_status == 'active', TelegramAccount.bot_id == bot_id))).scalar() or 0
+            inactive = (await db_session.execute(select(func.count(TelegramAccount.id)).filter(TelegramAccount.account_status == 'inactive', TelegramAccount.bot_id == bot_id))).scalar() or 0
+            limited = (await db_session.execute(select(func.count(TelegramAccount.id)).filter(TelegramAccount.spam_status == 'limited', TelegramAccount.bot_id == bot_id))).scalar() or 0
+            dead = total - active
+            try:
+                from sqlalchemy import or_
+                q_err = select(func.count(TelegramAccount.id)).filter(
+                    TelegramAccount.bot_id == bot_id,
+                    TelegramAccount.spam_check_result.isnot(None),
+                    or_(
+                        TelegramAccount.spam_check_result.ilike('%SESSION_REVOKED%'),
+                        TelegramAccount.spam_check_result.ilike('%Auth%'),
+                        TelegramAccount.spam_check_result.ilike('%deactivated%')
+                    )
+                )
+                session_invalid = (await db_session.execute(q_err)).scalar() or 0
+            except Exception:
+                session_invalid = 0
+            return {
+                'total': total,
+                'active': active,
+                'inactive': inactive,
+                'dead': dead,
+                'limited': limited,
+                'session_invalid': session_invalid
+            }
+
+    # ================= MAINTENANCE MODE =================
+
+    @staticmethod
+    async def is_maintenance_mode(bot_id=1) -> bool:
+        val = await DatabaseManager.get_setting("maintenance_mode", "false", bot_id=bot_id)
+        return val == "true"
+
+    @staticmethod
+    async def set_maintenance_mode(enabled: bool, bot_id=1):
+        await DatabaseManager.set_setting("maintenance_mode", "true" if enabled else "false", bot_id=bot_id)
+
+    @staticmethod
+    async def get_maintenance_message(bot_id=1) -> str:
+        return await DatabaseManager.get_setting(
+            "maintenance_message",
+            "🔧 ربات در حال تعمیرات و بروزرسانی است.\n\n⏳ لطفاً چند دقیقه دیگر مجدداً تلاش کنید.\n\n🙏 از صبر شما سپاسگزاریم.",
+            bot_id=bot_id
+        )
+
+    @staticmethod
+    async def set_maintenance_message(message: str, bot_id=1):
+        await DatabaseManager.set_setting("maintenance_message", message, bot_id=bot_id)

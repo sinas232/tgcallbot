@@ -116,6 +116,13 @@ AWAITING_BACKUP_INTERVAL = 212
 # 💎 وضعیت‌های ایموجی پریمیوم (جایگزینی شناسهٔ ایموجی توسط ادمین)
 AWAITING_PREMIUM_EMOJI_OVERRIDE = 220
 
+# 🧹 مدیریت اکانت‌های سوخته + 🔧 حالت تعمیرات
+AWAITING_MAINTENANCE_MESSAGE = 230
+AWAITING_DEAD_ACCOUNTS_ACTION = 231
+AWAITING_DEAD_ACCOUNTS_DELETE_CONFIRM = 232
+AWAITING_DEAD_ACCOUNTS_BULK_DELETE = 233
+AWAITING_DEAD_SINGLE_DELETE = 234
+
 # ===================== BUTTONS =====================
 
 BTN_BACK = "🔙 بازگشت"
@@ -125,6 +132,10 @@ BTN_EXIT_ADMIN = "🔙 خروج از پنل ادمین"
 BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضافه شد
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
 BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
+BTN_DEAD_ACCOUNTS = "🧹 اکانت‌های سوخته"
+BTN_MAINTENANCE_MODE = "🔧 حالت تعمیرات"
+BTN_MAINTENANCE_ON = "🔧 فعال‌سازی تعمیرات"
+BTN_MAINTENANCE_OFF = "✅ غیرفعال‌سازی تعمیرات"
 
 REGEX_BACK = r".*بازگشت.*"
 REGEX_CANCEL = r".*انصراف.*"

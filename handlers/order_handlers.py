@@ -28,6 +28,23 @@ logger = logging.getLogger(__name__)
 async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_id = context.bot_data.get('bot_id', 1)
     user_id = update.effective_user.id
+
+    # 🔧 چک حالت تعمیرات - سوپر ادمین آزاد
+    try:
+        if await DatabaseManager.is_maintenance_mode(bot_id=bot_id):
+            from config import Config
+            is_god = user_id in Config.ADMIN_IDS
+            is_super = is_god
+            if not is_super:
+                db_u = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+                if db_u and db_u.get('admin_role') == 'super_admin':
+                    is_super = True
+            if not is_super:
+                msg = await DatabaseManager.get_maintenance_message(bot_id=bot_id)
+                await send_safe(context.bot, update.effective_chat.id, msg)
+                return ConversationHandler.END
+    except Exception:
+        pass
     
     user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
     if not user:
