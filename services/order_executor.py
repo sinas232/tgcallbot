@@ -735,28 +735,28 @@ class OrderExecutor:
                         wave_fail += 1
                         continue
 
-                outcome = join_brain.classify_message(msg)
-                # INTERDC / X_CALL is DC-interconnect transient — same handling as FloodWait:
-                # system pressure, not account fault. Keep budget, retry later.
-                is_interdc = any(k in msg.upper() for k in ("INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC"))
-                if outcome == OUTCOME_FLOOD or is_interdc:
-                    fm = re.search(r"FLOODWAIT:(\d+)", msg.upper())
-                    if fm:
-                        wait_s = float(fm.group(1))
-                    elif is_interdc:
-                        # DC4 inter-DC needs longer cool-down than flood
-                        wait_s = float(getattr(Config, "VOICE_STRATEGY_COOLDOWN_SECONDS", 60)) * 2
-                        wait_s = max(wait_s, 60.0)
-                    else:
-                        wait_s = float(getattr(Config, "VOICE_JOIN_FLOOD_PAUSE_SECONDS", 15))
-                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + wait_s
-                    logger.warning(
-                        f"Order {order_id}: account {aid} {'INTERDC' if is_interdc else 'FloodWait'} {wait_s:.0f}s — "
-                        f"budget kept, retry deferred (no replacement)"
-                    )
-                    join_brain.report_result(order_id, OUTCOME_FLOOD, msg)
-                    wave_fail += 1
-                    continue
+                    outcome = join_brain.classify_message(msg)
+                    # INTERDC / X_CALL is DC-interconnect transient — same handling as FloodWait:
+                    # system pressure, not account fault. Keep budget, retry later.
+                    is_interdc = any(k in msg.upper() for k in ("INTERDC", "X_CALL", "RICH_ERROR", "INTER_DC"))
+                    if outcome == OUTCOME_FLOOD or is_interdc:
+                        fm = re.search(r"FLOODWAIT:(\d+)", msg.upper())
+                        if fm:
+                            wait_s = float(fm.group(1))
+                        elif is_interdc:
+                            # DC4 inter-DC needs longer cool-down than flood
+                            wait_s = float(getattr(Config, "VOICE_STRATEGY_COOLDOWN_SECONDS", 60)) * 2
+                            wait_s = max(wait_s, 60.0)
+                        else:
+                            wait_s = float(getattr(Config, "VOICE_JOIN_FLOOD_PAUSE_SECONDS", 15))
+                        self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + wait_s
+                        logger.warning(
+                            f"Order {order_id}: account {aid} {'INTERDC' if is_interdc else 'FloodWait'} {wait_s:.0f}s — "
+                            f"budget kept, retry deferred (no replacement)"
+                        )
+                        join_brain.report_result(order_id, OUTCOME_FLOOD, msg)
+                        wave_fail += 1
+                        continue
 
                     attempts = self._voice_attempts.setdefault(order_id, {})
                     n_att = attempts.get(aid, 0) + 1
