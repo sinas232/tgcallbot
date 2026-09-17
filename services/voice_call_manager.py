@@ -775,7 +775,17 @@ class VoiceCallManager:
         })
         threshold = max(1, int(getattr(Config, "VOICE_STRATEGY_FAILURE_THRESHOLD", 3)))
         if failures >= threshold and failure_class in _RETRYABLE_FAILURES:
-            cooldown = max(1, int(getattr(Config, "VOICE_STRATEGY_COOLDOWN_SECONDS", 60)))
+            base_cooldown = max(1, int(getattr(Config, "VOICE_STRATEGY_COOLDOWN_SECONDS", 60)))
+            # INTERDC / X_CALL = DC4 inter-DC failure → needs much longer cooldown
+            # WARP still routes via Cloudflare, but Telegram's DC4 may be temporarily
+            # unreachable for that edge IP.  120-180s lets Telegram recover.
+            msg_low = str(message or "").lower()
+            if "interdc" in msg_low or "x_call" in msg_low or "rich_error" in msg_low:
+                cooldown = max(base_cooldown * 3, 120)
+                # cap at 5 minutes to avoid freezing the order forever
+                cooldown = min(cooldown, 300)
+            else:
+                cooldown = base_cooldown
             policy["cooldown_until"] = now + cooldown
             self._vc_event_log(None, None, "strategy_circuit_open", {
                 "chat_id": int(chat_id), "failure_class": failure_class,
@@ -2832,11 +2842,19 @@ class VoiceCallManager:
                     low = err_str.lower()
                     if "interdc" in low or "rich_error" in low or "x_call" in low or "x_call_error" in low or ("500" in low and "inter" in low):
                         self._vc_event_log(order_id, account_id, "interdc_error", {"chat_id": chat_id, "error": err_str[:150]})
-                        # رفرش کش و مدارشکن برای چت
-                        await self._force_refresh_call(app, chat_id)
+                        logger.warning(
+                            "[VoiceCall] INTERDC_X_CALL_ERROR order=%s acc=%s chat=%s — DC4 inter-DC failure (WARP IP may be temporarily throttled), refreshing and backing off",
+                            order_id, account_id, chat_id,
+                        )
+                        # رفرش کش و مدارشکن برای چت — WARP فعال می‌ماند (TUN)
+                        try:
+                            await self._force_refresh_call(app, chat_id)
+                        except Exception:
+                            pass
                         self._record_join_strategy(int(chat_id), False, f"INTERDC:{err_str[:80]}")
-                        # تأخیر طولانی‌تر برای ریکاوری DC
-                        await asyncio.sleep(random.uniform(5.0, 12.0))
+                        # تأخیر طولانی‌تر برای ریکاوری DC4 — تلگرام معمولاً 30-60 ثانیه بعد برمی‌گردد
+                        # با WARP، این تأخیر کمک می‌کند Cloudflare edge هم ریکاوری کند
+                        await asyncio.sleep(random.uniform(15.0, 30.0))
                         return False, f"INTERDC transient (retrying): {err_str[:80]}"
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
@@ -2947,6 +2965,8 @@ class VoiceCallManager:
         """
         trace_id = _uuid.uuid4().hex[:12]
         hard_limit = int(getattr(Config, 'VOICE_JOIN_RETRY_HARD_LIMIT', 2))
+        # INTERDC needs more retries — it's Telegram DC4 internal, not account fault
+        # WARP stays on (TUN), we just retry longer
         base_delay = 1.0
         last_msg = "Join failed"
         attempt = 0
@@ -3048,6 +3068,11 @@ class VoiceCallManager:
                 voice_cooldown.clear(account_id)
                 continue
 
+            # INTERDC / X_CALL → allow extra retries beyond hard_limit (up to +2)
+            # because it's DC4 inter-DC transient, especially common behind WARP
+            is_interdc_retry = any(k in msg.lower() for k in ("interdc", "x_call", "rich_error"))
+            effective_limit = hard_limit + (2 if is_interdc_retry else 0)
+
             if not _failure_is_retryable(failure):
                 # Permanent / auth / unknown — do NOT retry endlessly.
                 self._set_state(order_id, account_id, FAILED,
@@ -3056,19 +3081,24 @@ class VoiceCallManager:
                                  "last_error": msg[:200]})
                 return False, msg
 
-            if attempt >= hard_limit:
+            if attempt >= effective_limit:
                 self._set_state(order_id, account_id, FAILED,
                                 f"retry limit reached",
                                 {"failure_class": failure, "attempt": attempt,
                                  "last_error": msg[:200]})
                 return False, msg
 
-            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            # backoff: longer for INTERDC (15-30s already slept inside _join_call, plus here)
+            if is_interdc_retry:
+                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(3, 6)
+            else:
+                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
             self._vc_event_log(order_id, account_id, "join_retry_backoff", {
                 "attempt": attempt,
                 "delay_s": round(delay, 1),
                 "reason": msg[:80],
                 "failure_class": failure,
+                "interdc_extra": is_interdc_retry,
             })
             await asyncio.sleep(delay)
         return False, last_msg
