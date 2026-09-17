@@ -1252,6 +1252,13 @@ def register_handlers(application: Application) -> None:
 
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
+    # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
+    # docker kill -s USR1 telegram_bot_container
+    try:
+        import faulthandler as _fh, signal as _sig
+        _fh.register(_sig.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
     await DatabaseManager.init_db()
     try:
         await DatabaseManager.reset_stuck_orders()
