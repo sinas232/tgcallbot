@@ -660,6 +660,14 @@ def register_handlers(application: Application) -> None:
                     context.user_data['maint_notice_ts'] = now
                 except Exception:
                     pass
+            try:
+                _gu = update.effective_user
+                logger.warning("maintenance guard BLOCKED user=%s kind=%s ref=%s",
+                               _gu.id if _gu else None,
+                               "callback" if query else "message",
+                               str(query.data if query else (update.message.text if update.message else ''))[:64])
+            except Exception:
+                pass
             raise ApplicationHandlerStop
         except ApplicationHandlerStop:
             raise
