@@ -7,7 +7,7 @@ import logging
 import html
 import asyncio
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
@@ -53,13 +53,13 @@ async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
     if not accounts:
         await send_safe(context.bot, update.effective_chat.id, "❌ <b>هیچ اکانت فعالی در این ربات وجود ندارد.</b>", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
 
     txt = "📩 <b>دریافت کد ورود</b>\n\n👇 اکانت موردنظر را انتخاب کنید تا آخرین کد/پیام ورود ارسال شود:"
     kb = build_account_picker(accounts, pick_prefix="acc_getcode_", page_prefix="codepage_", page=1, back_cb="acc_pickclose")
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     # انتخاب از طریق کالبک acc_getcode_ انجام می‌شود (هندلر سراسری)
-    return ConversationHandler.END
+    return AWAITING_SETTINGS_ACTION
 
 async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
@@ -127,7 +127,7 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error sending code: {e}")
         await send_safe(context.bot, update.effective_chat.id, f"❌ خطا در ارسال کد:\n{e}", parse_mode=ParseMode.HTML)
         await _cleanup_client(context)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code = update.message.text
@@ -278,7 +278,7 @@ async def delete_account_start(update, context):
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
     if not accounts:
         await send_safe(context.bot, update.effective_chat.id, "❌ اکانتی برای حذف نیست.", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
     txt = "🗑 <b>حذف اکانت</b>\n\nبرای حذف، <b>شماره ردیف</b> یا <b>ID</b> را ارسال کنید:\n\n"
     account_map = {}
     for i, acc in enumerate(accounts):
@@ -322,7 +322,7 @@ async def leave_all_chats_start(update: Update, context: ContextTypes.DEFAULT_TY
         if db_user and db_user.get('admin_role') == 'super_admin': is_super = True
     if not is_super:
         await send_safe(context.bot, update.effective_chat.id, "⛔️ دسترسی غیرمجاز.")
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
     kb = [[InlineKeyboardButton("✅ بله، خارج شو", callback_data="confirm_leave_all"), InlineKeyboardButton("❌ خیر", callback_data="cancel_leave_all")]]
     await send_safe(context.bot, update.effective_chat.id, "⚠️ **هشدار جدی:**\n\nآیا مطمئن هستید که می‌خواهید **تمام اکانت‌های این ربات** از **تمام گروه‌ها و کانال‌ها** خارج شوند؟", reply_markup=InlineKeyboardMarkup(kb))
     return AWAITING_LEAVE_ALL_CONFIRM
@@ -334,12 +334,12 @@ async def leave_all_chats_callback(update: Update, context: ContextTypes.DEFAULT
     if data == "cancel_leave_all":
         await query.delete_message()
         await send_safe(context.bot, update.effective_chat.id, "🚫 عملیات لغو شد.", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
     if data == "confirm_leave_all":
         await query.edit_message_text("⏳ در حال شروع عملیات خروج از گروه‌ها و کانال‌ها...\nلطفاً صبر کنید (این عملیات در پس‌زمینه انجام می‌شود).")
         asyncio.create_task(process_leave_all_chats(context, update.effective_chat.id))
         await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
     return AWAITING_LEAVE_ALL_CONFIRM
 
 async def process_leave_all_chats(context, chat_id):
@@ -382,7 +382,7 @@ async def show_deleted_accounts_handler(update: Update, context: ContextTypes.DE
     
     if not dead_accounts:
         await send_safe(context.bot, update.effective_chat.id, "✅ **هیچ اکانت دلیت شده یا غیرفعالی یافت نشد.**", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
         
     txt = f"☠️ <b>لیست اکانت‌های غیرفعال/دلیت شده ({len(dead_accounts)}):</b>\n\n"
     for i, acc in enumerate(dead_accounts[:50]):
@@ -396,7 +396,7 @@ async def show_deleted_accounts_handler(update: Update, context: ContextTypes.DE
         
     kb = [[InlineKeyboardButton("🗑 حذف همه اکانت‌های دلیت شده", callback_data="confirm_delete_dead")], [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_acc_menu")]]
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return AWAITING_DELETE_DEAD_ACCS
+    return AWAITING_SETTINGS_ACTION
 
 async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -407,7 +407,7 @@ async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DE
         # اینجا چون کالبک است، نباید هندلر متنی را صدا بزنیم.
         # پس مستقیماً منو را ارسال می‌کنیم.
         await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
     if data == "confirm_delete_dead":
         bot_id = context.bot_data.get('bot_id', 1)
         accounts, _ = await DatabaseManager.get_accounts_paginated(limit=10000, bot_id=bot_id)
@@ -417,8 +417,8 @@ async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DE
             await DatabaseManager.delete_account(acc['id'], update.effective_user.id)
             count += 1
         await query.edit_message_text(f"✅ **{count} اکانت با موفقیت از دیتابیس حذف شدند.**")
-        return ConversationHandler.END
-    return AWAITING_DELETE_DEAD_ACCS
+        return AWAITING_SETTINGS_ACTION
+    return AWAITING_SETTINGS_ACTION
 
 async def cancel_handler(update, context):
     await _cleanup_client(context)

@@ -1376,11 +1376,30 @@ class OrderExecutor:
 		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
 		total_price = float(order.get("price_paid") or 0)
 		duration_minutes = int(order.get("duration_minutes") or 0)
+		status = (order.get("status") or "").lower()
 		started_at = order.get("started_at")
 
-		used_cost, refund_amount, _elapsed = self.compute_prorated_settlement(
-			total_price, duration_minutes, started_at
-		)
+		if status == "scheduled":
+			# سفارش زمان‌بندی‌شده هنوز هیچ مصرفی نداشته: عودت کامل.
+			used_cost, refund_amount, _elapsed = 0.0, total_price, 0.0
+		elif duration_minutes <= 0:
+			# سفارش حجمی (بدون مدت): سهم مصرف‌شده از روی پیشرفت واقعی.
+			target = int(order.get("target_count") or 0)
+			progress = int(order.get("progress") or 0)
+			if target > 0 and progress > 0:
+				used_cost = min(float(math.ceil(total_price * progress / target)), total_price)
+			else:
+				used_cost = 0.0
+			refund_amount = max(0.0, total_price - used_cost)
+			_elapsed = 0.0
+		else:
+			if not started_at:
+				# سفارش مدتی که قبل از شروع فاز صورتحساب لغو شده: مبنای
+				# کارکرد همان لحظهٔ ثبت سفارش است تا عودت کامل رخ ندهد.
+				started_at = order.get("created_at")
+			used_cost, refund_amount, _elapsed = self.compute_prorated_settlement(
+				total_price, duration_minutes, started_at
+			)
 		if not do_refund:
 			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
 			used_cost = total_price
