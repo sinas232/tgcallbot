@@ -7,7 +7,7 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import ContextTypes, ConversationHandler
 from helpers.message_utils import send_safe
 from database import DatabaseManager
-from constants import WALLET_MENU, AWAITING_WALLET_ACTION, BTN_BACK_MAIN, AWAITING_CHARGE_AMOUNT, USER_MAIN_MENU
+from constants import WALLET_MENU, AWAITING_WALLET_ACTION, BTN_BACK_MAIN, AWAITING_CHARGE_AMOUNT, USER_MAIN_MENU, BTN_CANCEL, CANCEL_KB, is_back_text, is_cancel_text
 from handlers.general_handlers import start_command
 from services.payment_service import payment_service
 from utils.helpers import clean_number
@@ -277,14 +277,21 @@ async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYP
     return AWAITING_WALLET_ACTION
 
 async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    if is_back_text(text): return await start_command(update, context)
+    text = update.message.text or ""
+    if is_back_text(text) or is_cancel_text(text):
+        # پاکسازی و بازگشت به منوی اصلی
+        for k in ('charge_gateway_slug', 'charge_card_status', 'charge_msg_add'):
+            context.user_data.pop(k, None)
+        return await start_command(update, context)
     bot_id = context.bot_data.get('bot_id', 1)
     
     try:
         amount = int(clean_number(text))
         if amount < 1000:
-            await update.message.reply_text("❌ حداقل مبلغ ۱,۰۰۰ تومان است.")
+            await update.message.reply_text("❌ حداقل مبلغ ۱,۰۰۰ تومان است.\nلطفاً مبلغ بیشتری وارد کنید:")
+            return AWAITING_CHARGE_AMOUNT
+        if amount > 100000000:
+            await update.message.reply_text("❌ حداکثر مبلغ ۱۰۰,۰۰۰,۰۰۰ تومان است.\nلطفاً مبلغ کمتری وارد کنید:")
             return AWAITING_CHARGE_AMOUNT
             
         tg_user = update.effective_user
@@ -294,23 +301,45 @@ async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYP
         # و سرویس اولین درگاه فعال را برمی‌دارد.
         selected_slug = context.user_data.get('charge_gateway_slug')
 
-        wait_msg = await update.message.reply_text("⏳ در حال اتصال به درگاه بانکی...")
-        success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id, gateway_slug=selected_slug)
+        wait_msg = await update.message.reply_text("⏳ در حال اتصال به درگاه بانکی... لطفاً صبر کنید.")
+        try:
+            success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id, gateway_slug=selected_slug)
+        except Exception as e:
+            logger.error(f"create_payment_link exception: {e}", exc_info=True)
+            await wait_msg.edit_text(f"❌ خطای داخلی در ایجاد لینک پرداخت:\n{e}\n\nلطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            return AWAITING_CHARGE_AMOUNT
         
         if success:
             # پاک‌سازی وضعیت انتخاب درگاه پس از موفقیت.
             for k in ('charge_gateway_slug', 'charge_card_status', 'charge_msg_add'):
                 context.user_data.pop(k, None)
             kb = [[InlineKeyboardButton("🔗 ورود به درگاه پرداخت", url=result)]]
-            msg_text = (f"✅ **لینک پرداخت ایجاد شد.**\n\n💰 مبلغ: `{amount:,}` تومان\n👤 کاربر: {user.get('first_name', 'کاربر')}\n\n👇 برای تکمیل پرداخت روی دکمه زیر کلیک کنید:")
-            await wait_msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
-            await send_safe(context.bot, update.effective_chat.id, "پس از پرداخت موفق، حساب شارژ می‌شود.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+            msg_text = (f"✅ **لینک پرداخت ایجاد شد.**\n\n💰 مبلغ: `{amount:,}` تومان\n👤 کاربر: {user.get('first_name', 'کاربر')}\n\n👇 برای تکمیل پرداخت روی دکمه زیر کلیک کنید:\n\n"
+                        f"🔗 `{result}`\n\n"
+                        f"⏳ پس از پرداخت موفق، حساب شما خودکار شارژ می‌شود.")
+            try:
+                await wait_msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                # اگر لینک طولانی بود و ادیت نشد، پیام جدید بفرست
+                await send_safe(context.bot, update.effective_chat.id, msg_text, reply_markup=InlineKeyboardMarkup(kb))
+            await send_safe(context.bot, update.effective_chat.id, "پس از پرداخت موفق، حساب شارژ می‌شود.\nبرای بازگشت به منوی اصلی از دکمه زیر استفاده کنید:", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
             return ConversationHandler.END
         else:
-            await wait_msg.edit_text(f"❌ خطا در ایجاد لینک پرداخت:\n{result}")
+            # خطا در ایجاد لینک - نمایش خطا و بازگشت به منوی کیف پول
+            err_text = str(result)[:500]
+            await wait_msg.edit_text(f"❌ خطا در ایجاد لینک پرداخت:\n{err_text}\n\nلطفاً دوباره تلاش کنید یا درگاه دیگری را انتخاب کنید.")
+            # پاکسازی انتخاب درگاه برای تلاش مجدد
+            context.user_data.pop('charge_gateway_slug', None)
             return await wallet_menu_handler(update, context)
     except ValueError:
-        await update.message.reply_text("❌ لطفاً مبلغ را به صورت عدد وارد کنید.")
+        await update.message.reply_text("❌ لطفاً مبلغ را به صورت عدد وارد کنید.\nمثال: 50000")
+        return AWAITING_CHARGE_AMOUNT
+    except Exception as e:
+        logger.error(f"handle_charge_amount unexpected error: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ خطای غیرمنتظره: {e}\nلطفاً دوباره تلاش کنید.")
+        except Exception:
+            pass
         return AWAITING_CHARGE_AMOUNT
 
 async def show_recent_transactions(update, context, is_callback=False):

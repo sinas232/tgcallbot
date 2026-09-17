@@ -886,12 +886,18 @@ def register_handlers(application: Application) -> None:
         states={
             AWAITING_WALLET_ACTION: [
                 MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
+                # دکمه‌های ریپلای کیف پول - صریح برای جلوگیری از گیر کردن
+                MessageHandler(filters.Regex("شارژ حساب|💳"), handle_wallet_action),
+                MessageHandler(filters.Regex("تراکنش|📈|تاریخچه"), handle_wallet_action),
                 MessageHandler(STD_TEXT, handle_wallet_action),
                 CallbackQueryHandler(handle_wallet_action)
             ],
             AWAITING_CHARGE_AMOUNT: [
                 MessageHandler(FILTER_BACK_OR_CANCEL, start_command),
-                MessageHandler(STD_TEXT, handle_charge_amount)
+                MessageHandler(STD_TEXT, handle_charge_amount),
+                MessageHandler(filters.ALL & ~filters.COMMAND, handle_charge_amount),
+                CallbackQueryHandler(handle_wallet_action, pattern="^back_to_wallet$|^wallet_add_new_card$|^chg_gw_"),
+                CallbackQueryHandler(wallet_menu_handler, pattern="^back_to_wallet$"),
             ],
         },
         fallbacks=STANDARD_FALLBACKS,

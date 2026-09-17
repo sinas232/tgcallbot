@@ -158,56 +158,137 @@ class AghayePardakhtGateway(BasePaymentGateway):
 class ZarinPalGateway(BasePaymentGateway):
     API_URL_REQUEST = "https://payment.zarinpal.com/pg/v4/payment/request.json"
     API_URL_VERIFY = "https://payment.zarinpal.com/pg/v4/payment/verify.json"
+    API_URL_REQUEST_SANDBOX = "https://sandbox.zarinpal.com/pg/v4/payment/request.json"
+    API_URL_VERIFY_SANDBOX = "https://sandbox.zarinpal.com/pg/v4/payment/verify.json"
     START_PAY_URL = "https://payment.zarinpal.com/pg/StartPay/"
+    START_PAY_SANDBOX_URL = "https://sandbox.zarinpal.com/pg/StartPay/"
+    
+    # کدهای خطای زرین‌پال برای پیام فارسی
+    ZP_ERROR_CODES = {
+        -9: "خطای اعتبارسنجی: پارامترهای ارسالی ناقص است (merchant_id, callback_url, description, amount)",
+        -10: "مرچنت کد یا IP پذیرنده صحیح نیست",
+        -11: "مرچنت کد فعال نیست - با پشتیبانی زرین‌پال تماس بگیرید",
+        -12: "تلاش بیش از حد در بازه کوتاه - کمی بعد تلاش کنید",
+        -13: "محدودیت تراکنش - مدارک را تکمیل کنید",
+        -14: "دامنه callback_url با دامنه ثبت شده درگاه مغایرت دارد",
+        -15: "درگاه به حالت تعلیق در آمده",
+        -16: "سطح تایید پذیرنده پایین است",
+        -17: "محدودیت سطح آبی",
+        -18: "امکان استفاده از درگاه روی دامنه دیگر نیست",
+        -19: "تراکنش برای این ترمینال مسدود است",
+        -40: "پارامتر expire_in نامعتبر",
+        -41: "حداکثر مبلغ 100 میلیون تومان است",
+        -50: "مبلغ پرداخت شده با مبلغ ارسالی متفاوت است",
+        -51: "پرداخت ناموفق",
+        -52: "خطای غیرمنتظره - با پشتیبانی زرین‌پال تماس بگیرید",
+        -53: "پرداخت متعلق به این مرچنت نیست",
+        -54: "authority نامعتبر است",
+        -55: "تراکنش یافت نشد",
+    }
     
     def __init__(self):
         super().__init__(GATEWAY_SLUG_ZARINPAL, "زرین‌پال")
+
+    def _is_sandbox(self, merchant_id: str) -> bool:
+        mid = str(merchant_id or "").strip().lower()
+        # مرچنت sandbox یا placeholder
+        return mid == "sandbox" or mid.startswith("xxxx") or len(mid) < 30 or mid.startswith("s")
+
+    def _error_message(self, data: dict) -> str:
+        try:
+            err = data.get('errors', {})
+            if isinstance(err, dict):
+                code = err.get('code')
+                msg = err.get('message', '')
+                if code in self.ZP_ERROR_CODES:
+                    return f"{self.ZP_ERROR_CODES[code]} (کد {code})"
+                if msg:
+                    return f"{msg} (کد {code})"
+                return f"کد خطا: {code}"
+            if isinstance(err, list) and err:
+                return str(err[0])
+            # data.code هم ممکنه خطا باشه
+            d = data.get('data', {})
+            if isinstance(d, dict) and d.get('code') and d.get('code') != 100:
+                code = d.get('code')
+                if code in self.ZP_ERROR_CODES:
+                    return f"{self.ZP_ERROR_CODES[code]} (کد {code})"
+                return f"کد خطا: {code} - {d.get('message','')}"
+        except Exception:
+            pass
+        return "خطای نامشخص از درگاه زرین‌پال"
         
     async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str], config: dict) -> Tuple[bool, str, Optional[str]]:
-        merchant_id = config.get('merchant_id', Config.ZARINPAL_MERCHANT_ID)
+        merchant_id = config.get('merchant_id', Config.ZARINPAL_MERCHANT_ID) or Config.ZARINPAL_MERCHANT_ID
         callback_url = Config.ZARINPAL_CALLBACK_URL
-        amount_rial = amount * 10 
+        amount_rial = amount * 10  # تومان به ریال
         
         full_callback = f"{callback_url}?user_id={user_id}"
-        # لاگِ آدرس بازگشت تا در صورت مشکلِ «بازنگشتن به ربات» به‌راحتی قابل بررسی باشد.
+        
+        is_sandbox = self._is_sandbox(merchant_id)
+        api_url = self.API_URL_REQUEST_SANDBOX if is_sandbox else self.API_URL_REQUEST
+        start_url = self.START_PAY_SANDBOX_URL if is_sandbox else self.START_PAY_URL
+        
         logger.info(
             f"ZarinPal create: amount={amount} تومان ({amount_rial} ریال), "
-            f"callback_url={full_callback}, proxy={_payment_proxy() or 'direct'}"
+            f"callback_url={full_callback}, sandbox={is_sandbox}, merchant_id={merchant_id[:8]}..., proxy={_payment_proxy() or 'direct'}"
         )
         if "localhost" in full_callback.lower() or "127.0.0.1" in full_callback.lower():
             logger.warning(
                 "⚠️ callback_url زرین‌پال روی localhost است؛ کاربر پس از پرداخت به "
                 "سرور بازنمی‌گردد. متغیر محیطی SERVER_URL را به آدرس عمومی سرور تنظیم کنید."
             )
+        if not merchant_id or str(merchant_id).startswith("xxxx"):
+            logger.error("ZarinPal merchant_id not set (placeholder)")
+            return False, "❌ مرچنت آیدی زرین‌پال تنظیم نشده است. لطفاً در پنل سوپر ادمین > مدیریت درگاه پرداخت، شناسه زرین‌پال را وارد کنید.", None
 
         metadata = {}
-        if mobile: metadata["mobile"] = mobile
-        if email: metadata["email"] = email
+        if mobile:
+            # فقط عدد انگلیسی
+            m = ''.join(c for c in str(mobile) if c.isdigit() or c == '+')
+            if m:
+                metadata["mobile"] = m
+        if email:
+            metadata["email"] = email
+        # order_id برای پیگیری بهتر
+        metadata["order_id"] = f"{user_id}-{int(time.time())}"
 
         payload = {
             "merchant_id": merchant_id,
             "amount": amount_rial,
-            "currency": "IRR", 
-            "description": f"شارژ کیف پول کاربر {user_id}",
+            "currency": "IRT" if is_sandbox else "IRR",  # در sandbox تست با IRT هم کار می‌کند، ولی IRR استاندارد است
+            "description": f"شارژ کیف پول کاربر {user_id} - مبلغ {amount} تومان",
             "callback_url": full_callback,
             "metadata": metadata
         }
+        # برای رعایت مستندات جدید، currency را IRT هم می‌توان فرستاد، ولی IRR با تبدیل *10 مطمئن‌تر است
+        # اگر بخواهیم دقیقاً مطابق مستندات جدید IRT استفاده کنیم:
+        # payload["currency"] = "IRT"
+        # payload["amount"] = amount
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(self.API_URL_REQUEST, json=payload, timeout=15, proxy=_payment_proxy()) as response:
-                    data = await response.json()
+                async with session.post(api_url, json=payload, timeout=20, proxy=_payment_proxy()) as response:
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception:
+                        text = await response.text()
+                        logger.error(f"ZarinPal non-JSON response: {text[:500]}")
+                        return False, f"خطای درگاه: پاسخ نامعتبر ({response.status})", None
+                    
+                    logger.info(f"ZarinPal response: status={response.status} data={data}")
+                    
                     if response.status == 200 and data.get('data', {}).get('code') == 100:
                         authority = data['data']['authority']
-                        link = f"{self.START_PAY_URL}{authority}"
+                        link = f"{start_url}{authority}"
                         return True, link, authority
                     else:
-                        errors = data.get('errors', [])
-                        logger.error(f"ZarinPal Create Error: {errors}")
-                        return False, f"خطا درگاه: {errors}", None
+                        err_msg = self._error_message(data)
+                        logger.error(f"ZarinPal Create Error: {err_msg} | full={data}")
+                        return False, f"❌ {err_msg}", None
         except Exception as e:
-            logger.error(f"ZarinPal Connection Error: {e}")
-            return False, "خطا در اتصال.", None
+            logger.error(f"ZarinPal Connection Error: {e}", exc_info=True)
+            return False, f"❌ خطا در اتصال به زرین‌پال: {e}", None
 
     async def verify_payment(self, verification_data: dict, config: dict) -> Tuple[bool, Dict[str, Any]]:
         merchant_id = config.get('merchant_id', Config.ZARINPAL_MERCHANT_ID)

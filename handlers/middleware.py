@@ -36,27 +36,39 @@ async def check_security(update: Update, context: ContextTypes.DEFAULT_TYPE, sho
     chat_id = update.effective_chat.id
     bot_id = context.bot_data.get('bot_id', 1)
 
-    # 🔧 حالت تعمیرات - فقط سوپر ادمین و گاد ادمین می‌توانند عبور کنند
+    # 🔧 حالت تعمیرات - فقط سفارش‌ها مسدود، سوپر ادمین آزاد
+    # اگر maintenance فعال باشد، فقط جلوی ثبت سفارش گرفته می‌شود (نه کیف پول و پشتیبانی)
+    # مگر اینکه متن پیام مربوط به سفارش باشد
     try:
         maint = await DatabaseManager.is_maintenance_mode(bot_id=bot_id)
         if maint:
-            # گاد ادمین همیشه آزاد
+            # گاد و سوپر ادمین همیشه آزاد
             if user.id in Config.ADMIN_IDS:
-                return True
-            # سوپر ادمین آزاد
-            db_u = await DatabaseManager.get_user(user.id, bot_id=bot_id)
-            if db_u and db_u.get('admin_role') == 'super_admin':
-                return True
-            # بقیه مسدود - پیام تعمیرات
-            if should_notify:
-                try:
-                    msg = await DatabaseManager.get_maintenance_message(bot_id=bot_id)
-                    await context.bot.send_message(chat_id=chat_id, text=msg)
-                except Exception:
-                    pass
-            return False
+                pass  # اجازه بده ادامه چک‌های دیگر انجام شود
+            else:
+                db_u = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+                is_super = bool(db_u and db_u.get('admin_role') == 'super_admin')
+                if not is_super:
+                    # فقط اگر کاربر قصد سفارش دارد، بلاک کن
+                    txt = ""
+                    if update.message and update.message.text:
+                        txt = update.message.text
+                    elif update.callback_query and update.callback_query.data:
+                        txt = update.callback_query.data
+                    # کلمات کلیدی مربوط به سفارش
+                    order_keywords = ["خرید سرویس", "🛍", "buy_plan_", "confirm_order", "cancel_order_", "order_", "سفارش"]
+                    is_order_attempt = any(k in txt for k in order_keywords)
+                    if is_order_attempt:
+                        if should_notify:
+                            try:
+                                msg = await DatabaseManager.get_maintenance_message(bot_id=bot_id)
+                                await context.bot.send_message(chat_id=chat_id, text=msg)
+                            except Exception:
+                                pass
+                        return False
+                    # برای سایر کارها (کیف پول، پشتیبانی) اجازه بده، ولی در start_command پیام تعمیرات نمایش داده می‌شود
     except Exception as e:
-        # اگر خطا در چک تعمیرات، ادامه بده (لاگ)
+        logger.debug(f"maintenance check error: {e}")
         pass
     
     if user.id in Config.ADMIN_IDS: return True
