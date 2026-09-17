@@ -9,8 +9,8 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 from database import DatabaseManager
-from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS
-from handlers.middleware import require_admin
+from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS, BTN_DELETE_DEAD_ACCOUNTS
+from handlers.middleware import require_admin, account_in_active_order, cleanup_voice_client_for_account
 from helpers.message_utils import send_safe
 from config import Config
 from telegram_client import TelegramAccountClient
@@ -69,6 +69,9 @@ async def account_management_handler(update: Update, context: ContextTypes.DEFAU
     has_leave_btn = any(BTN_LEAVE_ALL_CHATS in row for row in menu)
     if is_super and not has_leave_btn:
         menu.insert(3, [BTN_LEAVE_ALL_CHATS])
+    has_dead_btn = any(BTN_DELETE_DEAD_ACCOUNTS in row for row in menu)
+    if is_super and not has_dead_btn:
+        menu.insert(4, [BTN_DELETE_DEAD_ACCOUNTS])
     
     await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
@@ -431,11 +434,15 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if action == "delyes":
+        if await account_in_active_order(aid):
+            await query.answer("⚠️ این اکانت در یک سفارش فعال درگیر است؛ بعداً حذف کنید.", show_alert=True)
+            return
         await query.answer("در حال حذف...")
         try:
             await DatabaseManager.delete_account(aid, acc.get('user_id'))
         except Exception as e:
             logger.error(f"delete account error: {e}")
+        await cleanup_voice_client_for_account(aid)
         await query.edit_message_text(
             f"🗑 اکانت <code>{html.escape(str(acc['phone_number']))}</code> حذف شد.",
             parse_mode=ParseMode.HTML)

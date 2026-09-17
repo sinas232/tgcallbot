@@ -179,3 +179,63 @@ def require_god_admin(func):
         if update.callback_query: await update.callback_query.answer("⛔️ دسترسی غیرمجاز (God Admin only)", show_alert=True)
         return
     return wrapper
+# ===================== MAINTENANCE MODE (حالت بروزرسانی) =====================
+
+async def is_maintenance_active(bot_id) -> bool:
+    """آیا حالت نگه‌داری (بروزرسانی) برای این ربات فعال است؟"""
+    try:
+        return await DatabaseManager.get_setting("maintenance_mode", "false", bot_id=bot_id) == "true"
+    except Exception:
+        return False
+
+async def is_privileged_admin(user_id, bot_id) -> bool:
+    """مدیر کل (God) یا سوپر ادمین — کسانی که در حالت نگه‌داری هم
+    می‌توانند سفارش ثبت کنند."""
+    if user_id in Config.ADMIN_IDS:
+        return True
+    try:
+        db_user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        return bool(db_user and db_user.get("admin_role") == "super_admin")
+    except Exception:
+        return False
+
+async def maintenance_block_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True اگر این کاربر مجاز نیست در حال حاضر سفارش جدید ثبت کند
+    (حالت نگه‌داری فعال است و کاربر مدیر کل/سوپر ادمین نیست)."""
+    try:
+        bot_id = context.bot_data.get('bot_id', 1)
+        user_id = update.effective_user.id
+        if not await is_maintenance_active(bot_id):
+            return False
+        if await is_privileged_admin(user_id, bot_id):
+            return False
+        return True
+    except Exception:
+        return False
+
+# ===================== ACCOUNT DELETION HELPERS =====================
+
+async def account_in_active_order(account_id) -> bool:
+    """آیا این اکانت در یک سفارش فعال (در حال اجرا) درگیر است؟
+    حذف اکانت درگیر، میزبان تماسِ جاری را می‌شکند — حذف باید رد شود."""
+    try:
+        from services.voice_call_manager import voice_call_manager
+        if voice_call_manager is not None:
+            return bool(voice_call_manager._account_in_any_order(int(account_id)))
+    except Exception:
+        pass
+    return False
+
+async def cleanup_voice_client_for_account(account_id) -> bool:
+    """بستن کلاینت/موتور صوتیِ کش‌شدهٔ یک اکانت پس از حذفش از لیست
+    (best-effort — هیچ خطایی نشت نمی‌کند)."""
+    try:
+        from services.voice_call_manager import voice_call_manager
+        if voice_call_manager is not None:
+            await voice_call_manager._cleanup_client(
+                int(account_id), order_id=None, force=True, reason="account deleted"
+            )
+            return True
+    except Exception as exc:
+        logger.debug("cleanup voice client for deleted account %s failed: %s", account_id, exc)
+    return False

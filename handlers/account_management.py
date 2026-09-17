@@ -15,6 +15,8 @@ from config import Config
 from database import DatabaseManager
 from security import SecurityManager
 from constants import *
+from constants import BTN_DELETE_DEAD_ACCOUNTS
+from handlers.middleware import is_privileged_admin, account_in_active_order, cleanup_voice_client_for_account
 from helpers.message_utils import send_safe
 from telegram_client import TelegramAccountClient
 
@@ -300,8 +302,14 @@ async def handle_delete_account_input(update, context):
         acc = await DatabaseManager.get_account_by_id(target_aid)
         bot_id = context.bot_data.get('bot_id', 1)
         if acc and acc.get('bot_id', 1) == bot_id:
+            if await account_in_active_order(target_aid):
+                await send_safe(context.bot, update.effective_chat.id,
+                                "⚠️ این اکانت در یک سفارش فعال درگیر است؛ بعداً حذف کنید.",
+                                parse_mode=ParseMode.HTML)
+                return await delete_account_start(update, context)
             success = await DatabaseManager.delete_account(target_aid, update.effective_user.id)
             if success:
+                await cleanup_voice_client_for_account(target_aid)
                 await send_safe(context.bot, update.effective_chat.id, f"✅ حذف شد.", parse_mode=ParseMode.HTML)
                 return await delete_account_start(update, context)
         await send_safe(context.bot, update.effective_chat.id, "❌ خطا: اکانت یافت نشد یا دسترسی ندارید.", parse_mode=ParseMode.HTML)
@@ -424,4 +432,71 @@ async def cancel_handler(update, context):
     await _cleanup_client(context)
     context.user_data.clear()
     from handlers.menu_handlers import account_management_handler
+    return await account_management_handler(update, context)
+# --- حذف اکانت‌های سوخته (آفلاین/حذف‌شده) از لیست — فقط سوپر ادمین ---
+async def delete_dead_accounts_start(update, context):
+    """لیست اکانت‌های سوخته (غیرفعال) را نشان می‌دهد و دکمهٔ حذف همه را در اختیار سوپر ادمین می‌گذارد."""
+    from handlers.admin_handlers import _do_delete_dead_accounts
+    user_id = update.effective_user.id
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    if not await is_privileged_admin(user_id, bot_id):
+        await send_safe(context.bot, update.effective_chat.id, "⛔️ این قابلیت فقط برای سوپر ادمین در دسترس است.")
+        return ConversationHandler.END
+
+    accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+    if not accounts:
+        await send_safe(context.bot, update.effective_chat.id, "✅ هیچ اکانت سوخته‌ای (غیرفعال) در لیست نیست.")
+        from handlers.menu_handlers import account_management_handler
+        return await account_management_handler(update, context)
+
+    txt = f"🧹 **حذف اکانت‌های سوخته از لیست**\n\n{len(accounts)} اکانت غیرفعال (سوخته) پیدا شد:\n\n"
+    for acc in accounts[:30]:
+        txt += f"💀 `{acc['phone_number']}` (ID: `{acc['id']}`)\n"
+    if len(accounts) > 30:
+        txt += f"\n... و {len(accounts) - 30} اکانت دیگر\n"
+    txt += "\n⚠️ اکانت‌های درگیر در سفارش فعال حذف نمی‌شوند. این عمل غیرقابل بازگشت است."
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑 بله، حذف همهٔ {len(accounts)} اکانت", callback_data="deadacc_cf")],
+        [InlineKeyboardButton("❌ انصراف", callback_data="deadacc_cf_cancel")]
+    ])
+    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+
+async def delete_dead_accounts_confirm(update, context):
+    """تایید/انصراف حذف همهٔ اکانت‌های سوخته."""
+    from handlers.admin_handlers import _do_delete_dead_accounts
+    from handlers.menu_handlers import account_management_handler
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    if not await is_privileged_admin(update.effective_user.id, bot_id):
+        await query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        return await account_management_handler(update, context)
+
+    if data == "deadacc_cf_cancel":
+        try:
+            await query.edit_message_text("↩️ انصراف شد؛ هیچ اکانتی حذف نشد.")
+        except Exception:
+            pass
+        return await account_management_handler(update, context)
+
+    if data == "deadacc_cf":
+        accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+        ids = [a['id'] for a in accounts]
+        if not ids:
+            await query.edit_message_text("✅ دیگر اکانت سوخته‌ای در لیست نیست.")
+            return await account_management_handler(update, context)
+        await query.edit_message_text("⏳ در حال حذف اکانت‌های سوخته... لطفاً چند لحظه صبر کنید.")
+        deleted, skipped = await _do_delete_dead_accounts(update, context, ids)
+        skip_txt = f"\n\n⚠️ {len(skipped)} اکانت به دلیل درگیر بودن در سفارش فعال حذف نشد." if skipped else ""
+        await query.edit_message_text(
+            f"🗑 **{deleted} اکانت سوخته از لیست حذف شد.**{skip_txt}"
+        )
+        return await account_management_handler(update, context)
+
     return await account_management_handler(update, context)

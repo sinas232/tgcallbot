@@ -17,6 +17,7 @@ from utils.helpers import clean_number, format_jalali_datetime, format_price
 from config import Config
 from services.order_executor import order_executor
 from services.bot_manager import bot_manager
+from handlers.middleware import is_maintenance_active, is_privileged_admin, account_in_active_order, cleanup_voice_client_for_account
 from handlers.ticket_handlers import admin_tickets_list, show_ticket_list
 
 try:
@@ -173,6 +174,7 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ["🆔 تنظیم کانال‌های لاگ", "🆔 متن احراز هویت (مرحله ۱)"],
         ["🆔 متن احراز هویت (مرحله ۲)"],
         ["🩺 تنظیمات بررسی سلامت (SpamBot)"],
+        ["🛠 حالت نگه‌داری (بروزرسانی)"],
         [BTN_PREMIUM_EMOJI],
         ["📊 گزارش کلی", BTN_BACK]
     ]
@@ -185,6 +187,7 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
+        if "حالت نگه‌داری" in text: return await maintenance_mode_menu(update, context)
         # 💎 ایموجی پریمیوم (Custom Emoji)
         if "ایموجی پریمیوم" in text:
             from handlers.premium_emoji_handlers import premium_emoji_menu
@@ -232,8 +235,21 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 return AWAITING_SETTINGS_ACTION
             txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
             for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
-            if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+            if len(txt) > 3000: txt = txt[:3000] + "\n..."
+            # فقط سوپر ادمین دکمه‌های حذف را می‌بیند
+            admin_id = update.effective_user.id
+            can_del = await is_privileged_admin(admin_id, bot_id)
+            kb = []
+            if can_del:
+                for acc in accounts[:20]:
+                    kb.append([InlineKeyboardButton(
+                        f"🗑 حذف {str(acc['phone_number'])[-4:]} (ID {acc['id']})",
+                        callback_data=f"deadacc_del_{acc['id']}"
+                    )])
+                if len(accounts) > 1:
+                    kb.append([InlineKeyboardButton(f"🗑 حذف همهٔ {len(accounts)} اکانت", callback_data="deadacc_del_all")])
+            kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")])
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
             return AWAITING_SETTINGS_ACTION
         elif data == "view_limited_accounts":
             accounts = await DatabaseManager.get_limited_accounts(bot_id=bot_id)
@@ -250,7 +266,11 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
     dead_accs = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
     dead_count = len(dead_accs)
     txt = (f"🚑 **گزارش سلامت اکانت‌ها**\n\n🤖 کل اکانت‌ها: `{accs_stats['total']}`\n✅ فعال و سالم: `{accs_stats['active']}`\n⛔️ محدود (Limited): `{accs_stats['limited']}`\n💀 غیرفعال (سوخته/نشست بسته): `{dead_count}`\n\n👇 برای مشاهده جزئیات کلیک کنید:")
+    admin_id = update.effective_user.id
+    can_del = await is_privileged_admin(admin_id, bot_id)
     kb = [[InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")], [InlineKeyboardButton("⛔️ مشاهده لیست محدودها", callback_data="view_limited_accounts")]]
+    if can_del:
+        kb.append([InlineKeyboardButton("🗑 حذف همهٔ اکانت‌های سوخته از لیست", callback_data="deadacc_del_all")])
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else:
         if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -1665,6 +1685,67 @@ async def set_spam_interval_handler(update, context):
     await update.message.reply_text(f"✅ تنظیم شد: هر {text} دقیقه.")
     return await settings_menu_handler(update, context)
 
+# ===================== MAINTENANCE MODE (حالت نگه‌داری / بروزرسانی) =====================
+# While active, regular users cannot place new orders and see a
+# "در حال بروزرسانی است" message. God & super admins are exempt and can
+# still register orders. Toggled only by super admins from this menu.
+
+@require_super_admin
+async def maintenance_mode_menu(update, context):
+    bot_id = context.bot_data.get('bot_id', 1)
+    active = await is_maintenance_active(bot_id)
+    status_txt = "✅ **فعال** — کاربران عادی نمی‌توانند سفارش ثبت کنند" if active else "❌ **غیرفعال** — ثبت سفارش برای همه ممکن است"
+    txt = (
+        "🛠 **حالت نگه‌داری (بروزرسانی)**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"وضعیت فعلی: {status_txt}\n"
+        "\n"
+        "وقتی این حالت **فعال** باشد:\n"
+        "• کاربران عادی نمی‌توانند سفارش جدید ثبت کنند و پیام «در حال بروزرسانی است» می‌بینند.\n"
+        "• مدیر کل و **سوپر ادمین** همچنان می‌توانند سفارش ثبت کنند.\n"
+        "• سفارش‌های در حال اجرا متاثر نمی‌شوند.\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "👇 برای تغییر وضعیت روی دکمه بزنید:"
+    )
+    btn_label = "🔴 غیرفعال کردن حالت نگه‌داری" if active else "🟢 فعال کردن حالت نگه‌داری"
+    kb = [
+        [InlineKeyboardButton(btn_label, callback_data="toggle_maintenance")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="back_to_settings")]
+    ]
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
+    return AWAITING_SETTINGS_ACTION
+
+async def maintenance_mode_callback(update, context):
+    query = update.callback_query
+    data = query.data
+    if data == "back_to_settings":
+        await safe_answer(query)
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return await settings_menu_handler(update, context)
+    if data == "toggle_maintenance":
+        bot_id = context.bot_data.get('bot_id', 1)
+        # فقط سوپر ادمین / مدیر کل می‌تواند تغییر دهد
+        admin_id = update.effective_user.id
+        if not await is_privileged_admin(admin_id, bot_id):
+            await query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+        active = await is_maintenance_active(bot_id)
+        new_val = "false" if active else "true"
+        await DatabaseManager.set_setting("maintenance_mode", new_val, bot_id=bot_id)
+        await query.answer("✅ حالت نگه‌داری فعال شد." if new_val == "true" else "✅ حالت نگه‌داری غیرفعال شد.", show_alert=False)
+        # بازخوانی منو با وضعیت جدید
+        return await maintenance_mode_menu(update, context)
+    return AWAITING_SETTINGS_ACTION
+
 # --- God Services ---
 @require_god_admin
 async def services_management_menu(update, context):
@@ -1944,3 +2025,93 @@ async def receive_backup_interval(update, context):
     await DatabaseManager.set_setting("auto_backup_interval_hours", text, bot_id=bot_id)
     await update.message.reply_text(f"✅ بازه پشتیبان‌گیری خودکار تنظیم شد: هر {text} ساعت.")
     return await backup_restore_menu(update, context)
+
+# ===================== DELETE DEAD ACCOUNTS (حذف اکانت‌های سوخته) =====================
+# Super admins can permanently remove logged-out / dead accounts from the
+# list (DB row + in-memory voice client teardown). Active-order accounts are
+# never deleted (they would break a live call).
+
+async def _do_delete_dead_accounts(update, context, ids):
+    """Remove the given account ids; return (deleted_count, skipped_in_order)."""
+    deleted = 0
+    skipped = []
+    for aid in ids:
+        try:
+            acc = await DatabaseManager.get_account_by_id(aid)
+            if not acc:
+                continue
+            if await account_in_active_order(aid):
+                skipped.append(aid)
+                continue
+            ok = await DatabaseManager.delete_account(aid, acc.get('user_id'))
+            if ok:
+                deleted += 1
+                await cleanup_voice_client_for_account(aid)
+        except Exception as exc:
+            logger.error(f"delete dead account {aid} failed: {exc}")
+    return deleted, skipped
+
+async def delete_dead_account_callback(update, context):
+    query = update.callback_query
+    data = query.data
+    bot_id = context.bot_data.get('bot_id', 1)
+    admin_id = update.effective_user.id
+    if not await is_privileged_admin(admin_id, bot_id):
+        try:
+            await query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+
+    if data == "deadacc_del_all":
+        accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+        ids = [a['id'] for a in accounts]
+        if not ids:
+            await query.answer("هیچ اکانت سوخته‌ای برای حذف نیست.", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+        await query.answer("⏳ در حال حذف...", show_alert=False)
+        deleted, skipped = await _do_delete_dead_accounts(update, context, ids)
+        skip_txt = f"\n⚠️ {len(skipped)} اکانت به دلیل درگیر بودن در سفارش فعال حذف نشد." if skipped else ""
+        await query.edit_message_text(
+            f"🗑 **{deleted} اکانت سوخته از لیست حذف شد.**{skip_txt}\n"
+            f"↩️ برای بازگشت به گزارش سلامت: "
+        )
+        # بازرسازی دکمهٔ بازگشت
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به گزارش", callback_data="view_dead_accounts")]]))
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith("deadacc_del_"):
+        try:
+            aid = int(data.split("_")[2])
+        except Exception:
+            return AWAITING_SETTINGS_ACTION
+        acc = await DatabaseManager.get_account_by_id(aid)
+        if not acc or acc.get('bot_id', 1) != bot_id:
+            await query.answer("❌ اکانت یافت نشد.", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+        if await account_in_active_order(aid):
+            await query.answer("⚠️ این اکانت در یک سفارش فعال درگیر است؛ بعداً حذف کنید.", show_alert=True)
+            return AWAITING_SETTINGS_ACTION
+        await query.answer("⏳ در حال حذف...", show_alert=False)
+        await DatabaseManager.delete_account(aid, acc.get('user_id'))
+        await cleanup_voice_client_for_account(aid)
+        # لیست سوخته‌ها را تازه می‌کنیم (پیام اصلی همان می‌ماند)
+        accounts_left = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+        txt = "✅ اکانت سوخته حذف شد."
+        txt += "\n\n💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n" if accounts_left else "\n\n✅ دیگر اکانت سوخته‌ای در لیست نیست."
+        kb = []
+        if accounts_left:
+            for a in accounts_left[:20]:
+                kb.append([InlineKeyboardButton(
+                    f"🗑 حذف {str(a['phone_number'])[-4:]} (ID {a['id']})",
+                    callback_data=f"deadacc_del_{a['id']}"
+                )])
+            if len(accounts_left) > 1:
+                kb.append([InlineKeyboardButton(f"🗑 حذف همهٔ {len(accounts_left)} اکانت", callback_data="deadacc_del_all")])
+        kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")])
+        try:
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+    return AWAITING_SETTINGS_ACTION

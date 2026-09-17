@@ -4,7 +4,7 @@ constants.py
 """
 
 # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
-BOT_VERSION = "2.2.11"
+BOT_VERSION = "2.2.12"
 
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
@@ -123,6 +123,7 @@ BTN_CANCEL = "🔙 انصراف"
 BTN_BACK_MAIN = "بازگشت به منوی اصلی"
 BTN_EXIT_ADMIN = "🔙 خروج از پنل ادمین"
 BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضافه شد
+BTN_DELETE_DEAD_ACCOUNTS = "🧹 حذف اکانت‌های سوخته از لیست" # ✅ سوپر ادمین
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
 BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
 

@@ -712,12 +712,16 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^💳 مدیریت درگاه پرداخت$"), gateway_management_menu),
                 MessageHandler(filters.Regex("^🔒 تنظیمات امنیتی$"), security_settings_menu),
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings"),
+                # 🛠 حالت نگه‌داری (بروزرسانی) — فقط سوپر ادمین
+                MessageHandler(filters.Regex("^🛠 حالت نگه‌داری (بروزرسانی)$"), maintenance_mode_menu),
                 
                 # لاگ و متن
                 MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_|^set_spam_"),
+                # 🛠 حالت نگه‌داری (بروزرسانی)
+                CallbackQueryHandler(maintenance_mode_callback, pattern="^toggle_maintenance$"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
                 
@@ -753,6 +757,8 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
+                # 🗑 حذف اکانت‌های سوخته از لیست (سوپر ادمین)
+                CallbackQueryHandler(delete_dead_account_callback, pattern="^deadacc_del_"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
             ],
             
@@ -843,6 +849,7 @@ def register_handlers(application: Application) -> None:
             MessageHandler(filters.Regex("^➕ افزودن اکانت \(شماره\)$"), add_account_start),
             MessageHandler(filters.Regex("^📥 افزودن با سشن \(String\)$"), import_session_start),
             MessageHandler(filters.Regex("^❌ حذف اکانت$"), delete_account_start),
+            MessageHandler(filters.Regex(f"^{BTN_DELETE_DEAD_ACCOUNTS}$"), delete_dead_accounts_start),
             MessageHandler(filters.Regex("^📋 لیست اکانت‌ها$"), list_accounts_handler),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             MessageHandler(filters.Regex("^📩 دریافت کد ورود$"), get_code_start),
@@ -975,6 +982,8 @@ def register_handlers(application: Application) -> None:
     # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
     application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|del|delyes|sync)_\d+$"), group=0)
+    # 🧹 تایید/انصراف حذف اکانت‌های سوخته (سوپر ادمین)
+    application.add_handler(CallbackQueryHandler(delete_dead_accounts_confirm, pattern="^deadacc_cf$|^deadacc_cf_cancel$"), group=0)
     # صفحه‌بندی/بستن لیست‌های شیشه‌ای انتخاب اکانت (پروفایل و دریافت کد)
     application.add_handler(CallbackQueryHandler(profile_picker_page_callback, pattern=r"^profpage_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(getcode_picker_page_callback, pattern=r"^codepage_\d+$"), group=0)

@@ -20,6 +20,7 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
+from handlers.middleware import maintenance_block_order
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,18 @@ logger = logging.getLogger(__name__)
 async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_id = context.bot_data.get('bot_id', 1)
     user_id = update.effective_user.id
-    
+
+    # 🛠 حالت نگه‌داری (بروزرسانی): کاربران عادی نمی‌توانند سفارش ثبت کنند؛
+    # مدیر کل و سوپر ادمین همچنان می‌توانند.
+    if await maintenance_block_order(update, context):
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "🛠 **ربات در حال بروزرسانی است.**\n"
+            "فعلاً امکان ثبت سفارش جدید وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید.",
+            reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True),
+        )
+        return ConversationHandler.END
+
     user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
     if not user:
         tg_user = update.effective_user
@@ -306,7 +318,16 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         bot_id = context.bot_data.get('bot_id', 1)
         plan = context.user_data['selected_plan']
         link = context.user_data['target_link']
-        
+
+        # 🛠 حالت نگه‌داری (بروزرسانی): حتی اگر کاربر پیش از فعال‌شدن حالت
+        # نگه‌داری فرآیند را شروع کرده بود، در لحظهٔ پرداخت/ثبت دوباره چک می‌شود.
+        if await maintenance_block_order(update, context):
+            await query.edit_message_text(
+                "🛠 **ربات در حال بروزرسانی است.**\n"
+                "ثبت سفارش فعلاً ممکن نیست. لطفاً کمی بعد دوباره تلاش کنید."
+            )
+            return ConversationHandler.END
+
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
