@@ -243,16 +243,33 @@ class SystemSnapshot:
 
 @dataclass(frozen=True)
 class ResourceCost:
-    """هزینهٔ منابع به‌ازای هر اکانتِ همزمان."""
-    cpu_percent_per_account: float = 1.2
-    memory_mb_per_account: float = 45.0
+    """هزینهٔ منابع به‌ازای هر اکانتِ همزمان.
+
+    مقادیر پیش‌فرض صفرند یعنی «اندازه‌گیری نشده»؛ هیچ عددی به‌صورت
+    حدسی/دستی در مدل وارد نمی‌شود. فقط دو منبع معتبر داریم:
+      1) اندازه‌گیریٔ واقعی روی سرور مزانٔ اکانت‌های فعال (ResourceCalibrator)
+      2) عددی که ادمین خودش در .env قفل کند
+    تا وقتی هزینه اندازه‌گیری نشده باشد، پیش‌بینی ممکن نیست و گارد
+    به‌جای حدس، به اصلِ «اگر همین الان سرور درگیر است، نپذیر» تکیه می‌کند.
+    """
+    cpu_percent_per_account: float = 0.0
+    memory_mb_per_account: float = 0.0
+
+    def is_measured(self) -> bool:
+        """آیا هزینهٔ هر اکانت از اندازه‌گیریٔ واقعی به‌دست آمده؟"""
+        return self.cpu_percent_per_account > 0 or self.memory_mb_per_account > 0
 
 
 @dataclass(frozen=True)
 class ResourceLimits:
-    """سقف‌های مجاز — عبور از هر کدام یعنی عدم پذیرش سفارش."""
+    """سقف‌های مجاز — عبور از هر کدام یعنی عدم پذیرش سفارش.
+
+    قاعدهٔ محصولی: «اگر ۸۵ درصد منابع سرور درگیر بود، سفارش
+    پذیرفته نشود» — پس پیش‌فرض هر دو بعد ۸۵ درصد است (قابل تنظیم
+    جداگانه در صورت نیاز).
+    """
     max_cpu_percent: float = 85.0
-    max_memory_percent: float = 88.0
+    max_memory_percent: float = 85.0
     max_load_per_core: float = 1.5
 
 
@@ -274,6 +291,7 @@ class ResourceVerdict:
     current_load_per_core: float = 0.0
     peak_accounts: int = 0
     checked: bool = False
+    measured_now: bool = False       # True ⇒ مبنا، اندازه‌گیریِ واقعیِ همین لحظه است
 
 
 # ─────────────────────────── خواندن از سیستم ───────────────────────────
@@ -286,6 +304,22 @@ def _read_text(path: str) -> Optional[str]:
         return None
     except Exception:  # دفاعی: هر خطای غیرمنتظره نباید بالا برود
         return None
+
+
+def read_host_memory() -> Tuple[float, float, str]:
+    """(used_MB, total_MB, source) بر اساسٔ کلِ سرور (MemTotal - MemAvailable).
+
+    /proc/meminfo داخل کانتینر همان حافظهٔ هاست را نشان می‌دهد،
+    پس این همان عددی است که از نظر ادمین «رم سرور» حساب می‌شود.
+    استفاده از MemAvailable (نه MemFree) برای مصرف واقعی است.
+    """
+    meminfo = _read_text(PROC_MEMINFO)
+    if meminfo:
+        total_kb, avail_kb = parse_meminfo(meminfo)
+        if total_kb > 0:
+            used_kb = max(0, total_kb - avail_kb)
+            return used_kb / 1024.0, total_kb / 1024.0, "server"
+    return 0.0, 0.0, "unavailable"
 
 
 def read_memory(cgroup_v2: bool = True) -> Tuple[float, float, str]:
@@ -328,6 +362,24 @@ def read_memory(cgroup_v2: bool = True) -> Tuple[float, float, str]:
     return 0.0, 0.0, "unavailable"
 
 
+def read_host_cpu_snapshot(interval_sec: float = 0.35) -> Tuple[float, int, Optional[float], str]:
+    """(cpu_percent, cores, quota_cores, source) بر اساسٔ کلِ سرور (/proc/stat).
+
+    اختلاف دو نمونهٔ /proc/stat اشتغال مجموعٔ هسته‌های
+    سرور را می‌دهد (همان چیزی که در htop دیده می‌شود).
+    """
+    interval = max(0.05, min(2.0, float(interval_sec or 0.35)))
+    first = _read_text(PROC_STAT)
+    if first is None:
+        return 0.0, os.cpu_count() or 1, None, "unavailable"
+    time.sleep(interval)
+    second = _read_text(PROC_STAT)
+    if second is None:
+        return 0.0, os.cpu_count() or 1, None, "unavailable"
+    cores = cpu_core_count(second) or (os.cpu_count() or 1)
+    return cpu_busy_percent(first, second), cores, None, "server"
+
+
 def read_cpu_snapshot(interval_sec: float = 0.35) -> Tuple[float, int, Optional[float], str]:
     """(cpu_percent, cores, quota_cores, source) — نمونه‌برداری کوتاه."""
     interval = max(0.05, min(2.0, float(interval_sec or 0.35)))
@@ -360,11 +412,16 @@ def read_cpu_snapshot(interval_sec: float = 0.35) -> Tuple[float, int, Optional[
     return cpu_busy_percent(first, second), cores, quota_cores, "proc"
 
 
-def read_system_snapshot(interval_sec: float = 0.35) -> SystemSnapshot:
+def read_system_snapshot(interval_sec: float = 0.35, scope: str = "server") -> SystemSnapshot:
     """اسنپ‌شات کامل؛ هیچ‌گاه استثنا پرتاب نمی‌کند (fail-open در لایهٔ بالاتر)."""
     try:
-        used_mb, total_mb, mem_source = read_memory()
-        cpu_percent, cores, quota_cores, cpu_source = read_cpu_snapshot(interval_sec)
+        if str(scope or "server").lower() == "container":
+            used_mb, total_mb, mem_source = read_memory()
+            cpu_percent, cores, quota_cores, cpu_source = read_cpu_snapshot(interval_sec)
+        else:
+            # پیش‌فرض: اشتغال کل سرور (16GB / 8 هسته) — همان اعدادی که ادمین می‌بیند
+            used_mb, total_mb, mem_source = read_host_memory()
+            cpu_percent, cores, quota_cores, cpu_source = read_host_cpu_snapshot(interval_sec)
         loadavg_raw = _read_text(PROC_LOADAVG) or ""
         load = parse_loadavg(loadavg_raw)
         load_per_core = load / max(1, cores) if load else 0.0
@@ -380,7 +437,7 @@ def read_system_snapshot(interval_sec: float = 0.35) -> SystemSnapshot:
             load_per_core=round(load_per_core, 2),
             cpu_cores=cores,
             cpu_quota_cores=quota_cores,
-            source="cgroup" if ("cgroup" in (mem_source, cpu_source)) else cpu_source,
+            source=mem_source if mem_source == cpu_source else (mem_source or cpu_source),
         )
     except Exception:
         logger.exception("system_resources: snapshot failed (fail-open)")
@@ -494,83 +551,46 @@ def check_resources(
 # ─────────────────────────── کالیبراسیون تطبیقی ───────────────────────────
 
 class ResourceCalibrator:
-    """تخمینِ «هزینهٔ هر اکانت» و «خط‌مبنای سیستم» از نمونه‌های واقعی.
+    """یادگیریٔ هزینهٔ واقعی هر اکانت از اندازه‌گیری‌های زنده.
 
-    هر بار که گارد ظرفیت اجرا می‌شود، مصرف لحظه‌ای و تعداد اکانت‌های فعال را
-    می‌بیند؛ با تفاضلِ این دو، خط‌مبنا به‌دست می‌آید و با تقسیمِ مابقی بر
-    تعداد اکانت‌ها، هزینهٔ هر اکانت. مقادیر با میانگین متحرک نمایی (EWMA)
-    به‌روز می‌شوند تا نویزِ لحظه‌ای باعث تصمیمِ غلط نشود.
+    منطق دقیقاً مطابق خواستهٔ محصول: ما هیچ عددی اختراع نمی‌کنیم.
+    هر بار که گارد اجرا می‌شود، دو چیز اندازه‌گیری می‌شود:
+      1) مصرف واقعی سرور همین لحظه (که بار همهٔ سفارش‌های
+         در حال اجرا را در خود دارد) — این مبنای تصمیم برای
+         سفارش‌های آنی است.
+      2) تعداد اکانت‌های فعال همان لحظه — تا بتوان مصرف
+         را به آن‌ها نسبت داد.
 
-    اگر ادمین مقادیر را در `.env` قفل کرده باشد (بزرگ‌تر از صفر)، کالیبراسیون
-    فقط برای «خط‌مبنا» استفاده می‌شود و هزینه ثابت می‌ماند.
+    نحوهٔ یادگیری (منحصراً از داده):
+      کمترین مصرفی که تاکنون دیده‌ایم همراه با تعداد اکانتٔ
+      متناظرش به‌عنوان «نقطهٔ مرجع» نگه داشته می‌شود. وقتی
+      در لحظه‌ای دیگر تعداد اکانت‌های بیشتری فعال باشد، هزینهٔ
+      هر اکانت از تفاضل به‌دست می‌آید:
+
+          unit = (used_now - used_ref) / (accounts_now - accounts_ref)
+
+      اگر هنوز ارتقای تعداد اکانت دیده نشده باشد، هزینه ناشناخته
+      باقی می‌ماند (و گارد به‌جای حدس، به اصلِ «اگر همین الان
+      ۸۵ درصد درگیر است نپذیر» تکیه می‌کند).
     """
 
-    def __init__(
-        self,
-        cost: Optional[ResourceCost] = None,
-        baseline: Optional[ResourceBaseline] = None,
-        alpha: float = 0.25,
-    ) -> None:
-        self._cost = cost or ResourceCost()
-        self._baseline = baseline or ResourceBaseline()
+    def __init__(self, alpha: float = 0.25) -> None:
         self._alpha = min(1.0, max(0.01, float(alpha or 0.25)))
-        self._samples = 0
+        self._ref_cpu: Optional[float] = None       # کمترین مصرف دیده‌شده
+        self._ref_mem_mb: Optional[float] = None
+        self._ref_accounts: int = 0
+        self._cost: Optional[ResourceCost] = None
+        self._locked: Optional[ResourceCost] = None
+        self._samples: int = 0
+        self._learned: int = 0
 
     @property
     def samples(self) -> int:
         return self._samples
 
-    def observe(
-        self,
-        snapshot: SystemSnapshot,
-        active_accounts: int,
-        cost: Optional[ResourceCost] = None,
-    ) -> None:
-        """ثبت یک نمونهٔ جدید (مصرف فعلی + تعداد اکانتِ فعال همین لحظه)."""
-        if not snapshot or not snapshot.ok:
-            return
-        accounts = max(0, int(active_accounts or 0))
-        base_cost = cost or self._cost
-
-        observed_baseline_cpu = max(0.0, snapshot.cpu_percent - base_cost.cpu_percent_per_account * accounts)
-        observed_baseline_mem = max(0.0, snapshot.memory_used_mb - base_cost.memory_mb_per_account * accounts)
-        observed_baseline_mem = min(observed_baseline_mem, snapshot.memory_total_mb)
-
-        self._samples += 1
-        a = self._alpha
-
-        if self._samples == 1:
-            new_baseline = ResourceBaseline(
-                cpu_percent=observed_baseline_cpu,
-                memory_mb=observed_baseline_mem,
-            )
-        else:
-            new_baseline = ResourceBaseline(
-                cpu_percent=self._baseline.cpu_percent * (1 - a) + observed_baseline_cpu * a,
-                memory_mb=self._baseline.memory_mb * (1 - a) + observed_baseline_mem * a,
-            )
-        self._baseline = new_baseline
-
-        # اگر هزینه از تنظیمات قفل نشده باشد (صفر/منفی) → از داده یاد بگیر
-        if accounts > 0 and (
-            (cost is None and self._locked_cost() is None)
-        ):
-            unit_cpu = (snapshot.cpu_percent - new_baseline.cpu_percent) / accounts
-            unit_mem = (snapshot.memory_used_mb - new_baseline.memory_mb) / accounts
-            unit_cpu = self._clamp(unit_cpu, 0.02, 25.0)
-            unit_mem = self._clamp(unit_mem, 1.0, 1024.0)
-            self._cost = ResourceCost(
-                cpu_percent_per_account=self._cost.cpu_percent_per_account * (1 - a) + unit_cpu * a,
-                memory_mb_per_account=self._cost.memory_mb_per_account * (1 - a) + unit_mem * a,
-            )
-
-    def _locked_cost(self) -> Optional[ResourceCost]:
-        return getattr(self, "_locked", None)
-
-    def lock_cost(self, cost: ResourceCost) -> None:
-        """قفل‌کردن هزینه روی مقادیر تنظیم‌شده توسط ادمین."""
-        self._locked = cost
-        self._cost = cost
+    @property
+    def learned_samples(self) -> int:
+        return self._learned
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -579,19 +599,68 @@ class ResourceCalibrator:
         except Exception:
             return low
 
-    def cost(self) -> ResourceCost:
-        locked = getattr(self, "_locked", None)
-        return locked or self._cost
+    def observe(self, snapshot: SystemSnapshot, active_accounts: int) -> None:
+        """ثبت یک نمونه: مصرف واقعی + تعداد اکانت‌های فعال همان لحظه."""
+        if not snapshot or not snapshot.ok:
+            return
+        accounts = max(0, int(active_accounts or 0))
+        self._samples += 1
+
+        # ۱) به‌روزرسانیِ نقطهٔ مرجع (کمترین مصرفِ دیده‌شده)
+        if self._ref_cpu is None or accounts < self._ref_accounts or (
+            accounts == self._ref_accounts and snapshot.memory_used_mb < (self._ref_mem_mb or 0.0)
+        ):
+            self._ref_cpu = float(snapshot.cpu_percent)
+            self._ref_mem_mb = float(snapshot.memory_used_mb)
+            self._ref_accounts = accounts
+            return  # با این نمونه مرجع ساختیم؛ هزینه از نمونهٔ بعدی یاد گرفته می‌شود
+
+        # ۲) اگر تعداد اکانت‌ها بیشتر از مرجع شد ⇒ اختلاف را به اکانت‌ها نسبت بده
+        delta_accounts = accounts - self._ref_accounts
+        if delta_accounts <= 0:
+            return
+        unit_cpu = self._clamp(
+            (float(snapshot.cpu_percent) - float(self._ref_cpu)) / delta_accounts, 0.0, 100.0
+        )
+        unit_mem = self._clamp(
+            (float(snapshot.memory_used_mb) - float(self._ref_mem_mb)) / delta_accounts, 0.0, 8192.0
+        )
+        # نمونه‌های بی‌اعتبار (اختلافِ منفی/صفر) را نادیده بگیر
+        if unit_cpu <= 0 and unit_mem <= 0:
+            return
+        self._learned += 1
+        a = self._alpha
+        if self._cost is None or self._learned == 1:
+            self._cost = ResourceCost(cpu_percent_per_account=unit_cpu, memory_mb_per_account=unit_mem)
+        else:
+            self._cost = ResourceCost(
+                cpu_percent_per_account=self._cost.cpu_percent_per_account * (1 - a) + unit_cpu * a,
+                memory_mb_per_account=self._cost.memory_mb_per_account * (1 - a) + unit_mem * a,
+            )
+
+    def lock_cost(self, cost: ResourceCost) -> None:
+        """قفل‌کردن هزینه روی مقادیری که ادمین 2eودش در .env مشخص کرده."""
+        self._locked = cost
+
+    def cost(self) -> Optional[ResourceCost]:
+        """هزینهٔ هر اکانت؛ None یعنی «هنوز اندازه‌گیری نشده»."""
+        return self._locked or self._cost
 
     def baseline(self) -> ResourceBaseline:
-        return self._baseline
+        """نقطهٔ مرجع (کمترین مصرفِ دیده‌شده)."""
+        return ResourceBaseline(
+            cpu_percent=float(self._ref_cpu or 0.0),
+            memory_mb=float(self._ref_mem_mb or 0.0),
+        )
 
     def snapshot_state(self) -> Dict[str, Any]:
         cost = self.cost()
         return {
-            "cpu_percent_per_account": round(cost.cpu_percent_per_account, 3),
-            "memory_mb_per_account": round(cost.memory_mb_per_account, 2),
-            "baseline_cpu_percent": round(self._baseline.cpu_percent, 2),
-            "baseline_memory_mb": round(self._baseline.memory_mb, 1),
+            "measured": bool(cost and cost.is_measured()),
+            "cpu_percent_per_account": round(cost.cpu_percent_per_account, 3) if cost else 0.0,
+            "memory_mb_per_account": round(cost.memory_mb_per_account, 2) if cost else 0.0,
+            "baseline_cpu_percent": round(self.baseline().cpu_percent, 2),
+            "baseline_memory_mb": round(self.baseline().memory_mb, 1),
             "samples": self._samples,
+            "learned": self._learned,
         }

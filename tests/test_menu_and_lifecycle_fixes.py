@@ -280,7 +280,7 @@ class DeadButtonTests(unittest.TestCase):
 
 
 class SettlementAndTenancyTests(unittest.TestCase):
-    """عدالت در تسویه و ایمن‌سازیِ چندمستأجری (v2.2.5)."""
+    """عدالت در تسویه و ایمن‌سازیِ چندمستأجری (v2.2.6)."""
 
     def test_pending_order_without_start_refunds_fully(self):
         """سفارشی که هنوز اجرا نشده نباید برای زمانِ انتظار در صف
@@ -319,7 +319,7 @@ class DeadMenuConstantTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
-        self.assertIn('BOT_VERSION = "2.2.5"', _read("constants.py"))
+        self.assertIn('BOT_VERSION = "2.2.6"', _read("constants.py"))
 
     def test_changelog_has_224_section(self):
         self.assertIn("۲.۲.۴", _read("CHANGELOG.md"))

@@ -245,38 +245,156 @@ class TestCheckResources(unittest.TestCase):
 
 
 class TestCalibrator(unittest.TestCase):
-    def test_learns_per_account_cost(self):
-        cal = ResourceCalibrator(
-            cost=ResourceCost(cpu_percent_per_account=1.0, memory_mb_per_account=10.0),
-            alpha=1.0,  # کاملاً به آخرین نمونه وزن بده
+    """کالیبراتور فقط از اندازه‌گیریٔ واقعی یاد می‌گیرد و هیچ عددی اختراع نمی‌کند."""
+
+    def _snap(self, cpu=0.0, mem_mb=0.0, total_mb=16000.0):
+        return SystemSnapshot(
+            ok=True, cpu_percent=cpu, memory_used_mb=mem_mb,
+            memory_total_mb=total_mb,
+            memory_percent=(mem_mb * 100.0 / total_mb) if total_mb else 0.0,
+            load_per_core=0.2, cpu_cores=8,
         )
-        snap = SystemSnapshot(
-            ok=True, cpu_percent=60.0, memory_percent=50.0,
-            memory_used_mb=2600.0, memory_total_mb=8000.0,
-            load_per_core=0.4, cpu_cores=4,
-        )
-        cal.observe(snap, 5)  # ۵ اکانت فعال
-        # خط‌مبنا = ۶۰ - (۱×۵) = ۵۵٪ CPU و ۲۶۰۰ - (۱۰×۵) = ۲۵۵۰ مگابایت
-        self.assertAlmostEqual(cal.baseline().cpu_percent, 55.0, places=3)
-        self.assertAlmostEqual(cal.baseline().memory_mb, 2550.0, places=3)
+
+    def test_no_invented_numbers_before_measurement(self):
+        """تا وقتی اندازه‌گیری نشده، هزینه ناشناخته است (None) — نه پیش‌فرض."""
+        cal = ResourceCalibrator()
+        self.assertIsNone(cal.cost())
+        cal.observe(self._snap(cpu=5.0, mem_mb=500.0), 0)   # نقطهٔ مرجع
+        self.assertIsNone(cal.cost(), "هیچ عددی باید حدس زده نشود")
+
+    def test_learns_unit_cost_from_real_measurement(self):
+        """هزینهٔ هر اکانت = تفاضل اندازه‌گیری‌شده تقسیم بر اکانت‌ها."""
+        cal = ResourceCalibrator(alpha=1.0)
+        cal.observe(self._snap(cpu=5.0, mem_mb=500.0), 0)        # مرجع: بدون سفارش
+        cal.observe(self._snap(cpu=25.0, mem_mb=1500.0), 10)     # 10 اکانت فعال
         cost = cal.cost()
-        # هزینهٔ هر اکانت از روی نمونه: (۶۰-۵۵)/۵
-        self.assertAlmostEqual(cost.cpu_percent_per_account, 1.0, places=3)
-        self.assertAlmostEqual(cost.memory_mb_per_account, 10.0, places=3)
+        self.assertIsNotNone(cost)
+        self.assertTrue(cost.is_measured())
+        self.assertAlmostEqual(cost.cpu_percent_per_account, 2.0, places=3)   # (25-5)/10
+        self.assertAlmostEqual(cost.memory_mb_per_account, 100.0, places=3)    # (1500-500)/10
+
+    def test_reference_point_is_the_lowest_observation(self):
+        cal = ResourceCalibrator()
+        cal.observe(self._snap(cpu=40.0, mem_mb=4000.0), 20)
+        cal.observe(self._snap(cpu=10.0, mem_mb=1000.0), 0)
+        self.assertAlmostEqual(cal.baseline().cpu_percent, 10.0, places=3)
+        self.assertAlmostEqual(cal.baseline().memory_mb, 1000.0, places=3)
 
     def test_ignores_bad_snapshot(self):
         cal = ResourceCalibrator()
         cal.observe(SystemSnapshot(ok=False), 3)
         self.assertEqual(cal.samples, 0)
+        self.assertIsNone(cal.cost())
 
     def test_locked_cost_is_not_overwritten(self):
         locked = ResourceCost(cpu_percent_per_account=3.0, memory_mb_per_account=77.0)
-        cal = ResourceCalibrator(cost=locked)
+        cal = ResourceCalibrator()
         cal.lock_cost(locked)
-        cal.observe(SystemSnapshot(ok=True, cpu_percent=90.0, memory_used_mb=7000.0,
-                                   memory_total_mb=8000.0, memory_percent=87.5), 10)
+        cal.observe(self._snap(cpu=90.0, mem_mb=9000.0), 10)
         self.assertEqual(cal.cost().cpu_percent_per_account, 3.0)
         self.assertEqual(cal.cost().memory_mb_per_account, 77.0)
+
+    def test_negative_or_zero_delta_is_ignored(self):
+        """اگر اختلاف مصرف به اکانت‌ها قابل اسناد نبود، یاد نگیر."""
+        cal = ResourceCalibrator()
+        cal.observe(self._snap(cpu=50.0, mem_mb=5000.0), 10)
+        cal.observe(self._snap(cpu=20.0, mem_mb=2000.0), 10)  # تعداد ثابت، مصرف کمتر
+        self.assertIsNone(cal.cost())
+
+
+class TestProductRule(unittest.TestCase):
+    """قاعدهٔ دقیقٔ محصول: لحظهٔ ثبت سفارش بررسی شود که سرور چقدر درگیر است."""
+
+    def setUp(self):
+        self.now = datetime(2025, 1, 1, 12, 0)
+        self.limits = ResourceLimits()   # پیش‌فرض: ۸۵ درصد برای هر دو بعد
+        self.system = SystemSnapshot(
+            ok=True, cpu_percent=20.0, memory_percent=18.75,
+            memory_used_mb=3000.0, memory_total_mb=16000.0,   # رم سرور: 16 گیگ
+            load_per_core=0.3, cpu_cores=8,
+        )
+
+    def test_instant_order_rejected_when_server_is_85_percent_busy(self):
+        """اندازه‌گیریٔ واقعی: سرور همین لحظه ۹۰٪ پردازنده درگیر است."""
+        busy = SystemSnapshot(
+            ok=True, cpu_percent=91.0, memory_percent=40.0,
+            memory_used_mb=6400.0, memory_total_mb=16000.0,
+            load_per_core=0.5, cpu_cores=8,
+        )
+        verdict = check_capacity(
+            reservations=[], pool_size=100, accounts_needed=5,
+            start_utc=self.now, duration_minutes=30, now_utc=self.now,
+            system=busy, baseline=ResourceBaseline(), cost=None, limits=self.limits,
+        )
+        self.assertFalse(verdict.allowed)
+        self.assertEqual(verdict.reason, "cpu")
+        self.assertTrue(verdict.resource_checked)
+        self.assertAlmostEqual(verdict.projected_cpu_percent, 91.0, places=1)
+
+    def test_instant_order_accepted_when_server_is_idle(self):
+        verdict = check_capacity(
+            reservations=[], pool_size=100, accounts_needed=5,
+            start_utc=self.now, duration_minutes=30, now_utc=self.now,
+            system=self.system, baseline=ResourceBaseline(), cost=None, limits=self.limits,
+        )
+        self.assertTrue(verdict.allowed)
+        self.assertAlmostEqual(verdict.projected_cpu_percent, 20.0, places=1)
+
+    def test_future_window_is_not_blocked_without_real_measurement(self):
+        """برای آینده، بدون هزینهٔ اندازه‌گیری‌شده، حدس نمی‌زنیم."""
+        verdict = check_capacity(
+            reservations=[], pool_size=100, accounts_needed=50,
+            start_utc=self.now + timedelta(hours=3), duration_minutes=60,
+            now_utc=self.now, system=self.system,
+            baseline=ResourceBaseline(), cost=None, limits=self.limits,
+        )
+        self.assertTrue(verdict.allowed)
+        self.assertFalse(verdict.resource_checked)
+
+    def test_future_window_blocked_when_measured_projection_exceeds_threshold(self):
+        """وقتی هزینه از اندازه‌گیری واقعی به‌دست آمده باشد، پیش‌بینی اعمال می‌شود."""
+        reservations = [
+            Reservation(order_id=1, accounts=40,
+                        start=self.now + timedelta(hours=2),
+                        end=self.now + timedelta(hours=3)),
+        ]
+        # هزینهٔ اندازه‌گیری‌شده: 2٪ پردازنده و 100MB به‌ازای هر اکانت
+        cost = ResourceCost(cpu_percent_per_account=2.0, memory_mb_per_account=100.0)
+        # پیش‌بینی: 40+10=50 اکانت → CPU 100٪ و RAM (1000+5000)/16000 = 37.5٪
+        verdict = check_capacity(
+            reservations=reservations, pool_size=200, accounts_needed=10,
+            start_utc=self.now + timedelta(hours=2), duration_minutes=60,
+            now_utc=self.now, system=self.system,
+            baseline=ResourceBaseline(cpu_percent=5.0, memory_mb=1000.0),
+            cost=cost, limits=self.limits,
+        )
+        self.assertFalse(verdict.allowed)
+        self.assertEqual(verdict.reason, "cpu")
+        self.assertAlmostEqual(verdict.projected_cpu_percent, 105.0, places=1)
+
+    def test_rejection_tells_when_resources_free_up(self):
+        """ردّ باید ساعتٔ دقیقِ آزاد شدن را بگوید، نه «بعداً امتحان کنید»."""
+        busy = SystemSnapshot(
+            ok=True, cpu_percent=95.0, memory_percent=30.0,
+            memory_used_mb=4800.0, memory_total_mb=16000.0,
+            load_per_core=0.4, cpu_cores=8,
+        )
+        reservations = [
+            Reservation(order_id=7, accounts=30,
+                        start=self.now - timedelta(minutes=10),
+                        end=self.now + timedelta(minutes=95)),   # تا 13:35
+        ]
+        verdict = check_capacity(
+            reservations=reservations, pool_size=100, accounts_needed=5,
+            start_utc=self.now + timedelta(minutes=10), duration_minutes=60,
+            now_utc=self.now, system=busy, baseline=ResourceBaseline(),
+            cost=None, limits=self.limits,
+        )
+        self.assertFalse(verdict.allowed)
+        self.assertIsNotNone(verdict.busy_until_utc)
+        self.assertEqual(verdict.busy_until_utc, self.now + timedelta(minutes=95))
+        self.assertIsNotNone(verdict.suggested_start_utc)
+        self.assertGreaterEqual(verdict.suggested_start_utc, self.now + timedelta(minutes=95))
 
 
 class TestIntegrationWithPlanner(unittest.TestCase):
@@ -306,23 +424,38 @@ class TestIntegrationWithPlanner(unittest.TestCase):
         ]
 
     def test_window_based_cpu_rejection_and_exact_suggestion(self):
-        """اگر منابع تا ۱۳:۳۵ درگیرند، ۱۲:۱۰ رد شود و ساعتِ دقیق پیشنهاد گردد."""
-        # رزروِ سنگین: ۴۵ اکانت از ۱۲:۰۰ تا ۱۳:۳۵
-        reservations = self._reservations([(0, 95, 45)])
+        """با هزینهٔ اندازه‌گیری‌شده، بازهٔ آیندهٔ شلوغ رد می‌شود و ساعتٔ
+        دقیق پیشنهاد می‌گردد. هزینه از اندازه‌گیریٔ واقعی به‌دست
+        می‌آید، نه از پیش‌فرض."""
+        # یادگیری از دو اندازه‌گیریٔ واقعی: بدون سفارش و با ۴۵ اکانت
+        cal = ResourceCalibrator(alpha=1.0)
+        cal.observe(SystemSnapshot(ok=True, cpu_percent=5.0, memory_used_mb=500.0,
+                                   memory_total_mb=8000.0, memory_percent=6.25,
+                                   load_per_core=0.2, cpu_cores=4), 0)
+        cal.observe(SystemSnapshot(ok=True, cpu_percent=95.0, memory_used_mb=5000.0,
+                                   memory_total_mb=8000.0, memory_percent=62.5,
+                                   load_per_core=0.9, cpu_cores=4), 45)
+        measured = cal.cost()
+        self.assertIsNotNone(measured, "هزینه باید از اندازه‌گیری به‌دست آید")
+        self.assertTrue(measured.is_measured())
+
+        # رزروِ سنگین در آینده: ۴۵ اکانت از دقیقهٔ ۱۸۰ تا ۲۷۵
+        reservations = self._reservations([(180, 275, 45)])
         verdict = check_capacity(
             reservations=reservations, pool_size=100, accounts_needed=5,
-            start_utc=self.now + timedelta(minutes=10), duration_minutes=60,
-            now_utc=self.now, system=self.system, baseline=self.baseline,
-            cost=self.cost, limits=self.limits,
+            start_utc=self.now + timedelta(minutes=180), duration_minutes=60,
+            now_utc=self.now, system=self.system, baseline=cal.baseline(),
+            cost=measured, limits=self.limits,
         )
         self.assertFalse(verdict.allowed)
         self.assertTrue(verdict.resource_checked)
-        self.assertEqual(verdict.reason, "cpu")  # ۵ + (۴۵+۵)×۲ = ۱۰۵٪ > ۸۵٪
+        self.assertEqual(verdict.reason, "cpu")
         self.assertIsNotNone(verdict.suggested_start_utc)
-        # پیشنهاد باید بعد از آزاد شدنِ رزرو (دقیقهٔ ۹۵) باشد، نه ۱۰ دقیقه بعد
+        # پیشنهاد باید بعد از پایان رزروِ سنگین باشد، نه زودتر
         self.assertGreaterEqual(
-            verdict.suggested_start_utc, self.now + timedelta(minutes=95)
+            verdict.suggested_start_utc, self.now + timedelta(minutes=275)
         )
+
 
     def test_suggested_slot_satisfies_both_dimensions(self):
         """پیشنهاد باید هم از نظر اکانت و هم CPU/RAM جادار باشد."""

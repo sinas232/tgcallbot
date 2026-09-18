@@ -58,6 +58,7 @@ from services.system_resources import (  # هستهٔ اندازه‌گیری CP
     SystemSnapshot,
     check_resources,
     peak_accounts_in_window,
+    project_usage,
     read_system_snapshot,
 )
 
@@ -285,6 +286,34 @@ def peak_in_window(
     return peak_accounts, peak_orders
 
 
+def _resource_verdict(
+    cpu_percent: float,
+    memory_percent: float,
+    system: SystemSnapshot,
+    peak_accounts: int,
+    limits: ResourceLimits,
+    measured_now: bool,
+) -> ResourceVerdict:
+    """تصمیمٔ نهایی بر اساس مقایسه با سقف‌ها (پیش‌فرض: ۸۵ درصد)."""
+    reason = None
+    if limits.max_cpu_percent > 0 and cpu_percent > limits.max_cpu_percent:
+        reason = "cpu"
+    elif limits.max_memory_percent > 0 and memory_percent > limits.max_memory_percent:
+        reason = "memory"
+    return ResourceVerdict(
+        allowed=(reason is None),
+        reason=reason,
+        projected_cpu_percent=round(max(0.0, cpu_percent), 1),
+        projected_memory_percent=round(max(0.0, memory_percent), 1),
+        current_cpu_percent=system.cpu_percent,
+        current_memory_percent=system.memory_percent,
+        current_load_per_core=system.load_per_core,
+        peak_accounts=max(0, int(peak_accounts or 0)),
+        checked=True,
+        measured_now=measured_now,
+    )
+
+
 def resources_fit_at(
     reservations: List[Reservation],
     start: datetime,
@@ -293,36 +322,86 @@ def resources_fit_at(
     unknown_duration_min: int,
     system: SystemSnapshot,
     baseline: ResourceBaseline,
-    cost: ResourceCost,
+    cost: Optional[ResourceCost],
     limits: ResourceLimits,
     now_utc: Optional[datetime] = None,
     load_now_window_minutes: int = 15,
+    instant_window_minutes: int = 2,
 ) -> ResourceVerdict:
-    """داوریٔ بعد منابع سخت‌افزاری برای یک بازهٔ استاندارد.
+    """سنجش منابع سرور در «آن زمانٔ اجرای سفارش» (قاعدهٔ محصولی).
 
-    مصرف روی «اوج تعداد اکانت‌های همزمان» در کل بازه پیش‌بینی می‌شود، نه فقط لحظهٔ
-    شروع، تا دقیقاً همان منطقی باشد که برای ظرفیت اکانت‌ها گفته شد.
+    دو مسیر متفاوت است:
+      • سفارش آنی (شروع تا ۲ دقیقهٔ آینده): مبنا اندازه‌گیریٔ واقعی
+        همین لحظه است — که بار همهٔ سفارش‌های فعال را هم دارد.
+      • سفارش زمان‌بندی‌شده: بر اساس هزینهٔ اندازه‌گیری‌شدهٔ
+        هر اکانت پیش‌بینی می‌شود؛ اگر هنوز اندازه‌گیری نشده
+        (هیچ داده‌ای نداریم) حدس نمی‌زنیم و این بعد نادیده
+        می‌شود (fail-open — اصلِ مهم: هیچ عددی اختراع نمی‌شود).
 
-    دروازهٔ «Load Average» فقط برای بازه‌های نزدیک (پیش‌فرض ۱۵ دقیقه) اعمال می‌شود؛
-    برای زمان‌بندی‌های دورتر، بار لحظه‌ای اطلاعی دربارهٔ آینده نمی‌دهد
-    (و استفاده از آن یعنی ردّ بی‌دلیل سفارش‌هایی که ساعت‌ها بعد اجرا می‌شوند).
+    دروازهٔ «Load Average» فقط برای بازه‌های نزدیک اعمال می‌شود؛ بار
+    لحظه‌ای اطلاعی دربارهٔ چند ساعت بعد نمی‌دهد.
     """
+    now = now_utc or datetime.utcnow()
     end = estimate_end(start, duration_minutes, unknown_duration_min)
     peak_accounts = peak_accounts_in_window(reservations, start, end)
 
-    now = now_utc or datetime.utcnow()
+    # ۱) دروازهٔ بار لحظه‌ای (فقط برای شروع‌های نزدیک)
     effective_limits = limits
     if (start - now).total_seconds() > max(0, int(load_now_window_minutes)) * 60:
         effective_limits = replace(limits, max_load_per_core=0.0)
+    if effective_limits.max_load_per_core > 0 and system.load_per_core > effective_limits.max_load_per_core:
+        return ResourceVerdict(
+            allowed=False,
+            reason="load",
+            current_cpu_percent=system.cpu_percent,
+            current_memory_percent=system.memory_percent,
+            current_load_per_core=system.load_per_core,
+            peak_accounts=peak_accounts,
+            checked=True,
+            measured_now=True,
+        )
 
-    return check_resources(
-        snapshot=system,
-        baseline=baseline,
-        cost=cost,
-        limits=effective_limits,
-        peak_accounts=peak_accounts,
-        accounts_needed=accounts_needed,
+    # اندازه‌گیریٔ همین لحظه برای آیندهٔ نزدیک هم معتبر است:
+    # وضعیت سرور در ۱۵ دقیقهٔ آینده به همین سرعت عوض نمی‌شود؛
+    # پس اگر الان بالای آستانه است، زمانی زودتر پیشنهاد نمی‌شود.
+    is_now = (start - now).total_seconds() <= max(0, int(load_now_window_minutes)) * 60
+    cost_measured = bool(cost and cost.is_measured())
+
+    # ۲) سفارش آنی ⇒ اندازه‌گیریِ واقعیِ همین لحظه
+    if is_now:
+        cpu = float(system.cpu_percent or 0.0)
+        mem_mb = float(system.memory_used_mb or 0.0)
+        if cost_measured:
+            # سهمِ خودِ این سفارش (اگر هزینه از اندازه‌گیری واقعی به‌دست آمده باشد)
+            cpu += float(cost.cpu_percent_per_account) * max(0, int(accounts_needed or 0))
+            mem_mb += float(cost.memory_mb_per_account) * max(0, int(accounts_needed or 0))
+        mem_total = float(system.memory_total_mb or 0.0)
+        memory_percent = (mem_mb * 100.0 / mem_total) if mem_total > 0 else 0.0
+        return _resource_verdict(cpu, memory_percent, system, peak_accounts, effective_limits, True)
+
+    # ۳) سفارش زمان‌بندی‌شده ⇒ پیش‌بینی فقط با هزینهٔ واقعاً اندازه‌گیری‌شده
+    if not cost_measured:
+        # هنوز هزینهٔ هر اکانت را اندازه نگرفتیم؛ اما یک استنتاجٔ
+        # مستقیم از اندازه‌گیری وجود دارد: اگر سرور همین الان بالای
+        # آستانه است و سفارش‌هایی که این بار را ایجاد کرده‌اند در
+        # بازهٔ درخواستی هم هنوز اجرا می‌شوند، پس در آن زمان هم
+        # درگیر خواهند بود (مثال: درخواستٔ ۱۲:۱۰ در حالی که سرور
+        # تا ۱۳:۳۵ درگیر است). این نیازی به حدس ندارد.
+        now_busy = (
+            system.cpu_percent > effective_limits.max_cpu_percent
+            or system.memory_percent > effective_limits.max_memory_percent
+        )
+        if peak_accounts > 0 and now_busy:
+            return _resource_verdict(
+                system.cpu_percent, system.memory_percent, system,
+                peak_accounts, effective_limits, True,
+            )
+        return ResourceVerdict(allowed=True, checked=False, reason="unknown")
+
+    cpu, memory_percent = project_usage(
+        baseline, peak_accounts + max(0, int(accounts_needed or 0)), cost, system.memory_total_mb
     )
+    return _resource_verdict(cpu, memory_percent, system, peak_accounts, effective_limits, False)
 
 
 def fits_at(
@@ -354,8 +433,7 @@ def fits_at(
     if ok and system is not None and system.ok and baseline is not None and limits is not None:
         verdict = resources_fit_at(
             reservations, start, duration_minutes, accounts_needed,
-            unknown_duration_min, system, baseline, cost or ResourceCost(),
-            limits, now_utc,
+            unknown_duration_min, system, baseline, cost, limits, now_utc,
         )
         if not verdict.allowed:
             ok = False
@@ -540,9 +618,10 @@ class CapacityPlanner:
             if _cfg_bool("CAPACITY_CHECK_SYSTEM_LOAD", "CAPACITY_CHECK_SYSTEM_LOAD", True):
                 try:
                     interval = _cfg_float("CAPACITY_SAMPLE_INTERVAL_SEC", "CAPACITY_SAMPLE_INTERVAL_SEC", 0.35)
+                    scope = str(_get_cfg("CAPACITY_RESOURCE_SCOPE", "CAPACITY_RESOURCE_SCOPE", "server") or "server")
                     # نمونه‌برداریِ کوتاه (I/O روی فایل‌های /proc) داخل ترد جداگانه
                     # تا حلقهٔ رویدادِ ربات بلاک نشود.
-                    system = await asyncio.to_thread(read_system_snapshot, interval)
+                    system = await asyncio.to_thread(read_system_snapshot, interval, scope)
                 except Exception:
                     logger.warning("capacity: system sampling failed → بعد منابع نادیده گرفته می‌شود", exc_info=True)
                     system = None
@@ -553,8 +632,8 @@ class CapacityPlanner:
                     if cfg_cpu_per_acc > 0 or cfg_mem_per_acc > 0:
                         # ادمین هزینهٔ هر اکانت را قفل کرده → کالیبراسیون فقط برای خط‌مبنا
                         _CALIBRATOR.lock_cost(ResourceCost(
-                            cpu_percent_per_account=(cfg_cpu_per_acc if cfg_cpu_per_acc > 0 else 1.2),
-                            memory_mb_per_account=(cfg_mem_per_acc if cfg_mem_per_acc > 0 else 45.0),
+                            cpu_percent_per_account=max(0.0, cfg_cpu_per_acc),
+                            memory_mb_per_account=max(0.0, cfg_mem_per_acc),
                         ))
 
                     active_now = peak_accounts_in_window(
@@ -573,9 +652,10 @@ class CapacityPlanner:
                     else:
                         baseline = _CALIBRATOR.baseline()
 
+                    default_max = _cfg_float("CAPACITY_MAX_RESOURCE_PERCENT", "CAPACITY_MAX_RESOURCE_PERCENT", 85.0)
                     limits = ResourceLimits(
-                        max_cpu_percent=_cfg_float("CAPACITY_MAX_CPU_PERCENT", "CAPACITY_MAX_CPU_PERCENT", 85.0),
-                        max_memory_percent=_cfg_float("CAPACITY_MAX_MEMORY_PERCENT", "CAPACITY_MAX_MEMORY_PERCENT", 88.0),
+                        max_cpu_percent=_cfg_float("CAPACITY_MAX_CPU_PERCENT", "CAPACITY_MAX_CPU_PERCENT", default_max),
+                        max_memory_percent=_cfg_float("CAPACITY_MAX_MEMORY_PERCENT", "CAPACITY_MAX_MEMORY_PERCENT", default_max),
                         max_load_per_core=_cfg_float("CAPACITY_MAX_LOAD_PER_CORE", "CAPACITY_MAX_LOAD_PER_CORE", 1.5),
                     )
 

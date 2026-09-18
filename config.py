@@ -82,7 +82,10 @@ class Config:
     # بُعد دوم: منابع سخت‌افزاری (اندازه‌گیری مستقیم از /proc و cgroup)
     CAPACITY_CHECK_SYSTEM_LOAD = os.getenv('CAPACITY_CHECK_SYSTEM_LOAD', 'true').lower() in ('1', 'true', 'yes', 'on')
     CAPACITY_MAX_CPU_PERCENT = float(os.getenv('CAPACITY_MAX_CPU_PERCENT', '85'))
-    CAPACITY_MAX_MEMORY_PERCENT = float(os.getenv('CAPACITY_MAX_MEMORY_PERCENT', '88'))
+    CAPACITY_MAX_RESOURCE_PERCENT = float(os.getenv('CAPACITY_MAX_RESOURCE_PERCENT', '85'))  # آستانهٔ واحد محصول (۸۵ درصد)
+    # حوزهٔ اندازه‌گیری: server = کل سرور (16GB/8 هسته، همان چیزی که در htop می‌بینید) | container = سقف کانتینر
+    CAPACITY_RESOURCE_SCOPE = os.getenv('CAPACITY_RESOURCE_SCOPE', 'server')
+    CAPACITY_MAX_MEMORY_PERCENT = float(os.getenv('CAPACITY_MAX_MEMORY_PERCENT', '85'))
     CAPACITY_MAX_LOAD_PER_CORE = float(os.getenv('CAPACITY_MAX_LOAD_PER_CORE', '1.5'))
     CAPACITY_SAMPLE_INTERVAL_SEC = float(os.getenv('CAPACITY_SAMPLE_INTERVAL_SEC', '0.35'))
     # هزینهٔ هر اکانت همزمان؛ ۰ یعنی «خودکار از نمونه‌های واقعی کالیبره شود»
