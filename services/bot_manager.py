@@ -114,10 +114,12 @@ class BotManager:
             # 🔥 ذخیره API ID و Hash اختصاصی ربات نمایندگی
             app.bot_data['api_id'] = bot_data.get('api_id')
             app.bot_data['api_hash'] = bot_data.get('api_hash')
-            # پرچم حالت تعمیرات این ربات (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
+            # پرچم حالت تعمیرات — «سراسری»: مرجع، تنظیم ربات اصلی (bot_id=1)
+            # است تا تاگلِ سوپرادمین روی همهٔ ربات‌های نمایندگی هم اثر بگذارد
+            # (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
             try:
                 app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id), timeout=10) == "1"
+                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
             except Exception as e:
                 logger.warning(f"Bot {bot_id}: maintenance flag load failed ({e}) — default OFF")
                 app.bot_data['maintenance_mode'] = False

@@ -1,0 +1,1834 @@
+diff --git a/.env.example b/.env.example
+index 2946b26..2f9551e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -173,3 +173,20 @@ PREMIUM_EMOJI_COLORED_BUTTONS=true
+ # جایگزینی شناسهٔ ایموجی دلخواه (JSON یا key=id,key=id):
+ # PREMIUM_EMOJI_OVERRIDES={"rocket":"5389102131527556772"}
+ PREMIUM_EMOJI_OVERRIDES=
++
++# ═══════════════ 🛡 گارد ظرفیت منابع (Capacity Guard) ═══════════════
++# قبل از ثبت هر سفارش (آنی و زمان‌بندی) مصرف منابع در «کل بازهٔ اجرای سفارش»
++# سنجیده می‌شود؛ اگر ظرفیت کافی نباشد سفارش پذیرفته نمی‌شود و دقیق‌ترین
++# بازهٔ آزاد به کاربر پیشنهاد (و قابل رزرو) می‌گردد.
++# فعال/غیرفعال کردن گارد:
++CAPACITY_GUARD_ENABLED=true
++# حاشیهٔ ایمن از کل اکانت‌های سالم (درصد). مثلاً 10 یعنی فقط 90% پول قابل
++# رزرو است تا سفارش‌های در حال اجرا حاشیهٔ تنفس داشته باشند.
++CAPACITY_SAFETY_BUFFER_PERCENT=10
++# سفارش‌های «تکمیل و خروج» (بدون مدت) در تایم‌لاین ظرفیت با این تخمین (دقیقه)
++# لحاظ می‌شوند:
++CAPACITY_UNKNOWN_DURATION_MINUTES=60
++# دقت جست‌وجوی «اولین بازهٔ آزاد» برای پیشنهاد به کاربر (دقیقه):
++CAPACITY_STEP_MINUTES=5
++# افق جست‌وجوی پیشنهاد (ساعت):
++CAPACITY_HORIZON_HOURS=24
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b49b78a..6ac947d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,89 @@
+ 
+ ---
+ 
++## نسخهٔ ۲.۲.۳ — 🧰 فیکس منوها: تعمیرات سراسری، آمار کامل، لغو از پنل ادمین
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۶/۲۷
++
++### ۱) حالت تعمیرات حالا واقعاً همهٔ ربات‌ها را می‌بندد 🌍
++- **باگ:** تاگل تعمیرات فقط `bot_data` همان اپی را که ادمین از طریق آن تاگل
++  می‌کرد به‌روز می‌کرد؛ ربات‌های نمایندگی (اپ‌های جدا) پرچم قدیمی (خاموش)
++  داشتند و کاربرانشان می‌توانستند سفارش بزنند.
++- **فیکس:** تنظیم مرجع در `bot_id=1` ذخیره و پرچم همهٔ اپ‌های فعال همان لحظه
++  فلیپ می‌شود؛ `bot_manager` هم در استارتاپ هر ربات، پرچم سراسری را می‌خواند.
++  یعنی یک کلید = توقف همهٔ ربات‌ها + پایدار بعد از ری‌استارت.
++
++### ۲) سفارش تازهٔ ثبت‌شده در آمار دیده نمی‌شد 📊
++- **باگ:** `get_all_order_stats` فقط `running` و `scheduled` را می‌شمرد؛
++  سفارش تازه در وضعیت `pending` (صف) بود و در هیچ آماری ظاهر نمی‌شد.
++- **فیکس:** آمار حالا «⏳ در صف اجرا»، «📥 امروز» و «✅ تکمیل‌شده» را هم
++  نشان می‌دهد (هم «📉 آمار کل ربات» و هم «📊 گزارش کلی»)؛ حذف پیام
++  «در حال جمع‌آوری» هم ضدخطا شد (قبلاً خطای delete کل نمایش آمار را می‌خواباند).
++- تاریخچهٔ کاربر هم وضعیت `pending` را درست نمایش می‌دهد («⏳ در صف»).
++
++### ۳) لغو سفارش مستقیماً از لیست‌های ادمین 🛑
++- **باگ:** در لیست سفارشات ادمین هیچ دکمه‌ای برای انتخاب و لغو هر سفارش
++  نبود؛ تنها راه، فلو غیرشهودی «شمارهٔ ردیف بفرست» بود.
++- **فیکس:** زیر «📦 سفارشات اخیر/زمان‌بندی‌شده» و «سفارشات کاربر» در پروفایل،
++  برای هر سفارشِ قابل‌لغو دکمهٔ «🛑 لغو سفارش #id» اضافه شد → پیش‌نمایش مالی
++  (کل/مصرف‌شده/قابل‌عودت) → لغو با عودت / بدون عودت / انصراف.
++- سفارش‌های `pending` هم به فهرست «فعال» لیست‌های ادمین اضافه شدند تا
++  قابل انتخاب و لغو باشند.
++
++</div>
++
++---
++
++## نسخهٔ ۲.۲.۲ — 🛡 گارد ظرفیت منابع + بازگردانی گزارش مالی ادمین‌ها
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۶/۲۷
++
++### ۱) گارد ظرفیت منابع قبل از ثبت سفارش (آنی و زمان‌بندی‌شده)
++
++**مشکل:** اگر در یک بازهٔ زمانی، مجموع سفارش‌های فعال/رزروی از ظرفیت اکانت‌های
++سالم عبور می‌کرد، اجرا دچار کمبود منبع می‌شد (join ناموفق، سقوط live و در
++بدترین حالت لغو زنجیره‌ای سفارش‌ها) و کاربر تا لحظهٔ اجرا بی‌خبر بود.
++
++**راه‌حل (`services/capacity_planner.py`):**
++- قبل از پذیرش هر سفارش، مصرف منابع در **کل بازهٔ اجرا** `[شروع، شروع+مدت]`
++  سنجیده می‌شود — نه فقط لحظهٔ شروع. پس اگر ساعت ۱۲:۰۰ شلوغ باشد و کاربر
++  ۱۲:۱۰ تلاش کند، سفارشش پذیرفته **نمی‌شود**؛ سیستم اولین شروعی را که
++  «کل مدت سفارش» در آن جا می‌شود دقیق محاسبه و پیشنهاد می‌کند (مثلاً ۱۳:۳۵).
++- پیشنهاد با یک دکمه «📅 رزرو در ساعت پیشنهادی» قابل ثبت است + دکمه
++  «🔄 بررسی مجدد ظرفیت».
++- پیش‌نمایش زندهٔ ظرفیت در صفحهٔ تأیید سفارش (🟢 موجود / 🔴 تکمیل) قبل از پرداخت.
++- محاسبهٔ اوج مصرف به‌صورت event-based و دقیق (نه نمونه‌گیری زمانی)؛
++  سفارش‌های «تکمیل و خروج» (بدون مدت) با تخمین امن لحاظ می‌شوند.
++- حاشیهٔ ایمن پیش‌فرض ۱۰٪ از پول اکانت‌ها (`CAPACITY_SAFETY_BUFFER_PERCENT`)
++  و سقف سفارش همزمان (`MAX_CONCURRENT_ORDERS`) هم اعمال می‌شود.
++- **Fail-open:** هر خطای داخلی گارد، مسیر خرید را نمی‌بندد (فقط لاگ).
++- ۲۱ تست آفلاین جدید (`tests/test_capacity_planner.py`).
++
++### ۲) بازگردانی گزارش افزایش/کاهش موجودی ادمین‌ها در کانال گزارشات پرداختی
++
++**مشکل:** شارژ/کسر موجودی کاربران توسط ادمین‌ها فقط به ادمین و کاربر اطلاع
++داده می‌شد و هیچ ردپایی در «کانال گزارشات پرداختی» (`log_channel_payments`)
++نمی‌ماند.
++
++**راه‌حل (`services/payment_reporter.py`):**
++- هر تغییر موجودی توسط ادمین، گزارش شکیل (مبلغ، کاربر، ادمین عامل، موجودی
++  جدید، ربات، توضیح و زمان شمسی) به همان کانالی می‌رود که رسیدهای پرداخت
++  آنلاین می‌روند — همهٔ جریان مالی در یک‌جا.
++- ارسال با Markdown + fallback متن ساده؛ هرگز عملیات مالی ادمین را نمی‌شکند.
++- تست‌های آفلاین (`tests/test_payment_reporter.py`).
++
++### متفرقه
++- `BOT_VERSION` به `2.2.2` بروزرسانی شد (برچسب قدیمیِ جا ماندهٔ 2.2.1).
++- متغیرهای محیطی جدید در `.env.example` مستند شدند.
++
++</div>
++
++---
++
+ ## نسخهٔ ۲.۲.۱ — 🚪 خروج مدیریت‌شده از ویس‌کال (ضد burst)
+ 
+ <div dir="rtl">
+diff --git a/constants.py b/constants.py
+index b237f6d..55ee3c6 100644
+--- a/constants.py
++++ b/constants.py
+@@ -4,7 +4,7 @@ constants.py
+ """
+ 
+ # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
+-BOT_VERSION = "2.2.1"
++BOT_VERSION = "2.2.3"
+ 
+ GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
+ GATEWAY_SLUG_ZARINPAL = "zarinpal"
+diff --git a/database.py b/database.py
+index cf2ea0c..bd04827 100644
+--- a/database.py
++++ b/database.py
+@@ -749,22 +749,22 @@ class DatabaseManager:
+     @staticmethod
+     async def get_all_orders_extended(limit=20, offset=0, status_filter=None, bot_id=1):
+         async with AsyncSessionLocal() as db_session:
+-            q = select(Order, User).join(User, Order.user_id == User.id).filter(Order.bot_id == bot_id)
+-            if status_filter and status_filter != 'all':
+-                if status_filter == 'active': q = q.filter(Order.status == 'running')
+-                elif status_filter == 'completed': q = q.filter(Order.status == 'completed')
+-                elif status_filter == 'scheduled': q = q.filter(Order.status == 'scheduled')
+-                elif status_filter == 'cancelled': q = q.filter(Order.status.in_(['stopped', 'failed']))
+-            q = q.order_by(desc(Order.created_at)).limit(limit).offset(offset)
+-            res = await db_session.execute(q)
+-            return [{'order': to_dict(o), 'user': to_dict(u)} for o, u in res.all()]
++            q = select(Order, User).join(User, Order.user_id == User.id).filter(Order.bot_id == bot_id)
++            if status_filter and status_filter != 'all':
++                if status_filter == 'active': q = q.filter(Order.status.in_(['running', 'pending']))
++                elif status_filter == 'completed': q = q.filter(Order.status == 'completed')
++                elif status_filter == 'scheduled': q = q.filter(Order.status == 'scheduled')
++                elif status_filter == 'cancelled': q = q.filter(Order.status.in_(['stopped', 'failed']))
++            q = q.order_by(desc(Order.created_at)).limit(limit).offset(offset)
++            res = await db_session.execute(q)
++            return [{'order': to_dict(o), 'user': to_dict(u)} for o, u in res.all()]
+ 
+     @staticmethod
+     async def get_all_orders_count(status_filter=None, bot_id=1):
+         async with AsyncSessionLocal() as db_session:
+             q = select(func.count(Order.id)).filter(Order.bot_id == bot_id)
+             if status_filter and status_filter != 'all':
+-                if status_filter == 'active': q = q.filter(Order.status == 'running')
++                if status_filter == 'active': q = q.filter(Order.status.in_(['running', 'pending']))
+                 elif status_filter == 'completed': q = q.filter(Order.status == 'completed')
+                 elif status_filter == 'scheduled': q = q.filter(Order.status == 'scheduled')
+                 elif status_filter == 'cancelled': q = q.filter(Order.status.in_(['stopped', 'failed']))
+@@ -880,12 +880,49 @@ class DatabaseManager:
+                 existing_end = existing_start + timedelta(minutes=existing_duration)
+                 
+                 # بررسی تداخل: اگر زمان شروع یا پایان جدید در بازه موجود باشد، تداخل وجود دارد
+-                if (new_start_time < existing_end and new_end_time > existing_start):
+-                    return True
+-            
+-            return False
+-
+-    @staticmethod
++                if (new_start_time < existing_end and new_end_time > existing_start):
++                    return True
++            
++            return False
++
++    @staticmethod
++    async def get_capacity_reservations(bot_id: int = 1) -> List[Dict[str, Any]]:
++        """
++        رزروهای فعال ظرفیت برای Capacity Guard (گارد منابع قبل از ثبت سفارش).
++        سبک: فقط ستون‌های لازم از سفارش‌های running/scheduled/pending خوانده
++        می‌شود؛ هر رکورد یعنی «accounts_count اکانت از شروع تا پایان مدت اشغال
++        است». محاسبهٔ تداخل/اوج در services/capacity_planner.py انجام می‌شود.
++        """
++        async with AsyncSessionLocal() as db_session:
++            q = select(
++                Order.id,
++                Order.user_id,
++                Order.accounts_count,
++                Order.duration_minutes,
++                Order.status,
++                Order.started_at,
++                Order.scheduled_for,
++                Order.created_at,
++            ).filter(
++                Order.bot_id == bot_id,
++                Order.status.in_(['running', 'scheduled', 'pending']),
++            )
++            res = await db_session.execute(q)
++            return [
++                {
++                    "id": row[0],
++                    "user_id": row[1],
++                    "accounts_count": row[2],
++                    "duration_minutes": row[3],
++                    "status": row[4],
++                    "started_at": row[5],
++                    "scheduled_for": row[6],
++                    "created_at": row[7],
++                }
++                for row in res.all()
++            ]
++
++    @staticmethod
+     async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None,
+                                    first_name=None, last_name=None, username=None):
+         async with AsyncSessionLocal() as db_session:
+@@ -1168,12 +1205,20 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
+             return [to_dict(a) for a in res.scalars().all()]
+ 
+     @staticmethod
+-    async def get_all_order_stats(bot_id=1):
+-        async with AsyncSessionLocal() as db_session:
+-            total = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id))).scalar() or 0
+-            running = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'running', Order.bot_id == bot_id))).scalar() or 0
+-            scheduled = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'scheduled', Order.bot_id == bot_id))).scalar() or 0
+-            return {'total': total, 'running': running, 'scheduled': scheduled}
++    async def get_all_order_stats(bot_id=1):
++        async with AsyncSessionLocal() as db_session:
++            total = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id))).scalar() or 0
++            running = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'running', Order.bot_id == bot_id))).scalar() or 0
++            scheduled = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'scheduled', Order.bot_id == bot_id))).scalar() or 0
++            # 🐞 فیکس «سفارش ثبت‌شده در آمار دیده نمی‌شود»: سفارش تازه ثبت‌شده
++            # تا لحظهٔ تحویل به executor در وضعیت pending (صف) است؛ بدون این
++            # شمارنده، سفارش جدید در آمار کلاً غایب بود.
++            pending = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'pending', Order.bot_id == bot_id))).scalar() or 0
++            completed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'completed', Order.bot_id == bot_id))).scalar() or 0
++            # سفارش‌های ثبت‌شدهٔ امروز (به وقت UTC — مبنای created_at دیتابیس)
++            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
++            today = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id, Order.created_at >= today_start))).scalar() or 0
++            return {'total': total, 'running': running, 'scheduled': scheduled, 'pending': pending, 'completed': completed, 'today': today}
+ 
+     @staticmethod
+     async def reset_stuck_orders():
+diff --git a/handlers/admin_handlers.py b/handlers/admin_handlers.py
+index c17fbd4..74c5a91 100644
+--- a/handlers/admin_handlers.py
++++ b/handlers/admin_handlers.py
+@@ -232,19 +232,29 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
+     return AWAITING_SETTINGS_ACTION
+ 
+ @require_admin
+-async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+-    bot_id = context.bot_data.get('bot_id', 1)
+-    msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال جمع‌آوری آمار...")
+-    users_count = await DatabaseManager.get_total_users_count(bot_id=bot_id)
+-    acc_stats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
+-    order_stats = await DatabaseManager.get_all_order_stats(bot_id=bot_id)
+-    running_orders = order_stats.get('running', 0)
+-    scheduled_orders = order_stats.get('scheduled', 0)
+-    total_orders = order_stats.get('total', 0)
+-    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`")
+-    if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+-    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
+-    return AWAITING_SETTINGS_ACTION
++async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    bot_id = context.bot_data.get('bot_id', 1)
++    msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال جمع‌آوری آمار...")
++    users_count = await DatabaseManager.get_total_users_count(bot_id=bot_id)
++    acc_stats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
++    order_stats = await DatabaseManager.get_all_order_stats(bot_id=bot_id)
++    running_orders = order_stats.get('running', 0)
++    scheduled_orders = order_stats.get('scheduled', 0)
++    total_orders = order_stats.get('total', 0)
++    # 🐞 فیکس: سفارش تازهٔ ثبت‌شده در وضعیت pending است و باید در آمار دیده شود
++    pending_orders = order_stats.get('pending', 0)
++    completed_orders = order_stats.get('completed', 0)
++    today_orders = order_stats.get('today', 0)
++    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز: `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`")
++    # حذف پیام «در حال جمع‌آوری» باید ضدخطا باشد؛ اگر شکست بخورد، آمار
++    # نباید از دست برود (باگ قبلی: خطای delete → هیچ آماری نمایش داده نمی‌شد)
++    if msg:
++        try:
++            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
++        except Exception:
++            pass
++    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
++    return AWAITING_SETTINGS_ACTION
+ 
+ def _maintenance_text(on):
+     status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
+@@ -297,17 +307,37 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
+         except Exception:
+             pass
+         return AWAITING_SETTINGS_ACTION
+-    on = (query.data == "maint_on")
+-    try:
+-        await asyncio.wait_for(DatabaseManager.set_setting(
+-            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
+-    except Exception:
+-        try:
+-            await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
+-        except Exception:
+-            pass
+-        return AWAITING_SETTINGS_ACTION
+-    context.bot_data['maintenance_mode'] = on
++    on = (query.data == "maint_on")
++    try:
++        await asyncio.wait_for(DatabaseManager.set_setting(
++            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
++    except Exception:
++        try:
++            await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
++        except Exception:
++            pass
++        return AWAITING_SETTINGS_ACTION
++    # 🌍 حالت تعمیرات «سراسری» است: اگر فقط bot_data همین اپ به‌روز شود،
++    # ربات‌های نمایندگی (اپ‌های جدا با bot_data جدا) همچنان باز می‌مانند و
++    # کاربرانشان می‌توانند سفارش بزنند (باگ گزارش‌شده). راه‌حل:
++    # ۱) تنظیم اصلی در bot_id=1 ذخیره می‌شود (مرجع لودِ استارت‌آپ همهٔ اپ‌ها)
++    # ۲) پرچم همهٔ اپ‌های فعال همین حالا فلیپ می‌شود
++    if bot_id != 1:
++        try:
++            await asyncio.wait_for(DatabaseManager.set_setting(
++                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
++        except Exception:
++            pass
++    try:
++        from services.bot_manager import bot_manager as _bm
++        for _bid, _app in list(_bm.active_bots.items()):
++            try:
++                _app.bot_data['maintenance_mode'] = on
++            except Exception:
++                pass
++    except Exception:
++        pass
++    context.bot_data['maintenance_mode'] = on
+     try:
+         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
+     except Exception:
+@@ -688,20 +718,30 @@ async def admin_orders_list_handler(update, context):
+         
+         txt += f"ID: <code>{o['id']}</code> | {st} | 👤 {user_name}\n🔗 {target_link}\n──────────────────\n"
+         
+-    kb = []
+-    if mode != "recent":
+-        total = await DatabaseManager.get_all_orders_count(status_filter=status_filter, bot_id=bot_id)
+-        total_pages = (total + 5 - 1) // 5
+-        nav = []
+-        page = count_or_page
+-        if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_orders_{mode}_{page-1}"))
+-        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+-        if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_orders_{mode}_{page+1}"))
+-        if nav: kb.append(nav)
+-        
+-    kb.append([InlineKeyboardButton("🔙", callback_data="back_to_admin_orders")])
+-    await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+-    return AWAITING_SETTINGS_ACTION
++    kb = []
++    if mode != "recent":
++        total = await DatabaseManager.get_all_orders_count(status_filter=status_filter, bot_id=bot_id)
++        total_pages = (total + 5 - 1) // 5
++        nav = []
++        page = count_or_page
++        if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_orders_{mode}_{page-1}"))
++        nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
++        if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_orders_{mode}_{page+1}"))
++        if nav: kb.append(nav)
++
++    # 🛑 دکمهٔ لغو برای هر سفارشِ قابل‌لغو (فعال/در صف/زمان‌بندی) — قبلاً ادمین
++    # فقط از طریق فلو «شماره ردیف» می‌توانست لغو کند و در خود لیست هیچ
++    # دکمه‌ای برای انتخاب و لغو سفارش دیده نمی‌شد.
++    for item in orders:
++        o = item['order']
++        if o.get('status') in ('running', 'scheduled', 'pending'):
++            kb.append([InlineKeyboardButton(
++                f"🛑 لغو سفارش #{o['id']}",
++                callback_data=f"admincancel_pick_{o['id']}"
++            )])
++    kb.append([InlineKeyboardButton("🔙", callback_data="back_to_admin_orders")])
++    await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
++    return AWAITING_SETTINGS_ACTION
+ 
+ async def admin_orders_back_callback(update, context): return await admin_orders_menu(update, context)
+ 
+@@ -798,6 +838,71 @@ async def stop_order_execute(update, context):
+     return AWAITING_SETTINGS_ACTION
+ 
+ 
++async def admin_cancel_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
++    """🛑 انتخاب لغو یک سفارش مستقیماً از لیست/پروفایل ادمین (admincancel_pick_<id>).
++
++    قبلاً تنها راه لغو، فلو «لغو سفارش فعال + تایپ شمارهٔ ردیف» بود و در
++    خودِ لیست سفارشات هیچ دکمه‌ای برای انتخاب و لغو نمایش داده نمی‌شد.
++    این هندلر پیش‌نمایش مالی سفارش را نشان می‌دهد و همان دکمه‌های
++    با/بدون عودت (admincancel_refund/norefund/abort) را می‌چیند.
++    """
++    query = update.callback_query
++    await safe_answer(query)
++    bot_id = context.bot_data.get('bot_id', 1)
++    try:
++        oid = int((query.data or "").split("_")[-1])
++    except Exception:
++        return AWAITING_SETTINGS_ACTION
++
++    order = await DatabaseManager.get_order(oid)
++    if not order or order.get('bot_id', bot_id) != bot_id:
++        await query.edit_message_text("❌ سفارش یافت نشد.")
++        return AWAITING_SETTINGS_ACTION
++
++    status = order.get('status')
++    if status not in ('running', 'scheduled', 'pending'):
++        await query.edit_message_text(
++            f"ℹ️ سفارش #{oid} دیگر فعال نیست (وضعیت: `{status}`) و امکان لغو ندارد.",
++            parse_mode='Markdown',
++        )
++        return AWAITING_SETTINGS_ACTION
++
++    if status == 'scheduled':
++        kb = InlineKeyboardMarkup([
++            [InlineKeyboardButton("💵 لغو و عودت کامل وجه", callback_data=f"admincancel_refund_{oid}")],
++            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
++        ])
++        txt = (
++            f"🛑 **لغو سفارش زمان‌بندی‌شده #{oid}**\n\n"
++            "این سفارش هنوز شروع نشده؛ با لغو، کل مبلغ به کیف پول کاربر عودت داده می‌شود."
++        )
++        await query.edit_message_text(txt, reply_markup=kb, parse_mode='Markdown')
++        return AWAITING_SETTINGS_ACTION
++
++    # running / pending → پیش‌نمایش تسویهٔ ثانیه‌ای + دو گزینهٔ لغو
++    total_price = float(order.get('price_paid') or 0)
++    used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
++    kb = InlineKeyboardMarkup([
++        [InlineKeyboardButton(
++            f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
++            callback_data=f"admincancel_refund_{oid}")],
++        [InlineKeyboardButton(
++            "🚫 لغو بدون عودت وجه",
++            callback_data=f"admincancel_norefund_{oid}")],
++        [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
++    ])
++    status_fa = "در حال اجرا" if status == 'running' else "در صف اجرا"
++    txt = (
++        f"🛑 **لغو سفارش فعال #{oid}** ({status_fa})\n\n"
++        f"💰 هزینه کل پلن: {format_price(total_price)} تومان\n"
++        f"📉 هزینه مصرف‌شده تا الان: {format_price(used_cost)} تومان\n"
++        f"💵 مبلغ قابل عودت: {format_price(refund_amount)} تومان\n\n"
++        f"لطفاً نوع لغو را انتخاب کنید:"
++    )
++    await query.edit_message_text(txt, reply_markup=kb, parse_mode='Markdown')
++    return AWAITING_SETTINGS_ACTION
++
++
+ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
+     query = update.callback_query
+@@ -1129,8 +1234,15 @@ async def admin_user_actions_handler(update, context):
+              nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
+              if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"view_orders_all_{page+1}"))
+              if nav: kb.append(nav)
+-        kb.append([InlineKeyboardButton("❌ لغو سفارش‌های فعال", callback_data="admin_stop_user_orders")])
+-        kb.append([InlineKeyboardButton("🔙 بازگشت به پروفایل", callback_data="back_to_profile")])
++        # 🛑 دکمهٔ لغو تک‌تک سفارش‌های قابل‌لغو کاربر (انتخاب مستقیم از پروفایل)
++        for o in orders:
++            if o.get('status') in ('running', 'scheduled', 'pending'):
++                kb.append([InlineKeyboardButton(
++                    f"🛑 لغو سفارش #{o['id']}",
++                    callback_data=f"admincancel_pick_{o['id']}"
++                )])
++        kb.append([InlineKeyboardButton("❌ لغو سفارش‌های فعال", callback_data="admin_stop_user_orders")])
++        kb.append([InlineKeyboardButton("🔙 بازگشت به پروفایل", callback_data="back_to_profile")])
+         await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+     elif data.startswith("view_trans_"):
+         parts = data.split("_")
+@@ -1177,16 +1289,31 @@ async def set_user_credit(update, context):
+         if not user:
+             await update.message.reply_text("❌ کاربر یافت نشد.")
+             return AWAITING_SETTINGS_ACTION
+-        success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین")
+-        if success:
+-            action_str = "افزایش" if sign > 0 else "کاهش"
+-            admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{int(new_balance):,}` تومان")
+-            await send_safe(context.bot, update.effective_chat.id, admin_msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
+-            try:
+-                user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
+-                await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
+-            except: pass
+-        else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
++        success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین")
++        if success:
++            action_str = "افزایش" if sign > 0 else "کاهش"
++            admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{int(new_balance):,}` تومان")
++            await send_safe(context.bot, update.effective_chat.id, admin_msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
++            try:
++                user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
++                await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
++            except: pass
++            # 💳 گزارش تغییر موجودی ادمین در «کانال گزارشات پرداختی»
++            # (قابلیت بازگردانی‌شده: همهٔ شارژ/کسرهای ادمین باید در کانال
++            #  log_channel_payments audit شوند — بدون شکستن عملیات اصلی)
++            try:
++                from services.payment_reporter import report_balance_change
++                await report_balance_change(
++                    bot_id=context.bot_data.get('bot_id', 1),
++                    admin=update.effective_user,
++                    target_user=user,
++                    amount=final_change,
++                    new_balance=new_balance,
++                    note=f"تغییر موجودی {action_str} از پنل ادمین",
++                )
++            except Exception:
++                logger.warning("admin balance report to payments channel failed", exc_info=True)
++        else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
+     except Exception as e:
+         logger.error(f"Set credit error: {e}")
+         await update.message.reply_text("❌ خطا در عملیات.")
+diff --git a/handlers/menu_handlers.py b/handlers/menu_handlers.py
+index 4a62998..8cf342f 100644
+--- a/handlers/menu_handlers.py
++++ b/handlers/menu_handlers.py
+@@ -476,14 +476,16 @@ async def reporting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
+     astats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
+     ostats = await DatabaseManager.get_all_order_stats(bot_id=bot_id)
+     
+-    txt = (
+-        "📊 <b>گزارش کلی ربات:</b>\n\n"
+-        "🤖 <b>اکانت‌ها:</b>\n"
+-        f"   • کل: <code>{astats['total']}</code>\n"
+-        f"   • فعال: <code>{astats['active']}</code>\n"
+-        f"   • محدود شده: <code>{astats['limited']}</code>\n\n"
+-        "📦 <b>سفارشات:</b>\n"
+-        f"   • کل سفارشات: <code>{ostats['total']}</code>\n"
+-        f"   • در حال اجرا: <code>{ostats['running']}</code>"
+-    )
++    txt = (
++        "📊 <b>گزارش کلی ربات:</b>\n\n"
++        "🤖 <b>اکانت‌ها:</b>\n"
++        f"   • کل: <code>{astats['total']}</code>\n"
++        f"   • فعال: <code>{astats['active']}</code>\n"
++        f"   • محدود شده: <code>{astats['limited']}</code>\n\n"
++        "📦 <b>سفارشات:</b>\n"
++        f"   • کل سفارشات: <code>{ostats['total']}</code>\n"
++        f"   • امروز: <code>{ostats.get('today', 0)}</code>\n"
++        f"   • در حال اجرا: <code>{ostats['running']}</code>\n"
++        f"   • در صف اجرا: <code>{ostats.get('pending', 0)}</code>"
++    )
+     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
+\ No newline at end of file
+diff --git a/handlers/order_handlers.py b/handlers/order_handlers.py
+index 081cc25..0fc376e 100644
+--- a/handlers/order_handlers.py
++++ b/handlers/order_handlers.py
+@@ -19,17 +19,148 @@ from database import DatabaseManager
+ from config import Config
+ from constants import *
+ from helpers.message_utils import send_safe
+-from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
+-from services.order_executor import order_executor
++from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
++from services.order_executor import order_executor
++from services.capacity_planner import capacity_planner
+ 
+ logger = logging.getLogger(__name__)
+ 
+-async def safe_answer(query):
+-    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+-    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+-    try: await asyncio.wait_for(query.answer(), timeout=35)
+-    except: pass
+-
++async def safe_answer(query):
++    # Hard 35s cap independent of PTB internals: even if answer gets stuck
++    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
++    try: await asyncio.wait_for(query.answer(), timeout=35)
++    except: pass
++
++# -------------------- 🛡 گارد ظرفیت منابع (Capacity Guard) --------------------
++
++def _order_window_from_context(context) -> tuple:
++    """(زمان شروع UTC، مدت دقیقه) سفارشِ در حال ساخت — برای آنی و زمان‌بندی."""
++    plan = context.user_data.get('selected_plan') or {}
++    try:
++        duration = int(plan.get('duration_minutes') or 0)
++    except Exception:
++        duration = 0
++    if context.user_data.get('is_scheduled'):
++        start = context.user_data.get('schedule_dt') or datetime.utcnow()
++    else:
++        start = datetime.utcnow()
++    return start, duration
++
++
++def _capacity_preview_line(verdict: dict) -> str:
++    """یک خطِ وضعیت ظرفیت برای پیش‌نمایش صفحهٔ تأیید (فارسی)."""
++    try:
++        if verdict.get('degraded'):
++            return ""
++        if verdict.get('allowed', True):
++            return "🟢 ظرفیت سرور برای کل بازهٔ اجرای این سفارش: **موجود است**\n"
++        suggested = verdict.get('suggested_start_utc')
++        peak = verdict.get('peak_usage', 0)
++        eff = verdict.get('effective_pool', 0)
++        line = f"🔴 ظرفیت سرور در بازهٔ اجرای این سفارش: **تکمیل است** (اوج مصرف `{peak}` از `{eff}` اکانت مفید)\n"
++        if suggested:
++            line += f"💡 پیشنهاد دقیق سیستم برای شروع: **{format_jalali_datetime(suggested)}**\n"
++        return line
++    except Exception:
++        return ""
++
++
++def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
++    """متن مشترک صفحهٔ تأیید سفارش (+ خط پیش‌نمایش ظرفیت در صورت وجود)."""
++    plan = context.user_data['selected_plan']
++    link = context.user_data['target_link']
++    is_sched = context.user_data.get('is_scheduled', False)
++
++    if is_sched:
++        dt = context.user_data['schedule_dt']
++        time_str = format_jalali_datetime(dt)
++    else:
++        time_str = format_jalali_datetime(get_tehran_time())
++
++    cap_line = _capacity_preview_line(capacity_verdict) if capacity_verdict is not None else ""
++
++    return (
++        "🧾 **تایید نهایی سفارش**\n\n"
++        f"📦 سرویس: {plan['name']}\n"
++        f"🔢 تعداد: {plan['accounts_count']}\n"
++        f"🔗 لینک: {link}\n"
++        f"⏰ اجرا: {time_str}\n"
++        f"{cap_line}"
++        f"💰 مبلغ قابل پرداخت: **{format_price(plan['price'])} تومان**\n\n"
++        "آیا اطلاعات بالا مورد تایید است؟"
++    )
++
++
++_CONFIRM_KB = lambda: InlineKeyboardMarkup(
++    [[InlineKeyboardButton("✅ پرداخت و ثبت", callback_data="confirm_order_pay")],
++     [InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]]
++)
++
++
++def _build_capacity_rejection(verdict: dict) -> tuple:
++    """پیام ردّ ظرفیت + دکمه‌های «رزرو ساعت پیشنهادی / بررسی مجدد / لغو».
++
++    طبق نیاز محصول، ردّ باید «محاسبه‌شده» باشد: به‌جای یک «بعداً امتحان کنید»
++    مبهم، اولین زمانِ شروعی که «کل بازهٔ سفارش» در آن جا می‌شود پیشنهاد و
++    رزروِ همان با یک دکمه ممکن است.
++    """
++    need = verdict.get('accounts_needed', 0)
++    pool = verdict.get('pool_size', 0)
++    eff = verdict.get('effective_pool', 0)
++    peak = verdict.get('peak_usage', 0)
++    busy_until = verdict.get('busy_until_utc')
++    suggested = verdict.get('suggested_start_utc')
++    reason = verdict.get('reason')
++
++    if reason == 'too_big':
++        txt = (
++            "⛔️ **امکان ثبت این سفارش وجود ندارد.**\n\n"
++            f"درخواست شما `{need}` اکانت است، اما کل ظرفیت سالم سرور `{pool}` اکانت است.\n\n"
++            "💡 لطفاً پلن کوچک‌تری انتخاب کنید یا با پشتیبانی در تماس باشید."
++        )
++        kb = [[InlineKeyboardButton("❌ بستن", callback_data="cancel_order")]]
++        return txt, InlineKeyboardMarkup(kb)
++
++    lines = [
++        "⛔️ **ظرفیت سرور برای این بازه تکمیل است — سفارش ثبت نشد.**\n",
++        "🛡 برای جلوگیری از لغو زنجیره‌ای سفارش‌ها، قبل از پذیرش، مصرف منابع در «کل بازهٔ اجرای سفارش» سنجیده می‌شود:\n",
++        f"🧮 اوج مصرف در بازهٔ درخواستی: `{peak}` از `{eff}` اکانت مفید (ظرفیت کل: `{pool}`)",
++        f"🔢 درخواست شما: `{need}` اکانت",
++    ]
++    if busy_until:
++        lines.append(f"⏳ ظرفیت از این ساعت آزاد می‌شود: **{format_jalali_datetime(busy_until)}**")
++    lines.append("")
++
++    kb = []
++    if suggested:
++        lines.append(
++            f"💡 **پیشنهاد دقیق سیستم:** برای ساعت **{format_jalali_datetime(suggested)}** اقدام کنید "
++            "(اولین بازه‌ای که کل سفارش شما در آن جا می‌شود) — یا همان را همین حالا رزرو کنید:"
++        )
++        kb.append([InlineKeyboardButton(
++            f"📅 رزرو در {format_jalali_datetime(suggested)}",
++            # epoch مستقل از timezone محیط (naive-UTC؛ ساعت سرور تهران است!)
++            callback_data=f"cap_slot_{int((suggested - _EPOCH).total_seconds())}"
++        )])
++    else:
++        lines.append("💡 لطفاً در ساعات دیگری تلاش کنید یا پلن کوچک‌تری انتخاب کنید.")
++    lines.append("\n⚠️ تا آزاد شدن ظرفیت، سفارش جدیدی پذیرفته نمی‌شود.")
++
++    kb.append([InlineKeyboardButton("🔄 بررسی مجدد ظرفیت", callback_data="cap_retry")])
++    kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_order")])
++    return "\n".join(lines), InlineKeyboardMarkup(kb)
++
++
++# مبنای تبدیل epoch مستقل از timezone (datetimeهای سیستم naive-UTC هستند و
++# .timestamp() روی سرور با TZ=Asia/Tehran خطای ۳:۳۰ ایجاد می‌کرد)
++_EPOCH = datetime(1970, 1, 1)
++
++
++def _naive_utc_from_epoch(epoch_seconds: int) -> datetime:
++    """epoch ثانیه → datetime naive-UTC (بدون وابستگی به TZ محیط)."""
++    return _EPOCH + timedelta(seconds=int(epoch_seconds))
++
++
+ # -------------------- ثبت سفارش جدید --------------------
+ 
+ async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+@@ -273,60 +404,115 @@ async def handle_time_selection(update: Update, context: ContextTypes.DEFAULT_TY
+         await update.message.reply_text("❌ زمان نامعتبر است. لطفا مجددا وارد کنید.")
+         return AWAITING_SCHEDULE_TIME
+ 
+-async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+-    plan = context.user_data['selected_plan']
+-    link = context.user_data['target_link']
+-    is_sched = context.user_data.get('is_scheduled', False)
+-    
+-    if is_sched:
+-        dt = context.user_data['schedule_dt']
+-        time_str = format_jalali_datetime(dt)
+-    else:
+-        time_str = format_jalali_datetime(get_tehran_time())
+-        
+-    txt = (
+-        "🧾 **تایید نهایی سفارش**\n\n"
+-        f"📦 سرویس: {plan['name']}\n"
+-        f"🔢 تعداد: {plan['accounts_count']}\n"
+-        f"🔗 لینک: {link}\n"
+-        f"⏰ اجرا: {time_str}\n"
+-        f"💰 مبلغ قابل پرداخت: **{format_price(plan['price'])} تومان**\n\n"
+-        "آیا اطلاعات بالا مورد تایید است؟"
+-    )
+-    
+-    kb = [[InlineKeyboardButton("✅ پرداخت و ثبت", callback_data="confirm_order_pay")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]]
+-    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+-    return AWAITING_ORDER_CONFIRMATION
+-
+-async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+-    query = update.callback_query
+-    await safe_answer(query)
+-    data = query.data
+-    
+-    if data == "cancel_order":
+-        await query.delete_message()
+-        await query.message.reply_text("❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+-        return ConversationHandler.END
+-        
+-    if data == "confirm_order_pay":
+-        user_id = update.effective_user.id
+-        bot_id = context.bot_data.get('bot_id', 1)
+-        plan = context.user_data['selected_plan']
+-        link = context.user_data['target_link']
+-        
+-        user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+-        if user['credit'] < plan['price']:
+-            await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
+-            return ConversationHandler.END
+-
+-        # 🔒 قفل لینک هوشمند: بررسی تداخل زمانی
+-        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
+-        start_time = schedule_time if schedule_time else datetime.utcnow()
+-        duration = plan.get('duration_minutes', 0)
+-        
+-        # بررسی تداخل زمانی با سفارشات موجود برای همین لینک
+-        has_overlap = await DatabaseManager.has_time_overlap_order(link, start_time, duration, bot_id=bot_id)
+-        if has_overlap:
++async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    plan = context.user_data['selected_plan']
++    bot_id = context.bot_data.get('bot_id', 1)
++
++    # 🛡 پیش‌نمایش زندهٔ ظرفیت قبل از پرداخت (fail-open: خطا = بدون خط اضافه)
++    capacity_verdict = None
++    try:
++        cap_start, cap_duration = _order_window_from_context(context)
++        capacity_verdict = await capacity_planner.check_order(
++            bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
++        )
++    except Exception:
++        logger.exception("capacity preview failed (non-fatal)")
++        capacity_verdict = None
++
++    txt = _build_confirmation_text(context, capacity_verdict)
++
++    await update.message.reply_text(txt, reply_markup=_CONFIRM_KB())
++    return AWAITING_ORDER_CONFIRMATION
++
++async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    query = update.callback_query
++    await safe_answer(query)
++    data = query.data
++    
++    if data == "cancel_order":
++        await query.delete_message()
++        await query.message.reply_text("❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
++        return ConversationHandler.END
++
++    # ── 🛡 گارد ظرفیت: پذیرش «رزرو ساعت پیشنهادی» و «بررسی مجدد» ──
++    if data.startswith("cap_slot_"):
++        try:
++            epoch = int(data.split("_")[2])
++            suggested_dt = _naive_utc_from_epoch(epoch)
++        except Exception:
++            return AWAITING_ORDER_CONFIRMATION
++        context.user_data['is_scheduled'] = True
++        context.user_data['schedule_dt'] = suggested_dt
++        try:
++            txt = _build_confirmation_text(context)
++        except Exception:
++            txt = "✅ زمان پیشنهادی روی سفارش اعمال شد. لطفاً مجدداً تایید کنید."
++        try:
++            await query.edit_message_text(txt, reply_markup=_CONFIRM_KB())
++        except Exception:
++            pass
++        return AWAITING_ORDER_CONFIRMATION
++
++    if data == "cap_retry":
++        # بازبینی ظرفیت با همان مشخصات (مثلاً کاربر می‌گوید «الان چی؟»)
++        bot_id = context.bot_data.get('bot_id', 1)
++        plan = context.user_data.get('selected_plan') or {}
++        capacity_verdict = None
++        try:
++            cap_start, cap_duration = _order_window_from_context(context)
++            capacity_verdict = await capacity_planner.check_order(
++                bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
++            )
++        except Exception:
++            capacity_verdict = None
++        try:
++            try:
++                txt = _build_confirmation_text(context, capacity_verdict)
++            except Exception:
++                txt = "🔄 ظرفیت بازبینی شد. لطفاً مجدداً تایید کنید یا سفارش را از نو ثبت کنید."
++            await query.edit_message_text(txt, reply_markup=_CONFIRM_KB())
++        except Exception:
++            pass
++        return AWAITING_ORDER_CONFIRMATION
++
++    if data == "confirm_order_pay":
++        user_id = update.effective_user.id
++        bot_id = context.bot_data.get('bot_id', 1)
++        plan = context.user_data['selected_plan']
++        link = context.user_data['target_link']
++        
++        user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
++        if user['credit'] < plan['price']:
++            await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
++            return ConversationHandler.END
++
++        # 🔒 قفل لینک هوشمند: بررسی تداخل زمانی
++        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
++        start_time = schedule_time if schedule_time else datetime.utcnow()
++        duration = plan.get('duration_minutes', 0)
++        
++        # ── 🛡 گارد ظرفیت منابع: سنجش «کل بازهٔ اجرا» قبل از پذیرش ──
++        # سفارش فقط وقتی پذیرفته می‌شود که منابعِ کافی برای کل بازهٔ
++        # [شروع، شروع+مدت] آزاد باشد؛ وگرنه ردّ محاسبه‌شده با پیشنهادِ
++        # دقیق اولین بازهٔ آزاد (قابل رزرو با یک دکمه).
++        try:
++            verdict = await capacity_planner.check_order(
++                bot_id, start_time, duration or 0, int(plan.get('accounts_count', 0) or 0)
++            )
++        except Exception:
++            logger.exception("capacity gate failed → fail-open")
++            verdict = {'allowed': True, 'degraded': True}
++        if not verdict.get('allowed', True):
++            reject_txt, reject_kb = _build_capacity_rejection(verdict)
++            try:
++                await query.edit_message_text(reject_txt, reply_markup=reject_kb)
++            except Exception:
++                await query.message.reply_text(reject_txt, reply_markup=reject_kb)
++            return AWAITING_ORDER_CONFIRMATION
++        
++        # بررسی تداخل زمانی با سفارشات موجود برای همین لینک
++        has_overlap = await DatabaseManager.has_time_overlap_order(link, start_time, duration, bot_id=bot_id)
++        if has_overlap:
+             await query.edit_message_text(
+                 "⛔️ **خطا:** زمان سفارش شما با یک سفارش فعال/رزروی دیگر برای همین لینک تداخل دارد.\n\n"
+                 "💡 **راه حل:**\n"
+@@ -550,8 +736,8 @@ async def handle_order_history_callback(update: Update, context: ContextTypes.DE
+         return
+ 
+     txt = f"📦 **لیست سفارشات شما (صفحه {page}):**\n\n"
+-    for o in orders:
+-        st = {'running': '🟢 اجرا', 'completed': '✅ تکمیل', 'scheduled': '📅 رزرو', 'stopped': '🛑 توقف', 'failed': '❌ خطا'}.get(o['status'], '؟')
++    for o in orders:
++        st = {'running': '🟢 اجرا', 'completed': '✅ تکمیل', 'scheduled': '📅 رزرو', 'stopped': '🛑 توقف', 'failed': '❌ خطا', 'pending': '⏳ در صف'}.get(o['status'], '؟')
+         
+         live_info = ""
+         if o['status'] == 'running':
+diff --git a/main.py b/main.py
+index 4ed9af4..78fb80a 100644
+--- a/main.py
++++ b/main.py
+@@ -993,6 +993,7 @@ def register_handlers(application: Application) -> None:
+             CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+             CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+             CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
++            CallbackQueryHandler(admin_cancel_pick_callback, pattern=r"^admincancel_pick_\d+$"),
+             CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
+             CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
+             CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
+@@ -1025,6 +1026,7 @@ def register_handlers(application: Application) -> None:
+                 CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+                 CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+                 CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
++                CallbackQueryHandler(admin_cancel_pick_callback, pattern=r"^admincancel_pick_\d+$"),
+                 MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
+ 
+                 # اکشن‌های کاربر (pattern محدود و دقیق تا کالبک‌های دیگر مثل
+@@ -1262,7 +1264,7 @@ def register_handlers(application: Application) -> None:
+             # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
+             CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
+             CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
+-            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
++            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$"),
+         ],
+         states={
+             AWAITING_SELECT_PLAN: [
+@@ -1276,7 +1278,7 @@ def register_handlers(application: Application) -> None:
+             AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
+             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
+             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
+-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
++            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$")]
+         },
+         fallbacks=STANDARD_FALLBACKS,
+         name="buy", persistent=True,
+diff --git a/services/bot_manager.py b/services/bot_manager.py
+index b438d44..ff47fe5 100644
+--- a/services/bot_manager.py
++++ b/services/bot_manager.py
+@@ -114,10 +114,12 @@ class BotManager:
+             # 🔥 ذخیره API ID و Hash اختصاصی ربات نمایندگی
+             app.bot_data['api_id'] = bot_data.get('api_id')
+             app.bot_data['api_hash'] = bot_data.get('api_hash')
+-            # پرچم حالت تعمیرات این ربات (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
++            # پرچم حالت تعمیرات — «سراسری»: مرجع، تنظیم ربات اصلی (bot_id=1)
++            # است تا تاگلِ سوپرادمین روی همهٔ ربات‌های نمایندگی هم اثر بگذارد
++            # (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
+             try:
+                 app.bot_data['maintenance_mode'] = await asyncio.wait_for(
+-                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=bot_id), timeout=10) == "1"
++                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
+             except Exception as e:
+                 logger.warning(f"Bot {bot_id}: maintenance flag load failed ({e}) — default OFF")
+                 app.bot_data['maintenance_mode'] = False
+diff --git a/services/capacity_planner.py b/services/capacity_planner.py
+new file mode 100644
+index 0000000..c210600
+--- /dev/null
++++ b/services/capacity_planner.py
+@@ -0,0 +1,419 @@
++"""
++services/capacity_planner.py
++════════════════════════════
++🛡 گارد ظرفیت منابع سرور — قبل از ثبت/تأیید هر سفارش (آنی و زمان‌بندی‌شده)
++
++مدل منبع:
++    منبع اشتراکی و محدود سیستم، «اکانت‌های سالم/فعال» (account_status=active)
++    هستند. هر سفارش به اندازهٔ accounts_count اکانت را برای کل بازهٔ اجرایش
++    [شروع، شروع + مدت] رزرو می‌کند. اگر مجموع رزروهای همپوشان از ظرفیت مفید
++    (کل اکانت‌های سالم منهای حاشیهٔ ایمن) عبور کند، اجرا دچار کمبود منبع
++    می‌شود: join ناموفق، سقوط live، و در بدترین حالت لغو زنجیره‌ای سفارش‌ها.
++    این ماژول دقیقاً جلوی همین را می‌گیرد.
++
++تضمین دقت (رفتار مورد انتظار کاربر):
++    اگر در ساعت ۱۲:۰۰ ظرفیت پر باشد و سفارش رد شود، برای درخواست ۱۲:۱۰ هم
++    «کل بازهٔ ۱۲:۱۰ تا پایان مدت سفارش» دوباره سنجیده می‌شود — نه فقط لحظهٔ
++    ۱۲:۱۰. پس اگر شلوغی تا ۱۳:۳۵ ادامه داشته باشد، به کاربر دقیقاً «۱۳:۳۵»
++    پیشنهاد می‌شود (اولین شروعی که «کل مدت» سفارش در آن جا می‌شود)، نه یک
++    «بعداً امتحان کنید» کلی و مبهم.
++
++جزئیات محاسبه:
++    - اوج مصرف بازه به‌صورت event-based و «دقیق» محاسبه می‌شود (نه نمونه‌گیری
++      زمانی): مرزهای همهٔ رزروهای همپوشان به بازه اضافه می‌شوند و مصرف بین
++      مرزهای متوالی ثابت است؛ بیشینهٔ همان عدد اوج بازه است.
++    - سفارش‌های بدون مدت (duration_minutes=0 یعنی «تکمیل و خروج») با یک
++      تخمین امن (CAPACITY_UNKNOWN_DURATION_MINUTES، پیش‌فرض ۶۰ دقیقه) در
++      تایم‌لاین لحاظ می‌شوند.
++    - سقف تعداد سفارش همزمان (MAX_CONCURRENT_ORDERS) هم مثل یک منبع مستقل
++      گارد می‌شود.
++
++Fail-open:
++    هر خطای داخلی (DB و…) فقط لاگ می‌شود و نتیجهٔ «مجاز» برمی‌گردد؛ گارد
++    هیچ‌وقت به‌خاطر باگ خودش مسیر خرید را از کاربر نمی‌گیرد.
++
++تنظیمات (متغیر محیطی یا config.Config):
++    CAPACITY_GUARD_ENABLED            (پیش‌فرض true)
++    CAPACITY_SAFETY_BUFFER_PERCENT    (پیش‌فرض 10)  حاشیهٔ ایمن از کل پول
++    CAPACITY_UNKNOWN_DURATION_MINUTES (پیش‌فرض 60)  تخمین سفارشِ بدون مدت
++    CAPACITY_STEP_MINUTES             (پیش‌فرض 5)   دقت جست‌وجوی اولین شیفت
++    CAPACITY_HORIZON_HOURS            (پیش‌فرض 24)  افق جست‌وجوی پیشنهاد
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from dataclasses import dataclass
++from datetime import datetime, timedelta
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++
++# ─────────────────────────── تنظیمات (lazy و تست‌پذیر) ───────────────────────────
++
++def _get_cfg(attr: str, env_key: str, default: Any) -> Any:
++    """اول متغیر محیطی، بعد config.Config، وگرنه پیش‌فرض (بدون import اجباری)."""
++    raw = os.getenv(env_key)
++    if raw is not None and raw != "":
++        return raw
++    try:
++        from config import Config  # noqa: WPS433 (import در زمان اجرا)
++        return getattr(Config, attr, default)
++    except Exception:
++        return default
++
++
++def _cfg_bool(attr: str, env_key: str, default: bool) -> bool:
++    val = _get_cfg(attr, env_key, default)
++    if isinstance(val, bool):
++        return val
++    return str(val).strip().lower() in ("1", "true", "yes", "on")
++
++
++def _cfg_int(attr: str, env_key: str, default: int) -> int:
++    try:
++        return int(_get_cfg(attr, env_key, default))
++    except Exception:
++        return default
++
++
++# ─────────────────────────── ساختار داده‌ها ───────────────────────────
++
++@dataclass(frozen=True)
++class Reservation:
++    """یک رزرو منبع: accounts اکانت از start تا end اشغال است."""
++    order_id: int
++    accounts: int
++    start: datetime
++    end: datetime
++    status: str = "running"
++
++
++@dataclass
++class CapacityVerdict:
++    allowed: bool
++    reason: Optional[str] = None          # None | 'too_big' | 'over_capacity' | 'concurrent'
++    pool_size: int = 0                    # کل اکانت‌های سالم
++    effective_pool: int = 0               # ظرفیت مفید بعد از حاشیهٔ ایمن
++    safety_buffer_percent: int = 0
++    accounts_needed: int = 0
++    start_utc: Optional[datetime] = None
++    end_utc: Optional[datetime] = None    # پایان تخمینی بازهٔ درخواست
++    peak_usage: int = 0                   # اوج مصرف رزروهای موجود در بازه
++    peak_concurrent: int = 0              # تعداد سفارش‌های همپوشان در اوج
++    max_concurrent_orders: int = 0
++    busy_until_utc: Optional[datetime] = None     # پایان آخرین رزروِ مزاحم
++    suggested_start_utc: Optional[datetime] = None  # اولین شروعِ جادار (دقیق)
++    degraded: bool = False                # True یعنی خطای داخلی → fail-open
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "allowed": self.allowed,
++            "reason": self.reason,
++            "pool_size": self.pool_size,
++            "effective_pool": self.effective_pool,
++            "safety_buffer_percent": self.safety_buffer_percent,
++            "accounts_needed": self.accounts_needed,
++            "start_utc": self.start_utc,
++            "end_utc": self.end_utc,
++            "peak_usage": self.peak_usage,
++            "peak_concurrent": self.peak_concurrent,
++            "max_concurrent_orders": self.max_concurrent_orders,
++            "busy_until_utc": self.busy_until_utc,
++            "suggested_start_utc": self.suggested_start_utc,
++            "degraded": self.degraded,
++        }
++
++
++# ─────────────────────────── هستهٔ محاسباتی (خالص/تست‌پذیر) ───────────────────────────
++
++def effective_pool_size(pool_size: int, safety_buffer_percent: int) -> int:
++    """ظرفیت مفید = کل اکانت‌های سالم منهای حاشیهٔ ایمن (حداقل ۰)."""
++    if pool_size <= 0:
++        return 0
++    buffer_pct = max(0, min(90, int(safety_buffer_percent or 0)))
++    return int(int(pool_size) * (100 - buffer_pct) / 100)
++
++
++def estimate_end(start: datetime, duration_minutes: Optional[int], unknown_duration_min: int = 60) -> datetime:
++    """پایان تخمینی سفارش؛ مدت صفر/نامعلوم → تخمین امن پیش‌فرض."""
++    try:
++        duration = int(duration_minutes or 0)
++    except Exception:
++        duration = 0
++    if duration <= 0:
++        duration = max(1, int(unknown_duration_min or 60))
++    return start + timedelta(minutes=duration)
++
++
++def _normalize_reservations(
++    rows: List[Dict[str, Any]],
++    now_utc: datetime,
++    unknown_duration_min: int,
++) -> List[Reservation]:
++    """تبدیل ردیف‌های سفارش فعال به رزروهای تایم‌لاین."""
++    reservations: List[Reservation] = []
++    for row in rows or []:
++        try:
++            accounts = int(row.get("accounts_count") or 0)
++        except Exception:
++            accounts = 0
++        if accounts <= 0:
++            continue
++
++        status = str(row.get("status") or "running")
++        started = row.get("started_at")
++        scheduled = row.get("scheduled_for")
++        created = row.get("created_at")
++
++        # تبدیل string ناخواسته به datetime (دفاعی)
++        for idx, val in enumerate((started, scheduled, created)):
++            if isinstance(val, str):
++                try:
++                    parsed = datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
++                    if idx == 0:
++                        started = parsed
++                    elif idx == 1:
++                        scheduled = parsed
++                    else:
++                        created = parsed
++                except Exception:
++                    if idx == 0:
++                        started = None
++                    elif idx == 1:
++                        scheduled = None
++                    else:
++                        created = None
++
++        if status == "scheduled":
++            start = scheduled or created or now_utc
++        elif status == "pending":
++            # سفارش آنیِ در صف اجرا → عملاً همین حالا شروع می‌شود
++            start = now_utc
++        else:  # running
++            start = started or created or now_utc
++
++        start = min(start, now_utc) if status in ("running", "pending") else start
++        end = estimate_end(start, row.get("duration_minutes"), unknown_duration_min)
++        reservations.append(
++            Reservation(
++                order_id=int(row.get("id") or 0),
++                accounts=accounts,
++                start=start,
++                end=end,
++                status=status,
++            )
++        )
++    return reservations
++
++
++def peak_in_window(
++    reservations: List[Reservation],
++    win_start: datetime,
++    win_end: datetime,
++) -> Tuple[int, int]:
++    """(اوج مصرف اکانت، تعداد سفارش همپوشان در اوج) در بازه — دقیق/event-based."""
++    if win_end <= win_start:
++        return 0, 0
++    boundaries = {win_start, win_end}
++    for res in reservations:
++        if res.end <= win_start or res.start >= win_end:
++            continue
++        boundaries.add(max(res.start, win_start))
++        boundaries.add(min(res.end, win_end))
++    points = sorted(boundaries)
++
++    peak_accounts = 0
++    peak_orders = 0
++    for point in points[:-1]:
++        usage = sum(r.accounts for r in reservations if r.start <= point and r.end > point)
++        orders = sum(1 for r in reservations if r.start <= point and r.end > point)
++        if usage > peak_accounts:
++            peak_accounts = usage
++            peak_orders = orders
++        elif usage == peak_accounts and orders > peak_orders:
++            peak_orders = orders
++    return peak_accounts, peak_orders
++
++
++def fits_at(
++    reservations: List[Reservation],
++    start: datetime,
++    duration_minutes: Optional[int],
++    accounts_needed: int,
++    effective_pool: int,
++    max_concurrent_orders: int,
++    unknown_duration_min: int,
++) -> Tuple[bool, int, int]:
++    """آیا بازهٔ [start، start+مدت] کامل جا می‌شود؟ → (جواب، اوج مصرف، تعداد همپوشان)"""
++    end = estimate_end(start, duration_minutes, unknown_duration_min)
++    peak, concurrent = peak_in_window(reservations, start, end)
++    ok = (
++        accounts_needed <= effective_pool
++        and (peak + accounts_needed) <= effective_pool
++        and (concurrent + 1) <= max(1, max_concurrent_orders)
++    )
++    return ok, peak, concurrent
++
++
++def earliest_fit_start(
++    reservations: List[Reservation],
++    accounts_needed: int,
++    duration_minutes: Optional[int],
++    effective_pool: int,
++    max_concurrent_orders: int,
++    from_utc: datetime,
++    step_minutes: int = 5,
++    horizon_minutes: int = 24 * 60,
++    unknown_duration_min: int = 60,
++) -> Optional[datetime]:
++    """اولین زمانِ شروعی که «کل بازهٔ سفارش» در آن جا می‌شود (جست‌وجوی پلکانی)."""
++    step = max(1, int(step_minutes or 5))
++    horizon_end = from_utc + timedelta(minutes=max(step, int(horizon_minutes or 24 * 60)))
++    candidate = from_utc
++    while candidate < horizon_end:
++        ok, _peak, _conc = fits_at(
++            reservations, candidate, duration_minutes, accounts_needed,
++            effective_pool, max_concurrent_orders, unknown_duration_min,
++        )
++        if ok:
++            return candidate
++        candidate += timedelta(minutes=step)
++    return None
++
++
++def check_capacity(
++    reservations: List[Reservation],
++    pool_size: int,
++    accounts_needed: int,
++    start_utc: datetime,
++    duration_minutes: Optional[int],
++    safety_buffer_percent: int = 10,
++    max_concurrent_orders: int = 10,
++    unknown_duration_min: int = 60,
++    step_minutes: int = 5,
++    horizon_minutes: int = 24 * 60,
++    now_utc: Optional[datetime] = None,
++) -> CapacityVerdict:
++    """داوری نهایی ظرفیت برای یک درخواست سفارش (تابع خالص — بدون DB/تلگرام)."""
++    now = now_utc or datetime.utcnow()
++    accounts_needed = max(0, int(accounts_needed or 0))
++    eff_pool = effective_pool_size(pool_size, safety_buffer_percent)
++    max_conc = max(1, int(max_concurrent_orders or 1))
++    end_utc = estimate_end(start_utc, duration_minutes, unknown_duration_min)
++
++    verdict = CapacityVerdict(
++        allowed=False,
++        pool_size=int(pool_size or 0),
++        effective_pool=eff_pool,
++        safety_buffer_percent=int(safety_buffer_percent or 0),
++        accounts_needed=accounts_needed,
++        start_utc=start_utc,
++        end_utc=end_utc,
++        max_concurrent_orders=max_conc,
++    )
++
++    # ۱) درخواست بزرگ‌تر از کل پول سالم → هیچ زمانی جواب نیست
++    if accounts_needed > int(pool_size or 0):
++        verdict.reason = "too_big"
++        return verdict
++
++    peak, concurrent = peak_in_window(reservations, start_utc, end_utc)
++    verdict.peak_usage = peak
++    verdict.peak_concurrent = concurrent
++
++    # ۲) جا شدن کامل بازه (اوج مصرف + درخواست ≤ ظرفیت مفید) و سقف همزمانی
++    if accounts_needed <= eff_pool and (peak + accounts_needed) <= eff_pool and (concurrent + 1) <= max_conc:
++        verdict.allowed = True
++        return verdict
++
++    # ۳) رد شد → دلیل + پایان شلوغی + دقیق‌ترین پیشنهاد
++    if accounts_needed > eff_pool:
++        verdict.reason = "over_capacity"
++    elif (concurrent + 1) > max_conc:
++        verdict.reason = "concurrent"
++    else:
++        verdict.reason = "over_capacity"
++
++    busy_until = max(
++        (res.end for res in reservations if res.start < end_utc and res.end > start_utc),
++        default=None,
++    )
++    verdict.busy_until_utc = busy_until
++
++    # پیشنهاد: اولین شروعی که «کل مدت» جا می‌شود؛ جست‌وجو از ماکسیممِ
++    # (الان، زمان درخواستی کاربر) — پیشنهادِ زودتر از درخواست کاربر (یا
++    # در گذشته) بی‌معناست. اگر خودِ درخواست از ظرفیت مفید بزرگ‌تر باشد،
++    # هیچ پیشنهادی معنا ندارد.
++    if accounts_needed <= eff_pool:
++        search_from = max(now, start_utc)
++        verdict.suggested_start_utc = earliest_fit_start(
++            reservations, accounts_needed, duration_minutes, eff_pool,
++            max_conc, search_from, step_minutes, horizon_minutes, unknown_duration_min,
++        )
++    return verdict
++
++
++# ─────────────────────────── پوشش async (DB + Config) ───────────────────────────
++
++class CapacityPlanner:
++    """لایهٔ سرویس: خواندن پول و رزروها از DB و اجرای هستهٔ محاسباتی."""
++
++    async def check_order(
++        self,
++        bot_id: int,
++        start_utc: datetime,
++        duration_minutes: Optional[int],
++        accounts_needed: int,
++    ) -> Dict[str, Any]:
++        """داوری ظرفیت برای سفارش جدید — همیشه dict برمی‌گرداند (fail-open)."""
++        if not _cfg_bool("CAPACITY_GUARD_ENABLED", "CAPACITY_GUARD_ENABLED", True):
++            return CapacityVerdict(allowed=True, degraded=False).to_dict()
++
++        try:
++            from database import DatabaseManager  # import در زمان اجرا (تست‌پذیری)
++
++            now = datetime.utcnow()
++            # سفارش آنیِ در گذشته معنا ندارد؛ از همین لحظه حساب کن
++            if start_utc is None or start_utc < now - timedelta(minutes=1):
++                start_utc = now
++
++            pool_size = int(await DatabaseManager.count_active_accounts(bot_id=bot_id) or 0)
++            rows = await DatabaseManager.get_capacity_reservations(bot_id=bot_id)
++
++            unknown_min = _cfg_int("CAPACITY_UNKNOWN_DURATION_MINUTES", "CAPACITY_UNKNOWN_DURATION_MINUTES", 60)
++            reservations = _normalize_reservations(rows, now, unknown_min)
++
++            verdict = check_capacity(
++                reservations=reservations,
++                pool_size=pool_size,
++                accounts_needed=int(accounts_needed or 0),
++                start_utc=start_utc,
++                duration_minutes=duration_minutes,
++                safety_buffer_percent=_cfg_int("CAPACITY_SAFETY_BUFFER_PERCENT", "CAPACITY_SAFETY_BUFFER_PERCENT", 10),
++                max_concurrent_orders=_cfg_int("MAX_CONCURRENT_ORDERS", "MAX_CONCURRENT_ORDERS", 10),
++                unknown_duration_min=unknown_min,
++                step_minutes=_cfg_int("CAPACITY_STEP_MINUTES", "CAPACITY_STEP_MINUTES", 5),
++                horizon_minutes=_cfg_int("CAPACITY_HORIZON_HOURS", "CAPACITY_HORIZON_HOURS", 24) * 60,
++                now_utc=now,
++            )
++            result = verdict.to_dict()
++            result["estimate_minutes"] = self._effective_duration(duration_minutes, unknown_min)
++            return result
++        except Exception:
++            logger.exception("CapacityPlanner: internal error → fail-open (order allowed)")
++            return CapacityVerdict(allowed=True, degraded=True).to_dict()
++
++    @staticmethod
++    def _effective_duration(duration_minutes: Optional[int], unknown_min: int) -> int:
++        try:
++            duration = int(duration_minutes or 0)
++        except Exception:
++            duration = 0
++        return duration if duration > 0 else max(1, int(unknown_min or 60))
++
++
++# سینگلتون سراسری (هم‌الگوی order_executor)
++capacity_planner = CapacityPlanner()
+diff --git a/services/payment_reporter.py b/services/payment_reporter.py
+new file mode 100644
+index 0000000..b312a12
+--- /dev/null
++++ b/services/payment_reporter.py
+@@ -0,0 +1,164 @@
++"""
++services/payment_reporter.py
++════════════════════════════
++💳 گزارش‌های مالی به «کانال گزارشات پرداختی» (تنظیم log_channel_payments)
++
++این ماژول حلقهٔ گمشدهٔ گزارش‌گیری است: افزایش/کاهش موجودی کاربران توسط
++ادمین‌ها (set_user_credit) قبلاً فقط به خودِ ادمین و کاربر اطلاع داده می‌شد و
++هیچ ردپایی در کانال گزارشات پرداختی نمی‌ماند. `report_balance_change` دوباره
++گزارشِ شکیل و کامل را به همان کانالی می‌فرستد که رسیدهای پرداخت آنلاین
++(main.py) می‌روند — تا همهٔ ورودی/خروجی‌های مالی در یک‌جا auditable باشند.
++
++Design notes:
++    - هرگز exception به بالا نمی‌اندازد: گزارش نباید عملیاتِ تغییر موجودیِ
++      ادمین را بشکند (همان فلسفهٔ _log_to_channel در order_executor).
++    - `build_balance_change_report` تابع خالص است (بدون import تلگرام/DB)
++      تا بدون وابستگی تست‌پذیر باشد.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Dict, Optional
++
++logger = logging.getLogger(__name__)
++
++SEP = "───────────────────────"
++
++
++def _display_name(user: Optional[Dict[str, Any]]) -> str:
++    if not user:
++        return "---"
++    name = " ".join(
++        part for part in (user.get("first_name"), user.get("last_name")) if part
++    ).strip()
++    return name or (user.get("username") and f"@{user['username']}") or "Unknown"
++
++
++def build_balance_change_report(
++    *,
++    admin_name: str,
++    admin_tg_id: Any,
++    target_name: str,
++    target_tg_id: Any,
++    amount: float,
++    new_balance: float,
++    note: str = "",
++    when_str: str = "---",
++    bot_id: int = 1,
++) -> str:
++    """متن گزارش تغییر موجودی (خالص — قابل تست بدون وابستگی).
++
++    amount مثبت = افزایش شارژ ، منفی = کاهش
++    """
++    try:
++        amount_val = float(amount or 0)
++    except Exception:
++        amount_val = 0.0
++    is_increase = amount_val >= 0
++    action_icon = "📈" if is_increase else "📉"
++    action_word = "افزایش (شارژ)" if is_increase else "کاهش"
++    amount_str = f"{abs(int(amount_val)):,}"
++
++    try:
++        balance_str = f"{int(float(new_balance or 0)):,}"
++    except Exception:
++        balance_str = str(new_balance)
++
++    note_line = note.strip() if isinstance(note, str) else ""
++    if not note_line:
++        note_line = "---"
++
++    lines = [
++        f"┌ 💳 **{action_word} موجودی توسط ادمین**",
++        "│",
++        f"├ {action_icon} **مبلغ:** `{amount_str}` تومان",
++        f"├ 👤 **کاربر:** {_display_name({'first_name': target_name})}",
++        f"├ 🆔 **آیدی کاربر:** `{target_tg_id}`",
++        f"├ 💎 **موجودی جدید:** `{balance_str}` تومان",
++        "│",
++        f"├ 🛡 **ادمین عامل:** {_display_name({'first_name': admin_name})}",
++        f"├ 🔖 **آیدی ادمین:** `{admin_tg_id}`",
++        f"├ 🤖 **ربات شماره:** `{bot_id}`",
++        f"├ 📝 **توضیح:** {note_line}",
++        f"└ 🕒 **زمان:** {when_str}",
++    ]
++    return "\n".join(lines)
++
++
++async def report_balance_change(
++    *,
++    bot_id: int = 1,
++    admin: Optional[Dict[str, Any]] = None,
++    target_user: Optional[Dict[str, Any]] = None,
++    amount: float = 0.0,
++    new_balance: float = 0.0,
++    note: str = "",
++) -> bool:
++    """
++    ارسال گزارش تغییر موجودی ادمین به کانال گزارشات پرداختی.
++
++    admin / target_user می‌توانند dict دیتابیس یا آبجکت تلگرام‌مانند باشند؛
++    فقط first_name / last_name / username / id / telegram_id خوانده می‌شود.
++    همیشه bool برمی‌گرداند و exception را قورت می‌دهد (گزارش نباید عملیاتِ
++    مالی ادمین را بشکند).
++    """
++    try:
++        # تبدیل آبجکت تلگرام (effective_user) به dict یکنواخت
++        def _as_dict(obj: Optional[Any]) -> Dict[str, Any]:
++            if obj is None:
++                return {}
++            if isinstance(obj, dict):
++                return obj
++            return {
++                "id": getattr(obj, "id", None),
++                "telegram_id": getattr(obj, "id", None),
++                "first_name": getattr(obj, "first_name", None),
++                "last_name": getattr(obj, "last_name", None),
++                "username": getattr(obj, "username", None),
++            }
++
++        admin_d = _as_dict(admin)
++        target_d = _as_dict(target_user)
++
++        from database import DatabaseManager  # در زمان اجرا (تست‌پذیری)
++
++        channel_id = await DatabaseManager.get_setting("log_channel_payments", bot_id=bot_id)
++        if not channel_id or str(channel_id).strip().lower() in ("off", "0", "", "none", "تعیین نشده"):
++            logger.info("Balance-change report skipped: log_channel_payments is not set.")
++            return False
++
++        try:
++            from utils.helpers import format_jalali_datetime, get_tehran_time
++            when_str = format_jalali_datetime(get_tehran_time())
++        except Exception:
++            from datetime import datetime
++            when_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
++
++        txt = build_balance_change_report(
++            admin_name=admin_d.get("first_name") or "",
++            admin_tg_id=admin_d.get("telegram_id") or admin_d.get("id") or "---",
++            target_name=_display_name(target_d),
++            target_tg_id=target_d.get("telegram_id") or target_d.get("id") or "---",
++            amount=amount,
++            new_balance=new_balance,
++            note=note,
++            when_str=when_str,
++            bot_id=bot_id,
++        )
++
++        from services.bot_manager import bot_manager
++        app = bot_manager.active_bots.get(bot_id)
++        if not app:
++            logger.warning(f"Balance-change report: bot {bot_id} is not active; report dropped.")
++            return False
++
++        try:
++            await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
++        except Exception:
++            # هر خطای فرمت‌بندی/ارسال Markdown → ارسال ساده (گزارش نباید گم شود)
++            await app.bot.send_message(channel_id, txt)
++        return True
++    except Exception:
++        logger.warning("Balance-change report failed (non-fatal).", exc_info=True)
++        return False
+diff --git a/tests/test_capacity_planner.py b/tests/test_capacity_planner.py
+new file mode 100644
+index 0000000..b05f1d0
+--- /dev/null
++++ b/tests/test_capacity_planner.py
+@@ -0,0 +1,193 @@
++"""
++Offline tests for the Capacity Guard (services/capacity_planner.py).
++
++سناریوی کلیدی کاربر:
++    ساعت ۱۲:۰۰ شلوغ است → سفارش رد می‌شود. کاربر ۱۲:۱۰ دوباره تلاش می‌کند؛
++    نباید صرفاً به‌خاطر «۱۲:۱۰ آزاد است» پذیرفته شود — کل بازهٔ سفارش تا
++    پایان مدتش باید سنجیده شود و دقیق‌ترین ساعتِ آزاد پیشنهاد گردد.
++
++Run:
++    python -m unittest tests.test_capacity_planner -v
++"""
++
++from __future__ import annotations
++
++import os
++import unittest
++from datetime import datetime, timedelta
++
++# محیط تست: بدون DB/تلگرام؛ فقط هستهٔ محاسباتی خالص
++os.environ.setdefault("CAPACITY_GUARD_ENABLED", "true")
++
++from services.capacity_planner import (  # noqa: E402
++    Reservation,
++    check_capacity,
++    earliest_fit_start,
++    effective_pool_size,
++    estimate_end,
++    peak_in_window,
++)
++
++
++def R(order_id, accounts, start, minutes, status="running"):
++    end = start + timedelta(minutes=minutes if minutes > 0 else 60)
++    return Reservation(order_id=order_id, accounts=accounts, start=start, end=end, status=status)
++
++
++class EffectivePoolTests(unittest.TestCase):
++    def test_buffer_applied(self):
++        self.assertEqual(effective_pool_size(100, 10), 90)
++        self.assertEqual(effective_pool_size(40, 10), 36)
++        self.assertEqual(effective_pool_size(0, 10), 0)
++
++    def test_buffer_clamped(self):
++        self.assertEqual(effective_pool_size(100, 95), 10)   # clamp to 90%
++        self.assertEqual(effective_pool_size(100, -5), 100)  # clamp to 0%
++
++
++class EstimateEndTests(unittest.TestCase):
++    def test_zero_duration_uses_default(self):
++        start = datetime(2026, 9, 18, 8, 0)
++        self.assertEqual(estimate_end(start, 0, 60), start + timedelta(minutes=60))
++        self.assertEqual(estimate_end(start, None, 45), start + timedelta(minutes=45))
++
++    def test_positive_duration_kept(self):
++        start = datetime(2026, 9, 18, 8, 0)
++        self.assertEqual(estimate_end(start, 30, 60), start + timedelta(minutes=30))
++
++
++class PeakInWindowTests(unittest.TestCase):
++    def test_exact_peak_between_boundaries(self):
++        base = datetime(2026, 9, 18, 12, 0)
++        reservations = [
++            R(1, 35, base, 60),                 # 12:00 → 13:00
++            R(2, 20, base + timedelta(minutes=30), 60),  # 12:30 → 13:30
++        ]
++        # اوج بین 12:30 تا 13:00 = 55
++        peak, orders = peak_in_window(reservations, base, base + timedelta(minutes=120))
++        self.assertEqual(peak, 55)
++        self.assertEqual(orders, 2)
++
++    def test_window_outside_reservations(self):
++        base = datetime(2026, 9, 18, 12, 0)
++        reservations = [R(1, 35, base, 60)]
++        peak, orders = peak_in_window(reservations, base + timedelta(minutes=120), base + timedelta(minutes=180))
++        self.assertEqual((peak, orders), (0, 0))
++
++
++class CheckCapacityTests(unittest.TestCase):
++    """سناریوی دقیق کاربر: شلوغی ۱۲:۰۰ → ردّ ۱۲:۱۰ → پیشنهاد دقیق."""
++
++    def setUp(self):
++        self.base = datetime(2026, 9, 18, 8, 30)  # = 12:00 تهران
++        # پول ۴۰ اکانت با حاشیهٔ ایمن ۱۰٪ → ظرفیت مفید ۳۶
++        self.reservations = [R(1, 35, self.base, 90)]  # 12:00 → 13:30 تهران
++
++    def _check(self, start_offset_min, need=10, dur=30, pool=40, buffer_pct=10):
++        return check_capacity(
++            reservations=self.reservations,
++            pool_size=pool,
++            accounts_needed=need,
++            start_utc=self.base + timedelta(minutes=start_offset_min),
++            duration_minutes=dur,
++            safety_buffer_percent=buffer_pct,
++            max_concurrent_orders=10,
++            unknown_duration_min=60,
++            step_minutes=5,
++            horizon_minutes=24 * 60,
++            now_utc=self.base - timedelta(minutes=30),
++        )
++
++    def test_busy_at_noon_rejected(self):
++        v = self._check(0)  # درخواست همزمان با سفارش ۳۵تایی
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "over_capacity")
++        self.assertEqual(v.peak_usage, 35)
++        self.assertIsNotNone(v.busy_until_utc)
++
++    def test_ten_minutes_later_still_rejected_full_window(self):
++        # ۱۲:۱۰ هم داخل بازهٔ شلوغ است → باید رد شود (نه فقط لحظهٔ شروع)
++        v = self._check(10)
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.busy_until_utc, self.base + timedelta(minutes=90))
++
++    def test_suggested_start_is_first_slot_where_whole_order_fits(self):
++        # شلوغی تا ۱۳:۳۰ تهران؛ سفارش ۳۰ دقیقه‌ای → اولین شروعِ جادار ۱۳:۳۰
++        v = self._check(10)
++        self.assertIsNotNone(v.suggested_start_utc)
++        self.assertEqual(v.suggested_start_utc, self.base + timedelta(minutes=90))
++        # و اگر همان پیشنهاد را بخواهیم، باید کاملاً جا شود:
++        v2 = self._check(90)
++        self.assertTrue(v2.allowed)
++
++    def test_after_busy_window_accepts(self):
++        v = self._check(95)  # ۱۳:۳۵ تهران → بعد از پایان سفارش قبلی
++        self.assertTrue(v.allowed)
++        self.assertIsNone(v.reason)
++
++    def test_too_big_for_whole_pool(self):
++        v = self._check(95, need=50, pool=40)
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "too_big")
++        self.assertIsNone(v.suggested_start_utc)
++
++    def test_over_effective_pool_but_under_raw(self):
++        # ۴۱ > ظرفیت مفید ۳۶ ولی ≤ پول ۴۰ → رد با دلیل over_capacity و بدون پیشنهاد
++        v = self._check(95, need=38, pool=40, buffer_pct=10)
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "over_capacity")
++        self.assertIsNone(v.suggested_start_utc)
++
++    def test_concurrent_cap_blocks_third_order(self):
++        base = datetime(2026, 9, 18, 9, 0)
++        reservations = [R(1, 1, base, 60), R(2, 1, base, 60)]
++        v = check_capacity(
++            reservations=reservations, pool_size=100, accounts_needed=1,
++            start_utc=base, duration_minutes=30,
++            safety_buffer_percent=0, max_concurrent_orders=2,
++            unknown_duration_min=60, step_minutes=5, horizon_minutes=60,
++            now_utc=base - timedelta(minutes=5),
++        )
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "concurrent")
++
++    def test_zero_duration_order_estimated(self):
++        # سفارشِ «تکمیل و خروج» (مدت ۰) با تخمین ۶۰ دقیقه سنجیده شود
++        v = check_capacity(
++            reservations=[], pool_size=40, accounts_needed=10,
++            start_utc=self.base, duration_minutes=0,
++            safety_buffer_percent=10, max_concurrent_orders=10,
++            unknown_duration_min=60, step_minutes=5, horizon_minutes=60,
++            now_utc=self.base - timedelta(minutes=5),
++        )
++        self.assertTrue(v.allowed)
++        self.assertEqual(v.end_utc, self.base + timedelta(minutes=60))
++
++
++class EarliestFitTests(unittest.TestCase):
++    def test_skips_overlapping_block_entirely(self):
++        base = datetime(2026, 9, 18, 8, 30)
++        reservations = [R(1, 30, base + timedelta(minutes=15), 60)]
++        got = earliest_fit_start(
++            reservations=reservations, accounts_needed=10, duration_minutes=45,
++            effective_pool=36, max_concurrent_orders=10,
++            from_utc=base, step_minutes=5, horizon_minutes=12 * 60,
++            unknown_duration_min=60,
++        )
++        # سفارش ۴۵ دقیقه‌ای نمی‌تواند داخل/چسبیده به بلوک ۱ ساعته بیفتد
++        block_end = base + timedelta(minutes=75)
++        self.assertIsNotNone(got)
++        self.assertGreaterEqual(got, block_end)
++
++
++class ReservationNormalizationGuardTests(unittest.TestCase):
++    def test_peak_handles_string_datetimes(self):
++        # رزرو با datetime عادی در برابر مرزهای datetime — بدون crash
++        base = datetime(2026, 9, 18, 12, 0)
++        reservations = [R(1, 10, base, 30)]
++        peak, _ = peak_in_window(reservations, base, base + timedelta(minutes=60))
++        self.assertEqual(peak, 10)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_leave_stagger.py b/tests/test_leave_stagger.py
+index 9a9ad18..fb29683 100644
+--- a/tests/test_leave_stagger.py
++++ b/tests/test_leave_stagger.py
+@@ -111,7 +111,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
+ 
+     def test_bot_version_bumped(self):
+         src = _read_source("constants.py")
+-        self.assertIn('BOT_VERSION = "2.2.1"', src)
++        self.assertIn('BOT_VERSION = "2.2.3"', src)
+ 
+ 
+ class StopAllPacingLogicTests(unittest.TestCase):
+diff --git a/tests/test_payment_reporter.py b/tests/test_payment_reporter.py
+new file mode 100644
+index 0000000..f62206b
+--- /dev/null
++++ b/tests/test_payment_reporter.py
+@@ -0,0 +1,65 @@
++"""
++Offline tests for the admin balance-change report builder
++(services/payment_reporter.py — گزارش افزایش/کاهش موجودی ادمین در کانال
++گزارشات پرداختی).
++
++Run:
++    python -m unittest tests.test_payment_reporter -v
++"""
++
++from __future__ import annotations
++
++import os
++import unittest
++
++from services.payment_reporter import build_balance_change_report  # noqa: E402
++
++
++class BalanceChangeReportTests(unittest.TestCase):
++    def setUp(self):
++        self.kwargs = dict(
++            admin_name="Sina",
++            admin_tg_id=111,
++            target_name="Ali",
++            target_tg_id=222,
++            amount=+500_000,
++            new_balance=1_200_000,
++            note="تغییر موجودی افزایش از پنل ادمین",
++            when_str="۲۷ شهریور ۱۴۰۵، ساعت ۱۲:۰۰",
++            bot_id=1,
++        )
++
++    def test_increase_report_contains_all_fields(self):
++        txt = build_balance_change_report(**self.kwargs)
++        self.assertIn("افزایش (شارژ)", txt)
++        self.assertIn("500,000", txt)
++        self.assertIn("1,200,000", txt)
++        self.assertIn("Ali", txt)
++        self.assertIn("222", txt)
++        self.assertIn("Sina", txt)
++        self.assertIn("111", txt)
++        self.assertIn("📈", txt)
++
++    def test_decrease_report_wording(self):
++        txt = build_balance_change_report(**{**self.kwargs, "amount": -300_000})
++        self.assertIn("کاهش", txt)
++        self.assertIn("300,000", txt)   # قدرمطلق مبلغ
++        self.assertNotIn("-300,000", txt)
++        self.assertIn("📉", txt)
++
++    def test_zero_amount_counts_as_increase(self):
++        txt = build_balance_change_report(**{**self.kwargs, "amount": 0})
++        self.assertIn("افزایش (شارژ)", txt)
++
++    def test_empty_note_fallback(self):
++        txt = build_balance_change_report(**{**self.kwargs, "note": "   "})
++        self.assertIn("---", txt)
++
++    def test_never_raises_on_bad_numbers(self):
++        txt = build_balance_change_report(**{**self.kwargs, "amount": "abc", "new_balance": None})
++        self.assertIsInstance(txt, str)
++        self.assertIn("0", txt)
++
++
++if __name__ == "__main__":
++    unittest.main()

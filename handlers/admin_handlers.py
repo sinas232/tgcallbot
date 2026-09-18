@@ -241,8 +241,18 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     running_orders = order_stats.get('running', 0)
     scheduled_orders = order_stats.get('scheduled', 0)
     total_orders = order_stats.get('total', 0)
-    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`")
-    if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+    # 🐞 فیکس: سفارش تازهٔ ثبت‌شده در وضعیت pending است و باید در آمار دیده شود
+    pending_orders = order_stats.get('pending', 0)
+    completed_orders = order_stats.get('completed', 0)
+    today_orders = order_stats.get('today', 0)
+    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز: `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`")
+    # حذف پیام «در حال جمع‌آوری» باید ضدخطا باشد؛ اگر شکست بخورد، آمار
+    # نباید از دست برود (باگ قبلی: خطای delete → هیچ آماری نمایش داده نمی‌شد)
+    if msg:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+        except Exception:
+            pass
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     return AWAITING_SETTINGS_ACTION
 
@@ -307,6 +317,26 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
         except Exception:
             pass
         return AWAITING_SETTINGS_ACTION
+    # 🌍 حالت تعمیرات «سراسری» است: اگر فقط bot_data همین اپ به‌روز شود،
+    # ربات‌های نمایندگی (اپ‌های جدا با bot_data جدا) همچنان باز می‌مانند و
+    # کاربرانشان می‌توانند سفارش بزنند (باگ گزارش‌شده). راه‌حل:
+    # ۱) تنظیم اصلی در bot_id=1 ذخیره می‌شود (مرجع لودِ استارت‌آپ همهٔ اپ‌ها)
+    # ۲) پرچم همهٔ اپ‌های فعال همین حالا فلیپ می‌شود
+    if bot_id != 1:
+        try:
+            await asyncio.wait_for(DatabaseManager.set_setting(
+                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
+        except Exception:
+            pass
+    try:
+        from services.bot_manager import bot_manager as _bm
+        for _bid, _app in list(_bm.active_bots.items()):
+            try:
+                _app.bot_data['maintenance_mode'] = on
+            except Exception:
+                pass
+    except Exception:
+        pass
     context.bot_data['maintenance_mode'] = on
     try:
         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
@@ -698,7 +728,17 @@ async def admin_orders_list_handler(update, context):
         nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
         if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_orders_{mode}_{page+1}"))
         if nav: kb.append(nav)
-        
+
+    # 🛑 دکمهٔ لغو برای هر سفارشِ قابل‌لغو (فعال/در صف/زمان‌بندی) — قبلاً ادمین
+    # فقط از طریق فلو «شماره ردیف» می‌توانست لغو کند و در خود لیست هیچ
+    # دکمه‌ای برای انتخاب و لغو سفارش دیده نمی‌شد.
+    for item in orders:
+        o = item['order']
+        if o.get('status') in ('running', 'scheduled', 'pending'):
+            kb.append([InlineKeyboardButton(
+                f"🛑 لغو سفارش #{o['id']}",
+                callback_data=f"admincancel_pick_{o['id']}"
+            )])
     kb.append([InlineKeyboardButton("🔙", callback_data="back_to_admin_orders")])
     await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
     return AWAITING_SETTINGS_ACTION
@@ -795,6 +835,71 @@ async def stop_order_execute(update, context):
         await show_user_profile(update, context, user)
     else: await manage_orders_start(update, context)
     
+    return AWAITING_SETTINGS_ACTION
+
+
+async def admin_cancel_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🛑 انتخاب لغو یک سفارش مستقیماً از لیست/پروفایل ادمین (admincancel_pick_<id>).
+
+    قبلاً تنها راه لغو، فلو «لغو سفارش فعال + تایپ شمارهٔ ردیف» بود و در
+    خودِ لیست سفارشات هیچ دکمه‌ای برای انتخاب و لغو نمایش داده نمی‌شد.
+    این هندلر پیش‌نمایش مالی سفارش را نشان می‌دهد و همان دکمه‌های
+    با/بدون عودت (admincancel_refund/norefund/abort) را می‌چیند.
+    """
+    query = update.callback_query
+    await safe_answer(query)
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        oid = int((query.data or "").split("_")[-1])
+    except Exception:
+        return AWAITING_SETTINGS_ACTION
+
+    order = await DatabaseManager.get_order(oid)
+    if not order or order.get('bot_id', bot_id) != bot_id:
+        await query.edit_message_text("❌ سفارش یافت نشد.")
+        return AWAITING_SETTINGS_ACTION
+
+    status = order.get('status')
+    if status not in ('running', 'scheduled', 'pending'):
+        await query.edit_message_text(
+            f"ℹ️ سفارش #{oid} دیگر فعال نیست (وضعیت: `{status}`) و امکان لغو ندارد.",
+            parse_mode='Markdown',
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    if status == 'scheduled':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💵 لغو و عودت کامل وجه", callback_data=f"admincancel_refund_{oid}")],
+            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
+        ])
+        txt = (
+            f"🛑 **لغو سفارش زمان‌بندی‌شده #{oid}**\n\n"
+            "این سفارش هنوز شروع نشده؛ با لغو، کل مبلغ به کیف پول کاربر عودت داده می‌شود."
+        )
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode='Markdown')
+        return AWAITING_SETTINGS_ACTION
+
+    # running / pending → پیش‌نمایش تسویهٔ ثانیه‌ای + دو گزینهٔ لغو
+    total_price = float(order.get('price_paid') or 0)
+    used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
+            callback_data=f"admincancel_refund_{oid}")],
+        [InlineKeyboardButton(
+            "🚫 لغو بدون عودت وجه",
+            callback_data=f"admincancel_norefund_{oid}")],
+        [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{oid}")],
+    ])
+    status_fa = "در حال اجرا" if status == 'running' else "در صف اجرا"
+    txt = (
+        f"🛑 **لغو سفارش فعال #{oid}** ({status_fa})\n\n"
+        f"💰 هزینه کل پلن: {format_price(total_price)} تومان\n"
+        f"📉 هزینه مصرف‌شده تا الان: {format_price(used_cost)} تومان\n"
+        f"💵 مبلغ قابل عودت: {format_price(refund_amount)} تومان\n\n"
+        f"لطفاً نوع لغو را انتخاب کنید:"
+    )
+    await query.edit_message_text(txt, reply_markup=kb, parse_mode='Markdown')
     return AWAITING_SETTINGS_ACTION
 
 
@@ -1129,6 +1234,13 @@ async def admin_user_actions_handler(update, context):
              nav.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="noop"))
              if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"view_orders_all_{page+1}"))
              if nav: kb.append(nav)
+        # 🛑 دکمهٔ لغو تک‌تک سفارش‌های قابل‌لغو کاربر (انتخاب مستقیم از پروفایل)
+        for o in orders:
+            if o.get('status') in ('running', 'scheduled', 'pending'):
+                kb.append([InlineKeyboardButton(
+                    f"🛑 لغو سفارش #{o['id']}",
+                    callback_data=f"admincancel_pick_{o['id']}"
+                )])
         kb.append([InlineKeyboardButton("❌ لغو سفارش‌های فعال", callback_data="admin_stop_user_orders")])
         kb.append([InlineKeyboardButton("🔙 بازگشت به پروفایل", callback_data="back_to_profile")])
         await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -1186,6 +1298,21 @@ async def set_user_credit(update, context):
                 user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
                 await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
             except: pass
+            # 💳 گزارش تغییر موجودی ادمین در «کانال گزارشات پرداختی»
+            # (قابلیت بازگردانی‌شده: همهٔ شارژ/کسرهای ادمین باید در کانال
+            #  log_channel_payments audit شوند — بدون شکستن عملیات اصلی)
+            try:
+                from services.payment_reporter import report_balance_change
+                await report_balance_change(
+                    bot_id=context.bot_data.get('bot_id', 1),
+                    admin=update.effective_user,
+                    target_user=user,
+                    amount=final_change,
+                    new_balance=new_balance,
+                    note=f"تغییر موجودی {action_str} از پنل ادمین",
+                )
+            except Exception:
+                logger.warning("admin balance report to payments channel failed", exc_info=True)
         else: await update.message.reply_text("❌ خطا در بروزرسانی دیتابیس.")
     except Exception as e:
         logger.error(f"Set credit error: {e}")

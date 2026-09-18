@@ -751,7 +751,7 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             q = select(Order, User).join(User, Order.user_id == User.id).filter(Order.bot_id == bot_id)
             if status_filter and status_filter != 'all':
-                if status_filter == 'active': q = q.filter(Order.status == 'running')
+                if status_filter == 'active': q = q.filter(Order.status.in_(['running', 'pending']))
                 elif status_filter == 'completed': q = q.filter(Order.status == 'completed')
                 elif status_filter == 'scheduled': q = q.filter(Order.status == 'scheduled')
                 elif status_filter == 'cancelled': q = q.filter(Order.status.in_(['stopped', 'failed']))
@@ -764,7 +764,7 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             q = select(func.count(Order.id)).filter(Order.bot_id == bot_id)
             if status_filter and status_filter != 'all':
-                if status_filter == 'active': q = q.filter(Order.status == 'running')
+                if status_filter == 'active': q = q.filter(Order.status.in_(['running', 'pending']))
                 elif status_filter == 'completed': q = q.filter(Order.status == 'completed')
                 elif status_filter == 'scheduled': q = q.filter(Order.status == 'scheduled')
                 elif status_filter == 'cancelled': q = q.filter(Order.status.in_(['stopped', 'failed']))
@@ -884,6 +884,43 @@ class DatabaseManager:
                     return True
             
             return False
+
+    @staticmethod
+    async def get_capacity_reservations(bot_id: int = 1) -> List[Dict[str, Any]]:
+        """
+        رزروهای فعال ظرفیت برای Capacity Guard (گارد منابع قبل از ثبت سفارش).
+        سبک: فقط ستون‌های لازم از سفارش‌های running/scheduled/pending خوانده
+        می‌شود؛ هر رکورد یعنی «accounts_count اکانت از شروع تا پایان مدت اشغال
+        است». محاسبهٔ تداخل/اوج در services/capacity_planner.py انجام می‌شود.
+        """
+        async with AsyncSessionLocal() as db_session:
+            q = select(
+                Order.id,
+                Order.user_id,
+                Order.accounts_count,
+                Order.duration_minutes,
+                Order.status,
+                Order.started_at,
+                Order.scheduled_for,
+                Order.created_at,
+            ).filter(
+                Order.bot_id == bot_id,
+                Order.status.in_(['running', 'scheduled', 'pending']),
+            )
+            res = await db_session.execute(q)
+            return [
+                {
+                    "id": row[0],
+                    "user_id": row[1],
+                    "accounts_count": row[2],
+                    "duration_minutes": row[3],
+                    "status": row[4],
+                    "started_at": row[5],
+                    "scheduled_for": row[6],
+                    "created_at": row[7],
+                }
+                for row in res.all()
+            ]
 
     @staticmethod
     async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None,
@@ -1173,7 +1210,15 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             total = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id))).scalar() or 0
             running = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'running', Order.bot_id == bot_id))).scalar() or 0
             scheduled = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'scheduled', Order.bot_id == bot_id))).scalar() or 0
-            return {'total': total, 'running': running, 'scheduled': scheduled}
+            # 🐞 فیکس «سفارش ثبت‌شده در آمار دیده نمی‌شود»: سفارش تازه ثبت‌شده
+            # تا لحظهٔ تحویل به executor در وضعیت pending (صف) است؛ بدون این
+            # شمارنده، سفارش جدید در آمار کلاً غایب بود.
+            pending = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'pending', Order.bot_id == bot_id))).scalar() or 0
+            completed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'completed', Order.bot_id == bot_id))).scalar() or 0
+            # سفارش‌های ثبت‌شدهٔ امروز (به وقت UTC — مبنای created_at دیتابیس)
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id, Order.created_at >= today_start))).scalar() or 0
+            return {'total': total, 'running': running, 'scheduled': scheduled, 'pending': pending, 'completed': completed, 'today': today}
 
     @staticmethod
     async def reset_stuck_orders():

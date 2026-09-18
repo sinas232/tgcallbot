@@ -993,6 +993,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
             CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
             CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
+            CallbackQueryHandler(admin_cancel_pick_callback, pattern=r"^admincancel_pick_\d+$"),
             CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
             CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
             CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
@@ -1025,6 +1026,7 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
                 CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
                 CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
+                CallbackQueryHandler(admin_cancel_pick_callback, pattern=r"^admincancel_pick_\d+$"),
                 MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
 
                 # اکشن‌های کاربر (pattern محدود و دقیق تا کالبک‌های دیگر مثل
@@ -1262,7 +1264,7 @@ def register_handlers(application: Application) -> None:
             # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
             CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
             CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
-            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$"),
         ],
         states={
             AWAITING_SELECT_PLAN: [
@@ -1276,7 +1278,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$")]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
