@@ -65,14 +65,13 @@ def require_admin(func):
 
 def require_super_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
-        bot_id = context.bot_data.get('bot_id', 1)
-        if user_id in Config.ADMIN_IDS:
+        from services.maintenance import is_super_admin
+        if await is_super_admin(update, context):
             return await func(update, context, *args, **kwargs)
-        user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
-        if user and user.get('admin_role') == 'super_admin':
-            return await func(update, context, *args, **kwargs)
-        await update.message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
+        if update.callback_query:
+            await update.callback_query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
         return AWAITING_SETTINGS_ACTION
     return wrapper
 
@@ -231,7 +230,6 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await send_safe(context.bot, update.effective_chat.id, "⚙️ **تنظیمات سیستم**", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return AWAITING_SETTINGS_ACTION
 
-@require_admin
 def _server_resource_line() -> str:
     """یک خط وضعیت منابع سرور (هرگز استثنا پرتاب نمی‌کند)."""
     try:
@@ -248,6 +246,7 @@ def _server_resource_line() -> str:
         return ""
 
 
+@require_admin
 async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_id = context.bot_data.get('bot_id', 1)
     msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال جمع‌آوری آمار...")
@@ -265,7 +264,7 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     failed_orders = order_stats.get('failed', 0)
     txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز (به وقت تهران): `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`\n   • 🛑 متوقف‌شده (لغو): `{stopped_orders}`\n   • ❌ ناموفق: `{failed_orders}`")
     # 🖥 وضعیت منابع سرور — همان اعدادی که گارد ظرفیت با آن‌ها تصمیم می‌گیرد
-    txt += _server_resource_line()
+    txt += await asyncio.to_thread(_server_resource_line)
     # حذف پیام «در حال جمع‌آوری» باید ضدخطا باشد؛ اگر شکست بخورد، آمار
     # نباید از دست برود (باگ قبلی: خطای delete → هیچ آماری نمایش داده نمی‌شد)
     if msg:
@@ -279,10 +278,11 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def _maintenance_text(on):
     status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
     return (
-        "🛠 **حالت تعمیرات (Maintenance)**\\n\\n"
-        f"وضعیت فعلی: {status}\\n\\n"
+        "🛠 **حالت تعمیرات (Maintenance)**\n\n"
+        f"وضعیت فعلی: {status}\n\n"
         "وقتی فعال باشد، هیچ کاربری (حتی ادمین عادی) نمی‌تواند با ربات "
-        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\\n"
+        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\n"
+        "این تنظیم روی ربات اصلی و همهٔ نمایندگی‌ها اعمال می‌شود.\n"
         "برای آپدیت امن: اول فعال کنید، آپدیت کنید، بعد خاموش کنید."
     )
 
@@ -295,69 +295,34 @@ def _maintenance_kb(on):
 
 @require_super_admin
 async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """منوی حالت تعمیرات — فقط سوپرادمین."""
-    bot_id = context.bot_data.get('bot_id', 1)
-    try:
-        on = context.bot_data.get('maintenance_mode')
-        if on is None:
-            on = (await asyncio.wait_for(DatabaseManager.get_setting(
-                "maintenance_mode", "0", bot_id=bot_id), timeout=10)) == "1"
-            context.bot_data['maintenance_mode'] = on
-    except Exception:
-        on = False
-    await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
+    from services.maintenance import maintenance_enabled
+    on = maintenance_enabled(context.bot_data)
+    text = _maintenance_text(on)
+    if context.bot_data.get('maintenance_source') == 'unavailable':
+        text += "\n\n⚠️ دریافت وضعیت از دیتابیس ناموفق بود؛ دسترسی کاربران برای ایمنی بسته است. پس از رفع اتصال، وضعیت را دوباره ذخیره کنید."
+    await send_safe(context.bot, update.effective_chat.id, text,
+                    reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     return AWAITING_SETTINGS_ACTION
 
 
 async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """روشن/خاموش کردن حالت تعمیرات — فقط سوپرادمین (دکمهٔ شیشه‌ای)."""
+    from services.maintenance import maintenance, is_super_admin
     query = update.callback_query
-    user = update.effective_user
-    bot_id = context.bot_data.get('bot_id', 1)
-    allowed = bool(user and user.id in Config.ADMIN_IDS)
-    if not allowed and user:
+    if not await is_super_admin(update, context):
+        await query.answer("⛔️ مخصوص سوپرادمین.", show_alert=True)
+        return AWAITING_SETTINGS_ACTION
+    if query.data not in ('maint_on', 'maint_off'):
+        return AWAITING_SETTINGS_ACTION
+    on = query.data == 'maint_on'
+    try:
+        await maintenance.set_enabled(context.application, on)
+    except Exception:
+        logger.exception('maintenance toggle was not confirmed')
         try:
-            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
-            allowed = bool(db_user and db_user.get('admin_role') == 'super_admin')
-        except Exception:
-            allowed = False
-    if not allowed:
-        try:
-            await query.answer("⛔️ مخصوص سوپرادمین.", show_alert=True)
+            await query.answer("❌ ذخیرهٔ وضعیت تأیید نشد؛ اتصال دیتابیس را بررسی کنید و دوباره تلاش کنید.", show_alert=True)
         except Exception:
             pass
         return AWAITING_SETTINGS_ACTION
-    on = (query.data == "maint_on")
-    try:
-        await asyncio.wait_for(DatabaseManager.set_setting(
-            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
-    except Exception:
-        try:
-            await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
-        except Exception:
-            pass
-        return AWAITING_SETTINGS_ACTION
-    # 🌍 حالت تعمیرات «سراسری» است: اگر فقط bot_data همین اپ به‌روز شود،
-    # ربات‌های نمایندگی (اپ‌های جدا با bot_data جدا) همچنان باز می‌مانند و
-    # کاربرانشان می‌توانند سفارش بزنند (باگ گزارش‌شده). راه‌حل:
-    # ۱) تنظیم اصلی در bot_id=1 ذخیره می‌شود (مرجع لودِ استارت‌آپ همهٔ اپ‌ها)
-    # ۲) پرچم همهٔ اپ‌های فعال همین حالا فلیپ می‌شود
-    if bot_id != 1:
-        try:
-            await asyncio.wait_for(DatabaseManager.set_setting(
-                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
-        except Exception:
-            pass
-    try:
-        from services.bot_manager import bot_manager as _bm
-        for _bid, _app in list(_bm.active_bots.items()):
-            try:
-                _app.bot_data['maintenance_mode'] = on
-            except Exception:
-                pass
-    except Exception:
-        pass
-    context.bot_data['maintenance_mode'] = on
     try:
         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
     except Exception:
@@ -365,7 +330,8 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
     try:
         await query.edit_message_text(_maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     except Exception:
-        pass
+        await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on),
+                        reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     return AWAITING_SETTINGS_ACTION
 
 

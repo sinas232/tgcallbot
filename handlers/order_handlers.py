@@ -22,6 +22,7 @@ from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
 from services.capacity_planner import capacity_planner
+from services.maintenance import maintenance, enforce_maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -569,18 +570,23 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
             )
             return ConversationHandler.END
 
-        await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
-        
-        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
-        
-        order = await DatabaseManager.create_order(
-            user['id'], plan['service_type'], link,
-            plan['accounts_count'], plan['duration_minutes'], plan['price'],
-            plan_id=plan['id'], scheduled_for=schedule_time, bot_id=bot_id
-        )
-        
+        # Final admission shares the toggle lock. A form/capacity check that
+        # began before maintenance cannot debit/create/launch after it turns ON.
+        async with maintenance.lock:
+            await enforce_maintenance(update, context)
+            await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
+
+            schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
+
+            order = await DatabaseManager.create_order(
+                user['id'], plan['service_type'], link,
+                plan['accounts_count'], plan['duration_minutes'], plan['price'],
+                plan_id=plan['id'], scheduled_for=schedule_time, bot_id=bot_id
+            )
+
+            if not schedule_time:
+                await order_executor.submit_order(order['id'], order)
         if not schedule_time:
-            await order_executor.submit_order(order['id'], order)
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]

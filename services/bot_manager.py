@@ -14,6 +14,7 @@ from telegram.request import HTTPXRequest
 from telegram import Update
 
 from database import DatabaseManager
+from services.maintenance import initialize_bot_runtime
 from utils.premium_bot import PremiumEmojiApplication, PremiumEmojiBot
 
 logger = logging.getLogger(__name__)
@@ -103,27 +104,12 @@ class BotManager:
                 logger.error(f"❌ No handler registrar set for bot {bot_id}!")
                 return False
 
-            # مقداردهی اولیه (لود کردن فایل‌های ذخیره شده)
-            await app.initialize()
-            
-            # 🔥🔥🔥 نکته کلیدی رفع باگ ایزوله‌سازی 🔥🔥🔥
-            # بعد از initialize، حتماً bot_id را دوباره ست می‌کنیم.
-            # چون ممکن است persistence قدیمی مقدار غلط (مثلاً 1) را لود کرده باشد.
-            app.bot_data['bot_id'] = bot_id
-            app.bot_data['owner_id'] = bot_data['owner_id']
-            # 🔥 ذخیره API ID و Hash اختصاصی ربات نمایندگی
-            app.bot_data['api_id'] = bot_data.get('api_id')
-            app.bot_data['api_hash'] = bot_data.get('api_hash')
-            # پرچم حالت تعمیرات — «سراسری»: مرجع، تنظیم ربات اصلی (bot_id=1)
-            # است تا تاگلِ سوپرادمین روی همهٔ ربات‌های نمایندگی هم اثر بگذارد
-            # (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
-            try:
-                app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
-            except Exception as e:
-                logger.warning(f"Bot {bot_id}: maintenance flag load failed ({e}) — default OFF")
-                app.bot_data['maintenance_mode'] = False
-            
+            # Same post-persistence identity + global maintenance policy as main.
+            await initialize_bot_runtime(
+                app, bot_id=bot_id, owner_id=bot_data['owner_id'],
+                api_id=bot_data.get('api_id'), api_hash=bot_data.get('api_hash'),
+            )
+
             # استارت ربات
             await app.start()
             

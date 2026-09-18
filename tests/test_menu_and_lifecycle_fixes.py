@@ -46,35 +46,37 @@ class MaintenanceGuardTests(unittest.TestCase):
 
     def test_guard_blocks_text_messages(self):
         block = self._guard_block()
-        self.assertIn("filters.TEXT & ~filters.COMMAND", block)
+        self.assertIn("TypeHandler(Update, _maintenance_guard)", block)
 
     def test_guard_blocks_all_commands_not_only_start(self):
         """🐞 باگ: فقط CommandHandler("start") بسته بود؛ /help و /stop_order باز بود."""
         self.assertIn(
-            "MessageHandler(filters.COMMAND, _maintenance_guard)",
+            "TypeHandler(Update, _maintenance_guard)",
             self.main,
             "همهٔ دستورات باید توسط نگهبان تعمیرات مسدود شوند",
         )
 
     def test_guard_blocks_callbacks(self):
         block = self._guard_block()
-        self.assertIn("CallbackQueryHandler(_maintenance_guard)", block)
+        self.assertIn("TypeHandler(Update, _maintenance_guard)", block)
 
     def test_guard_registered_in_own_group(self):
         seg = self._guard_block()
         self.assertGreaterEqual(seg.count("group=-3"), 1)
 
     def test_guard_stops_propagation(self):
-        self.assertIn("raise ApplicationHandlerStop", self._guard_block())
+        self.assertIn("await enforce_maintenance(update, context)", self._guard_block())
+        self.assertIn("raise ApplicationHandlerStop", _read("services/maintenance.py"))
 
     def test_guard_lets_super_admin_through(self):
-        self.assertIn("_is_super_admin_user", self.main)
+        self.assertIn("await is_super_admin(update, context)", _read("services/maintenance.py"))
 
     def test_flag_loaded_for_every_bot(self):
         """ربات‌های نمایندگی هم باید پرچم سراسری را بخوانند."""
         bot_manager = _read("services/bot_manager.py")
-        self.assertIn("maintenance_mode", bot_manager)
-        self.assertIn('get_setting("maintenance_mode", "0", bot_id=1)', bot_manager)
+        self.assertIn("initialize_bot_runtime(", bot_manager)
+        self.assertIn("initialize_bot_runtime(main_app", self.main)
+        self.assertIn("'maintenance_mode', '0', bot_id=1", _read("services/maintenance.py"))
 
 
 class ScheduledLauncherTests(unittest.TestCase):
@@ -89,7 +91,7 @@ class ScheduledLauncherTests(unittest.TestCase):
         return self.main[start:end]
 
     def test_job_skips_during_maintenance(self):
-        self.assertIn("maintenance_mode", self._job())
+        self.assertIn("maintenance_enabled(context.bot_data)", self._job())
 
     def test_job_throttles_launch_per_cycle(self):
         """جلوی «همهٔ سفارشات با هم استارت می‌خورند و لغو می‌شوند»."""
@@ -315,7 +317,7 @@ class DeadMenuConstantTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
-        self.assertIn('BOT_VERSION = "2.2.7"', _read("constants.py"))
+        self.assertIn('BOT_VERSION = "2.2.8"', _read("constants.py"))
 
     def test_changelog_has_224_section(self):
         self.assertIn("۲.۲.۴", _read("CHANGELOG.md"))

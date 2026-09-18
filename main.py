@@ -66,6 +66,7 @@ from services.order_executor import order_executor
 from services.payment_service import payment_service
 from services.health_checker import health_checker_service
 from services.bot_manager import bot_manager
+from services.maintenance import (maintenance, maintenance_enabled, enforce_maintenance, initialize_bot_runtime)
 from aiohttp import web 
 
 # هندلرها
@@ -526,11 +527,8 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     ریخته نشود (همان سناریوی «همهٔ سفارشات لغو شدن»).
     """
     try:
-        try:
-            if context.bot_data.get('maintenance_mode'):
-                return
-        except Exception:
-            pass
+        if maintenance_enabled(context.bot_data):
+            return
         due_orders = await DatabaseManager.get_due_scheduled_orders()
         if not due_orders: return
         max_per_cycle = 3
@@ -550,7 +548,11 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
                 # در دورهٔ بعد دوباره تلاش شود (قبلاً وضعیت را
                 # اول running می‌کردند و با خطا سفارش برای همیشه running
                 # می‌ماند).
-                await order_executor.submit_order(oid, order)
+                async with maintenance.lock:
+                    # A toggle may have happened while fetching due orders.
+                    if maintenance_enabled(context.bot_data):
+                        return
+                    await order_executor.submit_order(oid, order)
             except Exception as exc:
                 logger.error("Order %s: failed to launch scheduled order: %s", oid, exc)
                 continue
@@ -762,91 +764,12 @@ def register_handlers(application: Application) -> None:
     # می‌شود. پرچم در دیتابیس ذخیره و در bot_data کش می‌شود تا با ری‌استارت
     # (حین آپدیت) از بین نرود.
     # ─────────────────────────────────────────────────────────────
-    _MAINT_MSG = (
-        "🔧 ربات در حال بروزرسانی است...\n\n"
-        "لطفاً چند دقیقهٔ دیگر تلاش کنید. 🙏"
-    )
-
-    async def _is_super_admin_user(update, context) -> bool:
-        try:
-            user = update.effective_user
-            if not user:
-                return False
-            if user.id in Config.ADMIN_IDS:
-                return True
-            bot_id = context.bot_data.get('bot_id', 1)
-            try:
-                db_user = await asyncio.wait_for(
-                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
-            except Exception:
-                return False
-            return bool(db_user and db_user.get('admin_role') == 'super_admin')
-        except Exception:
-            return False
-
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user:
-            return
-        try:
-            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
-            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
-            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
-            flag = context.bot_data.get('maintenance_mode', False)
-            if not flag:
-                return
-            if await _is_super_admin_user(update, context):
-                return
-            # کاربر غیرسوپر در حالت تعمیرات → پیام (تراتل ۶۰ ثانیه‌ای) + توقف انتشار.
-            now = time.time()
-            try:
-                last = float((context.user_data or {}).get('maint_notice_ts', 0))
-            except Exception:
-                last = 0.0
-            fresh = (now - last) >= 60
-            query = update.callback_query
-            if query:
-                try:
-                    if fresh:
-                        await asyncio.wait_for(query.answer(_MAINT_MSG, show_alert=True), timeout=35)
-                    else:
-                        await asyncio.wait_for(query.answer(), timeout=35)
-                except Exception:
-                    pass
-            elif update.message:
-                if fresh:
-                    try:
-                        await update.message.reply_text(_MAINT_MSG)
-                    except Exception:
-                        pass
-            if fresh:
-                try:
-                    context.user_data['maint_notice_ts'] = now
-                except Exception:
-                    pass
-            try:
-                _gu = update.effective_user
-                logger.warning("maintenance guard BLOCKED user=%s kind=%s ref=%s",
-                               _gu.id if _gu else None,
-                               "callback" if query else "message",
-                               str(query.data if query else (update.message.text if update.message else ''))[:64])
-            except Exception:
-                pass
-            raise ApplicationHandlerStop
-        except ApplicationHandlerStop:
-            raise
-        except Exception:
-            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
-            return
+        # Every Update: text, commands, callbacks, contact, photo, document,
+        # edited messages, etc. Notification failure must never permit access.
+        await enforce_maintenance(update, context)
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
-        group=-3,
-    )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-3)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-3)
-    # 🛠 همهٔ دستورات (/help، /stop_order، ...) هم در حالت تعمیرات
-    # مسدودند؛ قبلاً فقط /start بسته بود.
-    application.add_handler(MessageHandler(filters.COMMAND, _maintenance_guard), group=-3)
+    application.add_handler(TypeHandler(Update, _maintenance_guard), group=-3)
 
 
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
@@ -936,7 +859,7 @@ def register_handlers(application: Application) -> None:
             return
         # ۱) دکمه‌های سطح بالا → پاک کردن همهٔ stateها (شروع تمیز)
         if text in _TOPLEVEL_EXACT:
-            clear_conversations(update)
+            clear_conversations(update, context)
             try:
                 context.user_data.clear()
             except Exception:
@@ -944,26 +867,26 @@ def register_handlers(application: Application) -> None:
             return
         # ۲) زیرمنوهای کیف پول → فقط مکالمهٔ کیف پول در state پایه
         if text in _WALLET_SUBMENU_EXACT:
-            clear_conversations(update, except_names={"wallet"})
-            set_conversation_state(update, "wallet", AWAITING_WALLET_ACTION)
+            clear_conversations(update, context, except_names={"wallet"})
+            set_conversation_state(update, "wallet", AWAITING_WALLET_ACTION, context=context)
             return
         # ۳) زیرمنوهای پشتیبانی → فقط مکالمهٔ تیکت در state پایه
         if text in _SUPPORT_SUBMENU_EXACT:
-            clear_conversations(update, except_names={"support_ticket"})
-            set_conversation_state(update, "support_ticket", AWAITING_TICKET_MESSAGE)
+            clear_conversations(update, context, except_names={"support_ticket"})
+            set_conversation_state(update, "support_ticket", AWAITING_TICKET_MESSAGE, context=context)
             return
         # ۴) دسته‌بندی خرید → فقط مکالمهٔ خرید در state پایه
         if text in _BUY_CATEGORY_EXACT:
-            clear_conversations(update, except_names={"buy"})
-            set_conversation_state(update, "buy", AWAITING_SELECT_PLAN)
+            clear_conversations(update, context, except_names={"buy"})
+            set_conversation_state(update, "buy", AWAITING_SELECT_PLAN, context=context)
             return
         # ۵) زیرمنوهای ادمین/اکانت → فقط مکالمهٔ ادمین در state پایه
         # (تا از هر زیر-state عمیقی هم این دکمه‌ها کار کنند و مکالمه‌های
         #  کاربریِ کهنه، دکمه را نبلعند)
         if _re.match(_ADMIN_SUBMENU_RE, text) or _re.match(_ACCOUNT_SUBMENU_RE, text):
             if await _is_admin_user(update, context):
-                clear_conversations(update, except_names={"admin"})
-                set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+                clear_conversations(update, context, except_names={"admin"})
+                set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION, context=context)
             return
 
     application.add_handler(
@@ -991,7 +914,7 @@ def register_handlers(application: Application) -> None:
 
     # تابع بازگشت عمومی
     async def global_cancel_and_restart(update: Update, context):
-        clear_conversations(update)
+        clear_conversations(update, context)
         context.user_data.clear()
         await start_command(update, context)
         return ConversationHandler.END
@@ -1017,7 +940,7 @@ def register_handlers(application: Application) -> None:
 
         # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
         if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
-            clear_conversations(update)
+            clear_conversations(update, context)
             context.user_data.clear()
             return await start_command(update, context)
 
@@ -1035,9 +958,9 @@ def register_handlers(application: Application) -> None:
             from handlers.admin_handlers import admin_panel_start
             result = await admin_panel_start(update, context)
             # ست صریح state پایهٔ ادمین (return هندلر ساده، state را ست نمی‌کند)
-            set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+            set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION, context=context)
             return result
-        clear_conversations(update)
+        clear_conversations(update, context)
         context.user_data.clear()
         return await start_command(update, context)
 
@@ -1069,7 +992,7 @@ def register_handlers(application: Application) -> None:
         # button-driven conversations — see the PTBUserWarning note above).
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(support_conv))
+    application.add_handler(register_conversation(support_conv, application))
 
     # --- 2. احراز هویت (KYC) ---
     application.add_handler(CallbackQueryHandler(kyc_menu_callback, pattern="^kyc_back$|^kyc_add_card$|^kyc_send_video$"))
@@ -1085,7 +1008,7 @@ def register_handlers(application: Application) -> None:
         name="kyc", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(kyc_conv))
+    application.add_handler(register_conversation(kyc_conv, application))
 
     # --- 3. پنل ادمین (ادغام‌شده با مدیریت اکانت و پروفایل) ---
     # قبلاً acc و prof مکالمه‌های جدا بودند؛ account_management با return END،
@@ -1313,7 +1236,7 @@ def register_handlers(application: Application) -> None:
         name="admin", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(admin_conv))
+    application.add_handler(register_conversation(admin_conv, application))
 
     # --- 4. کیف پول ---
     # نکته: stateهای احراز هویت (KYC) هم اینجا تکرار شده‌اند، چون فلوی «ثبت
@@ -1341,7 +1264,7 @@ def register_handlers(application: Application) -> None:
         name="wallet", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(wallet_conv))
+    application.add_handler(register_conversation(wallet_conv, application))
 
     # --- 5. مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
     # فقط مرحلهٔ دریافت متن پیام حالت‌دار است؛ انتخاب سفارش/اکانت‌ها و ری‌اکشن‌ها
@@ -1360,7 +1283,7 @@ def register_handlers(application: Application) -> None:
         name="incall", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(incall_conv))
+    application.add_handler(register_conversation(incall_conv, application))
 
     # ورود به مرکز (دکمهٔ منو) + کالبک‌های بدون‌حالت
     application.add_handler(MessageHandler(filters.Regex(r"^💬 چت در ویس‌کال$"), incall_center_start), group=0)
@@ -1403,7 +1326,7 @@ def register_handlers(application: Application) -> None:
         name="buy", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(buy_conv))
+    application.add_handler(register_conversation(buy_conv, application))
 
     # هندلرهای عمومی خارج از Conversation
     application.add_handler(CommandHandler("start", start_command))
@@ -1502,18 +1425,10 @@ async def main_loop():
         .build()
     )
     
-    main_app.bot_data['bot_id'] = 1
-    main_app.bot_data['owner_id'] = 0
-    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
-    try:
-        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
-    except Exception as e:
-        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
-        main_app.bot_data['maintenance_mode'] = False
-    
     register_handlers(main_app)
-    await main_app.initialize()
+    # initialize() REPLACES bot_data from pickle. Runtime identity and the DB
+    # maintenance flag must be loaded AFTER it, before starting updates/jobs.
+    await initialize_bot_runtime(main_app, bot_id=1, owner_id=0)
     await main_app.start()
 
     # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها

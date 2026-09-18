@@ -30,6 +30,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         self.cancel_patch.start()
         self.app = Application.builder().token('123:TEST').persistence(DictPersistence()).build()
         main.register_handlers(self.app)
+        self.app.bot_data.update(bot_id=1, maintenance_mode=False)
         # No getMe/network. Run real Application.process_update with an offline bot.
         self.app._initialized = True
         self.app.bot._bot_user = User(123, 'Bot', True)

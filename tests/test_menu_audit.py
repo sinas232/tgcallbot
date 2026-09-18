@@ -313,10 +313,10 @@ class TestNoDeadButtons(unittest.TestCase):
         تعمیرات هم می‌توانست سفارش بزند)."""
         src = _read("main.py")
         self.assertIn("_maintenance_guard", src)
-        self.assertIn("filters.TEXT & ~filters.COMMAND", src)
-        self.assertIn("CallbackQueryHandler(_maintenance_guard)", src)
-        self.assertIn("MessageHandler(filters.COMMAND, _maintenance_guard)", src)
-        self.assertIn("raise ApplicationHandlerStop", src)
+        self.assertIn("TypeHandler(Update, _maintenance_guard), group=-3", src)
+        self.assertIn("await enforce_maintenance(update, context)", src)
+        guard = _read("services/maintenance.py")
+        self.assertIn("raise ApplicationHandlerStop", guard)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ constants.py
 """
 
 # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
-BOT_VERSION = "2.2.7"
+BOT_VERSION = "2.2.8"
 
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
