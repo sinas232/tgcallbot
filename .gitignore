@@ -14,3 +14,4 @@ diag_voice.py
 
 # Local server env drafts (contain secrets, never commit)
 .env.newserver
+backups/
