@@ -44,11 +44,27 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.system_resources import (  # هستهٔ اندازه‌گیری CPU/RAM/Load
+    ResourceBaseline,
+    ResourceCalibrator,
+    ResourceCost,
+    ResourceLimits,
+    ResourceVerdict,
+    SystemSnapshot,
+    check_resources,
+    peak_accounts_in_window,
+    read_system_snapshot,
+)
+
 logger = logging.getLogger(__name__)
+
+# کالیبراتور سراسری: هزینهٔ هر اکانت و خط‌مبنای سیستم از نمونه‌های واقعی
+_CALIBRATOR = ResourceCalibrator()
 
 
 # ─────────────────────────── تنظیمات (lazy و تست‌پذیر) ───────────────────────────
@@ -70,6 +86,13 @@ def _cfg_bool(attr: str, env_key: str, default: bool) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cfg_float(attr: str, env_key: str, default: float) -> float:
+    try:
+        return float(_get_cfg(attr, env_key, default))
+    except Exception:
+        return default
 
 
 def _cfg_int(attr: str, env_key: str, default: int) -> int:
@@ -108,6 +131,19 @@ class CapacityVerdict:
     suggested_start_utc: Optional[datetime] = None  # اولین شروعِ جادار (دقیق)
     degraded: bool = False                # True یعنی خطای داخلی → fail-open
 
+    # ── بُعد دوم: منابع سخت‌افزاری سرور (CPU / RAM / Load) ──
+    resource_checked: bool = False        # آیا این بُعد اصلاً سنجیده شد؟
+    resource_reason: Optional[str] = None  # None | 'cpu' | 'memory' | 'load'
+    current_cpu_percent: float = 0.0
+    current_memory_percent: float = 0.0
+    current_load_per_core: float = 0.0
+    projected_cpu_percent: float = 0.0     # پیش‌بینی در اوجِ بازه با این سفارش
+    projected_memory_percent: float = 0.0
+    max_cpu_percent: float = 0.0
+    max_memory_percent: float = 0.0
+    max_load_per_core: float = 0.0
+    peak_accounts_in_window: int = 0       # اوج اکانت‌های همزمان در بازه
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "allowed": self.allowed,
@@ -124,6 +160,17 @@ class CapacityVerdict:
             "busy_until_utc": self.busy_until_utc,
             "suggested_start_utc": self.suggested_start_utc,
             "degraded": self.degraded,
+            "resource_checked": self.resource_checked,
+            "resource_reason": self.resource_reason,
+            "current_cpu_percent": round(self.current_cpu_percent, 1),
+            "current_memory_percent": round(self.current_memory_percent, 1),
+            "current_load_per_core": round(self.current_load_per_core, 2),
+            "projected_cpu_percent": round(self.projected_cpu_percent, 1),
+            "projected_memory_percent": round(self.projected_memory_percent, 1),
+            "max_cpu_percent": round(self.max_cpu_percent, 1),
+            "max_memory_percent": round(self.max_memory_percent, 1),
+            "max_load_per_core": round(self.max_load_per_core, 2),
+            "peak_accounts_in_window": self.peak_accounts_in_window,
         }
 
 
@@ -238,6 +285,46 @@ def peak_in_window(
     return peak_accounts, peak_orders
 
 
+def resources_fit_at(
+    reservations: List[Reservation],
+    start: datetime,
+    duration_minutes: Optional[int],
+    accounts_needed: int,
+    unknown_duration_min: int,
+    system: SystemSnapshot,
+    baseline: ResourceBaseline,
+    cost: ResourceCost,
+    limits: ResourceLimits,
+    now_utc: Optional[datetime] = None,
+    load_now_window_minutes: int = 15,
+) -> ResourceVerdict:
+    """داوریٔ بعد منابع سخت‌افزاری برای یک بازهٔ استاندارد.
+
+    مصرف روی «اوج تعداد اکانت‌های همزمان» در کل بازه پیش‌بینی می‌شود، نه فقط لحظهٔ
+    شروع، تا دقیقاً همان منطقی باشد که برای ظرفیت اکانت‌ها گفته شد.
+
+    دروازهٔ «Load Average» فقط برای بازه‌های نزدیک (پیش‌فرض ۱۵ دقیقه) اعمال می‌شود؛
+    برای زمان‌بندی‌های دورتر، بار لحظه‌ای اطلاعی دربارهٔ آینده نمی‌دهد
+    (و استفاده از آن یعنی ردّ بی‌دلیل سفارش‌هایی که ساعت‌ها بعد اجرا می‌شوند).
+    """
+    end = estimate_end(start, duration_minutes, unknown_duration_min)
+    peak_accounts = peak_accounts_in_window(reservations, start, end)
+
+    now = now_utc or datetime.utcnow()
+    effective_limits = limits
+    if (start - now).total_seconds() > max(0, int(load_now_window_minutes)) * 60:
+        effective_limits = replace(limits, max_load_per_core=0.0)
+
+    return check_resources(
+        snapshot=system,
+        baseline=baseline,
+        cost=cost,
+        limits=effective_limits,
+        peak_accounts=peak_accounts,
+        accounts_needed=accounts_needed,
+    )
+
+
 def fits_at(
     reservations: List[Reservation],
     start: datetime,
@@ -246,8 +333,17 @@ def fits_at(
     effective_pool: int,
     max_concurrent_orders: int,
     unknown_duration_min: int,
+    system: Optional[SystemSnapshot] = None,
+    baseline: Optional[ResourceBaseline] = None,
+    cost: Optional[ResourceCost] = None,
+    limits: Optional[ResourceLimits] = None,
+    now_utc: Optional[datetime] = None,
 ) -> Tuple[bool, int, int]:
-    """آیا بازهٔ [start، start+مدت] کامل جا می‌شود؟ → (جواب، اوج مصرف، تعداد همپوشان)"""
+    """آیا بازهٔ [start، start+مدت] کامل جا می‌شود؟ → (جواب، اوج مصرف، تعداد همپوشان)
+
+    اگر پارامترهای منابع سخت‌افزاری داده شوند، علاوه بر ظرفیت
+    اکانت‌ها، پیش‌بینی CPU/رم در اوج بازه هم باید زیر سقف باشد.
+    """
     end = estimate_end(start, duration_minutes, unknown_duration_min)
     peak, concurrent = peak_in_window(reservations, start, end)
     ok = (
@@ -255,6 +351,14 @@ def fits_at(
         and (peak + accounts_needed) <= effective_pool
         and (concurrent + 1) <= max(1, max_concurrent_orders)
     )
+    if ok and system is not None and system.ok and baseline is not None and limits is not None:
+        verdict = resources_fit_at(
+            reservations, start, duration_minutes, accounts_needed,
+            unknown_duration_min, system, baseline, cost or ResourceCost(),
+            limits, now_utc,
+        )
+        if not verdict.allowed:
+            ok = False
     return ok, peak, concurrent
 
 
@@ -268,6 +372,11 @@ def earliest_fit_start(
     step_minutes: int = 5,
     horizon_minutes: int = 24 * 60,
     unknown_duration_min: int = 60,
+    system: Optional[SystemSnapshot] = None,
+    baseline: Optional[ResourceBaseline] = None,
+    cost: Optional[ResourceCost] = None,
+    limits: Optional[ResourceLimits] = None,
+    now_utc: Optional[datetime] = None,
 ) -> Optional[datetime]:
     """اولین زمانِ شروعی که «کل بازهٔ سفارش» در آن جا می‌شود (جست‌وجوی پلکانی)."""
     step = max(1, int(step_minutes or 5))
@@ -277,6 +386,7 @@ def earliest_fit_start(
         ok, _peak, _conc = fits_at(
             reservations, candidate, duration_minutes, accounts_needed,
             effective_pool, max_concurrent_orders, unknown_duration_min,
+            system, baseline, cost, limits, now_utc,
         )
         if ok:
             return candidate
@@ -296,6 +406,10 @@ def check_capacity(
     step_minutes: int = 5,
     horizon_minutes: int = 24 * 60,
     now_utc: Optional[datetime] = None,
+    system: Optional[SystemSnapshot] = None,
+    baseline: Optional[ResourceBaseline] = None,
+    cost: Optional[ResourceCost] = None,
+    limits: Optional[ResourceLimits] = None,
 ) -> CapacityVerdict:
     """داوری نهایی ظرفیت برای یک درخواست سفارش (تابع خالص — بدون DB/تلگرام)."""
     now = now_utc or datetime.utcnow()
@@ -324,18 +438,49 @@ def check_capacity(
     verdict.peak_usage = peak
     verdict.peak_concurrent = concurrent
 
+    # ۲-الف) بعد دوم: منابع سخت‌افزاری (CPU / RAM / Load)
+    # اگر اسنپشات معتبر باشد، مصرف پیش‌بینی‌شده در «اوج بازه»
+    # حساب می‌شود (با احتساب همین سفارش).
+    resource_verdict: Optional[ResourceVerdict] = None
+    if system is not None and system.ok and baseline is not None and limits is not None:
+        resource_verdict = resources_fit_at(
+            reservations, start_utc, duration_minutes, accounts_needed,
+            unknown_duration_min, system, baseline, cost or ResourceCost(),
+            limits, now,
+        )
+        verdict.resource_checked = bool(resource_verdict.checked)
+        verdict.resource_reason = resource_verdict.reason
+        verdict.current_cpu_percent = resource_verdict.current_cpu_percent
+        verdict.current_memory_percent = resource_verdict.current_memory_percent
+        verdict.current_load_per_core = resource_verdict.current_load_per_core
+        verdict.projected_cpu_percent = resource_verdict.projected_cpu_percent
+        verdict.projected_memory_percent = resource_verdict.projected_memory_percent
+        verdict.peak_accounts_in_window = resource_verdict.peak_accounts
+        verdict.max_cpu_percent = limits.max_cpu_percent
+        verdict.max_memory_percent = limits.max_memory_percent
+        verdict.max_load_per_core = limits.max_load_per_core
+
     # ۲) جا شدن کامل بازه (اوج مصرف + درخواست ≤ ظرفیت مفید) و سقف همزمانی
-    if accounts_needed <= eff_pool and (peak + accounts_needed) <= eff_pool and (concurrent + 1) <= max_conc:
-        verdict.allowed = True
-        return verdict
+    accounts_ok = (
+        accounts_needed <= eff_pool
+        and (peak + accounts_needed) <= eff_pool
+        and (concurrent + 1) <= max_conc
+    )
+    if accounts_ok:
+        if resource_verdict is None or resource_verdict.allowed:
+            verdict.allowed = True
+            return verdict
+        # ظرفیت اکانت هست، اما منابع سرور کافی نیست
+        verdict.reason = resource_verdict.reason or "over_capacity"
 
     # ۳) رد شد → دلیل + پایان شلوغی + دقیق‌ترین پیشنهاد
-    if accounts_needed > eff_pool:
-        verdict.reason = "over_capacity"
-    elif (concurrent + 1) > max_conc:
-        verdict.reason = "concurrent"
-    else:
-        verdict.reason = "over_capacity"
+    if not verdict.reason:
+        if accounts_needed > eff_pool:
+            verdict.reason = "over_capacity"
+        elif (concurrent + 1) > max_conc:
+            verdict.reason = "concurrent"
+        else:
+            verdict.reason = "over_capacity"
 
     busy_until = max(
         (res.end for res in reservations if res.start < end_utc and res.end > start_utc),
@@ -352,6 +497,7 @@ def check_capacity(
         verdict.suggested_start_utc = earliest_fit_start(
             reservations, accounts_needed, duration_minutes, eff_pool,
             max_conc, search_from, step_minutes, horizon_minutes, unknown_duration_min,
+            system, baseline, cost, limits, now,
         )
     return verdict
 
@@ -386,6 +532,53 @@ class CapacityPlanner:
             unknown_min = _cfg_int("CAPACITY_UNKNOWN_DURATION_MINUTES", "CAPACITY_UNKNOWN_DURATION_MINUTES", 60)
             reservations = _normalize_reservations(rows, now, unknown_min)
 
+            # ── 🖥 بُعد دوم: منابع واقعی سرور (CPU / RAM / Load) ──
+            system: Optional[SystemSnapshot] = None
+            baseline: Optional[ResourceBaseline] = None
+            cost: Optional[ResourceCost] = None
+            limits: Optional[ResourceLimits] = None
+            if _cfg_bool("CAPACITY_CHECK_SYSTEM_LOAD", "CAPACITY_CHECK_SYSTEM_LOAD", True):
+                try:
+                    interval = _cfg_float("CAPACITY_SAMPLE_INTERVAL_SEC", "CAPACITY_SAMPLE_INTERVAL_SEC", 0.35)
+                    # نمونه‌برداریِ کوتاه (I/O روی فایل‌های /proc) داخل ترد جداگانه
+                    # تا حلقهٔ رویدادِ ربات بلاک نشود.
+                    system = await asyncio.to_thread(read_system_snapshot, interval)
+                except Exception:
+                    logger.warning("capacity: system sampling failed → بعد منابع نادیده گرفته می‌شود", exc_info=True)
+                    system = None
+
+                if system is not None and system.ok:
+                    cfg_cpu_per_acc = _cfg_float("CAPACITY_CPU_PERCENT_PER_ACCOUNT", "CAPACITY_CPU_PERCENT_PER_ACCOUNT", 0.0)
+                    cfg_mem_per_acc = _cfg_float("CAPACITY_MEMORY_MB_PER_ACCOUNT", "CAPACITY_MEMORY_MB_PER_ACCOUNT", 0.0)
+                    if cfg_cpu_per_acc > 0 or cfg_mem_per_acc > 0:
+                        # ادمین هزینهٔ هر اکانت را قفل کرده → کالیبراسیون فقط برای خط‌مبنا
+                        _CALIBRATOR.lock_cost(ResourceCost(
+                            cpu_percent_per_account=(cfg_cpu_per_acc if cfg_cpu_per_acc > 0 else 1.2),
+                            memory_mb_per_account=(cfg_mem_per_acc if cfg_mem_per_acc > 0 else 45.0),
+                        ))
+
+                    active_now = peak_accounts_in_window(
+                        reservations, now, now + timedelta(minutes=1)
+                    )
+                    _CALIBRATOR.observe(system, active_now)
+                    cost = _CALIBRATOR.cost()
+
+                    cfg_base_cpu = _cfg_float("CAPACITY_BASELINE_CPU_PERCENT", "CAPACITY_BASELINE_CPU_PERCENT", 0.0)
+                    cfg_base_mem = _cfg_float("CAPACITY_BASELINE_MEMORY_MB", "CAPACITY_BASELINE_MEMORY_MB", 0.0)
+                    if cfg_base_cpu > 0 or cfg_base_mem > 0:
+                        baseline = ResourceBaseline(
+                            cpu_percent=max(0.0, cfg_base_cpu),
+                            memory_mb=max(0.0, cfg_base_mem),
+                        )
+                    else:
+                        baseline = _CALIBRATOR.baseline()
+
+                    limits = ResourceLimits(
+                        max_cpu_percent=_cfg_float("CAPACITY_MAX_CPU_PERCENT", "CAPACITY_MAX_CPU_PERCENT", 85.0),
+                        max_memory_percent=_cfg_float("CAPACITY_MAX_MEMORY_PERCENT", "CAPACITY_MAX_MEMORY_PERCENT", 88.0),
+                        max_load_per_core=_cfg_float("CAPACITY_MAX_LOAD_PER_CORE", "CAPACITY_MAX_LOAD_PER_CORE", 1.5),
+                    )
+
             verdict = check_capacity(
                 reservations=reservations,
                 pool_size=pool_size,
@@ -398,8 +591,14 @@ class CapacityPlanner:
                 step_minutes=_cfg_int("CAPACITY_STEP_MINUTES", "CAPACITY_STEP_MINUTES", 5),
                 horizon_minutes=_cfg_int("CAPACITY_HORIZON_HOURS", "CAPACITY_HORIZON_HOURS", 24) * 60,
                 now_utc=now,
+                system=system,
+                baseline=baseline,
+                cost=cost,
+                limits=limits,
             )
             result = verdict.to_dict()
+            result["system"] = system.to_dict() if system else None
+            result["calibration"] = _CALIBRATOR.snapshot_state()
             result["estimate_minutes"] = self._effective_duration(duration_minutes, unknown_min)
             return result
         except Exception:

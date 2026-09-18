@@ -71,6 +71,26 @@ class Config:
 
     # Order Settings
     MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
+    # ─── 🛡 گارد ظرفیت منابع (Capacity Guard) ────────────────────────────
+    # قبل از پذیرش هر سفارش (آنی یا زمان‌بندی‌شده)، مصرف منابع روی «کل بازهٔ
+    # اجرای سفارش» سنجیده می‌شود: ۱) تعداد اکانت‌های سالم ۲) CPU/RAM/Load سرور.
+    CAPACITY_GUARD_ENABLED = os.getenv('CAPACITY_GUARD_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+    CAPACITY_SAFETY_BUFFER_PERCENT = int(os.getenv('CAPACITY_SAFETY_BUFFER_PERCENT', '10'))
+    CAPACITY_UNKNOWN_DURATION_MINUTES = int(os.getenv('CAPACITY_UNKNOWN_DURATION_MINUTES', '60'))
+    CAPACITY_STEP_MINUTES = int(os.getenv('CAPACITY_STEP_MINUTES', '5'))
+    CAPACITY_HORIZON_HOURS = int(os.getenv('CAPACITY_HORIZON_HOURS', '24'))
+    # بُعد دوم: منابع سخت‌افزاری (اندازه‌گیری مستقیم از /proc و cgroup)
+    CAPACITY_CHECK_SYSTEM_LOAD = os.getenv('CAPACITY_CHECK_SYSTEM_LOAD', 'true').lower() in ('1', 'true', 'yes', 'on')
+    CAPACITY_MAX_CPU_PERCENT = float(os.getenv('CAPACITY_MAX_CPU_PERCENT', '85'))
+    CAPACITY_MAX_MEMORY_PERCENT = float(os.getenv('CAPACITY_MAX_MEMORY_PERCENT', '88'))
+    CAPACITY_MAX_LOAD_PER_CORE = float(os.getenv('CAPACITY_MAX_LOAD_PER_CORE', '1.5'))
+    CAPACITY_SAMPLE_INTERVAL_SEC = float(os.getenv('CAPACITY_SAMPLE_INTERVAL_SEC', '0.35'))
+    # هزینهٔ هر اکانت همزمان؛ ۰ یعنی «خودکار از نمونه‌های واقعی کالیبره شود»
+    CAPACITY_CPU_PERCENT_PER_ACCOUNT = float(os.getenv('CAPACITY_CPU_PERCENT_PER_ACCOUNT', '0'))
+    CAPACITY_MEMORY_MB_PER_ACCOUNT = float(os.getenv('CAPACITY_MEMORY_MB_PER_ACCOUNT', '0'))
+    # خط‌مبنای مصرف سیستم بدون اکانت فعال؛ ۰ یعنی خودکار
+    CAPACITY_BASELINE_CPU_PERCENT = float(os.getenv('CAPACITY_BASELINE_CPU_PERCENT', '0'))
+    CAPACITY_BASELINE_MEMORY_MB = float(os.getenv('CAPACITY_BASELINE_MEMORY_MB', '0'))
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)

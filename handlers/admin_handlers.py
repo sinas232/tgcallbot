@@ -232,6 +232,22 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     return AWAITING_SETTINGS_ACTION
 
 @require_admin
+def _server_resource_line() -> str:
+    """یک خط وضعیت منابع سرور (هرگز استثنا پرتاب نمی‌کند)."""
+    try:
+        from services.system_resources import read_system_snapshot
+        snap = read_system_snapshot()
+        if not snap or not snap.ok:
+            return ""
+        return (
+            f"\n\n🖥 **منابع سرور:**\n"
+            f"   • پردازنده (CPU): `{snap.cpu_percent:.0f}%`‌  · حافظه (RAM): `{snap.memory_percent:.0f}%`‌  · بار (Load): `{snap.load_per_core:.2f}`\n"
+            f"   • حافظه: `{snap.memory_used_mb:.0f}` از `{snap.memory_total_mb:.0f}` مگابایت · هسته‌ها: `{snap.cpu_cores}`"
+        )
+    except Exception:
+        return ""
+
+
 async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_id = context.bot_data.get('bot_id', 1)
     msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال جمع‌آوری آمار...")
@@ -248,6 +264,8 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     stopped_orders = order_stats.get('stopped', 0)
     failed_orders = order_stats.get('failed', 0)
     txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز (به وقت تهران): `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`\n   • 🛑 متوقف‌شده (لغو): `{stopped_orders}`\n   • ❌ ناموفق: `{failed_orders}`")
+    # 🖥 وضعیت منابع سرور — همان اعدادی که گارد ظرفیت با آن‌ها تصمیم می‌گیرد
+    txt += _server_resource_line()
     # حذف پیام «در حال جمع‌آوری» باید ضدخطا باشد؛ اگر شکست بخورد، آمار
     # نباید از دست برود (باگ قبلی: خطای delete → هیچ آماری نمایش داده نمی‌شد)
     if msg:

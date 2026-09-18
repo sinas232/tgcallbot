@@ -281,7 +281,7 @@ class DeadButtonTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
-        self.assertIn('BOT_VERSION = "2.2.4"', _read("constants.py"))
+        self.assertIn('BOT_VERSION = "2.2.5"', _read("constants.py"))
 
     def test_changelog_has_224_section(self):
         self.assertIn("۲.۲.۴", _read("CHANGELOG.md"))

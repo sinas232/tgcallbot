@@ -53,11 +53,28 @@ def _capacity_preview_line(verdict: dict) -> str:
         if verdict.get('degraded'):
             return ""
         if verdict.get('allowed', True):
-            return "🟢 ظرفیت سرور برای کل بازهٔ اجرای این سفارش: **موجود است**\n"
+            line = "🟢 ظرفیت سرور برای کل بازهٔ اجرای این سفارش: **موجود است**\n"
+            if verdict.get('resource_checked'):
+                line += (
+                    f"🖥 منابع سرور: پردازنده `{verdict.get('current_cpu_percent', 0):.0f}%`"
+                    f" · حافظه `{verdict.get('current_memory_percent', 0):.0f}%`"
+                    f" → پیش‌بینی در اوج بازه: `{verdict.get('projected_cpu_percent', 0):.0f}% / {verdict.get('projected_memory_percent', 0):.0f}%`\n"
+                )
+            return line
         suggested = verdict.get('suggested_start_utc')
         peak = verdict.get('peak_usage', 0)
         eff = verdict.get('effective_pool', 0)
         line = f"🔴 ظرفیت سرور در بازهٔ اجرای این سفارش: **تکمیل است** (اوج مصرف `{peak}` از `{eff}` اکانت مفید)\n"
+        if verdict.get('resource_checked'):
+            why = verdict.get('resource_reason')
+            why_fa = {'cpu': 'پردازنده', 'memory': 'حافظه', 'load': 'بار پردازشی'}.get(why)
+            line += (
+                f"🖥 منابع سرور: پردازنده `{verdict.get('current_cpu_percent', 0):.0f}%`"
+                f" · حافظه `{verdict.get('current_memory_percent', 0):.0f}%`"
+                f" → پیش‌بینی در اوج بازه: `{verdict.get('projected_cpu_percent', 0):.0f}% / {verdict.get('projected_memory_percent', 0):.0f}%`"
+                + (f" (مانع: {why_fa})" if why_fa else "")
+                + "\n"
+            )
         if suggested:
             line += f"💡 پیشنهاد دقیق سیستم برای شروع: **{format_jalali_datetime(suggested)}**\n"
         return line
@@ -124,9 +141,37 @@ def _build_capacity_rejection(verdict: dict) -> tuple:
     lines = [
         "⛔️ **ظرفیت سرور برای این بازه تکمیل است — سفارش ثبت نشد.**\n",
         "🛡 برای جلوگیری از لغو زنجیره‌ای سفارش‌ها، قبل از پذیرش، مصرف منابع در «کل بازهٔ اجرای سفارش» سنجیده می‌شود:\n",
-        f"🧮 اوج مصرف در بازهٔ درخواستی: `{peak}` از `{eff}` اکانت مفید (ظرفیت کل: `{pool}`)",
+        f"🧮 اوج مصرف اکانت در بازهٔ درخواستی: `{peak}` از `{eff}` اکانت مفید (ظرفیت کل: `{pool}`)",
         f"🔢 درخواست شما: `{need}` اکانت",
     ]
+
+    # 🖥 جزئیات منابع سخت‌افزاری (اگر این بُعد سنجیده شده باشد)
+    if verdict.get("resource_checked"):
+        cur_cpu = verdict.get("current_cpu_percent") or 0.0
+        cur_mem = verdict.get("current_memory_percent") or 0.0
+        load_pc = verdict.get("current_load_per_core") or 0.0
+        proj_cpu = verdict.get("projected_cpu_percent") or 0.0
+        proj_mem = verdict.get("projected_memory_percent") or 0.0
+        max_cpu = verdict.get("max_cpu_percent") or 0.0
+        max_mem = verdict.get("max_memory_percent") or 0.0
+        lines.append(
+            f"🖥 مصرف فعلی سرور: پردازنده `{cur_cpu:.0f}%`"
+            f" · حافظه `{cur_mem:.0f}%` · بار `{load_pc:.2f}`"
+        )
+        if proj_cpu or proj_mem:
+            lines.append(
+                f"📈 پیش‌بینی در اوج بازه با این سفارش: "
+                f"پردازنده `{proj_cpu:.0f}%` (سقف `{max_cpu:.0f}%`)"
+                f" · حافظه `{proj_mem:.0f}%` (سقف `{max_mem:.0f}%`)"
+            )
+        why = verdict.get("resource_reason")
+        if why == "cpu":
+            lines.append("⚠️ علت اصلی: پردازندهٔ سرور در این بازه بیش از حد مجاز درگیر خواهد شد.")
+        elif why == "memory":
+            lines.append("⚠️ علت اصلی: حافظهٔ (RAM) سرور در این بازه بیش از حد مجاز پر خواهد شد.")
+        elif why == "load":
+            lines.append("⚠️ علت اصلی: بار پردازشی (Load Average) سرور همین لحظه بالاست.")
+
     if busy_until:
         lines.append(f"⏳ ظرفیت از این ساعت آزاد می‌شود: **{format_jalali_datetime(busy_until)}**")
     lines.append("")
