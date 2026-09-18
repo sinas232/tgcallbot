@@ -24,6 +24,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """دستور استارت ربات"""
     # پاک کردن حافظه مکالمه قبلی برای جلوگیری از تداخل
     context.user_data.clear()
+    # بیرون انداختن از همهٔ مکالمه‌های فعال تا /start همیشه از وضعیت تمیز شروع شود
+    try:
+        from handlers.conversation_registry import clear_conversations
+        clear_conversations(update, context)
+    except Exception:
+        pass
     
     user = update.effective_user
     if not user: return ConversationHandler.END

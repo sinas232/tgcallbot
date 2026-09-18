@@ -186,7 +186,12 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # accounts each owning an ffmpeg child, letting ffmpeg auto-spawn one thread
 # per core multiplies context-switching and pins every CPU core; pinning to 1
 # thread keeps the (trivial) silence decode cheap and bounded.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop -1"
+# NOTE (py-tgcalls 2.3.x): the play path now runs the ffmpeg command through
+# cleanup_commands(), which treats ANY token starting with "-" as a flag and
+# drops unknown ones — including the "-1" VALUE of -stream_loop. The result
+# was instant EOF ("Reached end of the file") + an endless StreamEnded loop.
+# A huge positive loop count behaves as infinite without a negative value.
+_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop 1000000"
 
 # Same single-thread cap for the non-looping fallback (short file, plays once).
 _SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
@@ -541,6 +546,28 @@ def _classify_error(err: Exception, message: str = "") -> str:
 
 def _failure_is_retryable(failure_class: str) -> bool:
     return failure_class in _RETRYABLE_FAILURES
+
+
+def _chat_id_from_join_result(res: object) -> Optional[int]:
+    """Extract the chat id from join_chat() across pyrogram/kurigram versions.
+
+    Classic pyrogram returns a Chat (``.id``). kurigram>=2.2.26 returns a
+    ChatJoinResult union instead: success carries ``.chat.id`` while anything
+    else (request-sent / declined / guard-bot approval) means we did NOT join
+    and must fail with a meaningful message instead of AttributeError.
+    """
+    if res is None:
+        return None
+    chat = getattr(res, "chat", res)
+    cid = getattr(chat, "id", None)
+    if cid is not None:
+        try:
+            return int(cid)
+        except (TypeError, ValueError):
+            return None
+    raise RuntimeError(
+        f"Join not completed ({type(res).__name__}); approval may be required"
+    )
 
 
 def _is_transient(err: Exception) -> bool:
@@ -1851,6 +1878,19 @@ class VoiceCallManager:
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
                     except Exception:
+                        # Best-effort teardown of the half-open client: without
+                        # this, our own lingering connection can DUPLICATE the
+                        # session key of the next retry and burn a healthy
+                        # account (AUTH_KEY_DUPLICATED invalidates the key
+                        # server-side, so the session can never be reused).
+                        try:
+                            if app is not None:
+                                try:
+                                    await asyncio.wait_for(app.disconnect(), timeout=5)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         if held:
                             session_ownership.release_voice(account_id)
                         raise
@@ -2456,7 +2496,7 @@ class VoiceCallManager:
         try:
             if target.startswith("https"):
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = _chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
                     try:
                         chat_id = (await app.get_chat(target)).id
@@ -2470,7 +2510,7 @@ class VoiceCallManager:
                             pass
             else:
                 try:
-                    chat_id = (await app.join_chat(target)).id
+                    chat_id = _chat_id_from_join_result(await app.join_chat(target))
                 except UserAlreadyParticipant:
                     chat_id = (await app.get_chat(target)).id
                 except Exception:
@@ -3927,6 +3967,78 @@ class VoiceCallManager:
                 await self.stop_all_for_order(oid, leave_group=True)
             except Exception as exc:
                 logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
+
+    async def shutdown_all(self, timeout: float = 60.0) -> int:
+        """Fast process-shutdown teardown of EVERY voice client.
+
+        Unlike cleanup_all() (paced, polite LeaveGroupCall per order — takes
+        ~1min+ for dozens of accounts), this skips API leaves and goes
+        straight to parallel MTProto disconnects, so all server-side sessions
+        are dropped well within the container stop grace period.
+
+        Without this, `docker restart` SIGKILLs the process with live
+        connections; Telegram keeps them half-open and the fresh container's
+        reconnects trigger AUTH_KEY_DUPLICATED — which permanently burns the
+        accounts. Disconnecting cleanly prevents that race.
+
+        Returns the number of accounts disconnected.
+        """
+        # Stop monitors / keepalives / inflight joins first: nothing new may spawn.
+        for oid in list(self._monitor_tasks.keys()):
+            try:
+                self._stop_monitor(oid)
+            except Exception:
+                pass
+        for key in list(self._keepalive_tasks.keys()):
+            ka = self._keepalive_tasks.pop(key, None)
+            try:
+                if ka and not ka.done():
+                    ka.cancel()
+            except Exception:
+                pass
+        for key in list(self._inflight_joins.keys()):
+            inf = self._inflight_joins.pop(key, None)
+            try:
+                if inf and not inf.done():
+                    inf.cancel()
+            except Exception:
+                pass
+        aids = list({*self.pyrogram_clients.keys(), *self.clients.keys()})
+        if not aids:
+            return 0
+        logger.info("[VoiceShutdown] disconnecting %d clients (fast path, no API leaves)...", len(aids))
+        sem = asyncio.Semaphore(10)
+        done = 0
+
+        async def _one(aid: int) -> None:
+            nonlocal done
+            async with sem:
+                # Engine dies with its client; no leave_call on the shutdown
+                # path (Telegram purges dead call participants server-side).
+                self.clients.pop(aid, None)
+                app = self.pyrogram_clients.pop(aid, None)
+                if app is not None:
+                    try:
+                        await asyncio.wait_for(app.disconnect(), timeout=5)
+                    except Exception:
+                        pass
+                try:
+                    session_ownership.release_voice(aid)
+                except Exception:
+                    pass
+                try:
+                    self._session_cache.pop(aid, None)
+                    self._client_locks.pop(aid, None)
+                except Exception:
+                    pass
+                done += 1
+
+        try:
+            await asyncio.wait_for(asyncio.gather(*[_one(a) for a in aids]), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[VoiceShutdown] timeout after %.0fs (%d/%d disconnected)", timeout, done, len(aids))
+        logger.info("[VoiceShutdown] done: %d/%d clients disconnected.", done, len(aids))
+        return done
 
     # ─── UNRECOVERABLE-SLOT API (executor-side replacement support) ───
 

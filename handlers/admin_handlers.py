@@ -2,6 +2,7 @@
 handlers/admin_handlers.py
 مدیریت ادمین، نمایندگی‌ها و گزارشات
 """
+import asyncio
 import logging
 import os
 import json
@@ -33,7 +34,9 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 async def safe_answer(query):
-    try: await query.answer()
+    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+    try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
 def clean_chat_id(chat_id_str: str) -> str:
@@ -92,8 +95,22 @@ async def stop_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("⚠️ لطفا آیدی سفارش را وارد کنید.\nمثال: /stop_order 123")
             return
         order_id = int(args[0])
-        await order_executor.stop_active_order(order_id)
-        await update.message.reply_text(f"✅ دستور توقف سفارش {order_id} ارسال شد.")
+        order = await DatabaseManager.get_order(order_id)
+        if not order or (order.get('status') or '').lower() not in ('running', 'scheduled'):
+            await update.message.reply_text(f"❌ سفارش {order_id} فعال نیست (یافت نشد یا قبلاً بسته شده).")
+            return
+        # مثل مسیر منوی ادمین: اول پیش‌نمایش تسویه، بعد انتخاب نوع لغو.
+        # (توقف مستقیم بدون تسویه باعث به‌هم‌ریختن حساب کاربر می‌شد.)
+        total_price = float(order.get('price_paid') or 0)
+        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)", callback_data=f"admincancel_refund_{order_id}")],
+            [InlineKeyboardButton("🚫 لغو بدون عودت وجه", callback_data=f"admincancel_norefund_{order_id}")],
+            [InlineKeyboardButton("↩️ انصراف", callback_data=f"admincancel_abort_{order_id}")],
+        ])
+        await update.message.reply_text(
+            f"🛑 **لغو سفارش #{order_id}**\n\n💰 هزینه کل پلن: {format_price(total_price)} تومان\n📉 مصرف‌شده تا الان: {format_price(used_cost)} تومان\n💵 قابل عودت: {format_price(refund_amount)} تومان\n\nلطفاً نوع لغو را انتخاب کنید:",
+            reply_markup=kb, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {e}")
 
@@ -178,10 +195,22 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     if is_god and bot_id == 1: kb.insert(5, ["🛠 مدیریت سرویس‌ها"])
     if is_god and bot_id == 1: kb.insert(6, [BTN_BACKUP_RESTORE])
+    # 🛠 حالت تعمیرات: فقط سوپرادمین (گاد یا نقش super_admin)
+    _is_super_maint = is_god
+    if not _is_super_maint and update.effective_user:
+        try:
+            _me = await asyncio.wait_for(
+                DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id), timeout=10)
+            _is_super_maint = bool(_me and _me.get('admin_role') == 'super_admin')
+        except Exception:
+            _is_super_maint = False
+    if _is_super_maint:
+        kb.insert(5, ["🛠 حالت تعمیرات"])
     
     if update.message:
         text = update.message.text
         if "مدیریت سفارشات" in text: return await admin_orders_menu(update, context)
+        if "حالت تعمیرات" in text: return await maintenance_menu(update, context)
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
@@ -217,6 +246,79 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     return AWAITING_SETTINGS_ACTION
 
+def _maintenance_text(on):
+    status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
+    return (
+        "🛠 **حالت تعمیرات (Maintenance)**\\n\\n"
+        f"وضعیت فعلی: {status}\\n\\n"
+        "وقتی فعال باشد، هیچ کاربری (حتی ادمین عادی) نمی‌تواند با ربات "
+        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\\n"
+        "برای آپدیت امن: اول فعال کنید، آپدیت کنید، بعد خاموش کنید."
+    )
+
+
+def _maintenance_kb(on):
+    if on:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🟢 خاموش کردن (بازگشت به حالت عادی)", callback_data="maint_off")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔴 فعال‌سازی حالت تعمیرات", callback_data="maint_on")]])
+
+
+@require_super_admin
+async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """منوی حالت تعمیرات — فقط سوپرادمین."""
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        on = context.bot_data.get('maintenance_mode')
+        if on is None:
+            on = (await asyncio.wait_for(DatabaseManager.get_setting(
+                "maintenance_mode", "0", bot_id=bot_id), timeout=10)) == "1"
+            context.bot_data['maintenance_mode'] = on
+    except Exception:
+        on = False
+    await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
+    return AWAITING_SETTINGS_ACTION
+
+
+async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """روشن/خاموش کردن حالت تعمیرات — فقط سوپرادمین (دکمهٔ شیشه‌ای)."""
+    query = update.callback_query
+    user = update.effective_user
+    bot_id = context.bot_data.get('bot_id', 1)
+    allowed = bool(user and user.id in Config.ADMIN_IDS)
+    if not allowed and user:
+        try:
+            db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+            allowed = bool(db_user and db_user.get('admin_role') == 'super_admin')
+        except Exception:
+            allowed = False
+    if not allowed:
+        try:
+            await query.answer("⛔️ مخصوص سوپرادمین.", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+    on = (query.data == "maint_on")
+    try:
+        await asyncio.wait_for(DatabaseManager.set_setting(
+            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
+    except Exception:
+        try:
+            await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+    context.bot_data['maintenance_mode'] = on
+    try:
+        await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(_maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
+    except Exception:
+        pass
+    return AWAITING_SETTINGS_ACTION
+
+
 @require_admin
 async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_id = context.bot_data.get('bot_id', 1)
@@ -233,7 +335,27 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
             txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
             for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
             if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+            kb_dead = [[InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")], [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_dead))
+            return AWAITING_SETTINGS_ACTION
+        elif data == "dead_del_all":
+            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+            if not accounts:
+                await query.edit_message_text("✅ هیچ اکانت غیرفعالی (سوخته) یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+                return AWAITING_SETTINGS_ACTION
+            kb_confirm = [[InlineKeyboardButton(f"🗑 بله، حذف {len(accounts)} اکانت سوخته", callback_data="dead_del_yes")], [InlineKeyboardButton("🔙 بازگشت", callback_data="view_dead_accounts")]]
+            await query.edit_message_text(f"⚠️ **حذف {len(accounts)} اکانت سوخته؟**\n\nاین عمل غیرقابل بازگشت است.", reply_markup=InlineKeyboardMarkup(kb_confirm))
+            return AWAITING_SETTINGS_ACTION
+        elif data == "dead_del_yes":
+            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+            n = 0
+            for acc in accounts:
+                try:
+                    if await DatabaseManager.delete_account(acc['id'], update.effective_user.id):
+                        n += 1
+                except Exception:
+                    pass
+            await query.edit_message_text(f"✅ **{n} اکانت سوخته حذف شد.**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
             return AWAITING_SETTINGS_ACTION
         elif data == "view_limited_accounts":
             accounts = await DatabaseManager.get_limited_accounts(bot_id=bot_id)
@@ -643,9 +765,7 @@ async def stop_order_execute(update, context):
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
         total_price = float(order.get('price_paid') or 0)
-        used_cost, refund_amount, _elapsed = order_executor.compute_prorated_settlement(
-            total_price, order.get('duration_minutes'), order.get('started_at')
-        )
+        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
@@ -681,7 +801,7 @@ async def stop_order_execute(update, context):
 async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data or ""
     bot_id = context.bot_data.get('bot_id', 1)
     try:

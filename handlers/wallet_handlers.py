@@ -2,7 +2,9 @@
 handlers/wallet_handlers.py
 مدیریت کیف پول + احراز هویت هوشمند + معافیت ادمین‌ها
 """
+import asyncio
 import logging
+import re
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from helpers.message_utils import send_safe
@@ -16,7 +18,9 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 async def safe_answer(query):
-    try: await query.answer()
+    # Hard 35s cap independent of PTB internals: even if answer gets stuck
+    # in PTB retry/FloodWait sleep, the handler must proceed (receipt via edit).
+    try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
 async def check_permissions_and_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, user: dict, bot_id: int) -> tuple[bool, str]:
@@ -276,6 +280,31 @@ async def handle_wallet_action(update: Update, context: ContextTypes.DEFAULT_TYP
             
     return AWAITING_WALLET_ACTION
 
+def _escape_md(text: str) -> str:
+    """گریز کاراکترهای خاص مارک‌داون در متن‌های کاربری (نام و...)."""
+    return re.sub(r'([_*\[\]()~`>#+|=|{}.!-])', r'\\\1', str(text or ''))
+
+
+def build_payment_invoice_message(amount: int, first_name: str, pay_url: str) -> str:
+    """متن حرفه‌ای فاکتور پرداخت.
+
+    لینک فقط داخل دکمه است (تمیز) و شماره پیگیری از انتهای URL استخراج می‌شود.
+    """
+    ref = (pay_url or '').rstrip('/').rsplit('/', 1)[-1] or '-'
+    name = _escape_md(first_name or 'کاربر')
+    return "\n".join([
+        "💳 **فاکتور پرداخت**",
+        "",
+        "➖➖➖➖➖➖➖➖",
+        f"💰 مبلغ قابل پرداخت: `{amount:,}` تومان",
+        f"👤 کاربر: {name}",
+        f"🧾 شماره پیگیری: `{ref}`",
+        "➖➖➖➖➖➖➖➖",
+        "",
+        "👇 برای پرداخت امن، روی دکمه زیر بزنید:",
+    ])
+
+
 async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
     if BTN_BACK_MAIN in text: return await start_command(update, context)
@@ -301,10 +330,10 @@ async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYP
             # پاک‌سازی وضعیت انتخاب درگاه پس از موفقیت.
             for k in ('charge_gateway_slug', 'charge_card_status', 'charge_msg_add'):
                 context.user_data.pop(k, None)
-            kb = [[InlineKeyboardButton("🔗 ورود به درگاه پرداخت", url=result)]]
-            msg_text = (f"✅ **لینک پرداخت ایجاد شد.**\n\n💰 مبلغ: `{amount:,}` تومان\n👤 کاربر: {user.get('first_name', 'کاربر')}\n\n👇 برای تکمیل پرداخت روی دکمه زیر کلیک کنید:")
+            kb = [[InlineKeyboardButton("💳 پرداخت امن", url=result)]]
+            msg_text = build_payment_invoice_message(amount, user.get('first_name', 'کاربر'), result)
             await wait_msg.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
-            await send_safe(context.bot, update.effective_chat.id, "پس از پرداخت موفق، حساب شارژ می‌شود.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
+            await send_safe(context.bot, update.effective_chat.id, "⏳ پس از پرداخت موفق، کیف‌پول شما به‌صورت خودکار شارژ می‌شود.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
             return ConversationHandler.END
         else:
             await wait_msg.edit_text(f"❌ خطا در ایجاد لینک پرداخت:\n{result}")

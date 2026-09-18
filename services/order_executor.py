@@ -718,8 +718,14 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
+	                # NOTE: AUTH_KEY_DUPLICATED means Telegram INVALIDATED the
+	                # session key (used in 2 places at once) — the account is
+	                # burned until re-login, so mark it dead immediately instead
+	                # of wasting retries/backoffs on a session that can never
+	                # connect again.
 	                if status == "dead" or any(x in upper for x in (
 	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	                    "AUTH_KEY_DUPLICATED",
 	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
 	                )):
 	                    # Account itself is dead — mark inactive & replace.
@@ -1333,6 +1339,36 @@ class OrderExecutor:
 		return name, user.get("telegram_id", "---")
 
 	@staticmethod
+	def compute_order_settlement(order) -> Tuple[float, float, float]:
+		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
+
+		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
+		تابع استفاده کنند تا «پیش‌نمایش» و «اجرا» هیچ‌وقت با هم اختلاف نداشته باشند:
+		- scheduled → هنوز مصرفی نشده: عودت کامل.
+		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
+		- مدتی → ثانیه‌ای دقیق؛ اگر started_at خالی است (گیرکرده در فاز build)
+		  مبنا created_at است تا عودت کاملِ اشتباه رخ ندهد.
+		"""
+		order = order or {}
+		total_price = float(order.get("price_paid") or 0)
+		duration_minutes = int(order.get("duration_minutes") or 0)
+		status = (order.get("status") or "").lower()
+		started_at = order.get("started_at")
+		if status == "scheduled":
+			return 0.0, total_price, 0.0
+		if duration_minutes <= 0:
+			target = int(order.get("target_count") or 0)
+			progress = int(order.get("progress") or 0)
+			if target > 0 and progress > 0:
+				used = min(float(math.ceil(total_price * progress / target)), total_price)
+			else:
+				used = 0.0
+			return used, max(0.0, total_price - used), 0.0
+		if not started_at:
+			started_at = order.get("created_at")
+		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
+
+	@staticmethod
 	def compute_prorated_settlement(total_price, duration_minutes, started_at):
 		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
 
@@ -1375,12 +1411,7 @@ class OrderExecutor:
 		order = await DatabaseManager.get_order(order_id) or {}
 		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
 		total_price = float(order.get("price_paid") or 0)
-		duration_minutes = int(order.get("duration_minutes") or 0)
-		started_at = order.get("started_at")
-
-		used_cost, refund_amount, _elapsed = self.compute_prorated_settlement(
-			total_price, duration_minutes, started_at
-		)
+		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
 		if not do_refund:
 			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
 			used_cost = total_price

@@ -132,7 +132,7 @@ class TelegramAccountClient:
                         elif "joinchat/" in target:
                             part = target.split("t.me/")[-1] if "t.me/" in target else target
                             target = f"https://t.me/{part}"
-                    await app.join_chat(target)
+                    res = await app.join_chat(target)
                 else:
                     clean_link = (
                         raw.replace("https://t.me/", "")
@@ -143,8 +143,13 @@ class TelegramAccountClient:
                     )
                     if "/" in clean_link:
                         clean_link = clean_link.split("/")[0]
-                    await app.join_chat(clean_link)
+                    res = await app.join_chat(clean_link)
 
+                # kurigram>=2.2.26 یک ChatJoinResult برمی‌گرداند (نه Chat):
+                # فقط وقتی واقعاً عضو شدیم True بده، نه برای درخواستِ در انتظار تأیید.
+                joined = getattr(res, 'chat', res)
+                if getattr(joined, 'id', None) is None:
+                    return False, f"Join needs approval ({type(res).__name__})"
                 return True, "Joined"
         except UserAlreadyParticipant:
             return True, "Already Joined"

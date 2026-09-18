@@ -7,7 +7,7 @@ import os
 import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import ContextTypes
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
 from constants import *
@@ -24,13 +24,13 @@ async def profile_settings_start(update: Update, context: ContextTypes.DEFAULT_T
 
     if not accounts:
         await send_safe(context.bot, update.effective_chat.id, "❌ <b>اکانت فعالی موجود نیست.</b>", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
 
     txt = "🔧 <b>تنظیمات پروفایل و استوری</b>\n\n👇 اکانت موردنظر را برای ویرایش انتخاب کنید:"
     kb = build_account_picker(accounts, pick_prefix="acc_edit_", page_prefix="profpage_", page=1, back_cb="acc_pickclose")
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     # کلیک روی هر دکمه، خودش از طریق entry point کالبک (acc_edit_) وارد گفتگو می‌شود
-    return ConversationHandler.END
+    return AWAITING_SETTINGS_ACTION
 
 async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """ورود مستقیم به منوی ویرایش یک اکانت از طریق دکمهٔ شیشه‌ای «✏️ ویرایش» در لیست اکانت‌ها."""
@@ -41,12 +41,12 @@ async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_T
         aid = int(query.data.split("_")[2])  # acc_edit_<id>
     except Exception:
         await send_safe(context.bot, update.effective_chat.id, "❌ شناسهٔ اکانت نامعتبر است.")
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
 
     acc = await DatabaseManager.get_account_by_id(aid)
     if not acc or acc.get('bot_id', 1) != bot_id:
         await send_safe(context.bot, update.effective_chat.id, "❌ اکانت یافت نشد یا متعلق به این ربات نیست.")
-        return ConversationHandler.END
+        return AWAITING_SETTINGS_ACTION
 
     context.user_data['selected_acc_id'] = aid
 

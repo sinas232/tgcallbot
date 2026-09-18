@@ -25,8 +25,10 @@ warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 import logging
 import os
+import signal
 import time
 import asyncio
+from collections import deque
 
 # ── uvloop: drop-in, much faster asyncio loop (Linux/macOS) ──────────────
 # We do NOT call uvloop.install() here. Combined with the deprecated
@@ -53,7 +55,7 @@ from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ConversationHandler, CallbackQueryHandler, filters,
-    PicklePersistence, ContextTypes
+    PicklePersistence, ContextTypes, ApplicationHandlerStop, TypeHandler
 )
 # 🔥 تنظیمات پیشرفته شبکه برای جلوگیری از تایم‌اوت
 from telegram.request import HTTPXRequest
@@ -95,6 +97,11 @@ from handlers.ticket_handlers import (
     auto_close_idle_tickets,
 )
 from constants import *
+from handlers.conversation_registry import (
+    register_conversation,
+    clear_conversations,
+    set_conversation_state,
+)
 from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
 # 💎 ایموجی پریمیوم (Custom Emoji) — لایهٔ خروجی + پنل ادمین
 from utils.premium_bot import PremiumEmojiApplication, PremiumEmojiBot
@@ -141,7 +148,10 @@ logging.getLogger("ntgcalls").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # فیلترهای عمومی برای ناوبری
-REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+# الگوی دکمه‌های ناوبری که نباید به‌عنوان «متن آزاد» مصرف شوند.
+# نکته: 💬 (چت در ویس‌کال) هم جزو دکمه‌های اصلی است و باید از STD_TEXT مستثنا شود
+# تا وقتی کاربر داخل یک مکالمه (کیف پول/پروفایل/...) است، این دکمه بلعیده نشود.
+REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
 FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
@@ -537,9 +547,11 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
                 order = item['order']
                 duration = order.get('duration_minutes', 0)
                 if duration <= 0: continue
-                # A running order without started_at is still building its
-                # verified account set; it has not entered the billable phase.
-                start_time = order.get('started_at')
+                # مبنای انقضا: شروع قابل‌محاسبه (started_at) و در صورت نبود آن
+                # (سفارش گیرکرده در فاز ساخت) زمان ثبت سفارش. بدون این fallback،
+                # سفارش‌های بدون started_at هیچ‌وقت منقضی نمی‌شدند و برای همیشه
+                # running می‌ماندند.
+                start_time = order.get('started_at') or order.get('created_at')
                 if not start_time: continue
                 end_time = start_time + timedelta(minutes=duration)
                 
@@ -577,20 +589,293 @@ def register_handlers(application: Application) -> None:
     """ثبت تمام هندلرهای ربات"""
     application.add_error_handler(error_handler)
 
+    # ─────────────────────────────────────────────────────────────
+    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    #
+    # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
+    # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
+    # آپدیت‌هایش بی‌صدا دور ریخته می‌شود تا ربات برای بقیه کند نشود.
+    # گادها (ADMIN_IDS) از این محدودیت معاف‌اند.
+    # ─────────────────────────────────────────────────────────────
+    _SPAM_WINDOW_SEC = 2.0
+    _SPAM_MAX_HITS = 5
+    _SPAM_MUTE_SEC = 60
+    _SPAM_MSG = ("⏳ محدودیت موقت\n\nبه دلیل ارسال درخواست‌های پیاپی، "
+                 "به مدت ۱ دقیقه محدود شدید.\nلطفاً کمی صبر کنید و دوباره تلاش کنید.")
+    _spam_hits: dict = {}
+    _spam_muted_until: dict = {}
+
+    async def _spam_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user:
+            return
+        if user.id in Config.ADMIN_IDS:
+            return
+        try:
+            now = time.monotonic()
+            uid = user.id
+            if now < _spam_muted_until.get(uid, 0):
+                raise ApplicationHandlerStop
+            dq = _spam_hits.get(uid)
+            if dq is None:
+                dq = deque()
+                _spam_hits[uid] = dq
+            while dq and now - dq[0] > _SPAM_WINDOW_SEC:
+                dq.popleft()
+            dq.append(now)
+            if len(dq) > _SPAM_MAX_HITS:
+                _spam_muted_until[uid] = now + _SPAM_MUTE_SEC
+                dq.clear()
+                try:
+                    _q = update.callback_query
+                    if _q is not None:
+                        await asyncio.wait_for(_q.answer(_SPAM_MSG, show_alert=True), timeout=10)
+                    elif update.effective_message is not None:
+                        await asyncio.wait_for(update.effective_message.reply_text(_SPAM_MSG), timeout=10)
+                except Exception:
+                    pass
+                try:
+                    logger.warning("spam guard MUTED user=%s for %ss", uid, _SPAM_MUTE_SEC)
+                except Exception:
+                    pass
+                raise ApplicationHandlerStop
+            if len(_spam_hits) > 20000:
+                _cut = now - _SPAM_WINDOW_SEC
+                for _k in [k for k, v in _spam_hits.items() if not v or v[-1] < _cut][:5000]:
+                    _spam_hits.pop(_k, None)
+                for _k in [k for k, v in _spam_muted_until.items() if v < now][:5000]:
+                    _spam_muted_until.pop(_k, None)
+        except ApplicationHandlerStop:
+            raise
+        except Exception:
+            return
+    _spam_guard._hits = _spam_hits
+    _spam_guard._muted = _spam_muted_until
+    _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+
+    # ─────────────────────────────────────────────────────────────
+    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
+    #
+    # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
+    # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
+    # با ApplicationHandlerStop جلوی رسیدن آپدیت به بقیهٔ هندلرها گرفته
+    # می‌شود. پرچم در دیتابیس ذخیره و در bot_data کش می‌شود تا با ری‌استارت
+    # (حین آپدیت) از بین نرود.
+    # ─────────────────────────────────────────────────────────────
+    _MAINT_MSG = (
+        "🔧 ربات در حال بروزرسانی است...\n\n"
+        "لطفاً چند دقیقهٔ دیگر تلاش کنید. 🙏"
+    )
+
+    async def _is_super_admin_user(update, context) -> bool:
+        try:
+            user = update.effective_user
+            if not user:
+                return False
+            if user.id in Config.ADMIN_IDS:
+                return True
+            bot_id = context.bot_data.get('bot_id', 1)
+            try:
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
+            except Exception:
+                return False
+            return bool(db_user and db_user.get('admin_role') == 'super_admin')
+        except Exception:
+            return False
+
+    async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user:
+            return
+        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
+        try:
+            _q0 = update.callback_query
+            if _q0 is not None:
+                _u0 = update.effective_user
+                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
+        except Exception:
+            pass
+        try:
+            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
+            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
+            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
+            flag = context.bot_data.get('maintenance_mode', False)
+            if not flag:
+                return
+            if await _is_super_admin_user(update, context):
+                return
+            # کاربر غیرسوپر در حالت تعمیرات → پیام (تراتل ۶۰ ثانیه‌ای) + توقف انتشار.
+            now = time.time()
+            try:
+                last = float((context.user_data or {}).get('maint_notice_ts', 0))
+            except Exception:
+                last = 0.0
+            fresh = (now - last) >= 60
+            query = update.callback_query
+            if query:
+                try:
+                    if fresh:
+                        await asyncio.wait_for(query.answer(_MAINT_MSG, show_alert=True), timeout=35)
+                    else:
+                        await asyncio.wait_for(query.answer(), timeout=35)
+                except Exception:
+                    pass
+            elif update.message:
+                if fresh:
+                    try:
+                        await update.message.reply_text(_MAINT_MSG)
+                    except Exception:
+                        pass
+            if fresh:
+                try:
+                    context.user_data['maint_notice_ts'] = now
+                except Exception:
+                    pass
+            try:
+                _gu = update.effective_user
+                logger.warning("maintenance guard BLOCKED user=%s kind=%s ref=%s",
+                               _gu.id if _gu else None,
+                               "callback" if query else "message",
+                               str(query.data if query else (update.message.text if update.message else ''))[:64])
+            except Exception:
+                pass
+            raise ApplicationHandlerStop
+        except ApplicationHandlerStop:
+            raise
+        except Exception:
+            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
+            return
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
+        group=-1,
+    )
+    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+
+
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
     application.add_handler(
         CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
         group=-1,
     )
-    
+
+    # ─────────────────────────────────────────────────────────────
+    # 🧭 پیش‌روتر منوها (group=-1): رفع ریشه‌ای «دکمه‌ها جواب نمی‌دهند».
+    #
+    # مشکل: چند ConversationHandler هم‌پوشان، state مستقل نگه می‌داشتند.
+    # وقتی کاربر از منویی به منوی دیگر می‌رفت، state قبلی پاک نمی‌شد و
+    # هندلر قدیمی (مثلاً filters.ALL تیکت یا filters.TEXT پروفایل) دکمهٔ
+    # جدید را می‌بلعید (سکوت)، یا منو نمایش داده می‌شد ولی state جدید
+    # ست نمی‌شد و دکمه‌های بعدی هیچ handler فعالی نداشتند.
+    #
+    # این پیش‌روتر قبل از همهٔ مکالمه‌ها اجرا می‌شود، دکمه‌های شناخته‌شدهٔ
+    # منو را تشخیص می‌دهد و stateهای کهنه را تمیز می‌کند؛ سپس آپدیت را
+    # رها می‌کند تا به‌صورت عادی به handler درست برسد (جلوی انتشار را
+    # نمی‌گیرد و چیزی هم ارسال نمی‌کند).
+    # ─────────────────────────────────────────────────────────────
+    import re as _re
+
+    _TOPLEVEL_EXACT = {
+        "🛍 خرید سرویس",
+        "💰 کیف پول من",
+        "📦 سفارشات من",
+        "🆘 پشتیبانی",
+        "💬 چت در ویس‌کال",
+        "🔐 پنل مدیریت (ادمین)",
+        BTN_BACK_MAIN,
+        BTN_EXIT_ADMIN,
+    }
+    _WALLET_SUBMENU_EXACT = {"💳 شارژ حساب", "📈 تراکنش‌های اخیر"}
+    _SUPPORT_SUBMENU_EXACT = {"➕ ثبت تیکت جدید", "📂 تیکت‌های من"}
+    _BUY_CATEGORY_EXACT = {"🎙 ویس‌کال", "👥 عضویت گروه", "📢 عضویت کانال"}
+    _ADMIN_SUBMENU_RE = (
+        r"^(🤖 مدیریت نمایندگی‌ها|➕ افزودن نماینده جدید|📋 لیست نمایندگان"
+        r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
+        r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
+        r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
+        r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
+        r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
+        r"|👤 مدیریت کاربران|👤 ادمین عادی|⭐️ سوپر ادمین|➕ افزودن ادمین جدید|➖ حذف ادمین"
+        r"|📋 لیست ادمین‌ها|🔎 جستجوی کاربر|📞 پیام خصوصی|📢 پیام همگانی"
+        r"|👥 مدیریت اکانت‌های ربات|📊 گزارش کلی|📉 آمار کل ربات|🚑 گزارش سلامت اکانت‌ها"
+        r"|📅 وضعیت اعتبار ربات)"
+    )
+    _ACCOUNT_SUBMENU_RE = (
+        r"^(➕ افزودن اکانت \(شماره\)|📥 افزودن با سشن \(String\)"
+        r"|❌ حذف اکانت|📋 لیست اکانت‌ها|📩 دریافت کد ورود"
+        r"|🔧 تنظیمات پروفایل|" + _re.escape(BTN_LEAVE_ALL_CHATS) + r")"
+    )
+
+    async def _is_admin_user(update, context) -> bool:
+        try:
+            user = update.effective_user
+            if not user:
+                return False
+            if user.id in Config.ADMIN_IDS:
+                return True
+            bot_id = context.bot_data.get('bot_id', 1)
+            try:
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
+            except Exception:
+                return False
+            return bool(db_user and db_user.get('is_admin'))
+        except Exception:
+            return False
+
+    async def _menu_prerouter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = (update.message.text if update.message else "") or ""
+        if not text:
+            return
+        # ۱) دکمه‌های سطح بالا → پاک کردن همهٔ stateها (شروع تمیز)
+        if text in _TOPLEVEL_EXACT:
+            clear_conversations(update)
+            try:
+                context.user_data.clear()
+            except Exception:
+                pass
+            return
+        # ۲) زیرمنوهای کیف پول → فقط مکالمهٔ کیف پول در state پایه
+        if text in _WALLET_SUBMENU_EXACT:
+            clear_conversations(update, except_names={"wallet"})
+            set_conversation_state(update, "wallet", AWAITING_WALLET_ACTION)
+            return
+        # ۳) زیرمنوهای پشتیبانی → فقط مکالمهٔ تیکت در state پایه
+        if text in _SUPPORT_SUBMENU_EXACT:
+            clear_conversations(update, except_names={"support_ticket"})
+            set_conversation_state(update, "support_ticket", AWAITING_TICKET_MESSAGE)
+            return
+        # ۴) دسته‌بندی خرید → فقط مکالمهٔ خرید در state پایه
+        if text in _BUY_CATEGORY_EXACT:
+            clear_conversations(update, except_names={"buy"})
+            set_conversation_state(update, "buy", AWAITING_SELECT_PLAN)
+            return
+        # ۵) زیرمنوهای ادمین/اکانت → فقط مکالمهٔ ادمین در state پایه
+        # (تا از هر زیر-state عمیقی هم این دکمه‌ها کار کنند و مکالمه‌های
+        #  کاربریِ کهنه، دکمه را نبلعند)
+        if _re.match(_ADMIN_SUBMENU_RE, text) or _re.match(_ACCOUNT_SUBMENU_RE, text):
+            if await _is_admin_user(update, context):
+                clear_conversations(update, except_names={"admin"})
+                set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+            return
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _menu_prerouter),
+        group=-1,
+    )
+
     # هندلرهای عمومی
     application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    
+
     # کالبک‌های ادمین (KYC)
     application.add_handler(CallbackQueryHandler(kyc_admin_callback, pattern="^admin_kyc_"))
 
     # تابع بازگشت عمومی
     async def global_cancel_and_restart(update: Update, context):
+        clear_conversations(update)
         context.user_data.clear()
         await start_command(update, context)
         return ConversationHandler.END
@@ -598,15 +883,17 @@ def register_handlers(application: Application) -> None:
     async def global_back_safety_net(update, context):
         """شبکه ایمنی سراسری برای دکمه‌های بازگشت.
 
-        وقتی کاربر در منویی است که هیچ مکالمه‌ای فعال نیست (مثلاً منوی
-        «مدیریت اکانت‌های ربات» که بعد از پایان مکالمهٔ ادمین نمایش داده
-        می‌شود) و دکمهٔ بازگشت را می‌زند، این هندلر آن را می‌گیرد و به منوی
-        مناسب برمی‌گرداند. چون در گروه ۰ و پس از تمام مکالمه‌ها ثبت می‌شود،
-        فقط زمانی اجرا می‌شود که هیچ مکالمهٔ فعالی این آپدیت را مصرف نکرده
-        باشد (مکالمه‌های فعال، بازگشت را از طریق fallback خودشان می‌گیرند).
+        وقتی کاربر در منویی است که هیچ مکالمه‌ای فعال نیست و دکمهٔ بازگشت
+        را می‌زند، این هندلر آن را می‌گیرد و به منوی مناسب برمی‌گرداند.
+        چون در گروه ۰ و پس از تمام مکالمه‌ها ثبت می‌شود، فقط زمانی اجرا
+        می‌شود که هیچ مکالمهٔ فعالی این آپدیت را مصرف نکرده باشد.
+
+        نکتهٔ مهم (رفع باگ سکوت دکمه‌ها): چون این یک هندلر ساده است و مقدار
+        برگشتی آن state مکالمه را ست نمی‌کند، بعد از نمایش پنل ادمین، state
+        پایهٔ ادمین را صریحاً از طریق رجیستری می‌نشانیم تا دکمه‌های بعدی
+        handler فعال داشته باشند. برای منوی کاربر هم همهٔ stateها پاک می‌شود.
         """
         text = (update.message.text if update.message else "") or ""
-        context.user_data.clear()
         user = update.effective_user
         if not user:
             return
@@ -614,21 +901,28 @@ def register_handlers(application: Application) -> None:
 
         # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
         if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
+            clear_conversations(update)
+            context.user_data.clear()
             return await start_command(update, context)
 
         # تشخیص ادمین بودن
         is_admin = user.id in Config.ADMIN_IDS
         if not is_admin:
             try:
-                db_user = await DatabaseManager.get_user(user.id, bot_id=bot_id)
+                db_user = await asyncio.wait_for(
+                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
                 is_admin = bool(db_user and db_user.get('is_admin'))
             except Exception:
                 is_admin = False
 
-        # منوهای دارای دکمهٔ بازگشتِ بی‌مکالمه، همگی متعلق به بخش ادمین‌اند
         if is_admin:
             from handlers.admin_handlers import admin_panel_start
-            return await admin_panel_start(update, context)
+            result = await admin_panel_start(update, context)
+            # ست صریح state پایهٔ ادمین (return هندلر ساده، state را ست نمی‌کند)
+            set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+            return result
+        clear_conversations(update)
+        context.user_data.clear()
         return await start_command(update, context)
 
     STANDARD_FALLBACKS = [
@@ -640,7 +934,11 @@ def register_handlers(application: Application) -> None:
 
     # --- 1. سیستم تیکتینگ ---
     support_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🆘 پشتیبانی$"), start_ticket_support),
+            # دکمه‌های شیشه‌ای کهنهٔ تیکت (بعد از /start یا ری‌استارت) هم باید کار کنند.
+            CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
+        ],
         states={
             AWAITING_TICKET_MESSAGE: [
                 CallbackQueryHandler(user_ticket_callback, pattern="^uticket_"),
@@ -655,11 +953,11 @@ def register_handlers(application: Application) -> None:
         # button-driven conversations — see the PTBUserWarning note above).
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(support_conv)
+    application.add_handler(register_conversation(support_conv))
 
     # --- 2. احراز هویت (KYC) ---
     application.add_handler(CallbackQueryHandler(kyc_menu_callback, pattern="^kyc_back$|^kyc_add_card$|^kyc_send_video$"))
-    
+
     kyc_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_kyc_process, pattern="^start_kyc_process$")],
         states={
@@ -671,9 +969,13 @@ def register_handlers(application: Application) -> None:
         name="kyc", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(kyc_conv)
+    application.add_handler(register_conversation(kyc_conv))
 
-    # --- 3. پنل ادمین ---
+    # --- 3. پنل ادمین (ادغام‌شده با مدیریت اکانت و پروفایل) ---
+    # قبلاً acc و prof مکالمه‌های جدا بودند؛ account_management با return END،
+    # مکالمهٔ ادمین را می‌بست و دکمه‌های بعدی پنل هیچ handler فعالی نداشتند
+    # (سکوت تا /start بعدی). حالا همه داخل همین یک مکالمه‌اند و جابه‌جایی
+    # بین زیرمنوها فقط state را عوض می‌کند، نه اینکه مکالمه را ببندد.
     admin_fallbacks = [
         CommandHandler("start", start_command),
         CommandHandler("cancel", start_command),
@@ -681,7 +983,28 @@ def register_handlers(application: Application) -> None:
         MessageHandler(FILTER_BACK, admin_panel_start),
     ]
     admin_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔐 پنل مدیریت \(ادمین\)$"), admin_panel_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start),
+            # دکمه‌های شیشه‌ای کهنهٔ پنل (بعد از /start یا ری‌استارت) هم باید
+            # وارد مکالمه شوند؛ وگرنه هیچ handlerای آن‌ها را نمی‌گیرد.
+            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+            CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
+            CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
+            CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+            CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+            CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
+            CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
+            CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
+            CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
+            CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
+            CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+            CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
+            CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+            CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
+            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
+            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+            CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
+        ],
         states={
             AWAITING_SETTINGS_ACTION: [
                 # نمایندگی
@@ -689,49 +1012,50 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
                 MessageHandler(filters.Regex("^➕ افزودن نماینده جدید$"), add_reseller_start),
                 MessageHandler(filters.Regex("^📋 لیست نمایندگان$"), list_resellers_handler),
-                
+
                 # خروج
                 MessageHandler(filters.Regex(f"^{BTN_EXIT_ADMIN}$"), start_command),
-                
+
                 # تیکتینگ
                 MessageHandler(filters.Regex("^📩 مدیریت تیکت‌ها"), admin_tickets_list),
                 CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
-                
+
                 # سفارشات
                 CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
                 CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
                 CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
                 CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
                 MessageHandler(filters.Regex("^📦 مدیریت سفارشات کاربران$"), manage_orders_start),
-                
-                # اکشن‌های کاربر
-                CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_|^view_orders_|^view_trans_|^back_to_profile"),
-                
+
+                # اکشن‌های کاربر (pattern محدود و دقیق تا کالبک‌های دیگر مثل
+                # admin_kyc و admin_orders بلعیده نشوند)
+                CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
+
                 # تنظیمات
                 MessageHandler(filters.Regex("^⚙️ تنظیمات سیستم$"), settings_menu_handler),
                 MessageHandler(filters.Regex("^💳 مدیریت درگاه پرداخت$"), gateway_management_menu),
                 MessageHandler(filters.Regex("^🔒 تنظیمات امنیتی$"), security_settings_menu),
-                CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings"),
-                
+                CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
+
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
-                CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_|^set_spam_"),
+                CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
-                
+
                 # 💾 پشتیبان‌گیری و بازیابی
                 MessageHandler(filters.Regex(f"^{BTN_BACKUP_RESTORE}$"), backup_restore_menu),
                 CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
-                
+
                 # پلن‌ها
                 MessageHandler(filters.Regex("^➕ ایجاد پلن جدید$"), create_plan_start),
                 MessageHandler(filters.Regex("^✏️ ویرایش پلن$"), edit_plan_start),
                 MessageHandler(filters.Regex("^📋 مدیریت پلن‌ها$"), plan_management_menu),
                 MessageHandler(filters.Regex("^📋 لیست پلن‌ها$"), list_plans_handler),
                 MessageHandler(filters.Regex("^❌ حذف پلن$"), delete_plan_start),
-                
+
                 # مدیریت کاربر
                 MessageHandler(filters.Regex(r"^👤 (مدیریت کاربران|جستجوی کاربر \(پیشرفته\))$"), user_manage_menu),
                 MessageHandler(filters.Regex("^👥 مدیریت اکانت‌های ربات$"), account_management_handler),
@@ -742,7 +1066,7 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📋 لیست ادمین‌ها$"), list_admins_handler),
                 MessageHandler(filters.Regex("^📞 پیام خصوصی$"), private_message_start),
                 MessageHandler(filters.Regex("^📢 پیام همگانی$"), broadcast_start),
-                
+
                 # 💎 ایموجی پریمیوم (متن + دکمه‌ها با Custom Emoji)
                 MessageHandler(filters.Regex(f"^{BTN_PREMIUM_EMOJI}$"), premium_emoji_menu),
                 MessageHandler(filters.Regex("ایموجی پریمیوم"), premium_emoji_menu),
@@ -752,10 +1076,26 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
-                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back)$"),
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
+
+                # ── مدیریت اکانت‌ها (قبلاً acc_conv جدا بود؛ حالا داخل ادمین) ──
+                MessageHandler(filters.Regex("^➕ افزودن اکانت \\(شماره\\)$"), add_account_start),
+                MessageHandler(filters.Regex("^📥 افزودن با سشن \\(String\\)$"), import_session_start),
+                MessageHandler(filters.Regex("^❌ حذف اکانت$"), delete_account_start),
+                MessageHandler(filters.Regex("^📋 لیست اکانت‌ها$"), list_accounts_handler),
+                CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
+                MessageHandler(filters.Regex("^📩 دریافت کد ورود$"), get_code_start),
+                MessageHandler(filters.Regex(f"^{BTN_LEAVE_ALL_CHATS}$"), leave_all_chats_start),
+
+                # ── پروفایل (قبلاً prof_conv جدا بود؛ حالا داخل ادمین) ──
+                MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل و استوری$"), profile_settings_start),
+                MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start),
+                # ورود مستقیم به ویرایش اکانت از دکمهٔ شیشه‌ای لیست اکانت‌ها
+                CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
             ],
-            
+
             # وضعیت‌های ادمین
             AWAITING_ADMIN_TICKET_REPLY: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, handle_admin_reply_message)],
             AWAITING_GATEWAY_SELECT: [MessageHandler(filters.TEXT & ~FILTER_NAV_BUTTONS, handle_gateway_selection)],
@@ -766,12 +1106,12 @@ def register_handlers(application: Application) -> None:
             AWAITING_PM_ID: [MessageHandler(STD_TEXT, private_message_confirm_user)],
             AWAITING_PM_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, private_message_send)],
             AWAITING_BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND & ~FILTER_NAV_BUTTONS, broadcast_confirm)],
-            AWAITING_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_execute, pattern="^confirm_|^cancel_")],
+            AWAITING_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_execute, pattern="^confirm_broadcast$|^cancel_broadcast$")],
             # 💎 دریافت override شناسهٔ ایموجی پریمیوم (فقط متن‌های حاوی «=» یا «{»)
             AWAITING_PREMIUM_EMOJI_OVERRIDE: [
                 MessageHandler(filters.Regex(r"[={]"), premium_emoji_receive_override)
             ],
-            
+
             # پلن
             AWAITING_PLAN_NAME: [MessageHandler(STD_TEXT, receive_plan_name)],
             AWAITING_PLAN_DESC: [MessageHandler(STD_TEXT, receive_plan_desc)],
@@ -781,31 +1121,31 @@ def register_handlers(application: Application) -> None:
             AWAITING_PLAN_PRICE: [MessageHandler(STD_TEXT, receive_plan_price)],
             AWAITING_PLAN_DELETE: [MessageHandler(STD_TEXT, perform_delete_plan)],
             AWAITING_PLAN_DELETE_INDEX: [MessageHandler(STD_TEXT, perform_delete_plan)],
-            AWAITING_PLAN_EDIT_INDEX: [CallbackQueryHandler(handle_edit_plan_selection)],
-            AWAITING_PLAN_EDIT_SELECT: [CallbackQueryHandler(handle_edit_field_selection)],
-            AWAITING_PLAN_EDIT_VALUE: [CallbackQueryHandler(receive_plan_edit_value), MessageHandler(STD_TEXT, receive_plan_edit_value)],
-            
+            AWAITING_PLAN_EDIT_INDEX: [CallbackQueryHandler(handle_edit_plan_selection, pattern="^edit_plan_")],
+            AWAITING_PLAN_EDIT_SELECT: [CallbackQueryHandler(handle_edit_field_selection, pattern="^edit_(field_|plan_back)")],
+            AWAITING_PLAN_EDIT_VALUE: [CallbackQueryHandler(receive_plan_edit_value, pattern="^edit_val_"), MessageHandler(STD_TEXT, receive_plan_edit_value)],
+
             # سفارش
             AWAITING_STOP_ORDER_INDEX: [MessageHandler(STD_TEXT, stop_order_execute)],
             AWAITING_ORDER_USER_ID: [MessageHandler(STD_TEXT, manage_orders_user_search)],
-            
+
             # کاربر
             AWAITING_USER_SEARCH: [MessageHandler(STD_TEXT, user_search_result)],
             AWAITING_USER_AMOUNT: [MessageHandler(STD_TEXT, set_user_credit)],
             AWAITING_ADD_ADMIN: [MessageHandler(filters.Regex("^(👤 ادمین عادی|⭐️ سوپر ادمین)$"), perform_add_admin), MessageHandler(STD_TEXT, perform_add_admin)],
             AWAITING_REMOVE_ADMIN: [MessageHandler(STD_TEXT, perform_remove_admin)],
-            
+
             # تنظیمات
             AWAITING_SUPPORT_TEXT: [MessageHandler(STD_TEXT, handle_setting_text_input)],
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
-            
+
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
             AWAITING_BACKUP_CHANNEL: [MessageHandler(STD_TEXT, receive_backup_channel)],
             AWAITING_BACKUP_INTERVAL: [MessageHandler(STD_TEXT, receive_backup_interval)],
-            
+
             # نمایندگی
             AWAITING_RESELLER_TOKEN: [MessageHandler(STD_TEXT, receive_reseller_token)],
             AWAITING_RESELLER_ADMIN: [MessageHandler(STD_TEXT, receive_reseller_admin)],
@@ -813,89 +1153,76 @@ def register_handlers(application: Application) -> None:
             AWAITING_RESELLER_RENEW_DAYS: [MessageHandler(STD_TEXT, receive_reseller_renew_days)],
             AWAITING_RESELLER_API_ID: [MessageHandler(STD_TEXT, receive_reseller_api_id)],
             AWAITING_RESELLER_API_HASH: [MessageHandler(STD_TEXT, receive_reseller_api_hash)],
-            AWAITING_RESELLER_EDIT_VALUE: [MessageHandler(STD_TEXT, receive_reseller_edit_value)], 
+            AWAITING_RESELLER_EDIT_VALUE: [MessageHandler(STD_TEXT, receive_reseller_edit_value)],
+
+            # ── اکانت: ورودی‌های چندمرحله‌ای (قبلاً acc_conv) ──
+            # بازگشت/انصراف در این مراحل به «منوی مدیریت اکانت‌ها» برمی‌گردد
+            # (جایی که کاربر از آن آمده)، نه به پنل اصلی.
+            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_LEAVE_ALL_CONFIRM: [
+                CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$"),
+                MessageHandler(FILTER_BACK, account_management_handler),
+            ],
+
+            # ── پروفایل: ورودی‌های چندمرحله‌ای (قبلاً prof_conv) ──
+            AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account), MessageHandler(FILTER_BACK, account_management_handler)],
+            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)],
+            AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_NEW_LAST_NAME: [MessageHandler(STD_TEXT, set_last_name_handler), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish), MessageHandler(FILTER_BACK, back_to_menu)],
+            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)],
+            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
+            AWAITING_PHOTO_NAVIGATION: [
+                CallbackQueryHandler(photo_slider_callback, pattern="^(del_photo|prev_photo|next_photo|close_slider)$"),
+                MessageHandler(FILTER_BACK, back_to_menu),
+            ],
         },
         fallbacks=admin_fallbacks,
         name="admin", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(admin_conv)
-    
+    application.add_handler(register_conversation(admin_conv))
+
     # --- 4. کیف پول ---
+    # نکته: stateهای احراز هویت (KYC) هم اینجا تکرار شده‌اند، چون فلوی «ثبت
+    # کارت جدید» از داخل کیف پول شروع می‌شود (start_kyc_for_new_card از
+    # handle_wallet_action صدا زده می‌شود) و برگرداندن AWAITING_KYC_* از یک
+    # state والت، state همان مکالمهٔ والت را عوض می‌کند؛ اگر این stateها در
+    # والت تعریف نشده باشند، ورودی کارت/ویدیو هیچ handler فعالی نخواهد داشت.
     wallet_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^💰 کیف پول من$"), wallet_menu_handler),
-            CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet")
+            CallbackQueryHandler(wallet_menu_handler, pattern="^goto_wallet"),
+            # دکمه‌های شیشه‌ای کهنهٔ کیف پول (بعد از /start یا ری‌استارت).
+            CallbackQueryHandler(handle_wallet_action, pattern="^(charge_online|recent_transactions|card_to_card|wallet_add_new_card|back_to_wallet|chg_gw_)"),
         ],
         states={
-            AWAITING_WALLET_ACTION: [MessageHandler(STD_TEXT, handle_wallet_action), CallbackQueryHandler(handle_wallet_action)],
+            AWAITING_WALLET_ACTION: [
+                MessageHandler(STD_TEXT, handle_wallet_action),
+                CallbackQueryHandler(handle_wallet_action, pattern="^(charge_online|recent_transactions|card_to_card|wallet_add_new_card|back_to_wallet|chg_gw_)"),
+            ],
             AWAITING_CHARGE_AMOUNT: [MessageHandler(STD_TEXT, handle_charge_amount)],
+            AWAITING_KYC_CARD: [MessageHandler(STD_TEXT, handle_kyc_card)],
+            AWAITING_KYC_VIDEO: [MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.PHOTO | filters.Document.ALL, handle_kyc_video)],
         },
         fallbacks=STANDARD_FALLBACKS,
         name="wallet", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(wallet_conv)
-    
-    # --- 5. مدیریت اکانت ---
-    acc_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^➕ افزودن اکانت \(شماره\)$"), add_account_start),
-            MessageHandler(filters.Regex("^📥 افزودن با سشن \(String\)$"), import_session_start),
-            MessageHandler(filters.Regex("^❌ حذف اکانت$"), delete_account_start),
-            MessageHandler(filters.Regex("^📋 لیست اکانت‌ها$"), list_accounts_handler),
-            CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
-            MessageHandler(filters.Regex("^📩 دریافت کد ورود$"), get_code_start),
-            # 🔥 ثبت هندلر برای دکمه خروج همگانی
-            MessageHandler(filters.Regex(f"^{BTN_LEAVE_ALL_CHATS}$"), leave_all_chats_start),
-        ],
-        states={
-            AWAITING_PHONE_NUMBER: [MessageHandler(STD_TEXT, handle_phone_number), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_CODE: [MessageHandler(STD_TEXT, handle_code), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_PASSWORD: [MessageHandler(STD_TEXT, handle_password), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_ACCOUNT_ID_DELETE: [MessageHandler(STD_TEXT, handle_delete_account_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_GET_CODE_ACCOUNT: [MessageHandler(STD_TEXT, handle_get_code_input), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_ID: [MessageHandler(STD_TEXT, handle_import_api_id), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_API_HASH: [MessageHandler(STD_TEXT, handle_import_api_hash), MessageHandler(FILTER_BACK, admin_panel_start)],
-            AWAITING_SESSION_STRING: [MessageHandler(STD_TEXT, handle_import_session_string), MessageHandler(FILTER_BACK, admin_panel_start)],
-            # 🔥 وضعیت تایید برای خروج همگانی
-            AWAITING_LEAVE_ALL_CONFIRM: [CallbackQueryHandler(leave_all_chats_callback, pattern="^confirm_leave_all$|^cancel_leave_all$")],
-        },
-        fallbacks=STANDARD_FALLBACKS,
-        name="acc", persistent=True,
-        per_chat=True, per_user=True, per_message=False
-    )
-    application.add_handler(acc_conv)
+    application.add_handler(register_conversation(wallet_conv))
 
-    # --- 6. پروفایل ---
-    prof_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل و استوری$"), profile_settings_start),
-            MessageHandler(filters.Regex("^🔧 تنظیمات پروفایل$"), profile_settings_start),
-            # ورود مستقیم به ویرایش اکانت از دکمهٔ شیشه‌ای لیست اکانت‌ها
-            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_")
-        ],
-        states={
-            AWAITING_SELECT_ACCOUNT_FOR_PROFILE: [MessageHandler(STD_TEXT, select_account)],
-            AWAITING_PROFILE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_profile_menu_action)],
-            AWAITING_NEW_NAME: [MessageHandler(STD_TEXT, set_name_handler)],
-            AWAITING_NEW_BIO: [MessageHandler(STD_TEXT, set_bio_handler)],
-            AWAITING_NEW_USERNAME: [MessageHandler(STD_TEXT, set_username_handler)],
-            AWAITING_NEW_LAST_NAME: [MessageHandler(STD_TEXT, set_last_name_handler)],
-            AWAITING_PROFILE_PHOTO: [MessageHandler(filters.PHOTO, set_photo_handler)],
-            AWAITING_STORY_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, receive_story_media)],
-            AWAITING_STORY_CAPTION: [MessageHandler(STD_TEXT, post_story_finish)],
-            AWAITING_PRIVACY_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, privacy_menu_handler)],
-            AWAITING_PRIVACY_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_privacy_level)],
-            AWAITING_PHOTO_NAVIGATION: [CallbackQueryHandler(photo_slider_callback)]
-        },
-        fallbacks=STANDARD_FALLBACKS,
-        name="prof", persistent=True,
-        per_chat=True, per_user=True, per_message=False
-    )
-    application.add_handler(prof_conv)
-
-    # --- 6.5 مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
+    # --- 5. مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
     # فقط مرحلهٔ دریافت متن پیام حالت‌دار است؛ انتخاب سفارش/اکانت‌ها و ری‌اکشن‌ها
     # بدون‌حالت و از طریق کالبک‌های سراسری انجام می‌شوند تا سریع و مکرر باشند.
     incall_conv = ConversationHandler(
@@ -912,7 +1239,7 @@ def register_handlers(application: Application) -> None:
         name="incall", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(incall_conv)
+    application.add_handler(register_conversation(incall_conv))
 
     # ورود به مرکز (دکمهٔ منو) + کالبک‌های بدون‌حالت
     application.add_handler(MessageHandler(filters.Regex(r"^💬 چت در ویس‌کال$"), incall_center_start), group=0)
@@ -928,26 +1255,34 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(incall_react, pattern=r"^ic_react_"), group=0)
     application.add_handler(CallbackQueryHandler(incall_close, pattern=r"^ic_close$"), group=0)
 
-    # --- 7. خرید سرویس ---
+    # --- 6. خرید سرویس ---
     buy_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^🛍 خرید سرویس$"), new_order_start),
+            # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
+            CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
+            CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
+        ],
         states={
             AWAITING_SELECT_PLAN: [
                 MessageHandler(FILTER_BACK, start_command),
                 MessageHandler(filters.Regex("^(🎙|👥|📢)"), show_plans_for_category),
-                CallbackQueryHandler(handle_plan_callback, pattern="^buy_|^cancel")
+                # دکمهٔ لغوِ این مرحله دقیقاً «cancel_order» (بدون آیدی) است؛
+                # pattern محدود تا cancel_order_<id> و cancelهای دیگر بلعیده نشوند.
+                CallbackQueryHandler(handle_plan_callback, pattern="^buy_|^cancel_order$")
             ],
             AWAITING_ORDER_TIMING_TYPE: [MessageHandler(STD_TEXT, handle_timing_type)],
-            AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection)],
+            AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation)]
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(buy_conv)
+    application.add_handler(register_conversation(buy_conv))
 
     # هندلرهای عمومی خارج از Conversation
     application.add_handler(CommandHandler("start", start_command))
@@ -957,7 +1292,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.Regex("^📦 سفارشات من$"), my_orders_handler), group=0)
     # ✅ هندلر ریپلای ادمین
     application.add_handler(MessageHandler(filters.REPLY, reply_to_user_handler), group=0)
-    
+
     application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"), group=0)
     application.add_handler(CallbackQueryHandler(handle_order_history_callback, pattern="^history_"), group=0)
     application.add_handler(CallbackQueryHandler(handle_back_to_history_menu, pattern="^back_to_history_menu"), group=0)
@@ -980,8 +1315,16 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(getcode_picker_page_callback, pattern=r"^codepage_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(account_picker_close_callback, pattern=r"^acc_pickclose$"), group=0)
 
+
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
+    # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
+    # docker kill -s USR1 telegram_bot_container
+    try:
+        import faulthandler as _fh, signal as _sig
+        _fh.register(_sig.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
     await DatabaseManager.init_db()
     try:
         await DatabaseManager.reset_stuck_orders()
@@ -1034,6 +1377,13 @@ async def main_loop():
     
     main_app.bot_data['bot_id'] = 1
     main_app.bot_data['owner_id'] = 0
+    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
+    try:
+        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
+            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
+    except Exception as e:
+        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
+        main_app.bot_data['maintenance_mode'] = False
     
     register_handlers(main_app)
     await main_app.initialize()
@@ -1054,6 +1404,13 @@ async def main_loop():
     
     bot_manager.active_bots[1] = main_app
     logger.info(f"🚀 Main Bot Started. (version {BOT_VERSION})")
+    try:
+        import subprocess as _sp
+        _commit = _sp.check_output(['git', 'rev-parse', '--short', 'HEAD'],
+                                   stderr=_sp.DEVNULL, timeout=5).decode().strip()
+        logger.info("🔖 running commit: %s", _commit)
+    except Exception:
+        pass
     
     # راه‌اندازی ربات‌های نمایندگی
     await bot_manager.start_all_active_bots()
@@ -1071,9 +1428,82 @@ async def main_loop():
             interval=3600, first=180,
         )
 
-    # زنده نگه داشتن برنامه
+    # ── graceful shutdown ──
+    # داکر برای restart/stop اول SIGTERM می‌فرستد و بعد از مهلت (stop_grace_period)
+    # با SIGKILL می‌کشد. بدون این هندلر، پروسس وسط تماس‌های فعال کشته می‌شد و
+    # سشن‌های تلگرام روی سرور نیمه‌باز می‌ماند؛ کانتینر تازه با همان سشن‌ها وصل
+    # می‌شد و AUTH_KEY_DUPLICATED می‌گرفت که اکانت‌ها را برای همیشه می‌سوزاند.
     stop_event = asyncio.Event()
+    try:
+        _loop = asyncio.get_running_loop()
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                _loop.add_signal_handler(_sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+    except Exception:
+        pass
     await stop_event.wait()
+
+    logger.info("🛑 Shutdown signal received — stopping gracefully...")
+    # ۱) اول جلوی آپدیت‌های جدید تلگرام را بگیر (اصلی + نماینده‌ها).
+    try:
+        if main_app.updater.running:
+            await main_app.updater.stop()
+    except Exception:
+        pass
+    for _bid in [b for b in list(bot_manager.active_bots.keys()) if b != 1]:
+        try:
+            await bot_manager.stop_bot(_bid)
+        except Exception:
+            pass
+    # ۲) زمان‌بندهای سفارش را فریز کن تا وسط خاموش شدن join جدید نسازند.
+    try:
+        for _oid, _info in list(order_executor.active_orders.items()):
+            try:
+                _info["cancel_requested"] = True
+                _t = _info.get("task")
+                if _t and not _t.done():
+                    _t.cancel()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # ۳) قطع سریع همهٔ کلاینت‌های ویس (بدون leave مودبانهٔ کند — خود
+    # disconnect تمیز، سشن را روی سرور تلگرام آزاد می‌کند و جلوی
+    # AUTH_KEY_DUPLICATED در استارت بعدی را می‌گیرد).
+    try:
+        from services.voice_call_manager import voice_call_manager as _vcm
+        _n = await asyncio.wait_for(_vcm.shutdown_all(timeout=60.0), timeout=70.0)
+        logger.info(f"🛑 Voice shutdown: {_n} clients disconnected.")
+    except Exception as e:
+        logger.warning(f"🛑 Voice shutdown incomplete: {e}")
+    # ۴) توقف اپ اصلی (باعث flush شدن persistence هم می‌شود).
+    try:
+        if main_app.updater.running:
+            await main_app.updater.stop()
+        try:
+            await main_app.updater.shutdown()
+        except Exception:
+            pass
+        if main_app.running:
+            await main_app.stop()
+            await main_app.shutdown()
+    except Exception as e:
+        logger.warning(f"🛑 Main app stop: {e}")
+    # ۵) جاروی نهایی تسک‌های سرگردان.
+    try:
+        _pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+        for _t in _pending:
+            try:
+                _t.cancel()
+            except Exception:
+                pass
+        if _pending:
+            await asyncio.wait(_pending, timeout=5)
+    except Exception:
+        pass
+    logger.info("🛑 Shutdown complete.")
 
 if __name__ == "__main__":
     # Build the event loop explicitly. Prefer an EXPLICIT uvloop loop (fast
