@@ -279,6 +279,44 @@ class DeadButtonTests(unittest.TestCase):
         self.assertIn("^back_to_reseller_(menu|list)$", main)
 
 
+class SettlementAndTenancyTests(unittest.TestCase):
+    """عدالت در تسویه و ایمن‌سازیِ چندمستأجری (v2.2.5)."""
+
+    def test_pending_order_without_start_refunds_fully(self):
+        """سفارشی که هنوز اجرا نشده نباید برای زمانِ انتظار در صف
+        شارژ شود (created_at نباید مبنای محاسبهٔ مصرف باشد)."""
+        src = _read("services/order_executor.py")
+        self.assertIn('status == "pending" and not started_at', src)
+        self.assertIn('status == "scheduled":\n\t\t\treturn 0.0, total_price, 0.0', src)
+
+    def test_orders_history_accepts_bot_id(self):
+        db = _read("database.py")
+        self.assertIn("async def get_orders_history(user_id=None, limit=20, offset=0, bot_id=None):", db)
+        self.assertIn("if bot_id is not None: q = q.filter(Order.bot_id == bot_id)", db)
+
+    def test_callers_pass_bot_id(self):
+        admin = _read("handlers/admin_handlers.py")
+        orders = _read("handlers/order_handlers.py")
+        self.assertIn("get_orders_history(uid, limit=100, bot_id=bot_id)", admin)
+        self.assertIn("get_orders_history(uid, limit=actual_limit, offset=offset, bot_id=bot_id)", admin)
+        self.assertIn("get_orders_history(user['id'], limit=limit, offset=offset, bot_id=bot_id)", orders)
+
+
+class DeadMenuConstantTests(unittest.TestCase):
+    """ثابت‌های منوی بلااستفادهٔ کشف‌شده در ممیزی باید حذف باقی بمانند."""
+
+    def test_removed_dead_menus(self):
+        constants = _read("constants.py")
+        for name in ("SECURITY_SETTINGS_MENU", "ADMIN_SETTINGS_MENU",
+                     "USER_MANAGEMENT_MENU", "ORDER_MENU"):
+            self.assertNotIn("%s = [" % name, constants, "منوی بلااستفادهٔ %s دوباره اضافه شده" % name)
+
+    def test_security_menu_is_inline(self):
+        admin = _read("handlers/admin_handlers.py")
+        self.assertIn("sec_toggle_force_join", admin)
+        self.assertIn('^sec_toggle_|^back_to_settings$', _read("main.py"))
+
+
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
         self.assertIn('BOT_VERSION = "2.2.5"', _read("constants.py"))

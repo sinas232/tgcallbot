@@ -1436,6 +1436,11 @@ class OrderExecutor:
 		started_at = order.get("started_at")
 		if status == "scheduled":
 			return 0.0, total_price, 0.0
+		# 🐛 فیکسِ عدالت: سفارشِ «در صف» (pending) که هنوز اجرا نشده نباید
+		# برای زمانِ انتظار در صف شارژ شود ⇒ عودت کامل. اگر واقعاً
+		# شروع شده باشد، started_at دارد و همان مسیرِ تناسبیِ دقیق اعمال می‌شود.
+		if status == "pending" and not started_at:
+			return 0.0, total_price, 0.0
 		if duration_minutes <= 0:
 			target = int(order.get("target_count") or 0)
 			progress = int(order.get("progress") or 0)

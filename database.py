@@ -739,10 +739,18 @@ class DatabaseManager:
             return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
-    async def get_orders_history(user_id=None, limit=20, offset=0):
+    async def get_orders_history(user_id=None, limit=20, offset=0, bot_id=None):
+        """
+        تاریخچهٔ سفارش‌های کاربر.
+
+        `bot_id` اختیاری است: وقتی داده شود، فقط سفارش‌های همان ربات برگردانده
+        می‌شوند (ایمن‌سازیِ چندمستأجری: عدم اشتراک داده بین نمایندگی‌ها).
+        سازگاری با فراخوانی‌های قبلی حفظ شده است.
+        """
         async with AsyncSessionLocal() as db_session:
             q = select(Order).order_by(desc(Order.created_at)).limit(limit).offset(offset)
             if user_id: q = q.filter(Order.user_id == user_id)
+            if bot_id is not None: q = q.filter(Order.bot_id == bot_id)
             res = await db_session.execute(q)
             return [to_dict(o) for o in res.scalars().all()]
 

@@ -787,14 +787,6 @@ def register_handlers(application: Application) -> None:
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user:
             return
-        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
-        try:
-            _q0 = update.callback_query
-            if _q0 is not None:
-                _u0 = update.effective_user
-                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
-        except Exception:
-            pass
         try:
             # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
             # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await

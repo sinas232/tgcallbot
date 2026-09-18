@@ -782,7 +782,7 @@ async def handle_order_history_callback(update: Update, context: ContextTypes.DE
             offset = (page - 1) * limit
         except: pass
 
-    orders = await DatabaseManager.get_orders_history(user['id'], limit=limit, offset=offset)
+    orders = await DatabaseManager.get_orders_history(user['id'], limit=limit, offset=offset, bot_id=bot_id)
     
     if not orders:
         await query.edit_message_text("📭 هیچ سفارشی یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_history_menu")]]))

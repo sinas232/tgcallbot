@@ -1195,7 +1195,7 @@ async def admin_user_actions_handler(update, context):
         return await show_ticket_list(update, context, filter_status='all', user_id=uid)
 
     if data == "admin_stop_user_orders":
-        orders = await DatabaseManager.get_orders_history(uid, limit=100)
+        orders = await DatabaseManager.get_orders_history(uid, limit=100, bot_id=bot_id)
         # 🐛 فیکس: pending (در صف اجرا) هم باید دیده شود؛ قبلاً اگر کاربر
         # سفارشی در صف داشت، ادمین پیام «هیچ سفارش فعالی ندارد»
         # می‌گرفت و نمی‌توانست لغوش کند.
@@ -1253,7 +1253,7 @@ async def admin_user_actions_handler(update, context):
         limit = 100000 if count_str == "all" else int(count_str)
         actual_limit = 5 if count_str == "all" else limit
         offset = (page - 1) * actual_limit if count_str == "all" else 0
-        orders = await DatabaseManager.get_orders_history(uid, limit=actual_limit, offset=offset)
+        orders = await DatabaseManager.get_orders_history(uid, limit=actual_limit, offset=offset, bot_id=bot_id)
         if not orders:
             await query.edit_message_text("لیست خالی است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_profile")]]))
             return AWAITING_SETTINGS_ACTION
