@@ -787,12 +787,40 @@ class DatabaseManager:
 
     @staticmethod
     async def cancel_order_once(order_id: int) -> bool:
-        """Atomically claim a running/scheduled order for cancellation."""
+        """Atomically claim an open order (pending/running/scheduled) for cancellation.
+
+        🐞 فیکس: «pending» قبلاً در این ادعا نبود؛ در نتیجه سفارشی که هنوز به
+        executor تحویل داده نشده بود (گیرکرده در صف) نه توسط کاربر و نه از
+        مسیرهای اتمیکِ لغو قابل بستن بود — برای همیشه «فعال» می‌ماند و در
+        لیست‌های ادمین/آمار به‌صورت سفارشِ زombie دیده می‌شد.
+        """
+        return await DatabaseManager.finalize_order_status(order_id, 'stopped')
+
+    # وضعیت‌هایی که یک سفارش را «باز/قابل‌لغو» می‌دانیم.
+    OPEN_ORDER_STATUSES = ('pending', 'running', 'scheduled')
+
+    @staticmethod
+    async def finalize_order_status(
+        order_id: int,
+        new_status: str = 'stopped',
+        allowed_statuses=('pending', 'running', 'scheduled'),
+    ) -> bool:
+        """انتقال اتمیکِ وضعیت، فقط اگر سفارش هنوز در یکی از وضعیت‌های مجاز باشد.
+
+        این «ادعا» (claim) ستون فقرات لغوِ ایمن است: هر مسیر لغو (کاربر،
+        پنل ادمین، تسویهٔ زمان‌بندی‌شده) اول سفارش را ادعا می‌کند و فقط در صورت
+        موفقیت وارد مرحلهٔ مالی می‌شود. در نتیجه:
+          • هیچ عودتِ دوبار‌ای رخ نمی‌دهد،
+          • سفارشِ «completed/stopped/failed» هرگز دوباره باز نمی‌شود،
+          • سفارش‌های لغوشده واقعاً از لیست فعال/زمان‌بندی خارج می‌شوند
+            (قبلاً لغوِ سفارش زمان‌بندی‌شده وضعیتش را عوض نمی‌کرد و جاب
+             زمان‌بندی همان سفارش را بعداً اجرا می‌کرد!).
+        """
         async with AsyncSessionLocal() as db_session:
             result = await db_session.execute(
                 update(Order)
-                .where(Order.id == order_id, Order.status.in_(['running', 'scheduled']))
-                .values(status='stopped')
+                .where(Order.id == order_id, Order.status.in_(list(allowed_statuses)))
+                .values(status=new_status)
             )
             await db_session.commit()
             return bool(result.rowcount)
@@ -818,19 +846,33 @@ class DatabaseManager:
         the required accounts are present and the paid duration begins.
         """
         async with AsyncSessionLocal() as db_session:
+            # 🔒 انتقال محافظت‌شده: اگر سفارش در فاصلهٔ ثبت تا تحویل
+            # لغو شده باشد (stopped)، دیگر به running برنمی‌گردد تا
+            # سفارش لغوشده زنده نشود.
             await db_session.execute(
                 update(Order)
-                .where(Order.id == order_id)
+                .where(Order.id == order_id, Order.status.in_(['pending', 'scheduled']))
                 .values(status='running')
             )
             await db_session.commit()
 
     @staticmethod
-    async def complete_order(order_id: int):
+    async def complete_order(order_id: int) -> bool:
+        """تکمیل سفارش — فقط اگر همچنان باز است.
+
+        🔒 اگر سفارش در لحظات آخر لغو شده باشد، وضعیت stopped حفظ
+        می‌شود تا کاربر همزمان هم عودت بگیرد و هم پیام «تکمیل»
+        دریافت نکند (پرش از روی لغو ممنوع).
+        """
         async with AsyncSessionLocal() as db_session:
             now = datetime.utcnow()
-            await db_session.execute(update(Order).where(Order.id == order_id).values(status='completed', completed_at=now))
+            res = await db_session.execute(
+                update(Order)
+                .where(Order.id == order_id, Order.status.in_(['pending', 'running', 'scheduled']))
+                .values(status='completed', completed_at=now)
+            )
             await db_session.commit()
+            return bool(res.rowcount)
 
     @staticmethod
     async def get_due_scheduled_orders():
@@ -1215,17 +1257,56 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             # شمارنده، سفارش جدید در آمار کلاً غایب بود.
             pending = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'pending', Order.bot_id == bot_id))).scalar() or 0
             completed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'completed', Order.bot_id == bot_id))).scalar() or 0
-            # سفارش‌های ثبت‌شدهٔ امروز (به وقت UTC — مبنای created_at دیتابیس)
-            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            stopped = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'stopped', Order.bot_id == bot_id))).scalar() or 0
+            failed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'failed', Order.bot_id == bot_id))).scalar() or 0
+            # 🐞 فیکس «امروزِ اشتباه»: created_at در دیتابیس UTC است؛ مرزِ روز
+            # باید به وقت ایران (تهران، UTC+3:30) باشد وگرنه از ساعت ۰۰:۰۰
+            # تهران تا ۰۳:۳۰ بامداد، سفارش‌های امروز به‌اشتباه متعلق به دیروز
+            # دیده می‌شدند و آمارِ روزانه غلط بود.
+            tehran_now = datetime.utcnow() + timedelta(hours=3, minutes=30)
+            tehran_midnight = tehran_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_start = tehran_midnight - timedelta(hours=3, minutes=30)
             today = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id, Order.created_at >= today_start))).scalar() or 0
-            return {'total': total, 'running': running, 'scheduled': scheduled, 'pending': pending, 'completed': completed, 'today': today}
+            return {
+                'total': total, 'running': running, 'scheduled': scheduled,
+                'pending': pending, 'completed': completed, 'today': today,
+                'stopped': stopped, 'failed': failed,
+            }
 
     @staticmethod
     async def reset_stuck_orders():
+        """بستن سفارش‌هایی که با ری‌استارت ربات نیمه‌کاره مانده‌اند.
+
+        🐞 فیکس عدالت مالی: قبلاً فقط وضعیت عوض می‌شد و پولِ استفاده‌نشده‌ی
+        کاربر سوخت می‌شد. حالا فهرست سفارش‌های در حال اجرا «قبل از» بستن
+        خوانده و برگردانده می‌شود تا main.py بتواند ماندهٔ مبلغ را به کیف پول
+        کاربر عودت دهد (تسویهٔ ثانیه‌ای همانند لغو دستی).
+        """
         async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                select(Order).where(Order.status == 'running')
+            )
+            stuck = [to_dict(o) for o in res.scalars().all()]
             await db_session.execute(update(Order).where(Order.status == 'running').values(status='stopped'))
             await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.status == 'joined').values(status='reset'))
             await db_session.commit()
+            return stuck
+
+    @staticmethod
+    async def get_stale_pending_orders(minutes: int = 10):
+        """سفارش‌های «در صف» (pending) که از عمرشان بیش از `minutes` گذشته است.
+
+        یک سفارش آنی در حالت عادی باید ظرف چند ثانیه توسط executor تحویل
+        گرفته شود؛ اگر pending بماند یعنی تحویل شکست خورده (خطا/ری‌استارت).
+        این‌ها باید بسته و کاملاً عودت داده شوند تا نه پول کاربر بلوکه شود و
+        نه ظرفیت سرور در محاسبات Capacity Guard برای همیشه اشغال بماند.
+        """
+        async with AsyncSessionLocal() as db_session:
+            cutoff = datetime.utcnow() - timedelta(minutes=max(1, int(minutes)))
+            res = await db_session.execute(
+                select(Order).where(Order.status == 'pending', Order.created_at <= cutoff)
+            )
+            return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
     async def get_gateway(slug: str, bot_id=1):

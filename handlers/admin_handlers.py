@@ -245,7 +245,9 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     pending_orders = order_stats.get('pending', 0)
     completed_orders = order_stats.get('completed', 0)
     today_orders = order_stats.get('today', 0)
-    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز: `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`")
+    stopped_orders = order_stats.get('stopped', 0)
+    failed_orders = order_stats.get('failed', 0)
+    txt = (f"📉 **آمار کلی ربات:**\n\n👥 تعداد کل کاربران: `{users_count}`\n\n🤖 **اکانت‌ها:**\n   • کل: `{acc_stats['total']}`\n   • فعال: `{acc_stats['active']}`\n   • محدود: `{acc_stats['limited']}`\n\n📦 **سفارشات:**\n   • کل: `{total_orders}`\n   • 📥 امروز (به وقت تهران): `{today_orders}`\n   • 🟢 در حال اجرا: `{running_orders}`\n   • ⏳ در صف اجرا: `{pending_orders}`\n   • 📅 زمان‌بندی شده: `{scheduled_orders}`\n   • ✅ تکمیل‌شده: `{completed_orders}`\n   • 🛑 متوقف‌شده (لغو): `{stopped_orders}`\n   • ❌ ناموفق: `{failed_orders}`")
     # حذف پیام «در حال جمع‌آوری» باید ضدخطا باشد؛ اگر شکست بخورد، آمار
     # نباید از دست برود (باگ قبلی: خطای delete → هیچ آماری نمایش داده نمی‌شد)
     if msg:
@@ -792,15 +794,22 @@ async def stop_order_execute(update, context):
         await update.message.reply_text("❌ یافت نشد.")
         return AWAITING_STOP_ORDER_INDEX
         
-    if order['status'] == 'scheduled':
-        # سفارش زمان‌بندی‌شده هنوز شروع نشده → عودت کامل بدون محاسبهٔ ثانیه‌ای
-        await order_executor.settle_and_refund_order(
+    if order.get('status') in ('scheduled', 'pending'):
+        # سفارش شروع‌نشده (زمان‌بندی‌شده یا گیرکرده در صف) → عودت کامل بدون
+        # محاسبهٔ ثانیه‌ای. قبلاً فقط scheduled این‌طور بود و سفارش
+        # pending سراغ تسویهٔ ثانیه‌ای می‌رفت که برای سفارشی که هنوز اجرا
+        # نشده غلط است (پول زمانی که در صف بوده از کاربر کسر می‌شد).
+        _res = await order_executor.settle_and_refund_order(
             oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
             canceled_by_name=update.effective_user.first_name,
-            cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
+            cancellation_reason="لغو سفارش زمان‌بندی‌شده/در صف توسط ادمین",
             bot_id=context.bot_data.get('bot_id', 1),
         )
-        msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        if not _res.get('claimed', True):
+            msg = (f"ℹ️ سفارش #{oid} از قبل بسته شده بود "
+                   f"(وضعیت: {_res.get('status') or 'نامشخص'}) و عودتی انجام نشد.")
+        else:
+            msg = "✅ سفارش زمان‌بندی شده/در صف لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
         await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
@@ -931,6 +940,13 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
         cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
         bot_id=bot_id,
     )
+
+    if not result.get('claimed', True):
+        await query.edit_message_text(
+            f"ℹ️ سفارش #{oid} از قبل بسته شده بود "
+            f"(وضعیت: {result.get('status') or 'نامشخص'}) — عودتی انجام نشد."
+        )
+        return
 
     if do_refund:
         txt = (
@@ -1162,7 +1178,10 @@ async def admin_user_actions_handler(update, context):
 
     if data == "admin_stop_user_orders":
         orders = await DatabaseManager.get_orders_history(uid, limit=100)
-        active_orders = [o for o in orders if o['status'] in ['running', 'scheduled']]
+        # 🐛 فیکس: pending (در صف اجرا) هم باید دیده شود؛ قبلاً اگر کاربر
+        # سفارشی در صف داشت، ادمین پیام «هیچ سفارش فعالی ندارد»
+        # می‌گرفت و نمی‌توانست لغوش کند.
+        active_orders = [o for o in orders if o['status'] in ['running', 'scheduled', 'pending']]
         
         if not active_orders:
             await query.answer("❌ این کاربر هیچ سفارش فعال یا زمان‌بندی شده‌ای ندارد.", show_alert=True)

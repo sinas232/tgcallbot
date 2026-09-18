@@ -594,7 +594,10 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         status = order['status']
 
-        if status not in ['running', 'scheduled']:
+        # 🐛 فیکس: سفارش pending (در صف اجرا) هم قابل لغو است؛ قبلاً کاربر
+        # برای سفارشی که ثبت شده ولی هنوز تحویل executor نشده بود
+        # پیام «امکان لغو وجود ندارد» می‌گرفت.
+        if status not in ['running', 'scheduled', 'pending']:
             await query.edit_message_text("ℹ️ این سفارش دیگر فعال نیست و امکان لغو آن وجود ندارد.")
             return ConversationHandler.END
 
@@ -603,12 +606,17 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         spent_amount = 0.0
 
         # سفارش هنوز شروع نشده (رزرو شده) → بازگشت کامل
-        if status == 'scheduled':
+        if status in ('scheduled', 'pending'):
+            # رزرو شده یا هنوز در صف: هیچ مصرفی نداشته است
             if not await DatabaseManager.cancel_order_once(order_id):
                 await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")
                 return ConversationHandler.END
             refund_amount = total_price
-            msg_prefix = "✅ سفارش زمان‌بندی شده با موفقیت لغو شد."
+            msg_prefix = (
+                "✅ سفارش رزرو‌شده با موفقیت لغو شد."
+                if status == 'scheduled'
+                else "✅ سفارش در صف با موفقیت لغو شد و مبلغ کاملاً عودت داده شد."
+            )
             # گزارش لغو در انتهای تابع (به‌همراه جزئیات مالی) یک‌بار ارسال می‌شود.
         else:
             # سفارش در حال اجرا → تسویه از «تنها مرجع محاسبه» تا هیچ‌وقت با

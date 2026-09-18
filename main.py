@@ -516,13 +516,45 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Auto backup job error: {e}")
 
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    """اجرای سفارش‌های زمان‌بندی‌شدهٔ سررسید.
+
+    🛠 آگاه به «حالت تعمیرات»: در زمان بروزرسانی/تعمیرات
+    هیچ سفارش جدیدی استارت نمی‌خورد (قبلاً درمیانٔ آپدیت
+    اجرا می‌شدند و نیمه‌کاره می‌ماندند). بعد از خاموش
+    شدن تعمیرات، سفارش‌ها در نوبت اجرا می‌شوند — با سقف
+    تعداد در هر دوره تا یک‌باره ده‌ها سفارش روی هم
+    ریخته نشود (همان سناریوی «همهٔ سفارشات لغو شدن»).
+    """
     try:
+        try:
+            if context.bot_data.get('maintenance_mode'):
+                return
+        except Exception:
+            pass
         due_orders = await DatabaseManager.get_due_scheduled_orders()
         if not due_orders: return
+        max_per_cycle = 3
+        started = 0
         for order in due_orders:
+            if started >= max_per_cycle:
+                logger.info(
+                    "scheduled orders: %s order(s) postponed to the next cycle (throttle)",
+                    len(due_orders) - started,
+                )
+                break
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            oid = order['id']
+            try:
+                # برعکس قبل: اول submit (که خودش وضعیت را running می‌کند) و
+                # در صورت خطا سفارش دست‌نخورده باقی می‌ماند تا
+                # در دورهٔ بعد دوباره تلاش شود (قبلاً وضعیت را
+                # اول running می‌کردند و با خطا سفارش برای همیشه running
+                # می‌ماند).
+                await order_executor.submit_order(oid, order)
+            except Exception as exc:
+                logger.error("Order %s: failed to launch scheduled order: %s", oid, exc)
+                continue
+            started += 1
             try:
                 app = bot_manager.active_bots.get(bot_id)
                 if app:
@@ -530,11 +562,78 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
                     if user and user.get('telegram_id'):
                         await app.bot.send_message(
                             user['telegram_id'],
-                            f"⏰ **سفارش زمان‌بندی شده شما شروع شد!**\n🆔 کد سفارش: `{order['id']}`\n🚀 نوع: {order['order_type']}"
+                            f"⏰ **سفارش زمان‌بندی شده شما شروع شد!**\n🆔 کد سفارش: `{oid}`\n🚀 نوع: {order['order_type']}"
                         )
-            except: pass
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Scheduled orders check error: {e}")
+
+# سفارش‌هایی که با ری‌استارتِ ربات نیمه‌کاره مانده‌اند (برای عودت خودکار)
+_STARTUP_INTERRUPTED_ORDERS: list = []
+
+
+async def startup_recovery_job(context: ContextTypes.DEFAULT_TYPE):
+    """بازیابی مالیِ سفارش‌های نیمه‌کاره پس از ری‌استارت.
+
+    🐞 فیکس: ری‌استارت همهٔ سفارش‌های running را stopped می‌کرد و پولِ
+    استفاده‌نشده می‌سوخت؛ همچنین سفارش‌های pendingِ شکست‌خورده برای همیشه در
+    صف می‌ماندند (اشغالِ ظرفیت در Capacity Guard + بلوکه شدن پول کاربر).
+    اینجا هر دو دسته با همان مرجع محاسبه تسویه و عودت می‌شوند و کاربر هم
+    (در صورت در دسترس بودن ربات) مطلع می‌گردد.
+    """
+    for order in list(_STARTUP_INTERRUPTED_ORDERS):
+        try:
+            res = await order_executor.refund_interrupted_order(order)
+        except Exception:
+            logger.exception("startup recovery failed for order %s", (order or {}).get('id'))
+            continue
+        try:
+            _notify_user_of_refund(context, order, res, full=False)
+        except Exception:
+            pass
+    _STARTUP_INTERRUPTED_ORDERS.clear()
+    # سفارش‌های در صف (pending) که عمرشان از حد گذشته: بستن + عودت کامل
+    try:
+        stale = await DatabaseManager.get_stale_pending_orders(minutes=10)
+    except Exception:
+        logger.exception("stale pending sweep failed")
+        stale = []
+    for order in stale or []:
+        try:
+            res = await order_executor.refund_interrupted_order(order, full=True)
+        except Exception:
+            logger.exception("stale pending recovery failed for order %s", order.get('id'))
+            continue
+        try:
+            await _notify_user_of_refund(context, order, res, full=True)
+        except Exception:
+            pass
+
+
+async def _notify_user_of_refund(context, order, res, full=False):
+    """اطلاع‌رسانیِ (best-effort) عودتِ خودکار به کاربر."""
+    user = (res or {}).get('user')
+    if not user or not user.get('telegram_id'):
+        return
+    app = bot_manager.active_bots.get(order.get('bot_id', 1))
+    if not app:
+        return
+    from utils.helpers import format_price
+    amount = float((res or {}).get('refund_amount') or 0)
+    head = ("♻️ سفارش شما که در صف اجرا مانده بود لغو شد" if full
+            else "♻️ سفارش شما به‌دلیل ری‌استارت/اختلال متوقف شد")
+    txt = (
+        f"{head}\n"
+        f"🆔 کد سفارش: `{order.get('id')}`\n"
+        f"💵 مبلغ عودت‌شده به کیف پول شما: {format_price(amount)} تومان\n"
+        "🙏 بابت اختلال پیش‌آمده پوزش می‌طلبیم."
+    )
+    try:
+        await app.bot.send_message(user['telegram_id'], txt)
+    except Exception:
+        pass
+
 
 async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
     """بررسی سفارشات منقضی شده"""
@@ -753,6 +852,9 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
     application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+    # 🛠 همهٔ دستورات (/help، /stop_order، ...) هم در حالت تعمیرات
+    # مسدودند؛ قبلاً فقط /start بسته بود.
+    application.add_handler(MessageHandler(filters.COMMAND, _maintenance_guard), group=-1)
 
 
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
@@ -873,6 +975,18 @@ def register_handlers(application: Application) -> None:
     # کالبک‌های ادمین (KYC)
     application.add_handler(CallbackQueryHandler(kyc_admin_callback, pattern="^admin_kyc_"))
 
+    # 🧩 «دکمه‌های بی‌عمل» (مثل شمارهٔ صفحه): هیچ کاری نمی‌کنند ولی باید پاسخ
+    # بگیرند؛ وگرنه تلگرام تا ۶۰ ثانیه آیکون لودینگ نشان می‌دهد و کاربر فکر
+    # می‌کند ربات هنگ کرده (یکی از مصادیق «دکمه‌ها کار نمی‌کنند»).
+    async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"), group=-1)
+
     # تابع بازگشت عمومی
     async def global_cancel_and_restart(update: Update, context):
         clear_conversations(update)
@@ -987,7 +1101,7 @@ def register_handlers(application: Application) -> None:
             MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start),
             # دکمه‌های شیشه‌ای کهنهٔ پنل (بعد از /start یا ری‌استارت) هم باید
             # وارد مکالمه شوند؛ وگرنه هیچ handlerای آن‌ها را نمی‌گیرد.
-            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_|^back_to_reseller_(menu|list)$"),
             CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
             CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
             CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
@@ -1010,7 +1124,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SETTINGS_ACTION: [
                 # نمایندگی
                 MessageHandler(filters.Regex("^🤖 مدیریت نمایندگی‌ها$"), reseller_management_menu),
-                CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+                CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_|^back_to_reseller_(menu|list)$"),
                 MessageHandler(filters.Regex("^➕ افزودن نماینده جدید$"), add_reseller_start),
                 MessageHandler(filters.Regex("^📋 لیست نمایندگان$"), list_resellers_handler),
 
@@ -1079,6 +1193,9 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                # ☠️ لیست اکانت‌های دلیت‌شده: «حذف همه» و «بازگشت» قبلاً ثبت
+                # نشده بودند → دکمه‌ها هیچ واکنشی نشان نمی‌دادند.
+                CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
@@ -1329,7 +1446,13 @@ async def main_loop():
         pass
     await DatabaseManager.init_db()
     try:
-        await DatabaseManager.reset_stuck_orders()
+        # 🐞 فیکس عدالت مالی: لیست سفارش‌های در حال اجرا قبل از بستن گرفته
+        # می‌شود تا بعد از بالا آمدن ربات، ماندهٔ مبلغ به کاربران عودت گردد
+        # (قبلاً با هر ری‌استارت، پولِ استفاده‌نشده‌ی مشتری سوخت می‌شد).
+        _stuck = await DatabaseManager.reset_stuck_orders() or []
+        _STARTUP_INTERRUPTED_ORDERS.extend(_stuck)
+        if _stuck:
+            logger.warning("startup recovery: %s interrupted order(s) queued for refund", len(_stuck))
         from telegram_client import TelegramAccountClient
         await TelegramAccountClient.preload_all_clients()
     except: pass
@@ -1421,6 +1544,8 @@ async def main_loop():
     if main_app.job_queue:
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
+        # بازیابی مالیِ سفارش‌های نیمه‌کاره (اندکی بعد از بالا آمدن ربات‌ها)
+        main_app.job_queue.run_once(startup_recovery_job, when=20)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)

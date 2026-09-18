@@ -484,8 +484,12 @@ async def reporting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"   • محدود شده: <code>{astats['limited']}</code>\n\n"
         "📦 <b>سفارشات:</b>\n"
         f"   • کل سفارشات: <code>{ostats['total']}</code>\n"
-        f"   • امروز: <code>{ostats.get('today', 0)}</code>\n"
-        f"   • در حال اجرا: <code>{ostats['running']}</code>\n"
-        f"   • در صف اجرا: <code>{ostats.get('pending', 0)}</code>"
+        f"   • امروز (به وقت تهران): <code>{ostats.get('today', 0)}</code>\n"
+        f"   • 🟢 در حال اجرا: <code>{ostats['running']}</code>\n"
+        f"   • ⏳ در صف اجرا: <code>{ostats.get('pending', 0)}</code>\n"
+        f"   • 📅 زمان‌بندی شده: <code>{ostats.get('scheduled', 0)}</code>\n"
+        f"   • ✅ تکمیل شده: <code>{ostats.get('completed', 0)}</code>\n"
+        f"   • 🛑 متوقف/لغو شده: <code>{ostats.get('stopped', 0)}</code>\n"
+        f"   • ❌ ناموفق: <code>{ostats.get('failed', 0)}</code>"
     )
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
