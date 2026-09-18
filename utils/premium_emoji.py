@@ -821,6 +821,7 @@ class PremiumEmojiState:
         }
 
         self._parse_env_overrides()
+        self.seed_menu_aliases()
 
     # ────────────────────────── تنظیمات ──────────────────────────
     def _parse_env_overrides(self) -> None:
@@ -1364,6 +1365,28 @@ class PremiumEmojiState:
         return new_btn
 
     # ────────────────────────── alias دکمه‌های reply ──────────────────────────
+    def seed_menu_aliases(self, labels=()) -> None:
+        """Old reply keyboards survive bot restarts and feature toggles.
+
+        Seed canonical static menus without relying on sending a new keyboard.
+        Inline callback_data is never changed by label restoration.
+        """
+        import constants
+
+        def visit(value):
+            if isinstance(value, str):
+                emoji, stripped = self._leading_emoji(value)
+                if emoji and stripped:
+                    self.register_label_alias(stripped, value)
+            elif isinstance(value, (tuple, list, set)):
+                for item in value:
+                    visit(item)
+
+        for name, value in vars(constants).items():
+            if name.startswith("BTN_") or name.endswith(("_MENU", "_KB")):
+                visit(value)
+        visit(labels)
+
     def register_label_alias(self, stripped: str, original: str) -> None:
         if not stripped or stripped == original:
             return
@@ -1375,7 +1398,7 @@ class PremiumEmojiState:
 
     def restore_button_label(self, text: Optional[str]) -> Optional[str]:
         """متنِ دریافتی از دکمهٔ reply (بدون ایموجی) → متنِ اصلیِ با ایموجی."""
-        if not text or not self.enabled or not self.reply_buttons_enabled:
+        if not text:
             return text
         original = self.label_aliases.get(text)
         if original and original != text:
@@ -1385,7 +1408,7 @@ class PremiumEmojiState:
 
     def restore_update_labels(self, update: Any) -> bool:
         """بازگرداندن برچسبِ دکمه‌های reply روی یک Update (قبل از dispatch)."""
-        if update is None or not self.enabled or not self.reply_buttons_enabled:
+        if update is None:
             return False
         changed = False
         for attr in ("message", "edited_message", "channel_post", "edited_channel_post"):

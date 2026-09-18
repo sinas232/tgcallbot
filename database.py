@@ -9,6 +9,8 @@ database.py
 """
 import logging
 import json
+import uuid
+import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
@@ -158,6 +160,15 @@ class Transaction(Base):
     amount = Column(Float, nullable=False)
     type = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderSettlement(Base):
+    """Durable receipt/idempotency key; created by init_db's create_all."""
+    __tablename__ = "order_settlements"
+    order_id = Column(Integer, primary_key=True, autoincrement=False)
+    bot_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    receipt = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class VoiceCallSession(Base):
@@ -630,7 +641,12 @@ class DatabaseManager:
     @staticmethod
     async def update_user_credit(internal_user_id: int, amount: float, type: str, desc: str, bot_id=1):
         async with AsyncSessionLocal() as db_session:
-            user = await db_session.get(User, internal_user_id)
+            # Serialize all wallet writers (payments/admin/refunds) to avoid
+            # lost updates when two transactions read the same old balance.
+            user = (await db_session.execute(
+                select(User).where(User.id == internal_user_id, User.bot_id == bot_id)
+                .with_for_update()
+            )).scalar_one_or_none()
             if not user: return False, 0
             user.credit += amount
             trans = Transaction(bot_id=bot_id, user_id=internal_user_id, amount=amount, type=type, description=desc)
@@ -794,6 +810,63 @@ class DatabaseManager:
             await db_session.commit()
 
     @staticmethod
+    async def settle_order_atomic(order_id, calculator, *, bot_id=1,
+                                  expected_user_id=None, do_refund=True):
+        """Lock order then wallet; commit status, credit, ledger and receipt together.
+
+        calculator is synchronous: no Telegram/network I/O while holding locks.
+        A retry returns the stored receipt, never another credit. Any exception
+        (including commit failure) rolls back the ENTIRE operation.
+        """
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                order = (await session.execute(
+                    select(Order).where(Order.id == order_id, Order.bot_id == bot_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if not order or (expected_user_id is not None and order.user_id != expected_user_id):
+                    raise PermissionError("Order does not belong to this user/bot")
+                previous = await session.get(OrderSettlement, order_id)
+                if previous:
+                    return dict(json.loads(previous.receipt), claimed=False, already_settled=True)
+                if order.status not in DatabaseManager.OPEN_ORDER_STATUSES:
+                    return {"claimed": False, "already_settled": False, "status": order.status}
+                user = (await session.execute(
+                    select(User).where(User.id == order.user_id, User.bot_id == bot_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if not user:
+                    raise ValueError("Order wallet not found")
+                snapshot = to_dict(order)
+                total = float(order.price_paid or 0)
+                used, refund, elapsed = calculator(snapshot)
+                if not do_refund:
+                    used, refund = total, 0.0
+                if (not all(math.isfinite(v) for v in (total, used, refund, elapsed))
+                        or min(total, used, refund, elapsed) < 0
+                        or not math.isclose(used + refund, total, abs_tol=0.000001)):
+                    raise ValueError("Invalid order settlement")
+                tx_id = f"TX-{uuid.uuid4().hex.upper()}" if refund > 0 else None
+                user.credit = float(user.credit or 0) + refund
+                if refund > 0:
+                    session.add(Transaction(
+                        bot_id=bot_id, user_id=user.id, amount=refund, type="order_refund",
+                        description=f"عودت لغو سفارش {order_id} | {tx_id}",
+                    ))
+                order.status = "stopped"
+                order.completed_at = datetime.utcnow()
+                receipt = {
+                    "total_cost": total, "used_cost": used, "refund_amount": refund,
+                    "refund_tx_id": tx_id, "user_wallet_balance": user.credit,
+                    "elapsed_seconds": elapsed,
+                }
+                session.add(OrderSettlement(
+                    order_id=order_id, bot_id=bot_id, user_id=user.id,
+                    receipt=json.dumps(receipt, ensure_ascii=False),
+                ))
+            return dict(receipt, claimed=True, already_settled=False)
+
+    @staticmethod
     async def cancel_order_once(order_id: int) -> bool:
         """Atomically claim an open order (pending/running/scheduled) for cancellation.
 
@@ -857,12 +930,13 @@ class DatabaseManager:
             # 🔒 انتقال محافظت‌شده: اگر سفارش در فاصلهٔ ثبت تا تحویل
             # لغو شده باشد (stopped)، دیگر به running برنمی‌گردد تا
             # سفارش لغوشده زنده نشود.
-            await db_session.execute(
+            result = await db_session.execute(
                 update(Order)
                 .where(Order.id == order_id, Order.status.in_(['pending', 'scheduled']))
                 .values(status='running')
             )
             await db_session.commit()
+            return bool(result.rowcount)
 
     @staticmethod
     async def complete_order(order_id: int) -> bool:
@@ -1441,7 +1515,7 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
     @staticmethod
     async def delete_reseller(bot_id):
         async with AsyncSessionLocal() as db_session:
-            tables = [User, Plan, TelegramAccount, Order, Transaction, VoiceCallSession, PaymentGateway, PaymentTransaction, BotSetting]
+            tables = [User, Plan, TelegramAccount, Order, Transaction, OrderSettlement, VoiceCallSession, PaymentGateway, PaymentTransaction, BotSetting]
             for table in tables:
                 if hasattr(table, 'bot_id'):
                     await db_session.execute(delete(table).where(table.bot_id == bot_id))

@@ -60,9 +60,9 @@ class MaintenanceGuardTests(unittest.TestCase):
         block = self._guard_block()
         self.assertIn("CallbackQueryHandler(_maintenance_guard)", block)
 
-    def test_guard_registered_in_minus_one_group(self):
+    def test_guard_registered_in_own_group(self):
         seg = self._guard_block()
-        self.assertGreaterEqual(seg.count("group=-1"), 1)
+        self.assertGreaterEqual(seg.count("group=-3"), 1)
 
     def test_guard_stops_propagation(self):
         self.assertIn("raise ApplicationHandlerStop", self._guard_block())
@@ -121,20 +121,16 @@ class OrderLifecycleTests(unittest.TestCase):
         body = db[start:start + 700]
         self.assertIn("finalize_order_status(order_id, 'stopped')", body)
 
-    def test_settle_claims_order_before_refunding(self):
-        """🐞 مهم‌ترین باگ: تسویه بدون ادعا → عودتِ تکراری + اجرای دوباره."""
+    def test_settle_claims_order_and_refunds_in_same_transaction(self):
         ex = _read("services/order_executor.py")
         start = ex.index("async def settle_and_refund_order(")
-        body = ex[start:start + 4200]
-        self.assertIn("finalize_order_status", body)
-        self.assertIn('"claimed": False', body)
-        self.assertIn('"claimed": True', body)
-        # ادعا باید «قبل از» اولین عملیات مالی (update_user_credit) باشد
-        self.assertLess(
-            body.index("finalize_order_status"),
-            body.index("update_user_credit"),
-            "ادعای سفارش باید پیش از هر عودتی انجام شود",
-        )
+        body = ex[start:ex.index("# نگاشت", start)]
+        self.assertIn("settle_order_atomic", body)
+        self.assertNotIn("update_user_credit", body)
+        db = _read("database.py")
+        body = db[db.index("async def settle_order_atomic("):db.index("async def cancel_order_once(")]
+        for invariant in ("session.begin()", "with_for_update()", "OrderSettlement(", "Transaction("):
+            self.assertIn(invariant, body)
 
     def test_stop_active_order_always_closes_db_status(self):
         """🐞 باگ: فقط وقتی VCM کالی پیدا می‌کرد وضعیت بسته می‌شد."""
@@ -165,8 +161,8 @@ class OrderLifecycleTests(unittest.TestCase):
 
     def test_user_cancel_allows_pending(self):
         orders = _read("handlers/order_handlers.py")
-        self.assertIn("if status not in ['running', 'scheduled', 'pending']:", orders)
-        self.assertIn("if status in ('scheduled', 'pending'):", orders)
+        self.assertIn("order_executor.settle_and_refund_order(", orders)
+        self.assertIn("('pending', 'running', 'scheduled')", _read("database.py"))
 
     def test_admin_flow_treats_pending_like_scheduled_full_refund(self):
         admin = _read("handlers/admin_handlers.py")
@@ -319,7 +315,7 @@ class DeadMenuConstantTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
-        self.assertIn('BOT_VERSION = "2.2.6"', _read("constants.py"))
+        self.assertIn('BOT_VERSION = "2.2.7"', _read("constants.py"))
 
     def test_changelog_has_224_section(self):
         self.assertIn("۲.۲.۴", _read("CHANGELOG.md"))

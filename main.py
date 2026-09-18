@@ -689,7 +689,7 @@ def register_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    # 🛡 ضداسپم — اولین هندلر group=-4 (قبل از همه، حتی نگهبان تعمیرات).
     #
     # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
     # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
@@ -751,10 +751,10 @@ def register_handlers(application: Application) -> None:
     _spam_guard._hits = _spam_hits
     _spam_guard._muted = _spam_muted_until
     _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
-    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-4)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
+    # 🛠 نگهبان «حالت تعمیرات» — group=-3 (بعد از ضداسپم، قبل از همهٔ بقیه).
     #
     # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
     # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
@@ -840,19 +840,25 @@ def register_handlers(application: Application) -> None:
 
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
-        group=-1,
+        group=-3,
     )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+    application.add_handler(CommandHandler("start", _maintenance_guard), group=-3)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-3)
     # 🛠 همهٔ دستورات (/help، /stop_order، ...) هم در حالت تعمیرات
     # مسدودند؛ قبلاً فقط /start بسته بود.
-    application.add_handler(MessageHandler(filters.COMMAND, _maintenance_guard), group=-1)
+    application.add_handler(MessageHandler(filters.COMMAND, _maintenance_guard), group=-3)
 
 
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
+    # PTB executes only ONE matching handler per group. Keep guards and
+    # cancellation separate, and stop propagation after a terminal callback.
+    async def _cancel_order_dispatch(update, context):
+        await cancel_order_callback(update, context)
+        raise ApplicationHandlerStop
+
     application.add_handler(
-        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
-        group=-1,
+        CallbackQueryHandler(_cancel_order_dispatch, pattern=r"^cancel_order_\d+$"),
+        group=-2,
     )
 
     # ─────────────────────────────────────────────────────────────
@@ -884,6 +890,10 @@ def register_handlers(application: Application) -> None:
     _WALLET_SUBMENU_EXACT = {"💳 شارژ حساب", "📈 تراکنش‌های اخیر"}
     _SUPPORT_SUBMENU_EXACT = {"➕ ثبت تیکت جدید", "📂 تیکت‌های من"}
     _BUY_CATEGORY_EXACT = {"🎙 ویس‌کال", "👥 عضویت گروه", "📢 عضویت کانال"}
+    from utils.premium_emoji import premium_emoji
+    premium_emoji.seed_menu_aliases(
+        _TOPLEVEL_EXACT | _WALLET_SUBMENU_EXACT | _SUPPORT_SUBMENU_EXACT
+    )
     _ADMIN_SUBMENU_RE = (
         r"^(🤖 مدیریت نمایندگی‌ها|➕ افزودن نماینده جدید|📋 لیست نمایندگان"
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"

@@ -191,10 +191,18 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # drops unknown ones — including the "-1" VALUE of -stream_loop. The result
 # was instant EOF ("Reached end of the file") + an endless StreamEnded loop.
 # A huge positive loop count behaves as infinite without a negative value.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop 1000000"
+# Decoder -threads alone does NOT cap the filter pool (defaults to CPU count).
+# Bound input decoder, filter pool and output encoder independently. Keep the
+# exact audio format, continuous loop, mute and recovery behaviour unchanged.
+_SILENCE_FFMPEG_LOOP_PARAMS = (
+    "--audio ---start -threads 1 -filter_threads 1 -stream_loop 1000000 "
+    "---end -threads 1"
+)
 
 # Same single-thread cap for the non-looping fallback (short file, plays once).
-_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
+_SILENCE_FFMPEG_THREADS_PARAMS = (
+    "--audio ---start -threads 1 -filter_threads 1 ---end -threads 1"
+)
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -2330,6 +2338,9 @@ class VoiceCallManager:
         # Always cap ffmpeg at a single decode thread (CPU). When looping is on
         # we also add ``-stream_loop -1``; otherwise fall back to the
         # threads-only input options so the non-loop path is still bounded.
+        if getattr(Config, "VOICE_FFMPEG_COMMAND_CACHE", True):
+            from services.ffmpeg_cache import install_silence_command_cache
+            install_silence_command_cache(SILENT_AUDIO_PATH)
         loop_flag = (
             _SILENCE_FFMPEG_LOOP_PARAMS
             if getattr(Config, "VOICE_SILENCE_LOOP", True)

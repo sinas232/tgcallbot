@@ -143,13 +143,19 @@ class SilenceStreamCommandTests(unittest.TestCase):
         # The single-dash fake flag must be gone.
         self.assertNotIn(" -audio ", f" {joined} ")
         self.assertIn("-stream_loop", cmd)
-        self.assertIn("-1", cmd)
+        self.assertIn("1000000", cmd)
         # -stream_loop is an INPUT option: it must appear before -i.
         self.assertLess(cmd.index("-stream_loop"), cmd.index("-i"), joined)
         # The loop count sits right next to the flag.
-        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "-1", joined)
+        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "1000000", joined)
         # Output format is the ntgcalls wire format.
         self.assertIn("s16le", joined)
+        self.assertEqual(cmd[cmd.index("-filter_threads") + 1], "1")
+        caps = [i for i, token in enumerate(cmd) if token == "-threads"]
+        self.assertEqual(len(caps), 2)
+        self.assertLess(caps[0], cmd.index("-i"))
+        self.assertGreater(caps[1], cmd.index("-i"))
+        self.assertTrue(all(cmd[i + 1] == "1" for i in caps))
 
     def test_old_flag_regression_shape(self):
         # Documents the old bug: "-audio ..." is treated as a literal ffmpeg
@@ -159,13 +165,17 @@ class SilenceStreamCommandTests(unittest.TestCase):
 
     def test_silence_file_format(self):
         path = os.path.join(_TMP, "silence_check.wav")
-        vcm_mod.SILENT_AUDIO_PATH = path
-        vcm_mod._ensure_silence_file()
+        original_path = vcm_mod.SILENT_AUDIO_PATH
+        try:
+            vcm_mod.SILENT_AUDIO_PATH = path
+            vcm_mod._ensure_silence_file()
+        finally:
+            vcm_mod.SILENT_AUDIO_PATH = original_path
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), vcm_mod._SILENCE_RATE)
+            self.assertEqual(r.getnchannels(), vcm_mod._SILENCE_CHANNELS)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(r.getnframes(), vcm_mod._SILENCE_FRAMES)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).
@@ -473,7 +483,7 @@ class EngineLifecycleTests(unittest.TestCase):
             self.mgr.clients[1] = engine
             got = await self.mgr._get_or_create_client(901, 1, "fake-session")
             self.assertIsNot(got, engine)
-            self.assertEqual(engine.stopped, 1)
+            self.assertEqual(engine.stopped, 0, "PyTgCalls 2.3.3 has no stop()")
             self.assertEqual(got.started, 1)
             # stream-end + chat-update handlers attached on the fresh engine
             self.assertEqual(len(got.handlers), 2)

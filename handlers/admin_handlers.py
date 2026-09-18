@@ -96,13 +96,13 @@ async def stop_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         order_id = int(args[0])
         order = await DatabaseManager.get_order(order_id)
-        if not order or (order.get('status') or '').lower() not in ('running', 'scheduled'):
+        if not order or order.get('bot_id', 1) != context.bot_data.get('bot_id', 1) or (order.get('status') or '').lower() not in ('running', 'scheduled', 'pending'):
             await update.message.reply_text(f"❌ سفارش {order_id} فعال نیست (یافت نشد یا قبلاً بسته شده).")
             return
         # مثل مسیر منوی ادمین: اول پیش‌نمایش تسویه، بعد انتخاب نوع لغو.
         # (توقف مستقیم بدون تسویه باعث به‌هم‌ریختن حساب کاربر می‌شد.)
         total_price = float(order.get('price_paid') or 0)
-        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+        used_cost, refund_amount, _elapsed = order_executor.preview_order_settlement(order)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)", callback_data=f"admincancel_refund_{order_id}")],
             [InlineKeyboardButton("🚫 لغو بدون عودت وجه", callback_data=f"admincancel_norefund_{order_id}")],
@@ -765,6 +765,7 @@ async def admin_orders_list_handler(update, context):
 
 async def admin_orders_back_callback(update, context): return await admin_orders_menu(update, context)
 
+@require_admin
 async def admin_stop_order_start(update, context):
     bot_id = context.bot_data.get('bot_id', 1)
     orders = await DatabaseManager.get_all_orders_extended(50, 0, status_filter='active', bot_id=bot_id)
@@ -786,6 +787,7 @@ async def admin_stop_order_start(update, context):
     await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_STOP_ORDER_INDEX
 
+@require_admin
 async def stop_order_execute(update, context):
     text = clean_number(update.message.text)
     
@@ -832,7 +834,7 @@ async def stop_order_execute(update, context):
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
         total_price = float(order.get('price_paid') or 0)
-        used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+        used_cost, refund_amount, _elapsed = order_executor.preview_order_settlement(order)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
@@ -865,6 +867,7 @@ async def stop_order_execute(update, context):
     return AWAITING_SETTINGS_ACTION
 
 
+@require_admin
 async def admin_cancel_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🛑 انتخاب لغو یک سفارش مستقیماً از لیست/پروفایل ادمین (admincancel_pick_<id>).
 
@@ -908,7 +911,7 @@ async def admin_cancel_pick_callback(update: Update, context: ContextTypes.DEFAU
 
     # running / pending → پیش‌نمایش تسویهٔ ثانیه‌ای + دو گزینهٔ لغو
     total_price = float(order.get('price_paid') or 0)
-    used_cost, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
+    used_cost, refund_amount, _elapsed = order_executor.preview_order_settlement(order)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"💵 لغو با عودت وجه ({format_price(refund_amount)} ت)",
@@ -930,6 +933,7 @@ async def admin_cancel_pick_callback(update: Update, context: ContextTypes.DEFAU
     return AWAITING_SETTINGS_ACTION
 
 
+@require_admin
 async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """هندلر دکمه‌های لغو سفارش توسط ادمین: با عودت / بدون عودت / انصراف."""
     query = update.callback_query
@@ -947,7 +951,7 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
         return
 
     order = await DatabaseManager.get_order(oid)
-    if not order:
+    if not order or order.get('bot_id', 1) != bot_id:
         await query.edit_message_text("❌ سفارش یافت نشد یا قبلاً بسته شده است.")
         return
 
@@ -1312,6 +1316,7 @@ async def admin_user_actions_handler(update, context):
         await show_user_profile(update, context, user)
     return AWAITING_SETTINGS_ACTION
 
+@require_admin
 async def set_user_credit(update, context):
     try:
         text_input = clean_number(update.message.text)
@@ -1326,7 +1331,7 @@ async def set_user_credit(update, context):
         if not user:
             await update.message.reply_text("❌ کاربر یافت نشد.")
             return AWAITING_SETTINGS_ACTION
-        success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین")
+        success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین", bot_id=context.bot_data.get('bot_id', 1))
         if success:
             action_str = "افزایش" if sign > 0 else "کاهش"
             admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{int(new_balance):,}` تومان")

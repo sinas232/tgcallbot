@@ -145,10 +145,15 @@ class OrderExecutor:
 			"swapped_accounts": 0,
 		}
 		try:
-			await DatabaseManager.mark_order_as_running(order_id)
+			claimed = await DatabaseManager.mark_order_as_running(order_id)
+			if not claimed:
+				self.active_orders.pop(order_id, None)
+				return
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
+		if not self._is_order_active(order_id):
+			return  # cancelled while the database claim was in flight
 		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
 		self.active_orders[order_id]["task"] = task
 
@@ -1426,8 +1431,7 @@ class OrderExecutor:
 		تابع استفاده کنند تا «پیش‌نمایش» و «اجرا» هیچ‌وقت با هم اختلاف نداشته باشند:
 		- scheduled → هنوز مصرفی نشده: عودت کامل.
 		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
-		- مدتی → ثانیه‌ای دقیق؛ اگر started_at خالی است (گیرکرده در فاز build)
-		  مبنا created_at است تا عودت کاملِ اشتباه رخ ندهد.
+		- مدتی → ثانیه‌ای از started_at؛ انتظار و build قابل‌صورتحساب نیستند.
 		"""
 		order = order or {}
 		total_price = float(order.get("price_paid") or 0)
@@ -1442,15 +1446,13 @@ class OrderExecutor:
 		if status == "pending" and not started_at:
 			return 0.0, total_price, 0.0
 		if duration_minutes <= 0:
-			target = int(order.get("target_count") or 0)
+			target = int(order.get("target_count") or order.get("accounts_count") or 0)
 			progress = int(order.get("progress") or 0)
 			if target > 0 and progress > 0:
 				used = min(float(math.ceil(total_price * progress / target)), total_price)
 			else:
 				used = 0.0
 			return used, max(0.0, total_price - used), 0.0
-		if not started_at:
-			started_at = order.get("created_at")
 		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
 
 	@staticmethod
@@ -1481,9 +1483,20 @@ class OrderExecutor:
 		refund = max(0.0, total_price - used)
 		return used, refund, elapsed_seconds
 
+	def preview_order_settlement(self, order):
+		"""Use the same live volume progress in admin preview and locked settlement."""
+		snapshot = dict(order or {})
+		if int(snapshot.get("duration_minutes") or 0) <= 0:
+			order_id = snapshot.get("id")
+			info = self.active_orders.get(order_id) or {}
+			if info:
+				snapshot["progress"] = self._live_count(
+					order_id, snapshot.get("order_type"), info.get("joined_accounts") or [])
+		return self.compute_order_settlement(snapshot)
+
 	async def settle_and_refund_order(
 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
-		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1, expected_user_id=None,
 	):
 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
 
@@ -1494,50 +1507,19 @@ class OrderExecutor:
 		        user_wallet_balance برای نمایش به تماس‌گیرنده.
 		"""
 		order = await DatabaseManager.get_order(order_id) or {}
-		# 🔒 ادعای اتمیکی سفارش قبل از هر عملیات مالی.
-		# اگر سفارش از قبل بسته شده باشد (تکمیل/لغو/خطا) هیچ
-		# عودتی انجام نمی‌شود تا عودت دوباره‌ای رخ ندهد. این
-		# ادعا همچنین تضمین می‌کند لغوِ سفارش
-		# زمان‌بندی‌شده واقعاً آن را از صف اجرا خارج کند.
-		pre_status = (order.get("status") or "").lower()
-		claimed = False
-		try:
-			claimed = await DatabaseManager.finalize_order_status(
-				order_id, "stopped", ("pending", "running", "scheduled")
-			)
-		except Exception as exc:
-			logger.warning(f"Order {order_id}: claim for settlement failed ({exc})")
-		if not claimed:
-			logger.warning(
-				"Order %s: settle skipped — already closed (status=%s)", order_id, pre_status
-			)
-			return {
-				"claimed": False,
-				"status": pre_status,
-				"total_cost": float(order.get("price_paid") or 0),
-				"used_cost": 0.0,
-				"refund_amount": 0.0,
-				"refund_tx_id": None,
-				"user_wallet_balance": None,
-			}
-		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
-		total_price = float(order.get("price_paid") or 0)
-		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
-		if not do_refund:
-			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
-			used_cost = total_price
-			refund_amount = 0.0
 
-		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-		new_balance = None
-		if do_refund and refund_amount > 0 and user:
-			ok, new_balance = await DatabaseManager.update_user_credit(
-				user["id"], refund_amount, "order_refund",
-				f"عودت لغو سفارش {order_id} | {refund_tx_id}", bot_id=bot_id,
-			)
-		if new_balance is None and user:
-			fresh = await DatabaseManager.get_user_by_id(user["id"])
-			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+		result = await DatabaseManager.settle_order_atomic(
+			order_id, self.preview_order_settlement, bot_id=bot_id, do_refund=do_refund,
+			expected_user_id=expected_user_id,
+		)
+		if not result.get("claimed") and not result.get("already_settled"):
+			return result
+		user = None
+		total_price = result["total_cost"]
+		used_cost = result["used_cost"]
+		refund_amount = result["refund_amount"]
+		refund_tx_id = result["refund_tx_id"]
+		new_balance = result["user_wallet_balance"]
 
 		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
 		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
@@ -1547,6 +1529,14 @@ class OrderExecutor:
 			                             suppress_cancel_log=True)
 		except Exception as exc:
 			logger.warning(f"Order {order_id}: stop during settlement failed: {exc}")
+
+		if not result.get("claimed"):
+			return result  # retried cleanup, but never duplicate the financial log
+
+		try:
+			user = await DatabaseManager.get_user_by_id(order.get("user_id"))
+		except Exception:
+			logger.warning("Order %s: receipt committed; user lookup failed", order_id)
 
 		if not canceled_by_name:
 			canceled_by_name = self._user_display(user)[0] if user else "—"
@@ -1561,6 +1551,7 @@ class OrderExecutor:
 					"cancellation_reason": cancellation_reason,
 					"total_cost": total_price,
 					"used_cost": used_cost,
+					"elapsed_seconds": result["elapsed_seconds"],
 					"refund_amount": refund_amount,
 					"user_wallet_balance": new_balance,
 					"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else "—",
@@ -1569,14 +1560,7 @@ class OrderExecutor:
 		except Exception:
 			pass
 
-		return {
-			"claimed": True,
-			"total_cost": total_price,
-			"used_cost": used_cost,
-			"refund_amount": refund_amount,
-			"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else None,
-			"user_wallet_balance": new_balance,
-		}
+		return result
 
 	# نگاشت نوع سرویس به فارسی برای گزارش‌ها ({order_type_fa})
 	_ORDER_TYPE_FA = {
@@ -1671,6 +1655,8 @@ class OrderExecutor:
 			real_seconds = max(0, (ended_at - started_at).total_seconds()) if (started_at and ended_at) else 0
 		except Exception:
 			real_seconds = 0
+		if kind == "cancelled" and "elapsed_seconds" in extra:
+			real_seconds = extra["elapsed_seconds"]
 		actual_duration_formatted = self._fmt_duration_fa(real_seconds)
 
 		# ── گزارش لغو سفارش و تسویه مالی ──

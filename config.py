@@ -221,6 +221,7 @@ class Config:
     # ffmpeg (-stream_loop -1) at play time, so the media transport can never
     # die of EOF and an order of ANY length stays inside the call.
     VOICE_SILENCE_SECONDS = int(os.getenv('VOICE_SILENCE_SECONDS', '30'))
+    VOICE_FFMPEG_COMMAND_CACHE = os.getenv("VOICE_FFMPEG_COMMAND_CACHE", "true").lower() == "true"
     VOICE_SILENCE_LOOP = os.getenv('VOICE_SILENCE_LOOP', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # ── Stay-alive audio format (CPU) ────────────────────────────────────
     # The silence stream is fed to ntgcalls as AudioParameters(bitrate=<rate>,

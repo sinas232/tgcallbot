@@ -608,146 +608,61 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
 
 
 async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    لغو سفارش توسط کاربر از طریق دکمه شیشه‌ای
-    - برای سفارش زمان‌بندی شده: لغو کامل + بازگشت تمام مبلغ
-    - برای سفارش در حال اجرا: محاسبه مصرف بر اساس ثانیه و عودت مانده
-    """
+    """Cancel a paid order, returning a durable receipt even after a retry."""
     query = update.callback_query
-    await safe_answer(query)
-
-    data = query.data or ""
-    _eu = update.effective_user
-    logger.info("cancel pressed: data=%s user=%s", data, _eu.id if _eu else None)
+    # A stale callback ACK must never delay the financial operation by 35s.
     try:
-        # فرمت: cancel_order_<id>
-        order_id = int(data.split("_")[2])
-    except Exception:
-        return ConversationHandler.END
-
-    bot_id = context.bot_data.get('bot_id', 1)
-    tg_user_id = update.effective_user.id
-
-    try:
-        user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)
-        if not user:
-            await query.edit_message_text("❌ حساب شما در سیستم یافت نشد.")
-            return ConversationHandler.END
-
-        order = await DatabaseManager.get_order(order_id)
-        if not order or order.get('bot_id', 1) != bot_id or order['user_id'] != user['id']:
-            await query.edit_message_text("❌ این سفارش برای شما یا این ربات نیست.")
-            return ConversationHandler.END
-
-        status = order['status']
-
-        # 🐛 فیکس: سفارش pending (در صف اجرا) هم قابل لغو است؛ قبلاً کاربر
-        # برای سفارشی که ثبت شده ولی هنوز تحویل executor نشده بود
-        # پیام «امکان لغو وجود ندارد» می‌گرفت.
-        if status not in ['running', 'scheduled', 'pending']:
-            await query.edit_message_text("ℹ️ این سفارش دیگر فعال نیست و امکان لغو آن وجود ندارد.")
-            return ConversationHandler.END
-
-        total_price = float(order.get('price_paid') or 0)
-        refund_amount = 0.0
-        spent_amount = 0.0
-
-        # سفارش هنوز شروع نشده (رزرو شده) → بازگشت کامل
-        if status in ('scheduled', 'pending'):
-            # رزرو شده یا هنوز در صف: هیچ مصرفی نداشته است
-            if not await DatabaseManager.cancel_order_once(order_id):
-                await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")
-                return ConversationHandler.END
-            refund_amount = total_price
-            msg_prefix = (
-                "✅ سفارش رزرو‌شده با موفقیت لغو شد."
-                if status == 'scheduled'
-                else "✅ سفارش در صف با موفقیت لغو شد و مبلغ کاملاً عودت داده شد."
-            )
-            # گزارش لغو در انتهای تابع (به‌همراه جزئیات مالی) یک‌بار ارسال می‌شود.
-        else:
-            # سفارش در حال اجرا → تسویه از «تنها مرجع محاسبه» تا هیچ‌وقت با
-            # مسیر ادمین اختلاف نداشته باشد (ثانیه‌ای دقیق / حجمی از روی پیشرفت).
-            spent_amount, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
-
-            if not await DatabaseManager.cancel_order_once(order_id):
-                await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")
-                return ConversationHandler.END
-
-            # توقف سفارش و خروج سریع اکانت‌ها / قطع ویس‌کال
-            await order_executor.stop_active_order(
-                order_id,
-                is_expired=False,
-                reason="User cancelled order via inline button",
-                # گزارش کاملِ لغو را پایین‌تر همین هندلر می‌فرستد؛ جلوی گزارش
-                # «cancelled» تکراری/ناقصِ order_executor را بگیر.
-                suppress_cancel_log=True,
-            )
-            msg_prefix = "✅ سفارش فعال با موفقیت لغو شد."
-
-        # شناسهٔ یکتای تراکنش عودت (refund_tx_id) — برای درج در دیتابیس و گزارش
-        refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-
-        # عودت وجه به کیف پول کاربر (تراکنش اتمیک: اعتبار + رکورد تراکنش در یک commit)
-        new_balance = None
-        if refund_amount > 0:
-            ok, new_balance = await DatabaseManager.update_user_credit(
-                user['id'],
-                refund_amount,
-                "order_refund",
-                f"عودت لغو سفارش {order_id} | {refund_tx_id}",
-                bot_id=bot_id
-            )
-
-        # موجودی فعلی کیف پول برای نمایش (اگر عودتی نبود، از رکورد کاربر بخوان)
-        if new_balance is None:
-            fresh_user = await DatabaseManager.get_user_by_id(user['id'])
-            new_balance = (fresh_user or {}).get('credit', user.get('credit', 0))
-
-        spent_amount = max(0.0, total_price - refund_amount)
-
-        txt = (
-            f"{msg_prefix}\n\n"
-            f"💰 مبلغ کل پلن: {format_price(total_price)} تومان\n"
-            f"⏱ مبلغ مصرف‌شده تا لحظه لغو: {format_price(spent_amount)} تومان\n"
-            f"💵 مبلغ عودت داده شده به کیف پول: {format_price(refund_amount)} تومان\n"
-            f"🧾 کد پیگیری عودت: {refund_tx_id}\n"
-            f"👛 موجودی فعلی کیف‌پول: {format_price(new_balance)} تومان"
-        )
-
-        await query.edit_message_text(txt)
-    except Exception:
-        logger.exception("cancel_order failed: order_id=%s", order_id)
-        try:
-            await query.edit_message_text("❌ خطای غیرمنتظره هنگام لغو سفارش. لطفاً دوباره تلاش کنید.")
-        except Exception:
-            pass
-        return ConversationHandler.END
-
-    # گزارش شکیل لغو + تسویهٔ مالی به کانال لاگ (نقش لغوکننده = کاربر)
-    try:
-        cancel_name, _ = order_executor._user_display(user)
-        await order_executor._log_to_channel(
-            "cancelled",
-            order_id,
-            order,
-            user=user,
-            bot_id=bot_id,
-            reason="لغو دستی توسط کاربر",
-            extra={
-                "canceled_by_role": "کاربر",
-                "canceled_by_name": cancel_name,
-                "cancellation_reason": "لغو دستی توسط کاربر",
-                "total_cost": total_price,
-                "used_cost": spent_amount,
-                "refund_amount": refund_amount,
-                "user_wallet_balance": new_balance,
-                "refund_tx_id": refund_tx_id,
-            },
-        )
+        await asyncio.wait_for(query.answer(), timeout=3)
     except Exception:
         pass
+    match = re.fullmatch(r"cancel_order_(\d+)", query.data or "")
+    if not match:
+        return ConversationHandler.END
+    order_id = int(match.group(1))
+    bot_id = context.bot_data.get('bot_id', 1)
 
+    async def reply(text):
+        try:
+            await query.edit_message_text(text, parse_mode=None, reply_markup=None)
+        except Exception:
+            # Deleted/old/uneditable message: deliver receipt as a new message.
+            await context.bot.send_message(update.effective_user.id, text, parse_mode=None)
+
+    try:
+        user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+        if not user:
+            await reply("❌ حساب شما در سیستم یافت نشد.")
+            return ConversationHandler.END
+        result = await order_executor.settle_and_refund_order(
+            order_id, bot_id=bot_id, expected_user_id=user['id'],
+            canceled_by_role="کاربر", cancellation_reason="لغو دستی توسط کاربر",
+        )
+    except PermissionError:
+        await reply("❌ این سفارش برای شما یا این ربات نیست.")
+        return ConversationHandler.END
+    except Exception:
+        logger.exception("cancel_order failed: order_id=%s", order_id)
+        await reply("❌ لغو و تسویه تأیید نشد. لطفاً دوباره تلاش کنید؛ عودت تکراری انجام نمی‌شود.")
+        return ConversationHandler.END
+
+    if not result.get('claimed') and not result.get('already_settled'):
+        await reply("ℹ️ این سفارش دیگر فعال نیست و امکان لغو آن وجود ندارد.")
+        return ConversationHandler.END
+    prefix = "✅ سفارش لغو و تسویه شد."
+    if result.get('already_settled'):
+        prefix = "ℹ️ این سفارش قبلاً تسویه شده؛ رسید قبلی (بدون عودت مجدد):"
+    elapsed = int(result.get('elapsed_seconds') or 0)
+    text = (
+        f"{prefix}\n\n"
+        f"📦 شماره سفارش: {order_id}\n"
+        f"💰 مبلغ کل پلن: {format_price(result['total_cost'])} تومان\n"
+        f"⏱ زمان قابل محاسبه: {elapsed // 60} دقیقه و {elapsed % 60} ثانیه\n"
+        f"📉 مبلغ مصرف‌شده: {format_price(result['used_cost'])} تومان\n"
+        f"💵 مبلغ عودت داده شده به کیف پول: {format_price(result['refund_amount'])} تومان\n"
+        f"🧾 کد پیگیری عودت: {result['refund_tx_id'] or '—'}\n"
+        f"👛 موجودی کیف پول پس از تسویه: {format_price(result['user_wallet_balance'])} تومان"
+    )
+    await reply(text)
     return ConversationHandler.END
 
 # -------------------- تاریخچه سفارشات --------------------
