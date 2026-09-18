@@ -118,7 +118,7 @@ class Reservation:
 @dataclass
 class CapacityVerdict:
     allowed: bool
-    reason: Optional[str] = None          # None | 'too_big' | 'over_capacity' | 'concurrent'
+    reason: Optional[str] = None          # None | 'over_capacity' | 'concurrent' | 'cpu' | 'memory' | 'load'
     pool_size: int = 0                    # کل اکانت‌های سالم
     effective_pool: int = 0               # ظرفیت مفید بعد از حاشیهٔ ایمن
     safety_buffer_percent: int = 0
@@ -144,6 +144,9 @@ class CapacityVerdict:
     max_memory_percent: float = 0.0
     max_load_per_core: float = 0.0
     peak_accounts_in_window: int = 0       # اوج اکانت‌های همزمان در بازه
+    free_capacity: int = 0                 # تعداد اکانتِ آزاد در اوج بازه
+    concurrent_capacity: int = 0           # اکانت‌هایی که این سفارش همزمان اشغال می‌کند
+    waves: int = 0                         # تعداد موج‌های لازم (پیش‌فرض ۱)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -172,6 +175,9 @@ class CapacityVerdict:
             "max_memory_percent": round(self.max_memory_percent, 1),
             "max_load_per_core": round(self.max_load_per_core, 2),
             "peak_accounts_in_window": self.peak_accounts_in_window,
+            "free_capacity": self.free_capacity,
+            "concurrent_capacity": self.concurrent_capacity,
+            "waves": self.waves,
         }
 
 
@@ -425,9 +431,10 @@ def fits_at(
     """
     end = estimate_end(start, duration_minutes, unknown_duration_min)
     peak, concurrent = peak_in_window(reservations, start, end)
+    # سفارش‌های بزرگ‌تر از پول موج‌بندی می‌شوند؛ پس فقط
+    # وجودِ «اکانتِ آزاد» شرط است (effective_pool - peak > 0).
     ok = (
-        accounts_needed <= effective_pool
-        and (peak + accounts_needed) <= effective_pool
+        (accounts_needed <= 0 or (effective_pool - peak) > 0)
         and (concurrent + 1) <= max(1, max_concurrent_orders)
     )
     if ok and system is not None and system.ok and baseline is not None and limits is not None:
@@ -507,14 +514,24 @@ def check_capacity(
         max_concurrent_orders=max_conc,
     )
 
-    # ۱) درخواست بزرگ‌تر از کل پول سالم → هیچ زمانی جواب نیست
-    if accounts_needed > int(pool_size or 0):
-        verdict.reason = "too_big"
-        return verdict
-
     peak, concurrent = peak_in_window(reservations, start_utc, end_utc)
     verdict.peak_usage = peak
     verdict.peak_concurrent = concurrent
+
+    # ۱) تعداد کل سفارش محدودیت نیست (اصلِ محصولی). اگر درخواست
+    # بیشتر از تعداد اکانت‌های موجود باشد، سفارش به‌صورت
+    # موج‌بندی (wave) اجرا می‌شود: هر موج تا سقفِ اکانت‌های آزاد
+    # وارد می‌شوند، پس خیری کامل شده و موجِ بعدی از پول
+    # جایگزین می‌گردد. پس هیچ‌وقت به خاطر «بزرگی سفارش» رد نمی‌شود؛
+    # معیار فقط این است که در آن زمان اصلاً اکانتِ آزادی وجود داشته باشد.
+    free_now = max(0, eff_pool - peak)
+    verdict.free_capacity = free_now
+    verdict.concurrent_capacity = min(accounts_needed, free_now) if accounts_needed else 0
+    if free_now > 0 and accounts_needed > 0:
+        verdict.waves = max(1, -(-accounts_needed // free_now))  # سقف گرفتن (ceil)
+    else:
+        verdict.waves = 0
+
 
     # ۲-الف) بعد دوم: منابع سخت‌افزاری (CPU / RAM / Load)
     # اگر اسنپشات معتبر باشد، مصرف پیش‌بینی‌شده در «اوج بازه»
@@ -539,9 +556,11 @@ def check_capacity(
         verdict.max_load_per_core = limits.max_load_per_core
 
     # ۲) جا شدن کامل بازه (اوج مصرف + درخواست ≤ ظرفیت مفید) و سقف همزمانی
+    # درخواست‌های بزرگ‌تر از پول موج‌بندی می‌شوند؛ پس شرط
+    # فقط این است که در بازهٔ درخواستی «اکانتِ آزاد» وجود داشته
+    # باشد و سقف همزمانی رعایت شود.
     accounts_ok = (
-        accounts_needed <= eff_pool
-        and (peak + accounts_needed) <= eff_pool
+        (accounts_needed <= 0 or free_now > 0)
         and (concurrent + 1) <= max_conc
     )
     if accounts_ok:
@@ -568,15 +587,16 @@ def check_capacity(
 
     # پیشنهاد: اولین شروعی که «کل مدت» جا می‌شود؛ جست‌وجو از ماکسیممِ
     # (الان، زمان درخواستی کاربر) — پیشنهادِ زودتر از درخواست کاربر (یا
-    # در گذشته) بی‌معناست. اگر خودِ درخواست از ظرفیت مفید بزرگ‌تر باشد،
-    # هیچ پیشنهادی معنا ندارد.
-    if accounts_needed <= eff_pool:
-        search_from = max(now, start_utc)
-        verdict.suggested_start_utc = earliest_fit_start(
-            reservations, accounts_needed, duration_minutes, eff_pool,
-            max_conc, search_from, step_minutes, horizon_minutes, unknown_duration_min,
-            system, baseline, cost, limits, now,
-        )
+    # در گذشته) بی‌معناست.
+    # نکته: سفارش‌های بزرگ‌تر از ظرفیتِ همزمان موج‌بندی می‌شوند، پس برای
+    # آن‌ها هم پیشنهاد دادن کاملاً معنادار است (قبلاً به‌خاطر یک نگهبانِ
+    # قدیمی، برای این سفارش‌ها هیچ پیشنهادی داده نمی‌شد).
+    search_from = max(now, start_utc)
+    verdict.suggested_start_utc = earliest_fit_start(
+        reservations, accounts_needed, duration_minutes, eff_pool,
+        max_conc, search_from, step_minutes, horizon_minutes, unknown_duration_min,
+        system, baseline, cost, limits, now,
+    )
     return verdict
 
 

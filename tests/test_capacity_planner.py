@@ -19,6 +19,11 @@ from datetime import datetime, timedelta
 # محیط تست: بدون DB/تلگرام؛ فقط هستهٔ محاسباتی خالص
 os.environ.setdefault("CAPACITY_GUARD_ENABLED", "true")
 
+from services.system_resources import (
+    ResourceBaseline,
+    ResourceLimits,
+    SystemSnapshot,
+)
 from services.capacity_planner import (  # noqa: E402
     Reservation,
     check_capacity,
@@ -83,7 +88,7 @@ class CheckCapacityTests(unittest.TestCase):
         # پول ۴۰ اکانت با حاشیهٔ ایمن ۱۰٪ → ظرفیت مفید ۳۶
         self.reservations = [R(1, 35, self.base, 90)]  # 12:00 → 13:30 تهران
 
-    def _check(self, start_offset_min, need=10, dur=30, pool=40, buffer_pct=10):
+    def _check(self, start_offset_min, need=10, dur=30, pool=40, buffer_pct=10, system=None):
         return check_capacity(
             reservations=self.reservations,
             pool_size=pool,
@@ -96,24 +101,38 @@ class CheckCapacityTests(unittest.TestCase):
             step_minutes=5,
             horizon_minutes=24 * 60,
             now_utc=self.base - timedelta(minutes=30),
+            system=system,
+            baseline=ResourceBaseline() if system else None,
+            cost=None,
+            limits=ResourceLimits() if system else None,
+        )
+
+    def _busy_server(self):
+        """سروری که به‌خاطر اجرای سفارشِ ۳۵تایی درگیر است (اندازه‌گیری واقعی)."""
+        return SystemSnapshot(
+            ok=True, cpu_percent=92.0, memory_percent=58.0,
+            memory_used_mb=9280.0, memory_total_mb=16000.0,
+            load_per_core=1.1, cpu_cores=8,
         )
 
     def test_busy_at_noon_rejected(self):
-        v = self._check(0)  # درخواست همزمان با سفارش ۳۵تایی
+        """سرور در حال اجرای سفارشِ ۳۵تایی است و منابعش درگیر
+        → با اندازه‌گیریٔ واقعی (۹۲٪ پردازنده) رد می‌شود."""
+        v = self._check(0, system=self._busy_server())
         self.assertFalse(v.allowed)
-        self.assertEqual(v.reason, "over_capacity")
+        self.assertEqual(v.reason, "cpu")
         self.assertEqual(v.peak_usage, 35)
         self.assertIsNotNone(v.busy_until_utc)
 
     def test_ten_minutes_later_still_rejected_full_window(self):
         # ۱۲:۱۰ هم داخل بازهٔ شلوغ است → باید رد شود (نه فقط لحظهٔ شروع)
-        v = self._check(10)
+        v = self._check(10, system=self._busy_server())
         self.assertFalse(v.allowed)
         self.assertEqual(v.busy_until_utc, self.base + timedelta(minutes=90))
 
     def test_suggested_start_is_first_slot_where_whole_order_fits(self):
         # شلوغی تا ۱۳:۳۰ تهران؛ سفارش ۳۰ دقیقه‌ای → اولین شروعِ جادار ۱۳:۳۰
-        v = self._check(10)
+        v = self._check(10, system=self._busy_server())
         self.assertIsNotNone(v.suggested_start_utc)
         self.assertEqual(v.suggested_start_utc, self.base + timedelta(minutes=90))
         # و اگر همان پیشنهاد را بخواهیم، باید کاملاً جا شود:
@@ -125,18 +144,31 @@ class CheckCapacityTests(unittest.TestCase):
         self.assertTrue(v.allowed)
         self.assertIsNone(v.reason)
 
-    def test_too_big_for_whole_pool(self):
+    def test_order_bigger_than_pool_runs_in_waves(self):
+        """تعداد کل سفارش محدودیت نیست: درخواستٔ بزرگ‌تر از پول
+        موج‌بندی می‌شود و نباید رد شود (اصلِ محصولی)."""
         v = self._check(95, need=50, pool=40)
-        self.assertFalse(v.allowed)
-        self.assertEqual(v.reason, "too_big")
-        self.assertIsNone(v.suggested_start_utc)
+        self.assertTrue(v.allowed)
+        self.assertIsNone(v.reason)
+        # پول ۴۰ است، در اوج بازه ۲۰ اکانت اشغال است → ۲۰ آزاد
+        self.assertEqual(v.free_capacity, 36)      # ۳۶ = پولِ مفید (40 - 10٪) منهای اوج رزرو (0)
+        self.assertEqual(v.concurrent_capacity, 36)
+        self.assertEqual(v.waves, 2)   # ceil(50 / 36)
 
-    def test_over_effective_pool_but_under_raw(self):
-        # ۴۱ > ظرفیت مفید ۳۶ ولی ≤ پول ۴۰ → رد با دلیل over_capacity و بدون پیشنهاد
-        v = self._check(95, need=38, pool=40, buffer_pct=10)
+    def test_no_free_account_in_window_is_rejected(self):
+        """تنها حالتی که از نظر اکانت رد می‌شود: هیچ اکانتِ آزادی در بازه نیست."""
+        # پول ۱۰؛ رزروِ موجود ۱۰ اکانت را در بازهٔ درخواستی کاملاً اشغال کرده
+        v = self._check(10, need=5, pool=10, buffer_pct=0)
         self.assertFalse(v.allowed)
         self.assertEqual(v.reason, "over_capacity")
-        self.assertIsNone(v.suggested_start_utc)
+
+
+    def test_over_effective_pool_but_under_raw_runs_in_waves(self):
+        # ۳۸ > ظرفیت مفید ۳۶ ولی با موج‌بندی اجرا می‌شود → دیگر رد نمی‌شود
+        v = self._check(95, need=38, pool=40, buffer_pct=10)
+        self.assertTrue(v.allowed)
+        self.assertIsNone(v.reason)
+        self.assertEqual(v.waves, 2)   # ceil(38 / 36)
 
     def test_concurrent_cap_blocks_third_order(self):
         base = datetime(2026, 9, 18, 9, 0)
@@ -167,7 +199,8 @@ class CheckCapacityTests(unittest.TestCase):
 class EarliestFitTests(unittest.TestCase):
     def test_skips_overlapping_block_entirely(self):
         base = datetime(2026, 9, 18, 8, 30)
-        reservations = [R(1, 30, base + timedelta(minutes=15), 60)]
+        # بلوک کلِ ظرفیت (۳۶ از ۳۶) را اشغال کرده است → هیچ اکانتِ آزادی نیست
+        reservations = [R(1, 36, base + timedelta(minutes=15), 60)]
         got = earliest_fit_start(
             reservations=reservations, accounts_needed=10, duration_minutes=45,
             effective_pool=36, max_concurrent_orders=10,

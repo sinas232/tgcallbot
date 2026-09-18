@@ -60,6 +60,12 @@ def _capacity_preview_line(verdict: dict) -> str:
                     f" · حافظه `{verdict.get('current_memory_percent', 0):.0f}%`"
                     f" → پیش‌بینی در اوج بازه: `{verdict.get('projected_cpu_percent', 0):.0f}% / {verdict.get('projected_memory_percent', 0):.0f}%`\n"
                 )
+            waves = int(verdict.get('waves') or 0)
+            if waves > 1:
+                line += (
+                    f"🔄 این سفارش بزرگ‌تر از ظرفیتِ همزمان است؛ در `{waves}` موج اجرا می‌شود "
+                    f"(هر موج تا `{verdict.get('concurrent_capacity', 0)}` اکانت)\n"
+                )
             return line
         suggested = verdict.get('suggested_start_utc')
         peak = verdict.get('peak_usage', 0)
@@ -129,14 +135,10 @@ def _build_capacity_rejection(verdict: dict) -> tuple:
     suggested = verdict.get('suggested_start_utc')
     reason = verdict.get('reason')
 
-    if reason == 'too_big':
-        txt = (
-            "⛔️ **امکان ثبت این سفارش وجود ندارد.**\n\n"
-            f"درخواست شما `{need}` اکانت است، اما کل ظرفیت سالم سرور `{pool}` اکانت است.\n\n"
-            "💡 لطفاً پلن کوچک‌تری انتخاب کنید یا با پشتیبانی در تماس باشید."
-        )
-        kb = [[InlineKeyboardButton("❌ بستن", callback_data="cancel_order")]]
-        return txt, InlineKeyboardMarkup(kb)
+    # توجه: ردّ به‌دلیل «بزرگی سفارش» (too_big) حذف شد. تعداد کل
+    # سفارش محدودیت ندارد: اکانت‌ها به‌صورت موج‌بندی (wave)
+    # وارد می‌شوند و اگر تعدادِ درخواستی از پول بیشتر باشد،
+    # موج‌های بعدی از همان پول جایگزین می‌شوند.
 
     lines = [
         "⛔️ **ظرفیت سرور برای این بازه تکمیل است — سفارش ثبت نشد.**\n",
