@@ -1253,12 +1253,27 @@ class OrderExecutor:
 			await self._fail_order(order_id, "Stopped.")
 			return True, "Stopped"
 		vcm = _get_voice_call_manager()
+		n = 0
 		if vcm:
 			n = await vcm.stop_all_for_order(order_id, leave_group=True)
-			if n > 0:
-				await DatabaseManager.update_order_status(order_id, "stopped")
-				return True, f"{n} accounts left."
-		return False, "Not found."
+		# 🐛 فیکس حیاتی: وضعیت باید همیشه بسته شود، نه فقط وقتی که VCM کالی پیدا کند.
+		# قبلاً اگر سفارش در حافظه نبود (مثلاً سفارش زمان‌بندی‌شده یا
+		# بعد از ری‌استارت) و کالی هم فعال نبود، هیچ UPDATEای روی دیتابیس
+		# نمی‌خورد → سفارش لغوشده همچنان scheduled/pending/running
+		# می‌ماند؛ یعنی جاب زمان‌بندی همان سفارش عودت‌داده‌شده را بعداً اجرا
+		# می‌کرد و Capacity Guard هم ظرفیتش را برای همیشه اشغال می‌دید.
+		closed = False
+		try:
+			closed = await DatabaseManager.finalize_order_status(
+				order_id, "stopped", ("pending", "running", "scheduled")
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: finalize status failed: {exc}")
+		if n > 0:
+			return True, f"{n} accounts left."
+		if closed:
+			return True, "Closed without active calls."
+		return False, "Not found / already closed."
 
 	async def _eject_all_fast(self, order_id, accounts_list, data):
 		"""Pace mass-exit so N accounts never leave in the same millisecond.
@@ -1325,8 +1340,73 @@ class OrderExecutor:
 			except Exception as exc:
 				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
 		self._voice_forget_order(order_id)
-		await DatabaseManager.update_order_status(order_id, "failed")
+		# انتقال محافظت‌شده: اگر سفارش قبلاً به عنوان stopped/completed
+		# بسته شده (مثلاً لغوی دستی) دیگر به failed برنمی‌گردد.
+		try:
+			await DatabaseManager.finalize_order_status(
+				order_id, "failed", ("pending", "running", "scheduled")
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: failed-status update error: {exc}")
 		self.active_orders.pop(order_id, None)
+
+	async def refund_interrupted_order(self, order: Dict[str, Any], full: bool = False) -> Dict[str, Any]:
+		"""عودت ماندهٔ سفارشی که به‌دلیل ری‌استارت/خطا نیمه‌کاره مانده است.
+
+		🐛 فیکس عدالت مالی: ری‌استارت ربات همهٔ سفارش‌های running را
+		stopped می‌کرد بدون آن‌که ماندهٔ پول کاربر برگردانده شود.
+		اینجا با همان «تنها مرجع محاسبه» (compute_order_settlement)
+		تسویه و عودت انجام می‌شود تا مسیر لغوی دستی و
+		بازیابیِ خودکار هیچوقت اختلاف نداشته باشند.
+		"""
+		order = order or {}
+		order_id = order.get("id")
+		if not order_id:
+			return {}
+		bot_id = order.get("bot_id", 1)
+		total_price = float(order.get("price_paid") or 0)
+		if full:
+			used_cost, refund_amount = 0.0, total_price
+		else:
+			used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
+		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
+		new_balance = None
+		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
+		if refund_amount > 0 and user:
+			_ok, new_balance = await DatabaseManager.update_user_credit(
+				user["id"], refund_amount, "order_refund",
+				f"عودت ماندهٔ سفارش {order_id} (توقف به‌دلیل ری‌استارت/خطا) | {refund_tx_id}",
+				bot_id=bot_id,
+			)
+		if new_balance is None and user:
+			fresh = await DatabaseManager.get_user_by_id(user["id"])
+			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+		try:
+			await self._log_to_channel(
+				"cancelled", order_id, order, user=user, bot_id=bot_id,
+				reason="توقف به‌دلیل ری‌استارت/خطا — عودت خودکار",
+				extra={
+					"canceled_by_role": "سیستم (بازیابی)",
+					"canceled_by_name": "ری‌استارت/خطا",
+					"cancellation_reason": "توقف سفارش به‌دلیل ری‌استارت یا خطای اجرا",
+					"total_cost": total_price,
+					"used_cost": used_cost,
+					"refund_amount": refund_amount,
+					"user_wallet_balance": new_balance,
+					"refund_tx_id": refund_tx_id if refund_amount > 0 else "—",
+				},
+			)
+		except Exception:
+			pass
+		return {
+			"order_id": order_id,
+			"total_cost": total_price,
+			"used_cost": used_cost,
+			"refund_amount": refund_amount,
+			"refund_tx_id": refund_tx_id if refund_amount > 0 else None,
+			"user_wallet_balance": new_balance,
+			"user": user,
+		}
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))
@@ -1355,6 +1435,11 @@ class OrderExecutor:
 		status = (order.get("status") or "").lower()
 		started_at = order.get("started_at")
 		if status == "scheduled":
+			return 0.0, total_price, 0.0
+		# 🐛 فیکسِ عدالت: سفارشِ «در صف» (pending) که هنوز اجرا نشده نباید
+		# برای زمانِ انتظار در صف شارژ شود ⇒ عودت کامل. اگر واقعاً
+		# شروع شده باشد، started_at دارد و همان مسیرِ تناسبیِ دقیق اعمال می‌شود.
+		if status == "pending" and not started_at:
 			return 0.0, total_price, 0.0
 		if duration_minutes <= 0:
 			target = int(order.get("target_count") or 0)
@@ -1409,6 +1494,32 @@ class OrderExecutor:
 		        user_wallet_balance برای نمایش به تماس‌گیرنده.
 		"""
 		order = await DatabaseManager.get_order(order_id) or {}
+		# 🔒 ادعای اتمیکی سفارش قبل از هر عملیات مالی.
+		# اگر سفارش از قبل بسته شده باشد (تکمیل/لغو/خطا) هیچ
+		# عودتی انجام نمی‌شود تا عودت دوباره‌ای رخ ندهد. این
+		# ادعا همچنین تضمین می‌کند لغوِ سفارش
+		# زمان‌بندی‌شده واقعاً آن را از صف اجرا خارج کند.
+		pre_status = (order.get("status") or "").lower()
+		claimed = False
+		try:
+			claimed = await DatabaseManager.finalize_order_status(
+				order_id, "stopped", ("pending", "running", "scheduled")
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: claim for settlement failed ({exc})")
+		if not claimed:
+			logger.warning(
+				"Order %s: settle skipped — already closed (status=%s)", order_id, pre_status
+			)
+			return {
+				"claimed": False,
+				"status": pre_status,
+				"total_cost": float(order.get("price_paid") or 0),
+				"used_cost": 0.0,
+				"refund_amount": 0.0,
+				"refund_tx_id": None,
+				"user_wallet_balance": None,
+			}
 		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
 		total_price = float(order.get("price_paid") or 0)
 		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
@@ -1459,6 +1570,7 @@ class OrderExecutor:
 			pass
 
 		return {
+			"claimed": True,
 			"total_cost": total_price,
 			"used_cost": used_cost,
 			"refund_amount": refund_amount,
