@@ -35,3 +35,23 @@ class StartSettingsPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(START_DEFAULTS['start_brand'], '')
         self.assertEqual((await DB.get_settings(START_DEFAULTS, bot_id=1))['start_brand'], 'Main')
         self.assertEqual(await DB.get_settings({}, bot_id=7), {})
+
+
+    async def test_new_sections_and_reset_persist_only_for_selected_tenant(self):
+        from types import SimpleNamespace
+        from services.start_message import START_FIELDS, render_start_message
+        for key, _ in START_FIELDS.values():
+            await DB.set_setting(key, 'Custom ' + key, bot_id=7)
+        await DB.set_setting('service_voice_chat', 'false', bot_id=7)
+        settings = await DB.get_settings(START_DEFAULTS, bot_id=7)
+        user = SimpleNamespace(id=567, first_name='Sina', last_name=None, username=None)
+        bot = SimpleNamespace(first_name='Demo', username='demo_bot')
+        text = render_start_message(user, {'credit': 100.25}, bot, settings)
+        for key in ('start_intro', 'start_benefits', 'start_guide', 'start_cta', 'start_label_group_join'):
+            self.assertIn('Custom ' + key, text)
+        self.assertNotIn('Custom start_label_voice_chat', text)
+        self.assertIn('100.25', text)
+        self.assertEqual(await DB.get_settings(START_DEFAULTS, bot_id=1), START_DEFAULTS)
+        await DB.set_setting('start_brand', '', bot_id=7)
+        settings = await DB.get_settings(START_DEFAULTS, bot_id=7)
+        self.assertIn('<b>Demo</b>', render_start_message(user, {'credit': 100.25}, bot, settings))

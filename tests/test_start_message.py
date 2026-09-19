@@ -8,6 +8,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
 from services.start_message import (
     DEFAULT_START_TEXT, START_DEFAULTS, START_FIELDS, PREVIEW_START,
     USE_DEFAULT_START, render_start_message, start_values, validate_start_template,
+    PREVIEW_DEFAULT_START, SHOW_START_TEMPLATE, RESET_START_FIELD, BACK_START_EDITOR, START_FIELD_LIMITS,
 )
 from database import DatabaseManager as DB
 from constants import AWAITING_SUPPORT_TEXT, BTN_CANCEL, USER_MAIN_MENU
@@ -100,6 +101,28 @@ class TemplateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_start_template(text)
 
+    def test_all_sections_customizable_without_html_injection(self):
+        settings = {f'start_{key}': f'<b>{key}</b>' for key in ('intro', 'benefits', 'guide', 'cta')}
+        text = self.render(**settings)
+        for key in ('intro', 'benefits', 'guide', 'cta'):
+            self.assertIn(f'&lt;b&gt;{key}&lt;/b&gt;', text)
+
+    def test_custom_service_label_does_not_enable_disabled_service(self):
+        text = self.render('{services}', start_label_voice_chat='<b>Custom voice</b>', service_voice_chat='false')
+        self.assertNotIn('Custom voice', text)
+        text = self.render('{services}', start_label_voice_chat='<b>Custom voice</b>')
+        self.assertIn('&lt;b&gt;Custom voice&lt;/b&gt;', text)
+
+    def test_extreme_parameter_expansion_keeps_wallet_and_valid_budget(self):
+        settings = {key: '&' * limit for key, limit in START_FIELD_LIMITS.items()}
+        text = self.render(**settings)
+        self.assertIn('90,945,050.53', text)
+        self.assertLessEqual(len(text.encode('utf-16-le')) // 2, 3900)
+        self.assertNotIn('{credit}', text)
+
+    def test_old_two_variable_template_still_works(self):
+        self.assertEqual(self.render('سلام {name} | {credit} تومان'), 'سلام 🐢ѕιηα🐢 | 90,945,050.53 تومان')
+
 
 class StartHandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -116,6 +139,7 @@ class StartHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.context.user_data['setting_type'] = key
         with patch('services.maintenance.is_super_admin', AsyncMock(return_value=allowed)), \
                 patch.object(DB, 'set_setting', AsyncMock()) as save, \
+                patch.object(DB, 'get_setting', AsyncMock(side_effect=lambda key, default='', **kw: START_DEFAULTS.get(key, default))), \
                 patch.object(DB, 'get_settings', AsyncMock(return_value=dict(START_DEFAULTS))), \
                 patch.object(DB, 'get_user', AsyncMock(return_value={'credit': 100.25})):
             state = await handle_setting_text_input(self.update, self.context)
@@ -196,3 +220,60 @@ class StartHandlerTests(unittest.IsolatedAsyncioTestCase):
             save, state = await self.edit(BTN_CANCEL)
         save.assert_not_awaited()
         self.assertEqual(state, 99)
+
+
+    async def test_proposed_preview_does_not_replace_saved_template(self):
+        save, state = await self.edit(PREVIEW_DEFAULT_START)
+        save.assert_not_awaited()
+        self.assertEqual(state, AWAITING_SUPPORT_TEXT)
+        self.assertIn('خدمات در دسترس شما', self.bot.send_message.await_args.kwargs['text'])
+        from handlers.admin_handlers import _preview_start_text
+        saved = dict(START_DEFAULTS, start_text='قالب قدیمی {name}')
+        with patch.object(DB, 'get_settings', AsyncMock(return_value=saved)), \
+                patch.object(DB, 'get_user', AsyncMock(return_value={'credit': 25.5})), \
+                patch.object(DB, 'set_setting', AsyncMock()) as write:
+            await _preview_start_text(self.update, self.context, proposed=True)
+        write.assert_not_awaited()
+        self.assertEqual(saved['start_text'], 'قالب قدیمی {name}')
+        self.assertIn('خدمات در دسترس شما', self.bot.send_message.await_args.kwargs['text'])
+
+    async def test_copy_template_sends_raw_markup_without_save(self):
+        save, state = await self.edit(SHOW_START_TEMPLATE)
+        save.assert_not_awaited()
+        self.assertEqual(state, AWAITING_SUPPORT_TEXT)
+        payload = self.bot.send_message.await_args.kwargs
+        self.assertEqual(payload['text'], DEFAULT_START_TEXT)
+        self.assertIsNone(payload['parse_mode'])
+
+    async def test_multiline_guide_allowed_up_to_its_own_limit(self):
+        text = 'line one\n' + 'a' * 300
+        save, _ = await self.edit(text, key='start_guide')
+        save.assert_awaited_once_with('start_guide', text, bot_id=7)
+        save, _ = await self.edit('a' * 361, key='start_guide')
+        save.assert_not_awaited()
+
+    async def test_reset_brand_restores_auto_bot_name(self):
+        save, _ = await self.edit(RESET_START_FIELD, key='start_brand')
+        save.assert_awaited_once_with('start_brand', '', bot_id=7)
+
+    async def test_reset_guide_uses_preset_not_an_arbitrary_key(self):
+        save, _ = await self.edit(RESET_START_FIELD, key='start_guide')
+        save.assert_awaited_once_with('start_guide', START_DEFAULTS['start_guide'], bot_id=7)
+
+    async def test_back_to_editor_does_not_save_button_as_a_value(self):
+        save, state = await self.edit(BACK_START_EDITOR, key='start_intro')
+        save.assert_not_awaited()
+        self.assertEqual(state, AWAITING_SUPPORT_TEXT)
+        self.assertEqual(self.context.user_data['setting_type'], 'start_text')
+
+    async def test_each_parameter_has_a_reachable_two_column_button(self):
+        from handlers.admin_handlers import _start_editor_keyboard
+        rows = _start_editor_keyboard().keyboard
+        labels = [button.text for row in rows for button in row]
+        self.assertTrue(all(len(row) <= 2 for row in rows))
+        for label in START_FIELDS:
+            self.assertEqual(labels.count(label), 1)
+            save, state = await self.edit(label)
+            save.assert_not_awaited()
+            self.assertEqual(state, AWAITING_SUPPORT_TEXT)
+            self.assertEqual(self.context.user_data['setting_type'], START_FIELDS[label][0])

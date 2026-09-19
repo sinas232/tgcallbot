@@ -15,6 +15,8 @@ DEFAULT_START_TEXT = """👋 <b>{name} عزیز، خوش آمدید!</b>
 
 💎 <b>{brand}</b>
 <i>{tagline}</i>
+
+{intro}
 ━━━━━━━━━━━━━━
 🎯 <b>خدمات در دسترس شما</b>
 {services}
@@ -23,16 +25,17 @@ DEFAULT_START_TEXT = """👋 <b>{name} عزیز، خوش آمدید!</b>
 موجودی: <code>{credit}</code> تومان
 شناسه کاربری: <code>{id}</code>
 ━━━━━━━━━━━━━━
-✨ <b>از انتخاب تا پیگیری، همین‌جا</b>
-۱. از «🛍 خرید سرویس» پلن دلخواهتان را انتخاب کنید.
-۲. جزئیات و مبلغ را بررسی و سفارش را ثبت کنید.
-۳. وضعیت را از «📦 سفارشات من» دنبال کنید.
+✨ <b>با آگاهی انتخاب کنید</b>
+{benefits}
+
+🚀 <b>شروع، در سه قدم</b>
+{guide}
 
 📞 <b>کنار شما هستیم</b>
 {support}
 🕒 {support_hours}
 
-👇 <b>برای شروع، از منوی پایین انتخاب کنید.</b>"""
+👇 <b>{cta}</b>"""
 
 START_DEFAULTS = {
     'start_text': DEFAULT_START_TEXT,
@@ -40,6 +43,14 @@ START_DEFAULTS = {
     'start_tagline': 'انتخاب آسان، هزینه روشن، پیگیری سفارش در یک‌جا',
     'start_support': 'از بخش «🆘 پشتیبانی» با ما در ارتباط باشید.',
     'start_support_hours': 'زمان پاسخ‌گویی را از پشتیبانی بپرسید.',
+    'start_intro': 'برای حضوری پررنگ‌تر در تلگرام، سرویس مناسب خودتان را انتخاب کنید؛ از ثبت تا پیگیری سفارش، همراه شما هستیم.',
+    'start_benefits': '🧾 بررسی جزئیات و مبلغ، پیش از تأیید خرید\n📦 دسترسی به وضعیت و سوابق سفارش‌ها\n💬 ارتباط با پشتیبانی از داخل ربات',
+    'start_guide': '۱. از «🛍 خرید سرویس» پلن دلخواهتان را انتخاب کنید.\n۲. جزئیات و مبلغ را بررسی و سفارش را ثبت کنید.\n۳. وضعیت را از «📦 سفارشات من» دنبال کنید.',
+    'start_cta': 'انتخاب شما، قدم بعدی است؛ از منوی پایین شروع کنید.',
+    'start_label_voice_chat': '🎙 حضور اکانت‌ها در ویس‌کال',
+    'start_label_group_join': '👥 عضویت در گروه',
+    'start_label_channel_join': '📢 عضویت در کانال',
+    'start_label_incall_chat': '💬 چت در ویس‌کال',
     'service_voice_chat': 'true',
     'service_group_join': 'true',
     'service_channel_join': 'true',
@@ -51,12 +62,28 @@ START_FIELDS = {
     '📞 راه ارتباطی پشتیبانی': ('start_support', 'آیدی یا توضیح راه ارتباطی پشتیبانی (حداکثر ۱۲۰ نویسه):'),
     '🕒 ساعت پاسخ‌گویی': ('start_support_hours', 'ساعت واقعی پاسخ‌گویی، مثلاً هر روز ۹ تا ۲۳ (حداکثر ۱۲۰ نویسه):'),
 }
+START_FIELDS.update({
+    '📝 متن معرفی': ('start_intro', 'متن معرفی کوتاه (حداکثر ۲۴۰ نویسه):'),
+    '✨ ویژگی‌های خدمات': ('start_benefits', 'ویژگی‌های واقعی خدمات؛ هر مورد در یک خط (حداکثر ۳۶۰ نویسه):'),
+    '🧭 راهنمای خرید': ('start_guide', 'راهنمای خرید؛ هر مرحله در یک خط (حداکثر ۳۶۰ نویسه):'),
+    '🚀 دعوت به شروع': ('start_cta', 'متن دعوت به انتخاب سرویس (حداکثر ۱۲۰ نویسه):'),
+    '🎙 عنوان سرویس ویس': ('start_label_voice_chat', 'عنوان نمایشی سرویس ویس، همراه ایموجی دلخواه (حداکثر ۱۲۰ نویسه):'),
+    '👥 عنوان سرویس گروه': ('start_label_group_join', 'عنوان نمایشی سرویس گروه (حداکثر ۱۲۰ نویسه):'),
+    '📢 عنوان سرویس کانال': ('start_label_channel_join', 'عنوان نمایشی سرویس کانال (حداکثر ۱۲۰ نویسه):'),
+    '💬 عنوان سرویس چت ویس': ('start_label_incall_chat', 'عنوان نمایشی سرویس چت ویس (حداکثر ۱۲۰ نویسه):'),
+})
+START_FIELD_LIMITS = {key: 120 for key, _ in START_FIELDS.values()}
+START_FIELD_LIMITS.update(start_intro=240, start_benefits=360, start_guide=360)
 PREVIEW_START = '👁 پیش‌نمایش استارت'
+PREVIEW_DEFAULT_START = '🔎 پیش‌نمایش قالب پیشنهادی'
+SHOW_START_TEMPLATE = '📄 متن قالب فعلی'
+RESET_START_FIELD = '↩️ پیش‌فرض این بخش'
+BACK_START_EDITOR = '🔙 بازگشت به ویرایشگر'
 USE_DEFAULT_START = '✨ قالب پیشنهادی'
 START_VARIABLES = {
     'name', 'first_name', 'full_name', 'id', 'username', 'credit',
     'bot_name', 'bot_username', 'brand', 'tagline', 'support', 'support_hours',
-    'services', 'date', 'time',
+    'services', 'date', 'time', 'intro', 'benefits', 'guide', 'cta',
 }
 _TOKEN = re.compile(r'{{|}}|{([^{}]+)}')
 _HTML = re.compile(r'</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|span|tg-spoiler|tg-emoji|blockquote)\b[^>]*>', re.I)
@@ -111,14 +138,10 @@ def start_values(user, db_user, bot, settings, now=None):
     name = getattr(user, 'first_name', None) or 'کاربر'
     full = ' '.join(x for x in [getattr(user, 'first_name', None), getattr(user, 'last_name', None)] if x) or name
     services = []
-    for key, label in (
-        ('service_voice_chat', '🎙 حضور اکانت‌ها در ویس‌کال'),
-        ('service_group_join', '👥 عضویت در گروه'),
-        ('service_channel_join', '📢 عضویت در کانال'),
-        ('service_incall_chat', '💬 چت در ویس‌کال'),
-    ):
+    for service in ('voice_chat', 'group_join', 'channel_join', 'incall_chat'):
+        key, label_key = 'service_' + service, 'start_label_' + service
         if settings.get(key, START_DEFAULTS[key]) == 'true':
-            services.append(label)
+            services.append(settings.get(label_key, START_DEFAULTS[label_key])[:120])
     bot_name = _bot_attr(bot, 'first_name', 'خدمات تلگرام')
     return {
         'name': name, 'first_name': name, 'full_name': full,
@@ -130,6 +153,8 @@ def start_values(user, db_user, bot, settings, now=None):
         'support': settings.get('start_support', START_DEFAULTS['start_support'])[:120],
         'support_hours': settings.get('start_support_hours', START_DEFAULTS['start_support_hours'])[:120],
         'services': '\n'.join(services) or 'فعلاً سرویسی فعال نیست؛ برای راهنمایی با پشتیبانی تماس بگیرید.',
+        **{key: settings.get('start_' + key, START_DEFAULTS['start_' + key])[:START_FIELD_LIMITS['start_' + key]]
+           for key in ('intro', 'benefits', 'guide', 'cta')},
         'date': jdatetime.datetime.fromgregorian(datetime=local).strftime('%Y/%m/%d'),
         'time': local.strftime('%H:%M'),
     }
@@ -163,4 +188,11 @@ def render_start_message(user, db_user, bot, settings, now=None):
     if len(rendered.encode('utf-16-le')) // 2 > 3900:
         logger.warning('Start template exceeded message budget; using standard layout')
         rendered = _render(DEFAULT_START_TEXT, values)
+    if len(rendered.encode('utf-16-le')) // 2 > 3900:
+        # Even a fully customized standard layout can exceed the limit (emoji /
+        # HTML escaping expansion). Keep the wallet intact in a compact fallback.
+        compact = dict(values, name=str(values['name'])[:64], brand=str(values['brand'])[:80])
+        rendered = _render('👋 <b>{name} عزیز، خوش آمدید!</b>\n💎 <b>{brand}</b>\n\n'
+                           '💳 موجودی: <code>{credit}</code> تومان\n🆔 <code>{id}</code>\n\n'
+                           '👇 از منوی پایین انتخاب کنید؛ راهنمایی از بخش پشتیبانی.', compact)
     return rendered
