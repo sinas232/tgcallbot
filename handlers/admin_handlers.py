@@ -13,6 +13,10 @@ from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKe
 from telegram.ext import ContextTypes
 from database import DatabaseManager
 from helpers.message_utils import send_safe
+from services.start_message import (
+    DEFAULT_START_TEXT, START_DEFAULTS, START_FIELDS, START_VARIABLES,
+    PREVIEW_START, USE_DEFAULT_START, render_start_message, validate_start_template,
+)
 from constants import *
 from utils.helpers import clean_number, format_jalali_datetime, format_price
 from config import Config
@@ -1873,18 +1877,87 @@ async def set_support_text_start(update, context):
     context.user_data['setting_type'] = 'support_text'
     return AWAITING_SUPPORT_TEXT
 
-@require_super_admin
-async def set_start_text_start(update, context):
-    await send_safe(context.bot, update.effective_chat.id, "📝 **متن استارت** ({name}, {credit}):", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+def _start_editor_keyboard():
+    return ReplyKeyboardMarkup([
+        [PREVIEW_START, USE_DEFAULT_START],
+        list(START_FIELDS)[:2], list(START_FIELDS)[2:], [BTN_CANCEL],
+    ], resize_keyboard=True)
+
+
+async def _show_start_editor(update, context):
     context.user_data['setting_type'] = 'start_text'
+    await send_safe(context.bot, update.effective_chat.id,
+        "🎨 <b>طراحی پیام خوش‌آمد</b>\n\n"
+        "متن دلخواه را بفرستید یا با دکمه‌های زیر برند، شعار و پشتیبانی را تنظیم کنید.\n"
+        "«قالب پیشنهادی» متن قبلی را با طرح جدید جایگزین می‌کند؛ پیش‌نمایش چیزی را ذخیره نمی‌کند.\n\n"
+        "<b>متغیرهای قابل استفاده:</b>\n"
+        "<code>" + html.escape(', '.join('{' + key + '}' for key in sorted(START_VARIABLES))) + "</code>\n\n"
+        "<code>{services}</code> فقط سرویس‌های فعال همین ربات را نمایش می‌دهد.\n"
+        "<code>{username}</code> و <code>{bot_username}</code> بدون @ هستند.\n"
+        "تاریخ شمسی و ساعت تهران است. موجودی با اعشار نمایش داده می‌شود.\n"
+        "متن ساده، HTML تلگرام یا Markdown قدیمی پذیرفته می‌شود؛ قالب‌ها را با هم مخلوط نکنید.\n"
+        "نمونه: <code>&lt;b&gt;سلام {name}&lt;/b&gt;</code>\n"
+        "حداکثر ۲۵۰۰ نویسه؛ برای آکولاد معمولی از <code>{{</code> و <code>}}</code> استفاده کنید.",
+        reply_markup=_start_editor_keyboard(), parse_mode='HTML')
     return AWAITING_SUPPORT_TEXT
 
+
+async def _preview_start_text(update, context):
+    bot_id = context.bot_data.get('bot_id', 1)
+    settings = await DatabaseManager.get_settings(START_DEFAULTS, bot_id=bot_id)
+    db_user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id) or {'credit': 0}
+    await send_safe(context.bot, update.effective_chat.id,
+        render_start_message(update.effective_user, db_user, context.bot, settings),
+        parse_mode='HTML', reply_markup=_start_editor_keyboard())
+
+
+@require_super_admin
+async def set_start_text_start(update, context):
+    return await _show_start_editor(update, context)
+
+
+@require_super_admin
 async def handle_setting_text_input(update, context):
-    txt = update.message.text
-    if BTN_CANCEL in txt: return await settings_menu_handler(update, context)
+    txt = update.message.text or ''
+    if txt == BTN_CANCEL:
+        context.user_data.pop('setting_type', None)
+        return await settings_menu_handler(update, context)
     key = context.user_data.get('setting_type', 'support_text')
     bot_id = context.bot_data.get('bot_id', 1)
+    start_keys = {field[0] for field in START_FIELDS.values()}
+    if key == 'start_text':
+        if txt in START_FIELDS:
+            field, prompt = START_FIELDS[txt]
+            context.user_data['setting_type'] = field
+            await send_safe(context.bot, update.effective_chat.id, prompt,
+                            parse_mode=None, reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+            return AWAITING_SUPPORT_TEXT
+        if txt == PREVIEW_START:
+            await _preview_start_text(update, context)
+            return AWAITING_SUPPORT_TEXT
+        if txt == USE_DEFAULT_START:
+            txt = DEFAULT_START_TEXT
+        try:
+            validate_start_template(txt)
+        except ValueError as exc:
+            await send_safe(context.bot, update.effective_chat.id, f"❌ {exc}",
+                            parse_mode=None, reply_markup=_start_editor_keyboard())
+            return AWAITING_SUPPORT_TEXT
+    elif key in start_keys:
+        txt = txt.strip()
+        if not txt or len(txt) > 120:
+            await send_safe(context.bot, update.effective_chat.id, "❌ مقدار باید بین ۱ تا ۱۲۰ نویسه باشد.", parse_mode=None)
+            return AWAITING_SUPPORT_TEXT
+    elif key != 'support_text':
+        # Never let a stale/untrusted user_data key write arbitrary bot settings.
+        context.user_data.pop('setting_type', None)
+        return await settings_menu_handler(update, context)
     await DatabaseManager.set_setting(key, txt, bot_id=bot_id)
+    if key == 'start_text' or key in start_keys:
+        await send_safe(context.bot, update.effective_chat.id, "✅ برای همین ربات ذخیره شد. پیش‌نمایش با اطلاعات حساب شما:", parse_mode=None)
+        context.user_data['setting_type'] = 'start_text'
+        await _preview_start_text(update, context)
+        return AWAITING_SUPPORT_TEXT
     await send_safe(context.bot, update.effective_chat.id, "✅ ذخیره شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     return AWAITING_SETTINGS_ACTION
 

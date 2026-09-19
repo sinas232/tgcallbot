@@ -593,6 +593,18 @@ class DatabaseManager:
             except: return default
             
     @staticmethod
+    async def get_settings(defaults: dict, bot_id=1) -> dict:
+        """Load a bounded set of settings in one tenant-scoped query."""
+        values = dict(defaults)
+        if not values:
+            return values
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(BotSetting.key, BotSetting.value).where(
+                BotSetting.bot_id == bot_id, BotSetting.key.in_(values)))
+            values.update({key: value for key, value in result.all() if value is not None})
+        return values
+
+    @staticmethod
     async def set_setting(key: str, value: str, bot_id=1):
         async with AsyncSessionLocal() as db_session:
             res = await db_session.execute(select(BotSetting).filter(BotSetting.bot_id == bot_id, BotSetting.key == key))

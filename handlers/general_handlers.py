@@ -11,6 +11,7 @@ from database import DatabaseManager
 from config import Config
 from constants import USER_MAIN_MENU, BTN_EXIT_ADMIN
 from helpers.message_utils import send_safe
+from services.start_message import START_DEFAULTS, render_start_message
 
 # اگر میدل‌ور دارید، آن را ایمپورت کنید، وگرنه خط زیر را کامنت کنید
 try:
@@ -55,6 +56,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             if not is_secure: return ConversationHandler.END
         except: pass
 
+    # One read for the template, branding and enabled-service descriptions.
+    try:
+        start_settings = await DatabaseManager.get_settings(START_DEFAULTS, bot_id=bot_id)
+    except Exception:
+        logger.warning("Start settings unavailable for bot %s; using defaults", bot_id)
+        start_settings = dict(START_DEFAULTS)
+
     # 3. تعیین منو بر اساس سطح دسترسی (کاربر عادی یا ادمین)
     is_god_admin = user.id in Config.ADMIN_IDS
     is_db_admin = db_user.get('is_admin', False)
@@ -64,7 +72,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     menu = [list(row) for row in USER_MAIN_MENU]
     # نمایش دکمهٔ «چت در ویس‌کال» فقط وقتی ادمین قابلیت را فعال کرده باشد
     try:
-        incall_on = await DatabaseManager.get_setting("service_incall_chat", "false", bot_id=bot_id) == "true"
+        incall_on = start_settings.get("service_incall_chat") == "true"
         if incall_on:
             menu.append(["💬 چت در ویس‌کال"])
     except Exception:
@@ -72,49 +80,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if is_admin: 
         menu.append(["🔐 پنل مدیریت (ادمین)"])
     
-    # 4. دریافت متن استارت از تنظیمات
-    # قالب پیش‌فرض HTML تمیز و مینیمال — لایهٔ پریمیوم ایموجی‌ها را ارتقا می‌دهد
-    safe_name = (user.first_name or "کاربر").replace("<", "").replace(">", "")
-    default_text = (
-        f"👋 سلام <b>{safe_name}</b> عزیز\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"💎 به ربات خدمات مجازی خوش آمدید.\n\n"
-        f"✨ <b>خدمات:</b> ویس‌کال · عضویت · شارژ\n"
-        f"💰 موجودی شما: <code>{{credit}}</code> تومان\n\n"
-        f"👇 از منوی زیر انتخاب کنید"
-    )
-    start_text = await DatabaseManager.get_setting("start_text", default_text, bot_id=bot_id)
-
-    # جایگذاری متغیرها در متن
-    from utils.helpers import format_price
-    credit_fmt = format_price(db_user.get("credit", 0))
-    try:
-        final_text = start_text.format(
-            name=safe_name,
-            id=user.id,
-            username=user.username or "None",
-            credit=credit_fmt,
-        )
-    except Exception:
-        final_text = (
-            start_text.replace("{name}", safe_name)
-            .replace("{credit}", credit_fmt)
-            .replace("{id}", str(user.id))
-            .replace("{username}", user.username or "None")
-        )
-
-    # اگر متن سفارشی ادمین Markdown قدیمی باشد، لایهٔ پریمیوم تبدیلش می‌کند؛
-    # برای قالب پیش‌فرض HTML می‌فرستیم تا ظاهر رنگی/تمیز بماند.
-    parse_mode = ParseMode.HTML
-    if "**" in final_text or (final_text.count("*") >= 2 and "<b>" not in final_text):
-        parse_mode = ParseMode.MARKDOWN
+    # Templates are trusted admin markup; interpolated user/brand values are escaped.
+    final_text = render_start_message(user, db_user, context.bot, start_settings)
 
     await send_safe(
         context.bot,
         update.effective_chat.id,
         final_text,
         reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True, is_persistent=True),
-        parse_mode=parse_mode,
+        parse_mode=ParseMode.HTML,
     )
     
     return -1 # پایان هر کانتکست قبلی (ConversationHandler.END)
