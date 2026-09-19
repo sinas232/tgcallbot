@@ -84,7 +84,7 @@ class ReceiptTests(unittest.IsolatedAsyncioTestCase):
         receipt = dict(claimed=True, total_cost=1000, used_cost=250, refund_amount=750,
                        refund_tx_id='TX-test', user_wallet_balance=850, elapsed_seconds=150)
         query = SimpleNamespace(data='cancel_order_42', answer=AsyncMock(),
-                                edit_message_text=AsyncMock(side_effect=RuntimeError('old message')))
+                                edit_message_text=AsyncMock(side_effect=__import__('telegram.error', fromlist=['BadRequest']).BadRequest('Message to edit not found')))
         update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=567))
         context = SimpleNamespace(bot_data={'bot_id': 3}, bot=SimpleNamespace(send_message=AsyncMock()))
         with patch('handlers.order_handlers.DatabaseManager.get_user', AsyncMock(return_value={'id': 9})), \
@@ -123,11 +123,11 @@ class BillingTests(unittest.TestCase):
                          created_at=datetime.utcnow() - timedelta(hours=2))
             self.assertEqual(OrderExecutor.compute_order_settlement(order), (0, 1000, 0))
 
-    def test_seconds_round_up_and_conservation(self):
+    def test_seconds_decimal_rounding_and_conservation(self):
         now = datetime(2026, 9, 18, 12)
         with patch('services.order_executor.datetime') as clock:
             clock.utcnow.return_value = now
-            for seconds, expected in [(0, 0), (0.1, 1), (150, 250), (600, 1000), (900, 1000), (-10, 0)]:
+            for seconds, expected in [(0, 0), (0.1, 0.17), (150, 250), (600, 1000), (900, 1000), (-10, 0)]:
                 used, refund, elapsed = OrderExecutor.compute_order_settlement(dict(
                     status='running', price_paid=1000, duration_minutes=10,
                     started_at=now - timedelta(seconds=seconds)))

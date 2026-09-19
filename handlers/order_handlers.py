@@ -13,6 +13,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 import jdatetime
+from telegram.error import BadRequest
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
@@ -299,6 +300,7 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⛔️ این سرویس در حال حاضر غیرفعال است.")
         return AWAITING_SELECT_PLAN
 
+    context.user_data.pop('checkout_message', None)
     context.user_data['selected_plan'] = plan
     
     await query.delete_message()
@@ -469,7 +471,8 @@ async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_
 
     txt = _build_confirmation_text(context, capacity_verdict)
 
-    await update.message.reply_text(txt, reply_markup=_CONFIRM_KB())
+    message = await update.message.reply_text(txt, reply_markup=_CONFIRM_KB())
+    context.user_data['checkout_message'] = (message.chat_id, message.message_id)
     return AWAITING_ORDER_CONFIRMATION
 
 async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -481,6 +484,11 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         await query.delete_message()
         await query.message.reply_text("❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
         return ConversationHandler.END
+
+    expected_message = context.user_data.get('checkout_message')
+    if not expected_message or tuple(expected_message) != (query.message.chat_id, query.message.message_id):
+        await query.edit_message_text("ℹ️ این فرم پرداخت قدیمی است؛ لطفاً سفارش را دوباره از منو ثبت کنید. وجهی کسر نشد.")
+        return AWAITING_ORDER_CONFIRMATION
 
     # ── 🛡 گارد ظرفیت: پذیرش «رزرو ساعت پیشنهادی» و «بررسی مجدد» ──
     if data.startswith("cap_slot_"):
@@ -526,16 +534,23 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
     if data == "confirm_order_pay":
         user_id = update.effective_user.id
         bot_id = context.bot_data.get('bot_id', 1)
-        plan = context.user_data['selected_plan']
+        plan = dict(context.user_data['selected_plan'])
         link = context.user_data['target_link']
+        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
         
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        # Telegram confirmation message identity is stable across repeated clicks
+        # and across process restarts; unlike callback-query ID it cannot double debit.
+        request_key = f"checkout:{bot_id}:{user['id']}:{query.message.chat_id}:{query.message.message_id}"
+        prior = await DatabaseManager.get_checkout_order(request_key, user['id'], bot_id)
+        if prior:
+            await query.edit_message_text(f"ℹ️ این پرداخت قبلاً ثبت شده است. کد سفارش: {prior['id']}؛ وجه دوباره کسر نشد.")
+            return ConversationHandler.END
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
             return ConversationHandler.END
 
         # 🔒 قفل لینک هوشمند: بررسی تداخل زمانی
-        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
         start_time = schedule_time if schedule_time else datetime.utcnow()
         duration = plan.get('duration_minutes', 0)
         
@@ -574,27 +589,32 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         # began before maintenance cannot debit/create/launch after it turns ON.
         async with maintenance.lock:
             await enforce_maintenance(update, context)
-            await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
-
-            schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
-
-            order = await DatabaseManager.create_order(
-                user['id'], plan['service_type'], link,
-                plan['accounts_count'], plan['duration_minutes'], plan['price'],
-                plan_id=plan['id'], scheduled_for=schedule_time, bot_id=bot_id
-            )
-
+            try:
+                order = await DatabaseManager.purchase_order_atomic(
+                    user['id'], plan, link, request_key, bot_id=bot_id, scheduled_for=schedule_time)
+            except ValueError as exc:
+                await query.edit_message_text(f"❌ {exc}")
+                return ConversationHandler.END
+            if not order.get('_created', True):
+                await query.edit_message_text(f"ℹ️ سفارش #{order['id']} قبلاً ثبت شده؛ کسر مجدد انجام نشد.")
+                return ConversationHandler.END
             if not schedule_time:
-                await order_executor.submit_order(order['id'], order)
+                try:
+                    await order_executor.submit_order(order['id'], order)
+                except Exception:
+                    logger.exception("Order %s paid but launch failed; settling atomically", order['id'])
+                    await order_executor.refund_interrupted_order(order, full=True)
+                    await query.edit_message_text(f"❌ اجرای سفارش #{order['id']} آغاز نشد؛ تسویه در کیف پول ثبت شد.")
+                    return ConversationHandler.END
         if not schedule_time:
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]
             )
             await query.edit_message_text(
-                f"✅ **سفارش با موفقیت ثبت و آغاز شد.**\n"
+                f"✅ **پرداخت و ثبت سفارش انجام شد.**\n"
                 f"🆔 کد پیگیری: `{order['id']}`\n"
-                "در صورت نیاز می‌توانید سفارش را با دکمه زیر لغو کنید.",
+                "زمان خریداری‌شده پس از آماده‌شدن سرویس محاسبه می‌شود. در صورت نیاز می‌توانید سفارش را با دکمه زیر لغو کنید.",
                 reply_markup=kb
             )
         else:
@@ -630,9 +650,14 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     async def reply(text):
         try:
             await query.edit_message_text(text, parse_mode=None, reply_markup=None)
-        except Exception:
-            # Deleted/old/uneditable message: deliver receipt as a new message.
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return  # repeated click on the same stored receipt, not a new message
+            if "message to edit not found" not in str(exc).lower() and "can't be edited" not in str(exc).lower():
+                raise
             await context.bot.send_message(update.effective_user.id, text, parse_mode=None)
+        except Exception:
+            logger.warning("Order %s receipt edit uncertain; not sending a duplicate", order_id)
 
     try:
         user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
@@ -657,12 +682,13 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     prefix = "✅ سفارش لغو و تسویه شد."
     if result.get('already_settled'):
         prefix = "ℹ️ این سفارش قبلاً تسویه شده؛ رسید قبلی (بدون عودت مجدد):"
-    elapsed = int(result.get('elapsed_seconds') or 0)
+    elapsed = order_executor._fmt_duration_fa(result.get('elapsed_seconds') or 0)
     text = (
         f"{prefix}\n\n"
         f"📦 شماره سفارش: {order_id}\n"
         f"💰 مبلغ کل پلن: {format_price(result['total_cost'])} تومان\n"
-        f"⏱ زمان قابل محاسبه: {elapsed // 60} دقیقه و {elapsed % 60} ثانیه\n"
+        f"⏱ زمان قابل محاسبه: {elapsed}\n"
+        f"⏳ زمان باقی‌مانده: {float(result.get('remaining_seconds') or 0):.2f} ثانیه\n"
         f"📉 مبلغ مصرف‌شده: {format_price(result['used_cost'])} تومان\n"
         f"💵 مبلغ عودت داده شده به کیف پول: {format_price(result['refund_amount'])} تومان\n"
         f"🧾 کد پیگیری عودت: {result['refund_tx_id'] or '—'}\n"

@@ -138,15 +138,16 @@ class OrderLifecycleTests(unittest.TestCase):
         """🐞 باگ: فقط وقتی VCM کالی پیدا می‌کرد وضعیت بسته می‌شد."""
         ex = _read("services/order_executor.py")
         start = ex.index("async def stop_active_order(")
-        body = ex[start:start + 2000]
+        body = ex[start:ex.index("async def _eject_all_fast", start)]
         self.assertIn("finalize_order_status", body)
         self.assertIn("Closed without active calls.", body)
 
     def test_fail_order_does_not_resurrect_closed_orders(self):
         ex = _read("services/order_executor.py")
         start = ex.index("async def _fail_order(")
-        body = ex[start:start + 1500]
-        self.assertIn("finalize_order_status", body)
+        body = ex[start:ex.index("async def _notify_automatic_refund", start)]
+        self.assertIn("settle_and_refund_order", body)
+        self.assertNotIn("update_order_status", body)
 
     def test_admin_cancel_handles_already_closed(self):
         admin = _read("handlers/admin_handlers.py")
@@ -178,7 +179,8 @@ class StartupRecoveryTests(unittest.TestCase):
         db = _read("database.py")
         start = db.index("async def reset_stuck_orders(")
         body = db[start:start + 1200]
-        self.assertIn("return stuck", body)
+        self.assertIn("return result", body)
+        self.assertNotIn("values(status=", body)
 
     def test_stale_pending_sweep_exists(self):
         db = _read("database.py")
@@ -191,12 +193,13 @@ class StartupRecoveryTests(unittest.TestCase):
     def test_startup_recovery_job_wired(self):
         main = _read("main.py")
         self.assertIn("async def startup_recovery_job(", main)
-        self.assertIn("run_once(startup_recovery_job", main)
+        self.assertIn("run_repeating(startup_recovery_job", main)
         self.assertIn("_STARTUP_INTERRUPTED_ORDERS.extend(_stuck)", main)
 
     def test_user_is_notified_of_auto_refund(self):
         main = _read("main.py")
-        self.assertIn("_notify_user_of_refund", main)
+        self.assertIn("refund_interrupted_order", main)
+        self.assertIn("await self._notify_automatic_refund", _read("services/order_executor.py"))
 
 
 class StatsTests(unittest.TestCase):
@@ -283,9 +286,10 @@ class SettlementAndTenancyTests(unittest.TestCase):
     def test_pending_order_without_start_refunds_fully(self):
         """سفارشی که هنوز اجرا نشده نباید برای زمانِ انتظار در صف
         شارژ شود (created_at نباید مبنای محاسبهٔ مصرف باشد)."""
-        src = _read("services/order_executor.py")
-        self.assertIn('status == "pending" and not started_at', src)
-        self.assertIn('status == "scheduled":\n\t\t\treturn 0.0, total_price, 0.0', src)
+        from services.order_executor import OrderExecutor
+        for status in ('pending', 'scheduled', 'running'):
+            self.assertEqual(OrderExecutor.compute_order_settlement(dict(
+                status=status, price_paid=1000, duration_minutes=10)), (0, 1000, 0))
 
     def test_orders_history_accepts_bot_id(self):
         db = _read("database.py")
@@ -317,7 +321,7 @@ class DeadMenuConstantTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_version_bumped_to_224(self):
-        self.assertIn('BOT_VERSION = "2.2.8"', _read("constants.py"))
+        self.assertIn('BOT_VERSION = "2.2.9"', _read("constants.py"))
 
     def test_changelog_has_224_section(self):
         self.assertIn("۲.۲.۴", _read("CHANGELOG.md"))

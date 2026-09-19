@@ -251,6 +251,10 @@ def _normalize_reservations(
 
         start = min(start, now_utc) if status in ("running", "pending") else start
         end = estimate_end(start, row.get("duration_minutes"), unknown_duration_min)
+        if status == "running" and row.get("served_seconds") is not None:
+            start = now_utc
+            remaining = max(0, int(row.get("duration_minutes") or 0) * 60 - float(row["served_seconds"]))
+            end = now_utc + timedelta(seconds=remaining or unknown_duration_min * 60)
         reservations.append(
             Reservation(
                 order_id=int(row.get("id") or 0),

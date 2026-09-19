@@ -576,111 +576,36 @@ _STARTUP_INTERRUPTED_ORDERS: list = []
 
 
 async def startup_recovery_job(context: ContextTypes.DEFAULT_TYPE):
-    """بازیابی مالیِ سفارش‌های نیمه‌کاره پس از ری‌استارت.
-
-    🐞 فیکس: ری‌استارت همهٔ سفارش‌های running را stopped می‌کرد و پولِ
-    استفاده‌نشده می‌سوخت؛ همچنین سفارش‌های pendingِ شکست‌خورده برای همیشه در
-    صف می‌ماندند (اشغالِ ظرفیت در Capacity Guard + بلوکه شدن پول کاربر).
-    اینجا هر دو دسته با همان مرجع محاسبه تسویه و عودت می‌شوند و کاربر هم
-    (در صورت در دسترس بودن ربات) مطلع می‌گردد.
-    """
+    """Interrupted and stale work uses the SAME durable atomic settlement receipt."""
+    for oid, info in list(order_executor.active_orders.items()):
+        if info.get('execution_done'):
+            try:
+                await order_executor._fail_order(oid, "تسویهٔ اجرای متوقف‌شده")
+                if info.get('terminal_committed'):
+                    order_executor.active_orders.pop(oid, None)
+            except Exception:
+                logger.exception("Order %s settlement still unavailable; retrying later", oid)
     for order in list(_STARTUP_INTERRUPTED_ORDERS):
         try:
-            res = await order_executor.refund_interrupted_order(order)
+            await order_executor.refund_interrupted_order(order)
+            _STARTUP_INTERRUPTED_ORDERS.remove(order)
         except Exception:
-            logger.exception("startup recovery failed for order %s", (order or {}).get('id'))
-            continue
-        try:
-            _notify_user_of_refund(context, order, res, full=False)
-        except Exception:
-            pass
-    _STARTUP_INTERRUPTED_ORDERS.clear()
-    # سفارش‌های در صف (pending) که عمرشان از حد گذشته: بستن + عودت کامل
+            logger.exception("startup settlement failed for order %s; will retry", order.get('id'))
     try:
         stale = await DatabaseManager.get_stale_pending_orders(minutes=10)
+        for order in stale:
+            await order_executor.refund_interrupted_order(order, full=True)
     except Exception:
-        logger.exception("stale pending sweep failed")
-        stale = []
-    for order in stale or []:
-        try:
-            res = await order_executor.refund_interrupted_order(order, full=True)
-        except Exception:
-            logger.exception("stale pending recovery failed for order %s", order.get('id'))
-            continue
-        try:
-            await _notify_user_of_refund(context, order, res, full=True)
-        except Exception:
-            pass
-
-
-async def _notify_user_of_refund(context, order, res, full=False):
-    """اطلاع‌رسانیِ (best-effort) عودتِ خودکار به کاربر."""
-    user = (res or {}).get('user')
-    if not user or not user.get('telegram_id'):
-        return
-    app = bot_manager.active_bots.get(order.get('bot_id', 1))
-    if not app:
-        return
-    from utils.helpers import format_price
-    amount = float((res or {}).get('refund_amount') or 0)
-    head = ("♻️ سفارش شما که در صف اجرا مانده بود لغو شد" if full
-            else "♻️ سفارش شما به‌دلیل ری‌استارت/اختلال متوقف شد")
-    txt = (
-        f"{head}\n"
-        f"🆔 کد سفارش: `{order.get('id')}`\n"
-        f"💵 مبلغ عودت‌شده به کیف پول شما: {format_price(amount)} تومان\n"
-        "🙏 بابت اختلال پیش‌آمده پوزش می‌طلبیم."
-    )
-    try:
-        await app.bot.send_message(user['telegram_id'], txt)
-    except Exception:
-        pass
+        logger.exception("stale pending settlement failed; will retry")
 
 
 async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
-    """بررسی سفارشات منقضی شده"""
-    try:
-        for bot_id, app in bot_manager.active_bots.items():
-            active_orders = await DatabaseManager.get_all_orders_extended(limit=100, offset=0, status_filter='active', bot_id=bot_id)
-            if not active_orders: continue
-            now = datetime.utcnow()
-            for item in active_orders:
-                order = item['order']
-                duration = order.get('duration_minutes', 0)
-                if duration <= 0: continue
-                # مبنای انقضا: شروع قابل‌محاسبه (started_at) و در صورت نبود آن
-                # (سفارش گیرکرده در فاز ساخت) زمان ثبت سفارش. بدون این fallback،
-                # سفارش‌های بدون started_at هیچ‌وقت منقضی نمی‌شدند و برای همیشه
-                # running می‌ماندند.
-                start_time = order.get('started_at') or order.get('created_at')
-                if not start_time: continue
-                end_time = start_time + timedelta(minutes=duration)
-                
-                if now > end_time:
-                    logger.info(f"⏳ Order {order['id']} (Bot {bot_id}) expired. Finishing...")
-                    
-                    # توقف سفارش + خروج از کال/گروه
-                    await order_executor.stop_active_order(order['id'], is_expired=True, reason="Order expired")
-                    try:
-                        from services.voice_call_manager import voice_call_manager as _vcm
-                        if _vcm:
-                            await _vcm.stop_all_for_order(order['id'], leave_group=True)
-                    except Exception:
-                        pass
-                    await DatabaseManager.complete_order(order['id'])
-                    
-                    # لاگ
-                    try:
-                         await order_executor._log_to_channel("completed", order['id'], order, success_cnt=order['accounts_count'], bot_id=bot_id)
-                    except: pass
-                    
-                    # اطلاع به کاربر
-                    try:
-                        user = item['user']
-                        await app.bot.send_message(user['telegram_id'], f"✅ **سفارش شما تکمیل شد.**\n🆔 کد: `{order['id']}`\n⏰ مدت زمان: {duration} دقیقه")
-                    except: pass
-    except Exception as e:
-        logger.error(f"Expired orders check error: {e}")
+    """Compatibility no-op: only the executor's observed-service timer may finish.
+
+    created_at/started_at wall time cannot expire building or paused service.
+    A second task must never cancel a worker and then report it completed.
+    """
+    return
 
 # ---------------------------------------------------------
 # راه‌اندازی و هندلرها
@@ -1462,8 +1387,7 @@ async def main_loop():
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         # بازیابی مالیِ سفارش‌های نیمه‌کاره (اندکی بعد از بالا آمدن ربات‌ها)
-        main_app.job_queue.run_once(startup_recovery_job, when=20)
-        main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        main_app.job_queue.run_repeating(startup_recovery_job, interval=60, first=20)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
@@ -1490,6 +1414,9 @@ async def main_loop():
     await stop_event.wait()
 
     logger.info("🛑 Shutdown signal received — stopping gracefully...")
+    order_executor.shutting_down = True
+    for _oid in list(order_executor.active_orders):
+        order_executor._freeze_billing(_oid)
     # ۱) اول جلوی آپدیت‌های جدید تلگرام را بگیر (اصلی + نماینده‌ها).
     try:
         if main_app.updater.running:
@@ -1513,6 +1440,12 @@ async def main_loop():
                 pass
     except Exception:
         pass
+    _order_tasks = [info.get("task") for info in list(order_executor.active_orders.values()) if info.get("task")]
+    if _order_tasks:
+        try:
+            await asyncio.wait_for(asyncio.gather(*_order_tasks, return_exceptions=True), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("Some shutdown cleanup is still pending; persisted billing checkpoint is authoritative")
     # ۳) قطع سریع همهٔ کلاینت‌های ویس (بدون leave مودبانهٔ کند — خود
     # disconnect تمیز، سشن را روی سرور تلگرام آزاد می‌کند و جلوی
     # AUTH_KEY_DUPLICATED در استارت بعدی را می‌گیرد).

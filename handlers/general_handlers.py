@@ -86,8 +86,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     start_text = await DatabaseManager.get_setting("start_text", default_text, bot_id=bot_id)
 
     # جایگذاری متغیرها در متن
-    credit_val = int(db_user.get("credit", 0) or 0)
-    credit_fmt = f"{credit_val:,}"
+    from utils.helpers import format_price
+    credit_fmt = format_price(db_user.get("credit", 0))
     try:
         final_text = start_text.format(
             name=safe_name,

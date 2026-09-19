@@ -929,6 +929,13 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
         bot_id=bot_id,
     )
 
+    if result.get('already_settled'):
+        await query.edit_message_text(
+            f"ℹ️ سفارش #{oid} قبلاً تسویه شده؛ عودت دوباره انجام نشد.\n"
+            f"مصرف ثبت‌شده: {format_price(result['used_cost'])} تومان\n"
+            f"عودت ثبت‌شده: {format_price(result['refund_amount'])} تومان\n"
+            f"کد عودت: {result.get('refund_tx_id') or '—'}")
+        return
     if not result.get('claimed', True):
         await query.edit_message_text(
             f"ℹ️ سفارش #{oid} از قبل بسته شده بود "
@@ -948,7 +955,8 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
     else:
         txt = (
             f"✅ سفارش #{oid} بدون عودت وجه لغو شد.\n\n"
-            f"💰 کل مبلغ ({format_price(result['total_cost'])} تومان) به‌عنوان مصرف‌شده در نظر گرفته شد."
+            f"📉 هزینهٔ خدمت ارائه‌شده: {format_price(result.get('service_used_cost', result['used_cost']))} تومان\n"
+            f"💰 کل مبلغ نگه‌داشته‌شده طبق انتخاب ادمین: {format_price(result['total_cost'])} تومان"
         )
     await query.edit_message_text(txt)
 
@@ -1112,7 +1120,7 @@ async def show_user_profile(update, context, user):
         f"🏳️ معاف از تایید شماره: {exempt}\n"
         f"📅 تاریخ عضویت: {join_date}\n"
         f"➖➖➖➖➖➖➖➖\n"
-        f"💰 موجودی: <code>{int(user['credit']):,}</code> تومان\n"
+        f"💰 موجودی: <code>{format_price(user['credit'])}</code> تومان\n"
         f"📉 مجموع واریزی: <code>{int(stats['total_deposited']):,}</code> تومان\n"
         f"🛍 تعداد سفارش: <code>{stats['orders_count']}</code>\n"
     )
@@ -1300,10 +1308,10 @@ async def set_user_credit(update, context):
         success, new_balance = await DatabaseManager.update_user_credit(target_uid, final_change, "admin", "تغییر توسط ادمین", bot_id=context.bot_data.get('bot_id', 1))
         if success:
             action_str = "افزایش" if sign > 0 else "کاهش"
-            admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{int(new_balance):,}` تومان")
+            admin_msg = (f"✅ **موجودی کاربر بروزرسانی شد.**\n\n👤 کاربر: {user.get('first_name', 'Unknown')} (ID: `{user['id']}`)\n💰 عملیات: {action_str} `{int(amt):,}` تومان\n💎 موجودی جدید: `{format_price(new_balance)}` تومان")
             await send_safe(context.bot, update.effective_chat.id, admin_msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
             try:
-                user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{int(new_balance):,}` تومان")
+                user_msg = (f"🔔 **اعلان تغییر موجودی**\n\nمبلغ `{int(amt):,}` تومان به حساب شما {'اضافه' if sign > 0 else 'کسر'} شد.\n💰 موجودی فعلی: `{format_price(new_balance)}` تومان")
                 await context.bot.send_message(chat_id=user['telegram_id'], text=user_msg)
             except: pass
             # 💳 گزارش تغییر موجودی ادمین در «کانال گزارشات پرداختی»

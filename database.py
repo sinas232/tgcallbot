@@ -20,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from config import Config
+from services.billing import money
 
 logger = logging.getLogger(__name__)
 Base = declarative_base()
@@ -170,6 +171,33 @@ class OrderSettlement(Base):
     user_id = Column(Integer, nullable=False, index=True)
     receipt = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderBilling(Base):
+    """Durable observed service; never derive crashed service from wall time."""
+    __tablename__ = "order_billing"
+    order_id = Column(Integer, primary_key=True, autoincrement=False)
+    served_seconds = Column(Float, nullable=False, default=0)
+    delivered_ids = Column(Text, nullable=False, default="[]")
+    checkpoint_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OrderPurchase(Base):
+    __tablename__ = "order_purchases"
+    request_key = Column(String(160), primary_key=True)
+    order_id = Column(Integer, nullable=False, unique=True)
+    user_id = Column(Integer, nullable=False)
+    bot_id = Column(Integer, nullable=False)
+
+
+class OrderReport(Base):
+    """Durable at-most-once send claim; ambiguous Telegram timeouts aren't retried."""
+    __tablename__ = "order_reports"
+    order_id = Column(Integer, primary_key=True)
+    audience = Column(String(64), primary_key=True)
+    kind = Column(String(20), nullable=False)
+    state = Column(String(20), nullable=False, default="sending")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class VoiceCallSession(Base):
     __tablename__ = "voice_call_sessions"
@@ -648,7 +676,7 @@ class DatabaseManager:
                 .with_for_update()
             )).scalar_one_or_none()
             if not user: return False, 0
-            user.credit += amount
+            user.credit = float(money(user.credit) + money(amount))
             trans = Transaction(bot_id=bot_id, user_id=internal_user_id, amount=amount, type=type, description=desc)
             db_session.add(trans)
             await db_session.commit()
@@ -717,6 +745,99 @@ class DatabaseManager:
             return False
 
     @staticmethod
+    async def get_checkout_order(request_key, user_id, bot_id=1):
+        async with AsyncSessionLocal() as session:
+            purchase = await session.get(OrderPurchase, request_key)
+            if not purchase:
+                return None
+            if purchase.user_id != user_id or purchase.bot_id != bot_id:
+                raise PermissionError("Checkout ownership mismatch")
+            return to_dict(await session.get(Order, purchase.order_id))
+
+    @staticmethod
+    async def purchase_order_atomic(user_id, plan, target_link, request_key, *, bot_id=1, scheduled_for=None):
+        """Debit + order + ledger + request receipt in ONE wallet-locked transaction."""
+        async with AsyncSessionLocal() as session, session.begin():
+            user = (await session.execute(select(User).where(User.id == user_id, User.bot_id == bot_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not user:
+                raise PermissionError("Wallet not found")
+            prior = await session.get(OrderPurchase, request_key)
+            if prior:
+                if prior.user_id != user_id or prior.bot_id != bot_id:
+                    raise PermissionError("Checkout ownership mismatch")
+                return dict(to_dict(await session.get(Order, prior.order_id)), _created=False)
+            current = await session.get(Plan, plan['id'])
+            if not current or current.bot_id != bot_id or not current.is_active:
+                raise ValueError("پلن دیگر قابل خرید نیست؛ دوباره انتخاب کنید.")
+            for key in ('price', 'accounts_count', 'duration_minutes', 'service_type'):
+                if getattr(current, key) != plan.get(key):
+                    raise ValueError("مشخصات یا قیمت پلن تغییر کرده؛ دوباره انتخاب کنید.")
+            price = money(current.price)
+            if current.accounts_count <= 0 or current.duration_minutes < 0:
+                raise ValueError("مشخصات پلن معتبر نیست.")
+            if price < 0 or money(user.credit) < price:
+                raise ValueError("موجودی کافی نیست.")
+            order = Order(bot_id=bot_id, user_id=user_id, plan_id=current.id,
+                          order_type=current.service_type, target_link=target_link,
+                          accounts_count=current.accounts_count, duration_minutes=current.duration_minutes,
+                          price_paid=float(price), status='scheduled' if scheduled_for else 'pending',
+                          scheduled_for=scheduled_for)
+            session.add(order)
+            await session.flush()
+            user.credit = float(money(user.credit) - price)
+            session.add(Transaction(bot_id=bot_id, user_id=user_id, amount=-float(price), type='order',
+                                    description=f"خرید سفارش #{order.id} | {current.name}"))
+            session.add(OrderPurchase(request_key=request_key, order_id=order.id, user_id=user_id, bot_id=bot_id))
+            session.add(OrderBilling(order_id=order.id, served_seconds=0, delivered_ids='[]'))
+            return dict(to_dict(order), _created=True)
+
+    @staticmethod
+    async def checkpoint_order_billing(order_id, served_seconds, delivered_ids=()):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running':
+                return False
+            if not math.isfinite(served_seconds) or served_seconds < 0:
+                raise ValueError("Invalid service time")
+            row = await session.get(OrderBilling, order_id)
+            if not row:
+                row = OrderBilling(order_id=order_id, served_seconds=0, delivered_ids='[]')
+                session.add(row)
+            row.served_seconds = min((order.duration_minutes or 0) * 60, max(row.served_seconds, served_seconds))
+            row.delivered_ids = json.dumps(sorted(set(json.loads(row.delivered_ids)) | set(delivered_ids)))
+            row.checkpoint_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def claim_order_report(order_id, audience, kind):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order:
+                return False
+            terminal = kind in ('completed', 'cancelled', 'failed')
+            expected = {'completed': 'completed', 'cancelled': 'stopped', 'failed': 'failed'}
+            if terminal and order.status != expected[kind]:
+                return False
+            if kind in ('started', 'scheduled') and order.status != {'started': 'running', 'scheduled': 'scheduled'}[kind]:
+                return False
+            key = audience + (':terminal' if terminal else ':' + kind)
+            if await session.get(OrderReport, (order_id, key)):
+                return False
+            session.add(OrderReport(order_id=order_id, audience=key, kind=kind))
+            return True
+
+    @staticmethod
+    async def mark_order_report(order_id, audience, kind, state):
+        key = audience + (':terminal' if kind in ('completed', 'cancelled', 'failed') else ':' + kind)
+        async with AsyncSessionLocal() as session:
+            await session.execute(update(OrderReport).where(OrderReport.order_id == order_id,
+                                  OrderReport.audience == key).values(state=state))
+            await session.commit()
+
+    @staticmethod
     async def create_order(user_id, order_type, target_link, accounts_count, duration_minutes, price_paid=0, plan_id=None, scheduled_for=None, bot_id=1):
         async with AsyncSessionLocal() as db_session:
             status = "scheduled" if scheduled_for else "pending"
@@ -735,7 +856,12 @@ class DatabaseManager:
     async def get_order(order_id: int):
         async with AsyncSessionLocal() as db_session:
             order = await db_session.get(Order, order_id)
-            return to_dict(order)
+            result = to_dict(order)
+            if result:
+                billing = await db_session.get(OrderBilling, order_id)
+                if billing:
+                    result['_billing'] = to_dict(billing)
+            return result
 
     @staticmethod
     async def get_user_running_voice_orders(user_id: int, bot_id: int = 1):
@@ -838,27 +964,43 @@ class DatabaseManager:
                 if not user:
                     raise ValueError("Order wallet not found")
                 snapshot = to_dict(order)
-                total = float(order.price_paid or 0)
+                billing = await session.get(OrderBilling, order_id)
+                if billing:
+                    snapshot['_billing'] = to_dict(billing)
+                snapshot['_settled_at'] = datetime.utcnow()
+                total = float(money(order.price_paid))
                 used, refund, elapsed = calculator(snapshot)
-                if not do_refund:
-                    used, refund = total, 0.0
+                service_used_cost = used
                 if (not all(math.isfinite(v) for v in (total, used, refund, elapsed))
                         or min(total, used, refund, elapsed) < 0
                         or not math.isclose(used + refund, total, abs_tol=0.000001)):
                     raise ValueError("Invalid order settlement")
+                if float(money(used)) != used or float(money(refund)) != refund:
+                    raise ValueError("Settlement amounts must use two decimal places")
+                if not do_refund:
+                    used, refund = total, 0.0
                 tx_id = f"TX-{uuid.uuid4().hex.upper()}" if refund > 0 else None
-                user.credit = float(user.credit or 0) + refund
+                user.credit = float(money(user.credit) + money(refund))
                 if refund > 0:
                     session.add(Transaction(
                         bot_id=bot_id, user_id=user.id, amount=refund, type="order_refund",
                         description=f"عودت لغو سفارش {order_id} | {tx_id}",
                     ))
+                if billing and order.duration_minutes:
+                    billing.served_seconds = elapsed
+                    billing.checkpoint_at = snapshot['_settled_at']
                 order.status = "stopped"
-                order.completed_at = datetime.utcnow()
+                order.completed_at = snapshot['_settled_at']
                 receipt = {
                     "total_cost": total, "used_cost": used, "refund_amount": refund,
                     "refund_tx_id": tx_id, "user_wallet_balance": user.credit,
                     "elapsed_seconds": elapsed,
+                    "service_used_cost": service_used_cost,
+                    "do_refund": bool(do_refund),
+                    "withheld_unused_cost": float(money(total) - money(service_used_cost)) if not do_refund else 0.,
+                    "remaining_seconds": max(0., (order.duration_minutes or 0) * 60 - elapsed),
+                    "duration_seconds": (order.duration_minutes or 0) * 60,
+                    "settled_at": snapshot['_settled_at'].isoformat(),
                 }
                 session.add(OrderSettlement(
                     order_id=order_id, bot_id=bot_id, user_id=user.id,
@@ -907,16 +1049,16 @@ class DatabaseManager:
             return bool(result.rowcount)
 
     @staticmethod
-    async def start_order_duration(order_id: int) -> datetime:
-        """Set billable service start at the end of the build phase."""
-        async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
-            await db_session.execute(
-                update(Order).where(Order.id == order_id).values(started_at=now)
-            )
-            await db_session.commit()
-            return now
-    
+    async def start_order_duration(order_id: int):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running':
+                return None
+            if not order.started_at:
+                order.started_at = datetime.utcnow()
+            return order.started_at
+
     @staticmethod
     async def mark_order_as_running(order_id: int):
         """Move the order to `running` WITHOUT starting the billable clock.
@@ -940,21 +1082,22 @@ class DatabaseManager:
 
     @staticmethod
     async def complete_order(order_id: int) -> bool:
-        """تکمیل سفارش — فقط اگر همچنان باز است.
-
-        🔒 اگر سفارش در لحظات آخر لغو شده باشد، وضعیت stopped حفظ
-        می‌شود تا کاربر همزمان هم عودت بگیرد و هم پیام «تکمیل»
-        دریافت نکند (پرش از روی لغو ممنوع).
-        """
-        async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
-            res = await db_session.execute(
-                update(Order)
-                .where(Order.id == order_id, Order.status.in_(['pending', 'running', 'scheduled']))
-                .values(status='completed', completed_at=now)
-            )
-            await db_session.commit()
-            return bool(res.rowcount)
+        """One terminal transition winner; observed delivery, not created_at, expires work."""
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running' or await session.get(OrderSettlement, order_id):
+                return False
+            billing = await session.get(OrderBilling, order_id)
+            if billing:
+                if order.duration_minutes:
+                    if billing.served_seconds < order.duration_minutes * 60:
+                        return False
+                elif len(json.loads(billing.delivered_ids)) < order.accounts_count:
+                    return False
+            order.status = 'completed'
+            order.completed_at = datetime.utcnow()
+            return True
 
     @staticmethod
     async def get_due_scheduled_orders():
@@ -994,6 +1137,12 @@ class DatabaseManager:
             existing_orders = res.scalars().all()
             
             for order in existing_orders:
+                billing = await db_session.get(OrderBilling, order.id)
+                if order.status == 'running' and billing:
+                    remaining = max(0, (order.duration_minutes or 0) * 60 - billing.served_seconds)
+                    if not order.duration_minutes or new_start_time < datetime.utcnow() + timedelta(seconds=remaining):
+                        return True
+                    continue
                 # تعیین زمان شروع سفارش موجود
                 existing_start = order.started_at if order.started_at else (order.scheduled_for if order.scheduled_for else order.created_at)
                 if not existing_start:
@@ -1027,7 +1176,8 @@ class DatabaseManager:
                 Order.started_at,
                 Order.scheduled_for,
                 Order.created_at,
-            ).filter(
+                OrderBilling.served_seconds,
+            ).outerjoin(OrderBilling, OrderBilling.order_id == Order.id).filter(
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled', 'pending']),
             )
@@ -1042,6 +1192,7 @@ class DatabaseManager:
                     "started_at": row[5],
                     "scheduled_for": row[6],
                     "created_at": row[7],
+                    "served_seconds": row[8],
                 }
                 for row in res.all()
             ]
@@ -1357,22 +1508,17 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
 
     @staticmethod
     async def reset_stuck_orders():
-        """بستن سفارش‌هایی که با ری‌استارت ربات نیمه‌کاره مانده‌اند.
-
-        🐞 فیکس عدالت مالی: قبلاً فقط وضعیت عوض می‌شد و پولِ استفاده‌نشده‌ی
-        کاربر سوخت می‌شد. حالا فهرست سفارش‌های در حال اجرا «قبل از» بستن
-        خوانده و برگردانده می‌شود تا main.py بتواند ماندهٔ مبلغ را به کیف پول
-        کاربر عودت دهد (تسویهٔ ثانیه‌ای همانند لغو دستی).
-        """
-        async with AsyncSessionLocal() as db_session:
-            res = await db_session.execute(
-                select(Order).where(Order.status == 'running')
-            )
-            stuck = [to_dict(o) for o in res.scalars().all()]
-            await db_session.execute(update(Order).where(Order.status == 'running').values(status='stopped'))
-            await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.status == 'joined').values(status='reset'))
-            await db_session.commit()
-            return stuck
+        """Read interrupted work; atomic settlement, not this query, closes it."""
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(select(Order).where(Order.status == 'running'))).scalars().all()
+            result = []
+            for order in rows:
+                item = to_dict(order)
+                billing = await session.get(OrderBilling, order.id)
+                if billing:
+                    item['_billing'] = to_dict(billing)
+                result.append(item)
+            return result
 
     @staticmethod
     async def get_stale_pending_orders(minutes: int = 10):

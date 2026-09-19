@@ -237,6 +237,7 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             'selected_plan': {'id': 1, 'name': 'test', 'price': 100, 'duration_minutes': 10,
                               'accounts_count': 1, 'service_type': 'voice_chat'},
             'target_link': '@test',
+            'checkout_message': (567, 9),
         })
         async def capacity(*args):
             app.bot_data['maintenance_mode'] = True
@@ -244,7 +245,8 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(DatabaseManager, 'get_user', AsyncMock(return_value={'id': 1, 'credit': 1000})), \
              patch.object(DatabaseManager, 'has_time_overlap_order', AsyncMock(return_value=False)), \
              patch.object(order_handlers.capacity_planner, 'check_order', AsyncMock(side_effect=capacity)), \
-             patch.object(DatabaseManager, 'update_user_credit', AsyncMock()) as debit, \
+             patch.object(DatabaseManager, 'get_checkout_order', AsyncMock(return_value=None)), \
+             patch.object(DatabaseManager, 'purchase_order_atomic', AsyncMock()) as debit, \
              patch.object(DatabaseManager, 'create_order', AsyncMock()) as create, \
              patch.object(order_handlers.order_executor, 'submit_order', AsyncMock()) as submit:
             with self.assertRaises(ApplicationHandlerStop):
