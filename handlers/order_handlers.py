@@ -599,6 +599,15 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
                 await query.edit_message_text(f"ℹ️ سفارش #{order['id']} قبلاً ثبت شده؛ کسر مجدد انجام نشد.")
                 return ConversationHandler.END
             if not schedule_time:
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]])
+                try:
+                    await asyncio.wait_for(query.edit_message_text(
+                        f"✅ **پرداخت و ثبت سفارش انجام شد.**\n🆔 کد پیگیری: `{order['id']}`\n"
+                        + ("ورود اکانت‌ها آغاز می‌شود؛ زمان پولی پس از آماده‌شدن سرویس محاسبه می‌شود."
+                           if plan.get('duration_minutes') else "عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود."),
+                        reply_markup=kb), timeout=5)
+                except Exception:
+                    logger.warning("Order %s checkout ACK failed/uncertain; not replayed after execution", order['id'])
                 try:
                     await order_executor.submit_order(order['id'], order)
                 except Exception:
@@ -607,16 +616,7 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
                     await query.edit_message_text(f"❌ اجرای سفارش #{order['id']} آغاز نشد؛ تسویه در کیف پول ثبت شد.")
                     return ConversationHandler.END
         if not schedule_time:
-            # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]
-            )
-            await query.edit_message_text(
-                f"✅ **پرداخت و ثبت سفارش انجام شد.**\n"
-                f"🆔 کد پیگیری: `{order['id']}`\n"
-                "زمان خریداری‌شده پس از آماده‌شدن سرویس محاسبه می‌شود. در صورت نیاز می‌توانید سفارش را با دکمه زیر لغو کنید.",
-                reply_markup=kb
-            )
+            return ConversationHandler.END
         else:
             time_fa = format_jalali_datetime(schedule_time)
             kb = InlineKeyboardMarkup(

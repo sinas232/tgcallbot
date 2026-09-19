@@ -223,3 +223,48 @@ class AccountingPostgresTests(unittest.IsolatedAsyncioTestCase):
             await restarted.refund_interrupted_order(await DB.get_order(order['id']))
             await restarted.refund_interrupted_order(await DB.get_order(order['id']))
         self.assertEqual(await self.counts(), (5000, [('order', -1000), ('order_refund', 1000)]))
+
+    async def cancel_during_start_send(self, audience):
+        from types import SimpleNamespace
+        from services.bot_manager import bot_manager
+        plan = await self.seed_plan()
+        order = await DB.purchase_order_atomic(1, plan, '@test', 'key',
+                                               scheduled_for=datetime.utcnow() + timedelta(minutes=1))
+        ex = OrderExecutor()
+        entered = asyncio.Event()
+        events = []
+        async def send(chat, text, **kwargs):
+            is_start = 'شروع اجرا' in text or 'آغاز شد' in text
+            if is_start and ((chat == '@log') == (audience == 'channel')):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append('inflight start cancelled')
+            elif not is_start:
+                events.append('terminal delivered')
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
+        with patch.dict(bot_manager.active_bots, {1: SimpleNamespace(bot=bot)}, clear=True), \
+                patch.object(DB, 'get_setting', AsyncMock(return_value='@log')), \
+                patch.object(ex, '_voice_batched_fill', AsyncMock()) as fill, \
+                patch.object(ex, '_cleanup_order', AsyncMock()):
+            self.assertTrue(await ex.submit_order(order['id'], order))
+            await asyncio.wait_for(entered.wait(), 2)
+            result = await asyncio.wait_for(ex.settle_and_refund_order(order['id'], expected_user_id=1), 5)
+            await ex._announce_order_start(order['id'], order)  # stale re-entry must not send
+        fill.assert_not_awaited()
+        self.assertEqual(events, ['inflight start cancelled', 'terminal delivered'])
+        self.assertEqual(result['used_cost'], 0)
+        self.assertEqual(result['refund_amount'], 1000)
+        self.assertEqual(await self.counts(), (5000, [('order', -1000), ('order_refund', 1000)]))
+        async with self.sessions() as session:
+            report = await session.get(OrderReport, (order['id'], audience + ':started'))
+            self.assertEqual(report.state, 'uncertain')
+            terminal = await session.get(OrderReport, (order['id'], 'channel:terminal'))
+            self.assertEqual((terminal.kind, terminal.state), ('cancelled', 'sent'))
+
+    async def test_cancel_during_channel_start_has_no_late_start_or_charge(self):
+        await self.cancel_during_start_send('channel')
+
+    async def test_cancel_during_scheduled_customer_start_has_no_late_start_or_charge(self):
+        await self.cancel_during_start_send('customer')

@@ -552,22 +552,15 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
                     # A toggle may have happened while fetching due orders.
                     if maintenance_enabled(context.bot_data):
                         return
-                    await order_executor.submit_order(oid, order)
+                    launched = await order_executor.submit_order(oid, order)
+                    if not launched:
+                        continue
             except Exception as exc:
                 logger.error("Order %s: failed to launch scheduled order: %s", oid, exc)
                 continue
             started += 1
-            try:
-                app = bot_manager.active_bots.get(bot_id)
-                if app:
-                    user = await DatabaseManager.get_user_by_id(order['user_id'])
-                    if user and user.get('telegram_id'):
-                        await app.bot.send_message(
-                            user['telegram_id'],
-                            f"⏰ **سفارش زمان‌بندی شده شما شروع شد!**\n🆔 کد سفارش: `{oid}`\n🚀 نوع: {order['order_type']}"
-                        )
-            except Exception:
-                pass
+            # The executor owns the pre-build start announcement. Sending here
+            # races short orders and can announce a start AFTER completion.
     except Exception as e:
         logger.error(f"Scheduled orders check error: {e}")
 

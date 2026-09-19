@@ -8,6 +8,7 @@ import random
 import re
 import time
 import uuid
+import weakref
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -21,6 +22,9 @@ from services.session_ownership import SessionInUseError
 from services import self_healing
 
 logger = logging.getLogger(__name__)
+
+# Bound reporting, not service duration. Never queue stale starts for later replay.
+ORDER_REPORT_TIMEOUT_SECONDS = 8.0
 
 
 def _format_timer(seconds: float) -> str:
@@ -58,6 +62,7 @@ class OrderExecutor:
 		self.active_orders: Dict[int, Dict[str, Any]] = {}
 		self.app = None
 		self.shutting_down = False
+		self._report_locks = weakref.WeakValueDictionary()
 
 		# ─── Join Brain per-order scratch state (voice_chat) ───
 		# Kept OUTSIDE `active_orders` so it survives across build →
@@ -133,9 +138,9 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
 		if self.shutting_down or order_id in self.active_orders:
-			return
+			return False
 		self.active_orders[order_id] = {
 			"status": "running",
 			"data": order_data,
@@ -152,18 +157,18 @@ class OrderExecutor:
 			claimed = await DatabaseManager.mark_order_as_running(order_id)
 			if not claimed:
 				self.active_orders.pop(order_id, None)
-				return
+				return False
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
 		if not self._is_order_active(order_id):
-			return  # cancelled while the database claim was in flight
+			return False  # cancelled while the database claim was in flight
 		info = self.active_orders[order_id]
 		info.update(clock=ServiceClock(), serving=False, storage_ok=True, children=set(), delivered_ids=set())
 		try:
 			if not await DatabaseManager.checkpoint_order_billing(order_id, 0):
 				self.active_orders.pop(order_id, None)
-				return
+				return False
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			await DatabaseManager.finalize_order_status(order_id, order_data.get('status') or 'pending', ('running',))
@@ -178,6 +183,7 @@ class OrderExecutor:
 				logger.exception("Order %s worker ended; financial reconciliation will retry", order_id)
 		task.add_done_callback(consume_result)
 		self.active_orders[order_id]["task"] = task
+		return True
 
 	async def _run_with_billing(self, order_id, data):
 	    heartbeat = asyncio.create_task(self._billing_heartbeat(order_id))
@@ -318,6 +324,13 @@ class OrderExecutor:
 	        duration = int(data.get("duration_minutes") or 0)
 	        order_type = data["order_type"]
 
+	        if not self._is_order_active(order_id):
+	            raise asyncio.CancelledError()
+	        data['_execution_started_at'] = datetime.utcnow()
+	        logger.info('Order %s: execution starting; reporting before build (bot=%s)', order_id, bot_id)
+	        await self._announce_order_start(order_id, data)
+	        if not self._is_order_active(order_id):
+	            raise asyncio.CancelledError()
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
 	        exact = requested if eligible_count else 0
 	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
@@ -328,8 +341,6 @@ class OrderExecutor:
 
 	        if order_id in self.active_orders:
 	            self.active_orders[order_id]["target_count"] = exact
-
-	        await self._log_to_channel("started", order_id, data, bot_id=bot_id)
 
 	        # ────────────────────────────────────────────────────────────
 	        # BUILD PHASE — join time is NEVER part of the purchased window.
@@ -1640,7 +1651,9 @@ class OrderExecutor:
 
 		# ── گزارش شروع سفارش ──
 		if kind in ("started", "scheduled"):
-			head = "🟢 **سفارش جدید فعال شد**" if kind == "started" else "🗓️ **سفارش زمان‌بندی‌شده ثبت شد**"
+			head = "🟢 **سفارش جدید — شروع اجرا**" if kind == "started" else "🗓️ **سفارش زمان‌بندی‌شده ثبت شد**"
+			event_time = (data.get('_execution_started_at') or datetime.utcnow()) if kind == 'started' else order_rec.get('scheduled_for')
+			time_label = "آغاز عملیات ورود" if kind == 'started' else "زمان اجرای رزرو"
 			lines = [
 				f"┌ {head}",
 				"│",
@@ -1653,9 +1666,11 @@ class OrderExecutor:
 				f"├ 🔢 **تعداد اکانت:** `{count}` عدد",
 				f"├ ⏳ **مدت پلن:** `{plan_minutes}` دقیقه",
 				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
-				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(started_at)}`",
+				f"└ 🚀 **{time_label}:** `{format_jalali_datetime(event_time)}`",
 				sep,
-				"🛡️ *سیستم مانیتورینگ لحظه‌ای و خودکار فعال است.*",
+				(("⏳ *ورود اکانت‌ها آغاز می‌شود؛ زمان پولی پس از آماده‌شدن سرویس محاسبه می‌شود.*"
+				  if plan_minutes else "⏳ *عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود.*")
+				 if kind == 'started' else "📅 *این پیام ثبت رزرو است، نه شروع اجرا.*"),
 			]
 			return "\n".join(lines)
 
@@ -1746,7 +1761,78 @@ class OrderExecutor:
 			lines += [f"📝 دلیل: {reason}"]
 		return "\n".join(lines)
 
+	def _report_lock(self, order_id):
+	    lock = self._report_locks.get(order_id)
+	    if lock is None:
+	        lock = asyncio.Lock()
+	        self._report_locks[order_id] = lock
+	    return lock
+
+	async def _announce_order_start(self, order_id, data):
+	    # This is an awaited pre-build barrier. No account work or paid timer runs
+	    # before these attempts resolve. The scheduler never sends a late start.
+	    await self._log_to_channel('started', order_id, data, bot_id=data.get('bot_id', 1))
+	    if data.get('scheduled_for') and self._is_order_active(order_id):
+	        async with self._report_lock(order_id):
+	            try:
+	                await asyncio.wait_for(self._send_scheduled_start(order_id, data),
+	                                       timeout=ORDER_REPORT_TIMEOUT_SECONDS)
+	            except asyncio.TimeoutError:
+	                logger.warning('Order %s: scheduled start notification timed out; not queued for replay', order_id)
+
+	async def _send_scheduled_start(self, order_id, data):
+	    from services.bot_manager import bot_manager
+	    app = bot_manager.active_bots.get(data.get('bot_id', 1))
+	    if not app:
+	        return
+	    claimed = False
+	    try:
+	        user = await DatabaseManager.get_user_by_id(data['user_id'])
+	        if not user or not user.get('telegram_id'):
+	            return
+	        claimed = await DatabaseManager.claim_order_report(order_id, 'customer', 'started')
+	        if not claimed:
+	            return
+	        # Recheck after all preparation/claim awaits, before issuing the RPC.
+	        order = await DatabaseManager.get_order(order_id)
+	        if not order or order.get('status') != 'running' or not self._is_order_active(order_id):
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'skipped')
+	            return
+	        await app.bot.send_message(user['telegram_id'],
+	            f"⏰ اجرای سفارش زمان‌بندی‌شده #{order_id} آغاز شد.\n"
+	            + ("اکانت‌ها در حال ورود هستند؛ زمان پولی پس از آماده‌شدن سرویس محاسبه می‌شود."
+               if data.get('duration_minutes') else "عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود."),
+	            parse_mode=None, connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
+	        await DatabaseManager.mark_order_report(order_id, 'customer', 'started', 'sent')
+	        logger.info('Order %s: report sent kind=started audience=customer', order_id)
+	    except asyncio.CancelledError:
+	        if claimed:
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'uncertain')
+	        raise
+	    except Exception:
+	        if claimed:
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'uncertain')
+	        logger.exception('Order %s: scheduled start notification failed; not replayed', order_id)
+
+	async def _mark_report_safely(self, order_id, audience, kind, state):
+	    try:
+	        await asyncio.wait_for(DatabaseManager.mark_order_report(order_id, audience, kind, state), timeout=2)
+	    except Exception:
+	        # The durable sending claim still prevents a duplicate if storage is down.
+	        logger.warning('Order %s: could not record report outcome %s/%s', order_id, kind, state)
+
 	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
+	    # Cancellation may race a slow start report. Finish its send/cancellation
+	    # before any terminal report; no fire-and-forget send survives this barrier.
+	    async with self._report_lock(order_id):
+	        try:
+	            await asyncio.wait_for(self._send_channel_report(type, order_id, data, user=user,
+	                success_cnt=success_cnt, reason=reason, bot_id=bot_id, extra=extra),
+	                timeout=ORDER_REPORT_TIMEOUT_SECONDS)
+	        except asyncio.TimeoutError:
+	            logger.warning('Order %s: %s report deadline exceeded; no delayed replay', order_id, type)
+
+	async def _send_channel_report(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
 		from services.bot_manager import bot_manager
 		app = bot_manager.active_bots.get(bot_id)
 		if not app:
@@ -1769,19 +1855,34 @@ class OrderExecutor:
 			if not await DatabaseManager.claim_order_report(order_id, "channel", type):
 				return
 			claimed_report = True
+			if type in ('started', 'scheduled'):
+				latest = await DatabaseManager.get_order(order_id)
+				expected = 'running' if type == 'started' else 'scheduled'
+				if not latest or latest.get('status') != expected:
+					await self._mark_report_safely(order_id, "channel", type, "skipped")
+					return
 			try:
-				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
+				await app.bot.send_message(channel_id, txt, parse_mode="Markdown",
+				                           connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
 			except BadRequest as exc:
 				if "parse entities" not in str(exc).lower():
 					raise
-				await app.bot.send_message(channel_id, txt, parse_mode=None)
+				if type in ('started', 'scheduled'):
+					latest = await DatabaseManager.get_order(order_id)
+					if not latest or latest.get('status') != ('running' if type == 'started' else 'scheduled'):
+						await self._mark_report_safely(order_id, "channel", type, "skipped")
+						return
+				await app.bot.send_message(channel_id, txt, parse_mode=None,
+				                           connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
 			await DatabaseManager.mark_order_report(order_id, "channel", type, "sent")
+			logger.info('Order %s: report sent kind=%s audience=channel', order_id, type)
+		except asyncio.CancelledError:
+			if claimed_report:
+				await self._mark_report_safely(order_id, "channel", type, "uncertain")
+			raise
 		except Exception as exc:
 			logger.warning(f"Order {order_id}: report send failed/uncertain: {exc}")
 			if claimed_report:
-				try:
-					await DatabaseManager.mark_order_report(order_id, "channel", type, "uncertain")
-				except Exception:
-					pass
+				await self._mark_report_safely(order_id, "channel", type, "uncertain")
 
 order_executor = OrderExecutor()
