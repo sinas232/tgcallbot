@@ -70,7 +70,8 @@ class ReportTimingTests(unittest.IsolatedAsyncioTestCase):
             data['status'] = 'completed'
             await ex._log_to_channel('completed', 42, data, bot_id=2)
         stack, _, _ = self.transport(send, data)
-        with stack, patch.object(DB, 'count_active_accounts', AsyncMock(return_value=1)), \
+        with stack, patch.object(DB, 'checkpoint_order_billing', AsyncMock(return_value=True)), \
+                patch.object(DB, 'count_active_accounts', AsyncMock(return_value=1)), \
                 patch.object(DB, 'start_order_duration', AsyncMock(return_value=datetime.utcnow())), \
                 patch.object(ex, '_voice_batched_fill', side_effect=fill), \
                 patch.object(ex, '_progressive_fill', side_effect=fill), \

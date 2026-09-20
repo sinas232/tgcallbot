@@ -57,7 +57,7 @@ class ExactBillingTests(unittest.TestCase):
         del order['_billing']
         self.assertEqual(ex.preview_order_settlement(order), (0, 1000, 0))
 
-    def test_presence_unknown_or_partial_is_not_billable(self):
+    def test_presence_unknown_or_partial_is_not_full_count_health(self):
         ex = OrderExecutor()
         ex.active_orders[42] = dict(serving=True, storage_ok=True, data={'order_type': 'voice_chat', 'accounts_count': 2})
         vcm = SimpleNamespace(active_calls={(42, 1): {}, (42, 2): {}}, _account_states_by_order={42: {1: 'JOINED', 2: 'TEMPORARILY_UNKNOWN'}})
@@ -196,7 +196,7 @@ class RuntimeAccountingTests(unittest.IsolatedAsyncioTestCase):
             await ex._run_paid_duration(42, data)
         self.assertEqual(clock.served, 60)
         self.assertEqual(ex.active_orders[42]['remaining_seconds'], 0)
-        persist.assert_awaited_once_with(42, 60, {1})
+        persist.assert_awaited_once_with(42, 60, {1}, first_delivery_at=ex.active_orders[42]['first_delivery_at'])
 
     def test_financial_display_keeps_fractional_toman(self):
         from utils.helpers import format_price

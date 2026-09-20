@@ -112,7 +112,9 @@ def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
         f"⏰ اجرا: {time_str}\n"
         f"{cap_line}"
         f"💰 مبلغ قابل پرداخت: **{format_price(plan['price'])} تومان**\n\n"
-        "آیا اطلاعات بالا مورد تایید است؟"
+        + ("⏱ هزینه از زمان حضور تأییدشدهٔ هر اکانت محاسبه می‌شود؛ حضور بخشی از تعداد پلن، به همان نسبت مصرف دارد. در لغو، ماندهٔ مصرف‌نشده عودت می‌شود.\n\n"
+           if plan.get('duration_minutes') else "")
+        + "آیا اطلاعات بالا مورد تایید است؟"
     )
 
 
@@ -603,7 +605,7 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
                 try:
                     await asyncio.wait_for(query.edit_message_text(
                         f"✅ **پرداخت و ثبت سفارش انجام شد.**\n🆔 کد پیگیری: `{order['id']}`\n"
-                        + ("ورود اکانت‌ها آغاز می‌شود؛ زمان پولی پس از آماده‌شدن سرویس محاسبه می‌شود."
+                        + ("ورود اکانت‌ها آغاز می‌شود؛ هزینه از حضور تأییدشدهٔ هر اکانت، متناسب با زمان و تعداد، محاسبه می‌شود."
                            if plan.get('duration_minutes') else "عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود."),
                         reply_markup=kb), timeout=5)
                 except Exception:
@@ -687,8 +689,8 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"{prefix}\n\n"
         f"📦 شماره سفارش: {order_id}\n"
         f"💰 مبلغ کل پلن: {format_price(result['total_cost'])} تومان\n"
-        f"⏱ زمان قابل محاسبه: {elapsed}\n"
-        f"⏳ زمان باقی‌مانده: {float(result.get('remaining_seconds') or 0):.2f} ثانیه\n"
+        f"⏱ زمان مصرف معادل کل پلن: {elapsed}\n"
+        f"⏳ زمان معادل باقی‌مانده: {float(result.get('remaining_seconds') or 0):.2f} ثانیه\n"
         f"📉 مبلغ مصرف‌شده: {format_price(result['used_cost'])} تومان\n"
         f"💵 مبلغ عودت داده شده به کیف پول: {format_price(result['refund_amount'])} تومان\n"
         f"🧾 کد پیگیری عودت: {result['refund_tx_id'] or '—'}\n"

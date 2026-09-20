@@ -26,7 +26,7 @@ def prorate(total, elapsed, duration):
 
 
 class ServiceClock:
-    """Sampled monotonic delivery clock, excluding build/unknown/offline intervals.
+    """Sampled monotonic delivery clock, excluding unobserved/offline intervals.
 
     Unknown long scheduling gaps are gifted rather than billed. At crash, only
     the last persisted checkpoint is charged. Normally up to five recent seconds
@@ -34,15 +34,43 @@ class ServiceClock:
     """
     def __init__(self, served=0, now=time.monotonic):
         self.now = now
-        self.served = float(served)
+        self.served = served
+        self.account_ids = frozenset()
         self.last = now()
         self.delivering = False
+
+    @property
+    def served(self):
+        return float(self._served)
+
+    @served.setter
+    def served(self, value):
+        self._served = Decimal(str(value))
+
+    def sample_accounts(self, account_ids, required):
+        """Full-plan-equivalent seconds = observed account-seconds / plan count.
+
+        Only identities present at BOTH sample boundaries contribute. New joins,
+        replacements, unknown states and long observation gaps aren't backdated.
+        No per-tick money rounding; fractional service accumulates as Decimal.
+        """
+        now = self.now()
+        delta = max(0., now - self.last)
+        current = frozenset(account_ids)
+        if required > 0 and delta <= 5:
+            count = min(required, len(self.account_ids & current))
+            self._served += Decimal(str(delta)) * count / Decimal(required)
+        self.last = now
+        self.account_ids = current
+        self.delivering = bool(current)
+        return self.served
 
     def sample(self, delivering):
         now = self.now()
         delta = max(0., now - self.last)
         if self.delivering and delivering and delta <= 5:
-            self.served += delta
+            self._served += Decimal(str(delta))
         self.last = now
         self.delivering = delivering
+        self.account_ids = frozenset()
         return self.served
