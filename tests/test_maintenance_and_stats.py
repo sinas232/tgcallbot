@@ -231,7 +231,7 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await task
             save.assert_awaited_once()
 
-    async def test_checkout_rechecks_after_capacity_await_before_debit(self):
+    async def test_checkout_rechecks_after_admission_await_before_debit(self):
         app = await self.app()
         context = SimpleNamespace(application=app, bot_data=app.bot_data, user_data={
             'selected_plan': {'id': 1, 'name': 'test', 'price': 100, 'duration_minutes': 10,
@@ -239,12 +239,12 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
             'target_link': '@test',
             'checkout_message': (567, 9),
         })
-        async def capacity(*args):
+        async def admission(*args):
             app.bot_data['maintenance_mode'] = True
             return {'allowed': True}
         with patch.object(DatabaseManager, 'get_user', AsyncMock(return_value={'id': 1, 'credit': 1000})), \
              patch.object(DatabaseManager, 'has_time_overlap_order', AsyncMock(return_value=False)), \
-             patch.object(order_handlers.capacity_planner, 'check_order', AsyncMock(side_effect=capacity)), \
+             patch.object(order_handlers.order_admission, 'check_order', AsyncMock(side_effect=admission)), \
              patch.object(DatabaseManager, 'get_checkout_order', AsyncMock(return_value=None)), \
              patch.object(DatabaseManager, 'purchase_order_atomic', AsyncMock()) as debit, \
              patch.object(DatabaseManager, 'create_order', AsyncMock()) as create, \

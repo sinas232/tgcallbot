@@ -1173,12 +1173,12 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    async def get_capacity_reservations(bot_id: int = 1) -> List[Dict[str, Any]]:
+    async def get_active_order_windows(bot_id: int = 1) -> List[Dict[str, Any]]:
         """
-        رزروهای فعال ظرفیت برای Capacity Guard (گارد منابع قبل از ثبت سفارش).
+        رزروهای فعال ظرفیت برای سقف سفارش‌های فعال هم‌زمان.
         سبک: فقط ستون‌های لازم از سفارش‌های running/scheduled/pending خوانده
         می‌شود؛ هر رکورد یعنی «accounts_count اکانت از شروع تا پایان مدت اشغال
-        است». محاسبهٔ تداخل/اوج در services/capacity_planner.py انجام می‌شود.
+        است». شمارش هم‌پوشانی در services/order_admission.py انجام می‌شود.
         """
         async with AsyncSessionLocal() as db_session:
             q = select(

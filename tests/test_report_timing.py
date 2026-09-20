@@ -236,7 +236,7 @@ class ReportTimingTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=567))
         with patch.object(DB, 'get_user', AsyncMock(return_value={'id': 1, 'credit': 1000})), \
                 patch.object(DB, 'get_checkout_order', AsyncMock(return_value=None)), \
-                patch('handlers.order_handlers.capacity_planner.check_order', AsyncMock(return_value={'allowed': True})), \
+                patch('handlers.order_handlers.order_admission.check_order', AsyncMock(return_value={'allowed': True})), \
                 patch.object(DB, 'has_time_overlap_order', AsyncMock(return_value=False)), \
                 patch.object(DB, 'purchase_order_atomic', AsyncMock(return_value=data)), \
                 patch('handlers.order_handlers.enforce_maintenance', AsyncMock()), \

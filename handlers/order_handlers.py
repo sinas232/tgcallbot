@@ -22,7 +22,7 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
-from services.capacity_planner import capacity_planner
+from services.order_admission import order_admission, active_order_limit
 from services.maintenance import maintenance, enforce_maintenance
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ async def safe_answer(query):
     try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
-# -------------------- 🛡 گارد ظرفیت منابع (Capacity Guard) --------------------
+# -------------------- 👥 سقف سفارش‌های فعال هم‌زمان --------------------
 
 def _order_window_from_context(context) -> tuple:
     """(زمان شروع UTC، مدت دقیقه) سفارشِ در حال ساخت — برای آنی و زمان‌بندی."""
@@ -49,49 +49,22 @@ def _order_window_from_context(context) -> tuple:
     return start, duration
 
 
-def _capacity_preview_line(verdict: dict) -> str:
-    """یک خطِ وضعیت ظرفیت برای پیش‌نمایش صفحهٔ تأیید (فارسی)."""
+def _admission_preview_line(verdict: dict) -> str:
+    """یک خطِ ساده: چند سفارش فعال هم‌پوشان از سقف مجاز پر شده است."""
     try:
         if verdict.get('degraded'):
             return ""
+        limit = int(verdict.get('limit') or active_order_limit())
+        used = int(verdict.get('active_count') or 0)
         if verdict.get('allowed', True):
-            line = "🟢 ظرفیت سرور برای کل بازهٔ اجرای این سفارش: **موجود است**\n"
-            if verdict.get('resource_checked'):
-                line += (
-                    f"🖥 منابع سرور: پردازنده `{verdict.get('current_cpu_percent', 0):.0f}%`"
-                    f" · حافظه `{verdict.get('current_memory_percent', 0):.0f}%`"
-                    f" → پیش‌بینی در اوج بازه: `{verdict.get('projected_cpu_percent', 0):.0f}% / {verdict.get('projected_memory_percent', 0):.0f}%`\n"
-                )
-            waves = int(verdict.get('waves') or 0)
-            if waves > 1:
-                line += (
-                    f"🔄 این سفارش بزرگ‌تر از ظرفیتِ همزمان است؛ در `{waves}` موج اجرا می‌شود "
-                    f"(هر موج تا `{verdict.get('concurrent_capacity', 0)}` اکانت)\n"
-                )
-            return line
-        suggested = verdict.get('suggested_start_utc')
-        peak = verdict.get('peak_usage', 0)
-        eff = verdict.get('effective_pool', 0)
-        line = f"🔴 ظرفیت سرور در بازهٔ اجرای این سفارش: **تکمیل است** (اوج مصرف `{peak}` از `{eff}` اکانت مفید)\n"
-        if verdict.get('resource_checked'):
-            why = verdict.get('resource_reason')
-            why_fa = {'cpu': 'پردازنده', 'memory': 'حافظه', 'load': 'بار پردازشی'}.get(why)
-            line += (
-                f"🖥 منابع سرور: پردازنده `{verdict.get('current_cpu_percent', 0):.0f}%`"
-                f" · حافظه `{verdict.get('current_memory_percent', 0):.0f}%`"
-                f" → پیش‌بینی در اوج بازه: `{verdict.get('projected_cpu_percent', 0):.0f}% / {verdict.get('projected_memory_percent', 0):.0f}%`"
-                + (f" (مانع: {why_fa})" if why_fa else "")
-                + "\n"
-            )
-        if suggested:
-            line += f"💡 پیشنهاد دقیق سیستم برای شروع: **{format_jalali_datetime(suggested)}**\n"
-        return line
+            return f"👥 سفارش‌های فعال هم‌پوشان در این بازه: `{used}` از `{limit}`\n"
+        return f"👥 سفارش‌های فعال هم‌پوشان در این بازه: `{used}` از `{limit}` (تکمیل)\n"
     except Exception:
         return ""
 
 
-def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
-    """متن مشترک صفحهٔ تأیید سفارش (+ خط پیش‌نمایش ظرفیت در صورت وجود)."""
+def _build_confirmation_text(context, admission_verdict: dict = None) -> str:
+    """متن مشترک صفحهٔ تأیید سفارش (+ خط سقف سفارش‌های هم‌زمان در صورت وجود)."""
     plan = context.user_data['selected_plan']
     link = context.user_data['target_link']
     is_sched = context.user_data.get('is_scheduled', False)
@@ -102,7 +75,7 @@ def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
     else:
         time_str = format_jalali_datetime(get_tehran_time())
 
-    cap_line = _capacity_preview_line(capacity_verdict) if capacity_verdict is not None else ""
+    cap_line = _admission_preview_line(admission_verdict) if admission_verdict is not None else ""
 
     return (
         "🧾 **تایید نهایی سفارش**\n\n"
@@ -124,82 +97,42 @@ _CONFIRM_KB = lambda: InlineKeyboardMarkup(
 )
 
 
-def _build_capacity_rejection(verdict: dict) -> tuple:
-    """پیام ردّ ظرفیت + دکمه‌های «رزرو ساعت پیشنهادی / بررسی مجدد / لغو».
+def _build_admission_rejection(verdict: dict) -> tuple:
+    """پیام ردّ ساده: سقف سفارش‌های فعال هم‌زمان پر شده است.
 
-    طبق نیاز محصول، ردّ باید «محاسبه‌شده» باشد: به‌جای یک «بعداً امتحان کنید»
-    مبهم، اولین زمانِ شروعی که «کل بازهٔ سفارش» در آن جا می‌شود پیشنهاد و
-    رزروِ همان با یک دکمه ممکن است.
+    هیچ سنجش CPU/RAM و هیچ محدودیتی روی تعداد اکانت اینجا وجود ندارد؛ فقط
+    شمارش سفارش‌های هم‌پوشان و پیشنهاد اولین زمان آزاد.
     """
-    need = verdict.get('accounts_needed', 0)
-    pool = verdict.get('pool_size', 0)
-    eff = verdict.get('effective_pool', 0)
-    peak = verdict.get('peak_usage', 0)
-    busy_until = verdict.get('busy_until_utc')
+    limit = int(verdict.get('limit') or active_order_limit())
+    used = int(verdict.get('active_count') or 0)
     suggested = verdict.get('suggested_start_utc')
-    reason = verdict.get('reason')
-
-    # توجه: ردّ به‌دلیل «بزرگی سفارش» (too_big) حذف شد. تعداد کل
-    # سفارش محدودیت ندارد: اکانت‌ها به‌صورت موج‌بندی (wave)
-    # وارد می‌شوند و اگر تعدادِ درخواستی از پول بیشتر باشد،
-    # موج‌های بعدی از همان پول جایگزین می‌شوند.
 
     lines = [
-        "⛔️ **ظرفیت سرور برای این بازه تکمیل است — سفارش ثبت نشد.**\n",
-        "🛡 برای جلوگیری از لغو زنجیره‌ای سفارش‌ها، قبل از پذیرش، مصرف منابع در «کل بازهٔ اجرای سفارش» سنجیده می‌شود:\n",
-        f"🧮 اوج مصرف اکانت در بازهٔ درخواستی: `{peak}` از `{eff}` اکانت مفید (ظرفیت کل: `{pool}`)",
-        f"🔢 درخواست شما: `{need}` اکانت",
+        "⛔️ **سقف سفارش‌های فعال هم‌زمان تکمیل است — سفارش ثبت نشد.**\n",
+        f"👥 سفارش‌های فعال/رزروشده در این بازه: `{used}` از `{limit}`",
+        "🛡 برای اجرای پایدار، در هر بازهٔ زمانی حداکثر "
+        f"`{limit}` سفارش فعال پذیرفته می‌شود؛ تعداد اکانت‌های سفارش محدودیتی ندارد.",
+        "",
     ]
-
-    # 🖥 جزئیات منابع سخت‌افزاری (اگر این بُعد سنجیده شده باشد)
-    if verdict.get("resource_checked"):
-        cur_cpu = verdict.get("current_cpu_percent") or 0.0
-        cur_mem = verdict.get("current_memory_percent") or 0.0
-        load_pc = verdict.get("current_load_per_core") or 0.0
-        proj_cpu = verdict.get("projected_cpu_percent") or 0.0
-        proj_mem = verdict.get("projected_memory_percent") or 0.0
-        max_cpu = verdict.get("max_cpu_percent") or 0.0
-        max_mem = verdict.get("max_memory_percent") or 0.0
-        lines.append(
-            f"🖥 مصرف فعلی سرور: پردازنده `{cur_cpu:.0f}%`"
-            f" · حافظه `{cur_mem:.0f}%` · بار `{load_pc:.2f}`"
-        )
-        if proj_cpu or proj_mem:
-            lines.append(
-                f"📈 پیش‌بینی در اوج بازه با این سفارش: "
-                f"پردازنده `{proj_cpu:.0f}%` (سقف `{max_cpu:.0f}%`)"
-                f" · حافظه `{proj_mem:.0f}%` (سقف `{max_mem:.0f}%`)"
-            )
-        why = verdict.get("resource_reason")
-        if why == "cpu":
-            lines.append("⚠️ علت اصلی: پردازندهٔ سرور در این بازه بیش از حد مجاز درگیر خواهد شد.")
-        elif why == "memory":
-            lines.append("⚠️ علت اصلی: حافظهٔ (RAM) سرور در این بازه بیش از حد مجاز پر خواهد شد.")
-        elif why == "load":
-            lines.append("⚠️ علت اصلی: بار پردازشی (Load Average) سرور همین لحظه بالاست.")
-
-    if busy_until:
-        lines.append(f"⏳ ظرفیت از این ساعت آزاد می‌شود: **{format_jalali_datetime(busy_until)}**")
-    lines.append("")
 
     kb = []
     if suggested:
-        lines.append(
-            f"💡 **پیشنهاد دقیق سیستم:** برای ساعت **{format_jalali_datetime(suggested)}** اقدام کنید "
-            "(اولین بازه‌ای که کل سفارش شما در آن جا می‌شود) — یا همان را همین حالا رزرو کنید:"
-        )
+        lines.append(f"⏳ اولین زمان آزاد برای همین سفارش: **{format_jalali_datetime(suggested)}**")
+        lines.append("💡 می‌توانید همان ساعت را با یک دکمه رزرو کنید یا چند دقیقه بعد دوباره تلاش کنید.")
         kb.append([InlineKeyboardButton(
             f"📅 رزرو در {format_jalali_datetime(suggested)}",
-            # epoch مستقل از timezone محیط (naive-UTC؛ ساعت سرور تهران است!)
             callback_data=f"cap_slot_{int((suggested - _EPOCH).total_seconds())}"
         )])
     else:
-        lines.append("💡 لطفاً در ساعات دیگری تلاش کنید یا پلن کوچک‌تری انتخاب کنید.")
-    lines.append("\n⚠️ تا آزاد شدن ظرفیت، سفارش جدیدی پذیرفته نمی‌شود.")
-
-    kb.append([InlineKeyboardButton("🔄 بررسی مجدد ظرفیت", callback_data="cap_retry")])
+        lines.append("💡 تا آزاد شدن یکی از سفارش‌های فعال، سفارش جدیدی پذیرفته نمی‌شود.")
+    kb.append([InlineKeyboardButton("🔄 بررسی مجدد", callback_data="cap_retry")])
     kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_order")])
     return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+# مبنای تبدیل epoch مستقل از timezone (datetimeهای سیستم naive-UTC هستند و
+# .timestamp() روی سرور با TZ=Asia/Tehran خطای ۳:۳۰ ایجاد می‌کرد)
+_EPOCH = datetime(1970, 1, 1)
 
 
 # مبنای تبدیل epoch مستقل از timezone (datetimeهای سیستم naive-UTC هستند و
@@ -460,18 +393,16 @@ async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_
     plan = context.user_data['selected_plan']
     bot_id = context.bot_data.get('bot_id', 1)
 
-    # 🛡 پیش‌نمایش زندهٔ ظرفیت قبل از پرداخت (fail-open: خطا = بدون خط اضافه)
-    capacity_verdict = None
+    # 👥 پیش‌نمایش تعداد سفارش‌های فعال هم‌زمان (fail-open: خطا = بدون خط اضافه)
+    admission_verdict = None
     try:
         cap_start, cap_duration = _order_window_from_context(context)
-        capacity_verdict = await capacity_planner.check_order(
-            bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
-        )
+        admission_verdict = await order_admission.check_order(bot_id, cap_start, cap_duration)
     except Exception:
-        logger.exception("capacity preview failed (non-fatal)")
-        capacity_verdict = None
+        logger.exception("admission preview failed (non-fatal)")
+        admission_verdict = None
 
-    txt = _build_confirmation_text(context, capacity_verdict)
+    txt = _build_confirmation_text(context, admission_verdict)
 
     message = await update.message.reply_text(txt, reply_markup=_CONFIRM_KB())
     context.user_data['checkout_message'] = (message.chat_id, message.message_id)
@@ -492,7 +423,7 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("ℹ️ این فرم پرداخت قدیمی است؛ لطفاً سفارش را دوباره از منو ثبت کنید. وجهی کسر نشد.")
         return AWAITING_ORDER_CONFIRMATION
 
-    # ── 🛡 گارد ظرفیت: پذیرش «رزرو ساعت پیشنهادی» و «بررسی مجدد» ──
+    # ── 👥 سقف هم‌زمانی: پذیرش «رزرو ساعت پیشنهادی» و «بررسی مجدد» ──
     if data.startswith("cap_slot_"):
         try:
             epoch = int(data.split("_")[2])
@@ -512,22 +443,19 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         return AWAITING_ORDER_CONFIRMATION
 
     if data == "cap_retry":
-        # بازبینی ظرفیت با همان مشخصات (مثلاً کاربر می‌گوید «الان چی؟»)
+        # بازبینی شمارش سفارش‌های هم‌پوشان با همان مشخصات
         bot_id = context.bot_data.get('bot_id', 1)
-        plan = context.user_data.get('selected_plan') or {}
-        capacity_verdict = None
+        admission_verdict = None
         try:
             cap_start, cap_duration = _order_window_from_context(context)
-            capacity_verdict = await capacity_planner.check_order(
-                bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
-            )
+            admission_verdict = await order_admission.check_order(bot_id, cap_start, cap_duration)
         except Exception:
-            capacity_verdict = None
+            admission_verdict = None
         try:
             try:
-                txt = _build_confirmation_text(context, capacity_verdict)
+                txt = _build_confirmation_text(context, admission_verdict)
             except Exception:
-                txt = "🔄 ظرفیت بازبینی شد. لطفاً مجدداً تایید کنید یا سفارش را از نو ثبت کنید."
+                txt = "🔄 وضعیت سفارش‌های هم‌زمان بازبینی شد. لطفاً مجدداً تایید کنید."
             await query.edit_message_text(txt, reply_markup=_CONFIRM_KB())
         except Exception:
             pass
@@ -556,19 +484,16 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         start_time = schedule_time if schedule_time else datetime.utcnow()
         duration = plan.get('duration_minutes', 0)
         
-        # ── 🛡 گارد ظرفیت منابع: سنجش «کل بازهٔ اجرا» قبل از پذیرش ──
-        # سفارش فقط وقتی پذیرفته می‌شود که منابعِ کافی برای کل بازهٔ
-        # [شروع، شروع+مدت] آزاد باشد؛ وگرنه ردّ محاسبه‌شده با پیشنهادِ
-        # دقیق اولین بازهٔ آزاد (قابل رزرو با یک دکمه).
+        # ── 👥 سقف سادهٔ سفارش‌های فعال هم‌زمان (پیش‌فرض ۵) ──
+        # تعداد اکانت و منابع سرور هیچ نقشی ندارند؛ فقط شمارش سفارش‌های
+        # هم‌پوشان. هر خطای داخلی = پذیرش (fail-open).
         try:
-            verdict = await capacity_planner.check_order(
-                bot_id, start_time, duration or 0, int(plan.get('accounts_count', 0) or 0)
-            )
+            verdict = await order_admission.check_order(bot_id, start_time, duration or 0)
         except Exception:
-            logger.exception("capacity gate failed → fail-open")
+            logger.exception("admission gate failed → fail-open")
             verdict = {'allowed': True, 'degraded': True}
         if not verdict.get('allowed', True):
-            reject_txt, reject_kb = _build_capacity_rejection(verdict)
+            reject_txt, reject_kb = _build_admission_rejection(verdict)
             try:
                 await query.edit_message_text(reject_txt, reply_markup=reject_kb)
             except Exception:
@@ -587,7 +512,7 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
             )
             return ConversationHandler.END
 
-        # Final admission shares the toggle lock. A form/capacity check that
+        # Final admission shares the toggle lock. A form check that
         # began before maintenance cannot debit/create/launch after it turns ON.
         async with maintenance.lock:
             await enforce_maintenance(update, context)
