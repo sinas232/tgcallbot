@@ -1,4 +1,4 @@
-"""نسخهٔ ۲.۲.۱۸ — فقط «لینک خصوصی» پذیرفته می‌شود.
+"""نسخهٔ ۲.۲.۱۸/۲.۲.۱۹ — فقط «لینک خصوصی» پذیرفته می‌شود.
 
 قاعده:
     ✔ https://t.me/+HASH  ·  https://t.me/joinchat/HASH  (و شکل‌های هم‌ارز)
@@ -36,6 +36,32 @@ VALID = [
     'tg://join?invite=AbCdEf123456',
     '  https://t.me/+AbCdEf123456  ',
     'https://t.me/+2bX9kLmN0pQrStUv',
+]
+
+# لینک واقعی ادمین (نمونهٔ درخواست‌شده) و شکل‌های هم‌ارزش
+REAL_LINK = 'https://t.me/+8hR1-wquL2liMTVk'
+REAL_LINK_VARIANTS = [
+    REAL_LINK,
+    REAL_LINK + '/',
+    'http://t.me/+8hR1-wquL2liMTVk',
+    't.me/+8hR1-wquL2liMTVk',
+    'www.t.me/+8hR1-wquL2liMTVk',
+    'https://telegram.me/+8hR1-wquL2liMTVk',
+    'https://telegram.dog/+8hR1-wquL2liMTVk',
+    'tg://join?invite=8hR1-wquL2liMTVk',
+    'https://t.me/joinchat/8hR1-wquL2liMTVk',
+    '+8hR1-wquL2liMTVk',
+    'joinchat/8hR1-wquL2liMTVk',
+    REAL_LINK + '?single',
+    REAL_LINK + '\u200c',                      # نیم‌فاصله/کاراکتر نامرئی
+    f'«{REAL_LINK}»',                          # گیومهٔ فارسی
+    f'({REAL_LINK})',                          # پرانتز
+    REAL_LINK + '.',                           # نقطهٔ انتهایی
+    f'لینک گروه: {REAL_LINK}',                 # متن اضافه قبل از لینک
+    f'لینک رو بفرست {REAL_LINK} ممنون',        # متن اضافه دو طرف
+    f'[گروه]({REAL_LINK})',                    # مارک‌داون
+    f'{REAL_LINK}\nhttps://t.me/+OtherHash123',  # دو لینک در یک پیام
+    'https://t.me/+8hR1_wqu-L2liMTVk',         # آندرلاین و خط تیره در هش
 ]
 
 INVALID = [
@@ -112,13 +138,96 @@ class ValidatorTests(unittest.TestCase):
         with patch.dict(os.environ, {'ORDER_LINK_REGEX': '([unclosed'}):
             self.assertTrue(validate_order_link('https://t.me/+AbCdEf123456')[0])  # الگوی خراب ⇒ پیش‌فرض
 
+    def test_the_admin_sample_link_is_accepted_in_every_real_form(self):
+        for link in REAL_LINK_VARIANTS:
+            ok, normalized, error = validate_order_link(link)
+            self.assertTrue(ok, f'should accept {link!r} ({error})')
+            self.assertFalse(error)
+            self.assertTrue(normalized.startswith(('https://t.me/', 'https://telegram.dog/')),
+                            normalized)
+            self.assertTrue(normalized.rstrip('/').split('/')[-1].lstrip('+'), normalized)
+
+    def test_sample_link_normalizes_to_one_canonical_value(self):
+        expected = REAL_LINK
+        for link in ('t.me/+8hR1-wquL2liMTVk', '+8hR1-wquL2liMTVk',
+                     'tg://join?invite=8hR1-wquL2liMTVk', f'«{REAL_LINK}»',
+                     f'لینک: {REAL_LINK}.'):
+            self.assertEqual(normalize_invite_link(link), expected, link)
+
+    def test_decorated_text_is_still_rejected_when_the_link_itself_is_wrong(self):
+        for bad in (f'@mygroup و {REAL_LINK.replace("+", "")}',   # یوزرنیم + متن بی‌ربط
+                    'گروه من: @mygroup',
+                    'لینک: https://t.me/mygroup/12',
+                    'https://t.me/+short'):                       # هش کوتاه
+            ok, _n, error = validate_order_link(bad)
+            self.assertFalse(ok, bad)
+            self.assertIn('لینک درست را بفرستید', error)
+
+    def test_wrong_format_message_always_contains_the_required_sentence(self):
+        for bad in INVALID:
+            ok, _n, error = validate_order_link(bad)
+            self.assertFalse(ok, bad)
+            self.assertIn('👉 لینک درست را بفرستید.', error)
+            self.assertIn('❌', error)
+
+    def test_only_private_links_survive_a_full_message_with_words(self):
+        ok, normalized, _e = validate_order_link(
+            f'سلام، این لینک گروهه: {REAL_LINK} لطفاً سفارش رو ثبت کن')
+        self.assertTrue(ok)
+        self.assertEqual(normalized, REAL_LINK)
+        # پیام دیگری که فقط یوزرنیم دارد، با هیچ متنی پذیرفته نمی‌شود
+        self.assertFalse(validate_order_link('سلام، این لینک گروهه: @mygroup لطفاً')[0])
+
+    def test_hidden_hyperlink_url_is_checked(self):
+        """متن ≠ آدرس: آدرس واقعیِ هایپرلینک بررسی می‌شود."""
+        self.assertTrue(validate_order_link('گروه مقصد', [REAL_LINK])[0])
+        ok, normalized, _e = validate_order_link('گروه مقصد', [f'  {REAL_LINK}/  '])
+        self.assertTrue(ok)
+        self.assertEqual(normalized, REAL_LINK)
+        self.assertFalse(validate_order_link('گروه مقصد', ['https://t.me/mygroup'])[0])
+        self.assertFalse(validate_order_link('گروه مقصد', ['@mygroup'])[0])
+
+    def test_legacy_joinchat_hash_of_the_sample_link_is_kept(self):
+        ok, normalized, _e = validate_order_link('https://t.me/joinchat/8hR1-wquL2liMTVk')
+        self.assertTrue(ok)
+        self.assertEqual(normalized, 'https://t.me/joinchat/8hR1-wquL2liMTVk')
+
+    def test_custom_display_example_is_respected(self):
+        with patch.dict(os.environ, {'ORDER_LINK_EXAMPLE': REAL_LINK}):
+            self.assertIn(REAL_LINK, link_validator.message('public'))
+            self.assertIn(REAL_LINK, link_validator.help_text())
+            self.assertIn('joinchat/8hR1-wquL2liMTVk', link_validator.message('invalid'))
+        # مقدار نامعتبر نادیده گرفته می‌شود و قالب پیش‌فرض می‌ماند
+        with patch.dict(os.environ, {'ORDER_LINK_EXAMPLE': '@mygroup'}):
+            self.assertIn(PRIVATE_LINK_EXAMPLE, link_validator.message('public'))
+
     def test_same_group_forms_share_one_key(self):
         from services.deferred_leave import normalize_target
         keys = {normalize_target(v) for v in ('https://t.me/+AbCdEf123456',
                                               't.me/+AbCdEf123456',
                                               '+AbCdEf123456',
+                                              'https://t.me/AbCdEf123456/'.replace('/AbCd', '/+AbCd'),
+                                              '«https://t.me/+AbCdEf123456»',
+                                              f'لینک گروه: https://t.me/+AbCdEf123456 ممنون',
+                                              'https://t.me/+AbCdEf123456?single',
+                                              'https://telegram.dog/+AbCdEf123456',
                                               'tg://join?invite=AbCdEf123456')}
-        self.assertEqual(len(keys), 1)
+        self.assertEqual(keys, {'invite:abcdef123456'})
+
+    def test_group_key_helper_shares_the_validator_rule(self):
+        """قاعدهٔ کلید گروه نباید از اعتبارسنج جدا شود."""
+        import inspect
+        from services import deferred_leave
+        source = inspect.getsource(deferred_leave.normalize_target)
+        self.assertIn('link_validator', source)
+        self.assertIn('invite_hash', source)
+
+    def test_different_groups_never_share_a_key(self):
+        from services.deferred_leave import normalize_target
+        self.assertNotEqual(normalize_target('https://t.me/+AbCdEf123456'),
+                            normalize_target('https://t.me/+ZzYyXx654321'))
+        # لینک عمومی هرگز با لینک خصوصی یکی نمی‌شود
+        self.assertNotEqual(normalize_target('@mygroup'), normalize_target('+mygroup'))
 
 
 def message_update(text):
@@ -161,6 +270,43 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         state, data, reply = await self.call('t.me/+AbCdEf123456')
         self.assertEqual(state, 13)                     # AWAITING_ORDER_TIMING_TYPE
         self.assertEqual(data['target_link'], 'https://t.me/+AbCdEf123456')
+
+    async def test_sample_link_with_surrounding_text_is_accepted(self):
+        state, data, reply = await self.call(f'لینک گروه: {REAL_LINK} — ممنون')
+        self.assertEqual(state, 13)                     # AWAITING_ORDER_TIMING_TYPE
+        self.assertEqual(data['target_link'], REAL_LINK)
+
+    async def test_hidden_hyperlink_message_is_accepted(self):
+        """پیامی که فقط آدرسش (entity) لینک خصوصی است."""
+        import handlers.order_handlers as OH
+        from telegram import MessageEntity
+        user = User(567, 'Test', False)
+        msg = Message(7, datetime.now(), Chat(567, 'private'), text='گروه مقصد',
+                      entities=[MessageEntity(MessageEntity.TEXT_LINK, 0, len('گروه مقصد'),
+                                              url=REAL_LINK)])
+        update = Update(1, message=msg)
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace(), bot_data={})
+        with patch.object(OH, 'send_safe', AsyncMock()), \
+                patch.object(Message, 'reply_text', AsyncMock()):
+            state = await OH.receive_order_link(update, context)
+        self.assertEqual(state, 13)
+        self.assertEqual(context.user_data['target_link'], REAL_LINK)
+
+    async def test_hidden_public_hyperlink_is_rejected(self):
+        import handlers.order_handlers as OH
+        from telegram import MessageEntity
+        user = User(567, 'Test', False)
+        msg = Message(7, datetime.now(), Chat(567, 'private'), text='گروه مقصد',
+                      entities=[MessageEntity(MessageEntity.TEXT_LINK, 0, len('گروه مقصد'),
+                                              url='https://t.me/mygroup')])
+        update = Update(1, message=msg)
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace(), bot_data={})
+        with patch.object(OH, 'send_safe', AsyncMock()) as send, \
+                patch.object(Message, 'reply_text', AsyncMock()):
+            state = await OH.receive_order_link(update, context)
+        self.assertEqual(state, 11)
+        self.assertNotIn('target_link', context.user_data)
+        self.assertIn('لینک درست را بفرستید', send.await_args.args[2])
 
     async def test_payment_path_refuses_a_bad_link_and_returns_to_link_step(self):
         """مسیر پرداخت: لینک بد ذخیره‌شده ⇒ هیچ پرداختی انجام نمی‌شود."""
@@ -213,15 +359,18 @@ class StorageTests(unittest.TestCase):
         env = open(os.path.join(os.path.dirname(__file__), '..', '.env.example'), encoding='utf-8').read()
         self.assertIn('ORDER_LINK_MODE=private', env)
         self.assertIn('ORDER_LINK_REGEX=', env)
+        self.assertIn('ORDER_LINK_EXAMPLE=', env)
+        self.assertEqual(config.Config.ORDER_LINK_EXAMPLE, '')
 
     def test_version_and_docs(self):
         root = os.path.join(os.path.dirname(__file__), '..')
         constants = open(os.path.join(root, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(root, 'CHANGELOG.md'), encoding='utf-8').read()
-        docs = os.path.join(root, 'docs', 'LINK_FORMAT_2.2.18_FA.md')
-        self.assertTrue('BOT_VERSION = "2.2.18"' in constants)
-        self.assertTrue('نسخهٔ ۲.۲.۱۸' in changelog)
+        docs = os.path.join(root, 'docs', 'LINK_FORMAT_2.2.19_FA.md')
+        self.assertTrue('BOT_VERSION = "2.2.19"' in constants)
+        self.assertTrue('نسخهٔ ۲.۲.۱۹' in changelog)
         self.assertTrue(os.path.exists(docs))
+        self.assertTrue(os.path.exists(os.path.join(root, 'docs', 'LINK_FORMAT_2.2.18_FA.md')))
 
 
 if __name__ == '__main__':

@@ -80,6 +80,9 @@ class Config:
     ORDER_LINK_MODE = os.getenv('ORDER_LINK_MODE', 'private').strip().lower()
     # الگوی دقیق‌تر (اختیاری)؛ اگر خالی باشد از اعتبارسنجی پیش‌فرض استفاده می‌شود.
     ORDER_LINK_REGEX = os.getenv('ORDER_LINK_REGEX', '')
+    # لینک نمونه‌ای که در راهنما/پیام خطا نمایش داده می‌شود (اختیاری).
+    # مثال: ORDER_LINK_EXAMPLE=https://t.me/+8hR1-wquL2liMTVk
+    ORDER_LINK_EXAMPLE = os.getenv('ORDER_LINK_EXAMPLE', '').strip()
     # ─── 🚪 خروج تأخیری اکانت‌ها از گروه ─────────────────────────────
     # پس از پایان/لغو سفارش، اکانت فوراً از گروه خارج نمی‌شود (خروج فوری
     # باعث join/leave پشت‌سرهم و ریسک بن/حذف اکانت می‌شود). مهلت پیش‌فرض

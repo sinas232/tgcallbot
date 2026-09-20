@@ -65,10 +65,13 @@ def normalize_target(target: Any) -> str:
     value = str(target or "").strip()
     if not value:
         return ""
-    # لینک داخلی اپ تلگرام: tg://join?invite=HASH ⇒ همان کلید لینک دعوت
-    _tg = re.match(r"^tg://join\?invite=([A-Za-z0-9_-]+)$", value, flags=re.I)
-    if _tg:
-        return "invite:" + _tg.group(1).lower()
+    # هر شکلِ «لینک خصوصی» (t.me/+HASH · joinchat/HASH · telegram.dog ·
+    # tg://join?invite= · با گیومه/متن اضافه) یک کلید یکسان می‌دهد؛ قاعده در
+    # services/link_validator.py متمرکز است تا این دو هیچ‌وقت واگرا نشوند.
+    from services.link_validator import invite_hash as _invite_hash
+    _digest = _invite_hash(value)
+    if _digest:
+        return "invite:" + _digest.lower()
     value = re.sub(r"^https?://", "", value, flags=re.I)
     value = re.sub(r"^(www\.)?(t|telegram)\.me/", "", value, flags=re.I)
     value = value.split("?")[0].strip().strip("/").strip()

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import jdatetime
 from telegram.error import BadRequest
 from telegram.constants import ParseMode
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
 from config import Config
@@ -252,14 +252,28 @@ async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     «لینک درست را بفرستید» با قالب صحیح نمایش داده می‌شود و منتظر لینک
     بعدی می‌مانیم (بدون مصرف پرداخت/زمان‌بندی).
     """
-    link = (update.message.text or "").strip()
+    message = update.message
+    link = (message.text or message.caption or "").strip()
     if BTN_CANCEL in link:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
 
-    ok, normalized, error = validate_order_link(link)
+    # لینک‌های «هایپرلینک مخفی» (متن ≠ آدرس) هم بررسی می‌شوند تا لینک درست
+    # زیر متن دلخواه کاربر گم نشود؛ در این حالت آدرس واقعی از entity خوانده می‌شود.
+    hidden_urls = []
+    try:
+        source = message.text or message.caption or ""
+        for entity in list(message.entities or []) + list(message.caption_entities or []):
+            if entity.type == MessageEntity.TEXT_LINK and getattr(entity, 'url', None):
+                hidden_urls.append(entity.url)
+            elif entity.type == MessageEntity.URL:
+                hidden_urls.append(source[entity.offset:entity.offset + entity.length])
+    except Exception as exc:  # pragma: no cover - پیام‌های غیرمنتظره
+        logger.debug("Order link entity scan skipped: %s", exc)
+
+    ok, normalized, error = validate_order_link(link, hidden_urls)
     if not ok:
-        logger.info("Order link rejected: %r", link[:80])
+        logger.info("Order link rejected: %r", (link or str(hidden_urls))[:120])
         await send_safe(context.bot, update.effective_chat.id, rejection_message(error),
                         reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
         return AWAITING_ORDER_LINK
