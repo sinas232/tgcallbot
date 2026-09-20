@@ -83,6 +83,14 @@ class Config:
     GROUP_LEAVE_POLL_MINUTES = int(os.getenv('GROUP_LEAVE_POLL_MINUTES', '5'))
     GROUP_LEAVE_BATCH_LIMIT = int(os.getenv('GROUP_LEAVE_BATCH_LIMIT', '200'))
     GROUP_LEAVE_MAX_ATTEMPTS = int(os.getenv('GROUP_LEAVE_MAX_ATTEMPTS', '3'))
+    # 🔎 تعداد چرخهٔ متوالی «غیبت تأییدشده» پیش از هر تلاش بازیابی/جایگزینی.
+    # روی شبکه‌های بی‌ثبات (WARP/VPN) عدد بزرگ‌تر = خروج دیرتر و امن‌تر.
+    CONFIRMED_DISCONNECT_THRESHOLD = int(os.getenv('CONFIRMED_DISCONNECT_THRESHOLD', '8'))
+    # در هر چرخهٔ نگهداری حداکثر چند اسلات «غیرقابل‌بازیابی» رها/جایگزین شود
+    # (جلوگیری از خروج پشت‌سرهم اکانت‌ها در قطعی شبکه).
+    VOICE_MAX_RELEASES_PER_CYCLE = int(os.getenv('VOICE_MAX_RELEASES_PER_CYCLE', '2'))
+    # هر چند چرخه یک‌بار اسلات‌های در‌انتظار‌جایگزینی دوباره بررسی شوند.
+    VOICE_UNRECOVERABLE_RECHECK_CYCLES = int(os.getenv('VOICE_UNRECOVERABLE_RECHECK_CYCLES', '3'))
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)

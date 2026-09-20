@@ -238,9 +238,10 @@ MAX_REJOIN_ATTEMPTS = max(1, int(getattr(Config, 'RETRY_LIMIT', 3)))
 REJOIN_BACKOFF_BASE = max(1.0, float(getattr(Config, 'BACKOFF_BASE', 1)))
 
 # How many consecutive confirmed-absent checks before we call it a genuine
-# disconnect and move that account to CONFIRMED_DISCONNECTED. Default to 5
-# to be VERY conservative and avoid false positives on temporary API failures.
-CONFIRMED_DISCONNECT_THRESHOLD = max(2, int(getattr(Config, 'CONFIRMED_DISCONNECT_THRESHOLD', 5)))
+# disconnect and move that account to CONFIRMED_DISCONNECTED.  Default 8
+# (~1 minute of consecutive confirmed absence) to be VERY conservative and to
+# avoid false positives on temporary API failures / WARP network flaps.
+CONFIRMED_DISCONNECT_THRESHOLD = max(2, int(getattr(Config, 'CONFIRMED_DISCONNECT_THRESHOLD', 8)))
 
 # ─── JOIN RETRY / FLOOD-WAIT / VERIFICATION TUNING ────────────────────
 # Each WAVE joins up to `window` accounts CONCURRENTLY and every account is
@@ -673,6 +674,10 @@ class VoiceCallManager:
         # marked UNRECOVERABLE so the executor can REPLACE it (instead of
         # keeping a ghost that can never be brought back).
         self._rejoin_failures: Dict[Tuple[int, int], int] = {}
+        # 🛡 v2.2.17: زمان آخرین بازبینیِ اسلات‌های «جایگزینی‌درانتظار».
+        # اگر شبکه (WARP) برگشته باشد، همان اکانت دوباره سالم شناخته می‌شود
+        # و از خروج/جایگزینی نجات می‌یابد.
+        self._unrecoverable_recheck: Dict[Tuple[int, int], float] = {}
 
         self._chat_refresh_cache: Dict[int, float] = {}
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
@@ -3234,9 +3239,16 @@ class VoiceCallManager:
                             continue
                         rec = acc_info.get(acc_id) or {}
                         # Slot already proven unrecoverable → executor will
-                        # replace it; don't keep retrying it forever.
+                        # replace it.  BUT: re-verify it every few cycles so a
+                        # network recovery (WARP flap ending) keeps the same
+                        # healthy account in the call instead of ejecting it.
                         if rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE":
-                            continue
+                            _key = (order_id, acc_id)
+                            _every = max(1, int(getattr(Config, "VOICE_UNRECOVERABLE_RECHECK_CYCLES", 3)))
+                            _last = float(self._unrecoverable_recheck.get(_key) or 0.0)
+                            if time.time() - _last < _every * KEEPALIVE_INTERVAL:
+                                continue
+                            self._unrecoverable_recheck[_key] = time.time()
                         tgt = rec.get("target") or ""
                         cid = int(rec.get("chat_id") or chat_id)
                         app = self.pyrogram_clients.get(acc_id)
@@ -3390,6 +3402,7 @@ class VoiceCallManager:
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
+                            self._unrecoverable_recheck.pop((order_id, acc_id), None)
                             rec.pop("unrecoverable", None)
                             rec["status"] = "JOINED"
                             rec["last_ok"] = time.time()
@@ -3813,6 +3826,7 @@ class VoiceCallManager:
                 acc_states.pop(account_id, None)
             self._account_meta_by_order.get(order_id, {}).pop(account_id, None)
             self._rejoin_failures.pop((order_id, account_id), None)
+            self._unrecoverable_recheck.pop((order_id, account_id), None)
 
         # Cancel keepalive
         ka = self._keepalive_tasks.pop(key, None)
@@ -3956,6 +3970,8 @@ class VoiceCallManager:
         self._presence_reconcilers.pop(order_id, None)
         for key in [k for k in self._rejoin_failures if k[0] == order_id]:
             self._rejoin_failures.pop(key, None)
+        for key in [k for k in list(self._unrecoverable_recheck) if k[0] == order_id]:
+            self._unrecoverable_recheck.pop(key, None)
         for key in [k for k in self._media_restore_inflight if k[0] == order_id]:
             self._media_restore_inflight.discard(key)
         for key in [k for k in list(self._media_restore_last) if k[0] == order_id]:

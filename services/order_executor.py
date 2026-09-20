@@ -455,12 +455,38 @@ class OrderExecutor:
 	            joined_list = self._prune_joined(order_id, order_type, joined_list)
 	            live = self._live_count(order_id, order_type, joined_list)
 
-	        if order_id in self.active_orders:
-	            self.active_orders[order_id]["live_count"] = live
+	        # 🛡 v2.2.17 — پایانِ فاز ورود هرگز باعث لغو خودکار سفارش نمی‌شود.
+	        # دلیل: تشخیص «حضور» روی شبکهٔ بی‌ثبات (مثلاً عبور ترافیک از WARP)
+	        # می‌تواند موقتاً کمتر از واقعیت گزارش کند. قبلاً همین شرط
+	        # (`live < requested`) سفارش را چند دقیقه بعد از شروع می‌بست و
+	        # اکانت‌ها را از تماس و گروه بیرون می‌انداخت. حالا:
+	        #   • هر تعداد اکانتِ واقعاً وارد‌شده ⇒ سفارش تا پایان زمان
+	        #     خریداری‌شده ادامه می‌یابد (تکمیل/جایگزینی هم ادامه دارد).
+	        #   • فقط وقتی هیچ اکانتی وارد نشده باشد، سفارش تسویه و عودت می‌شود.
+	        delivered = set()
+	        for _entry in (joined_list or []):
+	            if not isinstance(_entry, dict):
+	                continue  # شکل‌های قدیمی/غیرمنتظره هرگز باعث خطا نمی‌شوند
+	            _acc = _entry.get("acc")
+	            _aid = _acc.get("id") if isinstance(_acc, dict) else _acc
+	            if _aid is not None:
+	                delivered.add(_aid)
+	        effective_live = max(int(live or 0), len(delivered))
 
-	        if live < requested:
-	            await self._fail_order(order_id, "Requested account count could not be delivered.")
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["live_count"] = effective_live
+
+	        if effective_live <= 0:
+	            # هیچ اکانتی وارد نشد ⇒ خدمتی ارائه نشده؛ تسویه با عودت کامل.
+	            await self._fail_order(order_id, "No account could be delivered.")
 	            return
+
+	        if effective_live < requested:
+	            logger.warning(
+	                f"Order {order_id}: {effective_live}/{requested} account(s) present after build — "
+	                "order continues to the end of its purchased duration (no auto-cancel)"
+	            )
+	            await self._notify_underfill(order_id, data, effective_live, requested)
 
 	        if duration > 0:
 	            await self._persist_billing(order_id)
@@ -960,7 +986,17 @@ class OrderExecutor:
 	        return 0
 
 	    released = 0
+	    # 🛡 v2.2.17: رهاسازی اسلات‌ها «قطره‌ای» انجام می‌شود تا در قطعی شبکه
+	    # (WARP) اکانت‌ها پشت‌سرهم از تماس بیرون نیفتند؛ بقیه در چرخهٔ بعد.
+	    max_releases = max(1, int(getattr(Config, "VOICE_MAX_RELEASES_PER_CYCLE", 2)))
+	    if len(slots) > max_releases:
+	        logger.warning(
+	            f"Order {order_id}: {len(slots)} slot(s) flagged unrecoverable at once — "
+	            f"releasing at most {max_releases} this cycle (possible network incident)"
+	        )
 	    for aid in list(slots.keys()):
+	        if released >= max_releases:
+	            break
 	        try:
 	            ok, _m = await vcm.release_unrecoverable_slot(order_id, aid, leave_group=False)
 	            if ok:
@@ -1516,6 +1552,33 @@ class OrderExecutor:
 			tasks.append(asyncio.create_task(_one(entry)))
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
+
+	async def _notify_underfill(self, order_id, data, live, requested):
+	    """یک‌بار به مشتری اطلاع می‌دهد که تعداد حاضر کمتر از سفارش است و سفارش ادامه دارد.
+
+	    متن عمداً تأکید می‌کند که سفارش لغو نشده و تا پایان زمان خریداری‌شده فعال
+	    می‌ماند و در صورت لغو، فقط زمان استفاده‌شده کسر می‌شود.
+	    """
+	    try:
+	        from services.bot_manager import bot_manager
+	        app = bot_manager.active_bots.get((data or {}).get("bot_id", 1))
+	        if not app:
+	            return
+	        user = await DatabaseManager.get_user_by_id((data or {}).get("user_id"))
+	        if not user:
+	            return
+	        if not await DatabaseManager.claim_order_report(order_id, "customer", "underfilled"):
+	            return
+	        await app.bot.send_message(
+	            user["telegram_id"],
+	            f"⚠️ سفارش #{order_id}: در حال حاضر {live} از {requested} اکانت داخل تماس/گروه هستند.\n"
+	            "سفارش لغو نشد و تا پایان زمان خریداری‌شده فعال می‌ماند؛ تلاش برای تکمیل تعداد ادامه دارد.\n"
+	            "هزینه بر مبنای زمان فعال سفارش محاسبه می‌شود و در صورت لغو، فقط زمان استفاده‌شده کسر می‌گردد.",
+	            parse_mode=None,
+	        )
+	        await DatabaseManager.mark_order_report(order_id, "customer", "underfilled", "sent")
+	    except Exception:
+	        logger.exception("Order %s underfill notice failed", order_id)
 
 	async def _fail_order(self, order_id, reason):
 	    info = self.active_orders.get(order_id) or {}
