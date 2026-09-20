@@ -1453,7 +1453,7 @@ class OrderExecutor:
 						f"هزینهٔ کل از پیش پرداخت شده (مبنای محاسبه فقط زمان فعال سفارش است؛ "
 						f"تعداد اکانت روی مبلغ هیچ اثری ندارد).\n"
 						"🔒 اکانت‌ها از تماس خارج شدند و برای جلوگیری از ریسک محدودیت، فعلاً در گروه می‌مانند؛ "
-						"اگر سفارش دیگری برای همین گروه نباشد، یک روز بعد خارج می‌شوند."
+						"اگر سفارش دیگری برای همین گروه نباشد، یک هفته بعد خارج می‌شوند."
 					)
 					if await DatabaseManager.claim_order_report(order_id, "customer", "completed"):
 						await app.bot.send_message(user["telegram_id"], msg)
@@ -1500,15 +1500,16 @@ class OrderExecutor:
 			logger.exception(f"Order {order_id}: deferred leave scheduling failed: {exc}")
 
 	async def _defer_group_leave(self, order_id, entries, data):
-		"""خروج اکانت‌ها از گروه را به تعویق می‌اندازد (پیش‌فرض: یک روز).
+		"""خروج اکانت‌ها از گروه را به تعویق می‌اندازد (پیش‌فرض: یک هفته).
 
 		خروج فوری فقط وقتی انجام می‌شود که ادمین صریحاً
 		``GROUP_LEAVE_DELAY_MINUTES=0`` گذاشته باشد. در حالت عادی، عضویت اکانت
 		در گروه/کانال حفظ می‌شود و اگر سفارش دیگری برای همان گروه نباشد، پس از
-		پایان مهلت با فاصله (stagger) خارج می‌شود.
+		پایان مهلت یکی‌یکی و با فاصله خارج می‌شود.
 		"""
 		order_type = (data or {}).get("order_type")
-		delay = deferred_leave.leave_delay_minutes()
+		bot_id = int((data or {}).get("bot_id") or 1)
+		delay = await deferred_leave.resolved_leave_delay_minutes(bot_id)
 		accounts = deferred_leave.accounts_from_entries(entries)
 		if delay <= 0:
 			if order_type == "voice_chat":
@@ -1711,34 +1712,40 @@ class OrderExecutor:
 	    return result
 
 	async def _schedule_interrupted_leave(self, order):
-	    """اکانت‌های سفارش نیمه‌کاره (بعد از ری‌استارت/کرش) را به صف خروج تأخیری می‌فرستد.
+		"""اکانت‌های سفارش نیمه‌کاره (بعد از ری‌استارت/کرش) را به صف خروج تأخیری می‌فرستد.
 
-	    اگر در زمان اجرا اکانتی وارد گروه شده باشد و اجرا متوقف شود، بدون این کار
-	    عضویت آن اکانت هرگز پاک نمی‌شد. خروج هم مثل حالت عادی یک روز بعد و فقط
-	    وقتی اتفاق می‌افتد که سفارش دیگری برای همان گروه باز نباشد.
-	    """
-	    order = order or {}
-	    if deferred_leave.leave_delay_minutes() <= 0:
-	        return 0
-	    try:
-	        row = await DatabaseManager.get_order(order.get('id'))
-	        row = row or order
-	        try:
-	            delivered = json.loads(((row.get('_billing') or {}).get('delivered_ids')) or '[]')
-	        except Exception:
-	            delivered = []
-	        accounts = [{'account_id': int(a), 'chat_id': 0} for a in delivered if a is not None]
-	        if not accounts:
-	            return 0
-	        return await deferred_leave.schedule_for_order(
-	            bot_id=int(row.get('bot_id') or 1),
-	            target=row.get('target_link') or '',
-	            accounts=accounts,
-	            order_id=row.get('id'),
-	        )
-	    except Exception as exc:
-	        logger.warning(f"Order {order.get('id')}: interrupted-leave scheduling failed: {exc}")
-	        return 0
+		اگر در زمان اجرا اکانتی وارد گروه شده باشد و اجرا متوقف شود، بدون این کار
+		عضویت آن اکانت هرگز پاک نمی‌شد. خروج هم مثل حالت عادی یک هفته بعد و فقط
+		وقتی اتفاق می‌افتد که سفارش دیگری برای همان گروه باز نباشد.
+		"""
+		order = order or {}
+		bot_id = int((order or {}).get('bot_id') or 1)
+		try:
+			delay = await deferred_leave.resolved_leave_delay_minutes(bot_id)
+		except Exception:
+			delay = deferred_leave.leave_delay_minutes()
+		if delay <= 0:
+			return 0
+		try:
+			row = await DatabaseManager.get_order(order.get('id'))
+			row = row or order
+			try:
+				delivered = json.loads(((row.get('_billing') or {}).get('delivered_ids')) or '[]')
+			except Exception:
+				delivered = []
+			accounts = [{'account_id': int(a), 'chat_id': 0} for a in delivered if a is not None]
+			if not accounts:
+				return 0
+			return await deferred_leave.schedule_for_order(
+				bot_id=int(row.get('bot_id') or bot_id or 1),
+				target=row.get('target_link') or '',
+				accounts=accounts,
+				order_id=row.get('id'),
+				delay_minutes=delay,
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order.get('id')}: interrupted-leave scheduling failed: {exc}")
+			return 0
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))
@@ -2014,10 +2021,10 @@ class OrderExecutor:
 				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
 				f"└ 👛 **موجودی کیف‌پول پس از تسویه:** `{_p(wallet_balance)}` تومان",
 				sep,
-				# 🚪 ضد بن/حذف اکانت: خروج از گروه فوری نیست (پیش‌فرض: یک روز بعد، فقط اگر سفارشی برای
+				# 🚪 ضد بن/حذف اکانت: خروج از گروه فوری نیست (پیش‌فرض: یک هفته بعد، فقط اگر سفارشی برای
 				# همین گروه نباشد). مقدار GROUP_LEAVE_DELAY_MINUTES=0 رفتار قدیمی را برمی‌گرداند.
 				("🚪 *اکانت‌های این سفارش فوراً از گروه خارج نمی‌شوند؛ بدون سفارش دیگر برای همین گروه، "
-				 "یک روز بعد با فاصله خارج می‌شوند (ضد بن/حذف اکانت).*"),
+				 "یک هفته بعد یکی‌یکی با فاصله خارج می‌شوند (ضد بن/حذف اکانت).*"),
 				("⚡ *ماندهٔ قابل‌عودت بدون کارمزد به کیف پول اضافه شد.*" if extra.get('do_refund', True)
 				 else f"⚠️ *لغو بدون عودت توسط ادمین؛ مبلغ خدمت ارائه‌نشدهٔ نگه‌داشته‌شده: {_p(extra.get('withheld_unused_cost', 0))} تومان.*"),
 			]

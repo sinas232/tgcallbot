@@ -118,12 +118,12 @@ class ConfigLeaveKeysTests(unittest.TestCase):
         start = src.index("async def _defer_group_leave")
         body = src[start:start + 2200]
         self.assertIn("schedule_for_order", body)
-        self.assertIn("leave_delay_minutes", body)
+        self.assertIn("resolved_leave_delay_minutes", body)
         self.assertIn("if delay <= 0", body)  # صریحاً ۰ ⇒ رفتار قدیمی
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.22"', src)
+        self.assertIn('BOT_VERSION = "2.2.23"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):

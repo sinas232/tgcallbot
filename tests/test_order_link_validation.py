@@ -367,7 +367,7 @@ class StorageTests(unittest.TestCase):
         constants = open(os.path.join(root, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(root, 'CHANGELOG.md'), encoding='utf-8').read()
         docs = os.path.join(root, 'docs', 'LINK_FORMAT_2.2.19_FA.md')
-        self.assertTrue('BOT_VERSION = "2.2.22"' in constants)   # نسخهٔ جاری
+        self.assertTrue('BOT_VERSION = "2.2.23"' in constants)   # نسخهٔ جاری
         self.assertTrue('نسخهٔ ۲.۲.۱۹' in changelog)
         self.assertTrue(os.path.exists(docs))
         self.assertTrue(os.path.exists(os.path.join(root, 'docs', 'LINK_FORMAT_2.2.18_FA.md')))

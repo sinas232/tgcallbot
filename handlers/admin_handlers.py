@@ -194,6 +194,7 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ["🆔 تنظیم کانال‌های لاگ", "🆔 متن احراز هویت (مرحله ۱)"],
         ["🆔 متن احراز هویت (مرحله ۲)"],
         ["🩺 تنظیمات بررسی سلامت (SpamBot)"],
+        [BTN_ANTIBAN],
         [BTN_PREMIUM_EMOJI],
         ["📊 گزارش کلی", BTN_BACK]
     ]
@@ -218,6 +219,7 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
+        if "ضد بن" in text: return await antiban_settings_menu(update, context)
         # 💎 ایموجی پریمیوم (Custom Emoji)
         if "ایموجی پریمیوم" in text:
             from handlers.premium_emoji_handlers import premium_emoji_menu
@@ -2300,3 +2302,105 @@ async def receive_backup_interval(update, context):
     await DatabaseManager.set_setting("auto_backup_interval_hours", text, bot_id=bot_id)
     await update.message.reply_text(f"✅ بازه پشتیبان‌گیری خودکار تنظیم شد: هر {text} ساعت.")
     return await backup_restore_menu(update, context)
+
+
+# ===================== ANTIBAN SETTINGS (ضد بن تلگرام) =====================
+
+def _antiban_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ مهلت خروج از گروه", callback_data="antiban_leave")],
+        [InlineKeyboardButton("🔒 قفل ثبت سفارش بعد از لغو", callback_data="antiban_cooldown")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="back_to_settings")],
+    ])
+
+
+async def _antiban_status_text(bot_id: int) -> str:
+    from services import cancel_cooldown, deferred_leave
+    delay = await deferred_leave.resolved_leave_delay_minutes(bot_id)
+    cooldown = await cancel_cooldown.cooldown_minutes(bot_id)
+    delay_txt = deferred_leave.leave_grace_phrase(delay)
+    cd_txt = "خاموش" if cooldown <= 0 else f"{cooldown} دقیقه"
+    return (
+        "🛡 **ضد بن تلگرام**\n"
+        "➖➖➖➖➖➖➖➖\n"
+        f"🚪 مهلت خروج از گروه: **{delay_txt}** (`{delay}` دقیقه)\n"
+        f"⏳ قفل ثبت سفارش بعد از لغو: **{cd_txt}**\n\n"
+        "بعد از پایان یا لغو سفارش، اکانت‌ها فوراً از گروه خارج نمی‌شوند؛ "
+        "اگر سفارش دیگری برای همان گروه نباشد، بعد از مهلت یکی‌یکی و با فاصله خارج می‌شوند.\n"
+        "کاربری که خودش سفارش را لغو کند تا مدت قفل نمی‌تواند سفارش جدید ثبت کند "
+        "(جلوگیری از ورود/خروج پشت‌سرهم و بن شدن اکانت‌ها).\n\n"
+        "۰ یعنی خروج فوری / قفل خاموش. مقدار از پنل سوپرادمین ذخیره می‌شود."
+    )
+
+
+@require_super_admin
+async def antiban_settings_menu(update, context):
+    bot_id = context.bot_data.get('bot_id', 1)
+    text = await _antiban_status_text(bot_id)
+    kb = _antiban_kb()
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=kb)
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb)
+    else:
+        await send_safe(context.bot, update.effective_chat.id, text, reply_markup=kb)
+    return AWAITING_SETTINGS_ACTION
+
+
+@require_super_admin
+async def antiban_settings_callback(update, context):
+    query = update.callback_query
+    data = query.data or ""
+    await safe_answer(query)
+    if data == "antiban_leave":
+        context.user_data['antiban_field'] = 'leave'
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "⏱ مهلت خروج از گروه را به **دقیقه** وارد کنید:\n"
+            "(پیش‌فرض `10080` = یک هفته. `0` = خروج فوری)",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTIBAN_VALUE
+    if data == "antiban_cooldown":
+        context.user_data['antiban_field'] = 'cooldown'
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "⏳ مدت قفل ثبت سفارش بعد از لغو را به **دقیقه** وارد کنید:\n"
+            "(پیش‌فرض `20`. `0` = خاموش)",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTIBAN_VALUE
+    return await antiban_settings_menu(update, context)
+
+
+@require_super_admin
+async def set_antiban_value_handler(update, context):
+    raw = update.message.text or ""
+    if BTN_CANCEL in raw:
+        context.user_data.pop('antiban_field', None)
+        return await antiban_settings_menu(update, context)
+    text = clean_number(raw)
+    if not text.isdigit():
+        await update.message.reply_text("❌ عدد نامعتبر است. لطفاً یک عدد صحیح (دقیقه) وارد کنید.")
+        return AWAITING_ANTIBAN_VALUE
+    value = int(text)
+    field = context.user_data.get('antiban_field')
+    bot_id = context.bot_data.get('bot_id', 1)
+    from services import cancel_cooldown, deferred_leave
+    if field == 'leave':
+        await DatabaseManager.set_setting(deferred_leave.SETTING_DELAY_KEY, str(value), bot_id=bot_id)
+        await update.message.reply_text(
+            f"✅ مهلت خروج تنظیم شد: {deferred_leave.leave_grace_phrase(value)} (`{value}` دقیقه)."
+        )
+    elif field == 'cooldown':
+        await DatabaseManager.set_setting(cancel_cooldown.SETTING_KEY, str(value), bot_id=bot_id)
+        if value:
+            await update.message.reply_text(f"✅ قفل ثبت سفارش بعد از لغو تنظیم شد: `{value}` دقیقه.")
+        else:
+            await update.message.reply_text("✅ قفل ثبت سفارش بعد از لغو خاموش شد.")
+    else:
+        context.user_data.pop('antiban_field', None)
+        return await settings_menu_handler(update, context)
+    context.user_data.pop('antiban_field', None)
+    return await antiban_settings_menu(update, context)

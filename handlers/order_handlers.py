@@ -26,6 +26,7 @@ from services.order_executor import order_executor
 from services.order_admission import order_admission, active_order_limit
 from services.maintenance import maintenance, enforce_maintenance
 from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
+from services import cancel_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,14 @@ async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             'first_name': tg_user.first_name, 
             'last_name': tg_user.last_name
         }, bot_id=bot_id)
+
+    blocked, remaining, minutes = await cancel_cooldown.check_user(user, user_id, bot_id)
+    if blocked:
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            cancel_cooldown.blocked_message(remaining, minutes),
+        )
+        return ConversationHandler.END
 
     kb = ReplyKeyboardMarkup(PLAN_TYPES_MENU, resize_keyboard=True)
     await send_safe(context.bot, update.effective_chat.id, "🛍 **خرید سرویس جدید**\n\nلطفاً نوع سرویس را انتخاب کنید:", reply_markup=kb)
@@ -509,6 +518,10 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
         
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        blocked, remaining, minutes = await cancel_cooldown.check_user(user, user_id, bot_id)
+        if blocked:
+            await query.edit_message_text(cancel_cooldown.blocked_message(remaining, minutes))
+            return ConversationHandler.END
         # Telegram confirmation message identity is stable across repeated clicks
         # and across process restarts; unlike callback-query ID it cannot double debit.
         request_key = f"checkout:{bot_id}:{user['id']}:{query.message.chat_id}:{query.message.message_id}"
@@ -650,6 +663,11 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if result.get('already_settled'):
         prefix = "ℹ️ این سفارش قبلاً تسویه شده؛ رسید قبلی (بدون عودت مجدد):"
     elapsed = order_executor._fmt_duration_fa(result.get('elapsed_seconds') or 0)
+    cooldown_note = ""
+    if result.get('claimed'):
+        await cancel_cooldown.mark_user_cancelled(user['id'])
+        minutes = await cancel_cooldown.cooldown_minutes(bot_id)
+        cooldown_note = cancel_cooldown.cancel_notice(minutes)
     text = (
         f"{prefix}\n\n"
         f"📦 شماره سفارش: {order_id}\n"
@@ -660,6 +678,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"💵 مبلغ عودت داده شده به کیف پول: {format_price(result['refund_amount'])} تومان\n"
         f"🧾 کد پیگیری عودت: {result['refund_tx_id'] or '—'}\n"
         f"👛 موجودی کیف پول پس از تسویه: {format_price(result['user_wallet_balance'])} تومان"
+        f"{cooldown_note}"
     )
     await reply(text)
     return ConversationHandler.END

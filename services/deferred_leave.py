@@ -3,8 +3,10 @@
 Why: leaving a group the moment an order finishes/cancels makes accounts
 join → leave → join repeatedly. Telegram treats that pattern as spam and can
 delete or ban the account. Accounts therefore keep their membership for a
-grace period (default 24h) and only leave when there is **no order** for that
-group anymore — that is, one day after the last order for that group ended.
+grace period (default one week) and only leave when there is **no order**
+for that group anymore — that is, one week after the last order for that
+group ended. Leaves are strictly sequential (one account at a time) with a
+human-like gap.
 """
 from __future__ import annotations
 
@@ -20,10 +22,13 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DELAY_MINUTES = 24 * 60
-DEFAULT_POLL_MINUTES = 5
-DEFAULT_BATCH_LIMIT = 200
+DEFAULT_DELAY_MINUTES = 7 * 24 * 60
+DEFAULT_POLL_MINUTES = 10
+DEFAULT_BATCH_LIMIT = 6
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_STAGGER_MIN = 60.0
+DEFAULT_STAGGER_MAX = 180.0
+SETTING_DELAY_KEY = "group_leave_delay_minutes"
 
 
 def _cfg_int(name: str, env_key: str, default: int) -> int:
@@ -54,6 +59,63 @@ def batch_limit() -> int:
 
 def max_attempts() -> int:
     return max(1, _cfg_int("GROUP_LEAVE_MAX_ATTEMPTS", "GROUP_LEAVE_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS))
+
+
+def leave_stagger_min() -> float:
+    try:
+        return max(0.0, float(getattr(Config, "GROUP_LEAVE_STAGGER_MIN", DEFAULT_STAGGER_MIN)))
+    except Exception:
+        return DEFAULT_STAGGER_MIN
+
+
+def leave_stagger_max() -> float:
+    try:
+        return max(leave_stagger_min(), float(getattr(Config, "GROUP_LEAVE_STAGGER_MAX", DEFAULT_STAGGER_MAX)))
+    except Exception:
+        return max(leave_stagger_min(), DEFAULT_STAGGER_MAX)
+
+
+def leave_concurrency() -> int:
+    """خروج از گروه همیشه یکی‌یکی است (ضد بن)؛ سقف کانفیگ هرگز از ۱ بالاتر نمی‌رود."""
+    try:
+        requested = int(getattr(Config, "GROUP_LEAVE_MAX_CONCURRENCY", 1))
+    except Exception:
+        requested = 1
+    return 1 if requested != 0 else 1
+
+
+def leave_grace_phrase(minutes: Optional[int] = None) -> str:
+    """عبارت فارسی مهلت خروج برای پیام مشتری/گزارش."""
+    value = leave_delay_minutes() if minutes is None else max(0, int(minutes))
+    if value <= 0:
+        return "فوراً"
+    if value == 7 * 24 * 60:
+        return "یک هفته بعد"
+    if value == 24 * 60:
+        return "یک روز بعد"
+    if value % (24 * 60) == 0:
+        days = value // (24 * 60)
+        return f"{days} روز بعد"
+    if value % 60 == 0:
+        hours = value // 60
+        return f"{hours} ساعت بعد"
+    return f"{value} دقیقه بعد"
+
+
+async def resolved_leave_delay_minutes(bot_id: int = 1) -> int:
+    """مهلت خروج: تنظیم پنل سوپرادمین بر env اولویت دارد."""
+    try:
+        from database import DatabaseManager
+
+        raw = await DatabaseManager.get_setting(SETTING_DELAY_KEY, "", bot_id=bot_id)
+        if raw not in ("", None):
+            try:
+                return max(0, int(str(raw).strip()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return leave_delay_minutes()
 
 
 def normalize_target(target: Any) -> str:
@@ -121,11 +183,26 @@ async def schedule_for_order(
     rows = [a for a in (accounts or []) if a.get("account_id") is not None]
     if not rows or not normalize_target(target):
         return 0
-    delay = leave_delay_minutes() if delay_minutes is None else max(0, int(delay_minutes))
-    due_at = datetime.utcnow() + timedelta(minutes=delay)
+    if delay_minutes is None:
+        delay = await resolved_leave_delay_minutes(int(bot_id or 1))
+    else:
+        delay = max(0, int(delay_minutes))
+    base = datetime.utcnow() + timedelta(minutes=delay)
+    gap_min = leave_stagger_min()
+    gap_max = leave_stagger_max()
+    # ترتیب پایدار بر اساس شناسه تا خروج‌ها الگوی تصادفی انفجاری نسازند.
+    ordered = sorted(rows, key=lambda item: int(item.get("account_id") or 0))
+    spread: List[Dict[str, Any]] = []
+    offset = 0.0
+    for index, acc in enumerate(ordered):
+        item = dict(acc)
+        if index > 0:
+            offset += random.uniform(gap_min, gap_max)
+        item["due_at"] = base + timedelta(seconds=offset)
+        spread.append(item)
     try:
         return await DatabaseManager.schedule_group_leaves(
-            bot_id=int(bot_id or 1), order_id=order_id, target=str(target), rows=rows, due_at=due_at,
+            bot_id=int(bot_id or 1), order_id=order_id, target=str(target), rows=spread,
         )
     except Exception:
         logger.exception("Deferred leave: scheduling failed for order %s (group %s)", order_id, target)
@@ -207,44 +284,48 @@ async def process_due_leaves(limit: Optional[int] = None, *, now: Optional[datet
     if not pending:
         return summary
 
-    gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-    gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
-    jitter_max = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-    concurrency = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
-    sem = asyncio.Semaphore(concurrency)
-    random.shuffle(pending)
-    logger.info("[DeferredLeave] leaving %s account(s) from %s group(s)",
-                len(pending), len({(r.get('bot_id'), normalize_target(r.get('target'))) for r in pending}))
+    gap_min = leave_stagger_min()
+    gap_max = leave_stagger_max()
+    # یکی‌یکی، به ترتیب سررسید — هرگز gather هم‌زمان.
+    pending.sort(key=lambda row: (
+        row.get("due_at") or now,
+        int(row.get("account_id") or 0),
+        int(row.get("id") or 0),
+    ))
+    logger.info(
+        "[DeferredLeave] leaving %s account(s) from %s group(s) sequentially (gap=%.0f-%.0fs)",
+        len(pending),
+        len({(r.get("bot_id"), normalize_target(r.get("target"))) for r in pending}),
+        gap_min, gap_max,
+    )
 
-    async def worker(row: Dict[str, Any]):
-        async with sem:
-            # بازبینی نهایی: اگر همین حالا سفارش جدیدی برای گروه ثبت شده باشد، بمان
-            try:
-                targets = await DatabaseManager.get_open_order_targets(int(row.get("bot_id") or 1))
-                if normalize_target(row.get("target")) in {normalize_target(t) for t in targets}:
-                    await _postpone(row, datetime.utcnow(), reason="new order arrived")
-                    summary["postponed"] += 1
-                    return
-            except Exception:
+    for index, row in enumerate(pending):
+        if index > 0 and (gap_min > 0 or gap_max > 0):
+            await asyncio.sleep(random.uniform(gap_min, gap_max))
+        try:
+            targets = await DatabaseManager.get_open_order_targets(int(row.get("bot_id") or 1))
+            if normalize_target(row.get("target")) in {normalize_target(t) for t in targets}:
+                await _postpone(row, datetime.utcnow(), reason="new order arrived")
                 summary["postponed"] += 1
-                return
-            ok, error = await _leave_one(row)
-            if ok:
-                await DatabaseManager.finish_group_leave(row.get("id"), "left")
-                summary["left"] += 1
+                continue
+        except Exception:
+            summary["postponed"] += 1
+            continue
+        ok, error = await _leave_one(row)
+        if ok:
+            await DatabaseManager.finish_group_leave(row.get("id"), "left")
+            summary["left"] += 1
+        else:
+            attempts = int(row.get("attempts") or 0) + 1
+            if attempts >= max_attempts():
+                await DatabaseManager.finish_group_leave(row.get("id"), "failed", error=error)
+                summary["failed"] += 1
             else:
-                attempts = int(row.get("attempts") or 0) + 1
-                if attempts >= max_attempts():
-                    await DatabaseManager.finish_group_leave(row.get("id"), "failed", error=error)
-                    summary["failed"] += 1
-                else:
-                    await DatabaseManager.schedule_group_leave_retry(
-                        row.get("id"), due_at=datetime.utcnow() + timedelta(minutes=30),
-                        error=error, attempts=attempts)
-                    summary["skipped"] += 1
-            await asyncio.sleep(random.uniform(gap_min, gap_max) + random.uniform(0, jitter_max))
+                await DatabaseManager.schedule_group_leave_retry(
+                    row.get("id"), due_at=datetime.utcnow() + timedelta(minutes=30),
+                    error=error, attempts=attempts)
+                summary["skipped"] += 1
 
-    await asyncio.gather(*(worker(row) for row in pending))
     logger.info("[DeferredLeave] done: %s", summary)
     return summary
 

@@ -235,7 +235,7 @@ class SourceGuardTests(unittest.TestCase):
             self.assertIn(key, env)
 
     def test_version_and_changelog(self):
-        self.assertIn('BOT_VERSION = "2.2.22"', self.read('constants.py'))
+        self.assertIn('BOT_VERSION = "2.2.23"', self.read('constants.py'))
         self.assertIn('نسخهٔ ۲.۲.۱۷', self.read('CHANGELOG.md'))
 
 

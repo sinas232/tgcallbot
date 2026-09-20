@@ -248,7 +248,7 @@ class DocsTests(unittest.TestCase):
         constants = open(os.path.join(ROOT, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8').read()
         env = open(os.path.join(ROOT, '.env.example'), encoding='utf-8').read()
-        self.assertIn('BOT_VERSION = "2.2.22"', constants)   # نسخهٔ جاری
+        self.assertIn('BOT_VERSION = "2.2.23"', constants)   # نسخهٔ جاری
         self.assertIn('نسخهٔ ۲.۲.۲۰', changelog)
         self.assertTrue(os.path.exists(os.path.join(ROOT, 'docs', 'NO_ACCOUNT_LIMITS_2.2.20_FA.md')))
         self.assertIn('VOICE_ACCOUNT_ATTEMPT_LIMIT=0', env)

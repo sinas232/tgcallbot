@@ -2,10 +2,10 @@
 
 قاعدهٔ تست‌شده:
     - پایان/لغو سفارش ⇒ اکانت‌ها فوراً از گروه خارج نمی‌شوند.
-    - خروج فقط پس از مهلت (پیش‌فرض ۲۴ ساعت) و تنها وقتی هیچ سفارشی برای آن
+    - خروج فقط پس از مهلت (پیش‌فرض یک هفته) و تنها وقتی هیچ سفارشی برای آن
       گروه باز نیست انجام می‌شود.
     - سفارش جدید برای همان گروه ⇒ مهلت تمدید/لغو می‌شود.
-    - خروج‌ها با فاصله (stagger) و محدودیت هم‌زمانی انجام می‌شود.
+    - خروج‌ها یکی‌یکی و با فاصلهٔ انسانی انجام می‌شود.
 """
 import asyncio
 import os
@@ -61,8 +61,8 @@ class EntryExtractionTests(unittest.TestCase):
 
 
 class DelayConfigTests(unittest.TestCase):
-    def test_default_delay_is_one_day(self):
-        self.assertEqual(leave_delay_minutes(), 24 * 60)
+    def test_default_delay_is_one_week(self):
+        self.assertEqual(leave_delay_minutes(), 7 * 24 * 60)
 
     def test_zero_delay_means_immediate_leave_is_available(self):
         with patch.object(deferred_leave.Config, 'GROUP_LEAVE_DELAY_MINUTES', 0):
@@ -103,7 +103,7 @@ class DeferralScheduleTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_delay_restores_the_old_immediate_behaviour(self):
         ex = OrderExecutor()
         entries = [{'acc': {'id': 1}, 'chat_id': -1001}]
-        with patch.object(deferred_leave, 'leave_delay_minutes', return_value=0), \
+        with patch.object(deferred_leave, 'resolved_leave_delay_minutes', AsyncMock(return_value=0)), \
                 patch.object(deferred_leave, 'schedule_for_order', AsyncMock()) as schedule, \
                 patch.object(ex, '_eject_all_fast', AsyncMock()) as eject:
             written = await ex._defer_group_leave(42, entries, {'order_type': 'group_join'})
@@ -166,7 +166,7 @@ class InterruptedOrderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_delay_keeps_the_old_behaviour(self):
         ex = OrderExecutor()
-        with patch.object(deferred_leave, 'leave_delay_minutes', return_value=0), \
+        with patch.object(deferred_leave, 'resolved_leave_delay_minutes', AsyncMock(return_value=0)), \
                 patch.object(deferred_leave, 'schedule_for_order', AsyncMock()) as schedule:
             self.assertEqual(await ex._schedule_interrupted_leave({'id': 9}), 0)
         schedule.assert_not_awaited()
@@ -183,9 +183,8 @@ class ProcessDueLeavesTests(unittest.IsolatedAsyncioTestCase):
                 patch(f'{DB}.finish_group_leave', AsyncMock(return_value=True)) as done, \
                 patch(f'{DB}.schedule_group_leave_retry', AsyncMock(return_value=True)) as retry, \
                 patch.object(deferred_leave, '_leave_one', AsyncMock(side_effect=leave_once)), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MIN', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MAX', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_JITTER_MAX', 0.0):
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MIN', 0.0), \
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MAX', 0.0):
             summary = await process_due_leaves()
         return summary, left, done, retry
 
@@ -225,7 +224,7 @@ class ProcessDueLeavesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary['postponed'], 1)
         leave.assert_not_awaited()
 
-    async def test_concurrency_is_capped_by_config(self):
+    async def test_leaves_are_strictly_sequential(self):
         rows = [row(i, account_id=i) for i in range(1, 7)]
         active = {'now': 0, 'max': 0}
         async def leave_once(one):
@@ -238,13 +237,11 @@ class ProcessDueLeavesTests(unittest.IsolatedAsyncioTestCase):
                 patch(f'{DB}.get_open_order_targets', AsyncMock(return_value=set())), \
                 patch(f'{DB}.finish_group_leave', AsyncMock(return_value=True)), \
                 patch.object(deferred_leave, '_leave_one', AsyncMock(side_effect=leave_once)), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_MAX_CONCURRENCY', 2), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MIN', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MAX', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_JITTER_MAX', 0.0):
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MIN', 0.0), \
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MAX', 0.0):
             summary = await process_due_leaves()
         self.assertEqual(summary['left'], 6)
-        self.assertLessEqual(active['max'], 2)
+        self.assertEqual(active['max'], 1)
 
     async def test_nothing_due_is_a_cheap_noop(self):
         with patch(f'{DB}.due_group_leaves', AsyncMock(return_value=[])) as read, \
@@ -283,7 +280,7 @@ class MessageAndConfigTests(unittest.TestCase):
     def test_completion_message_tells_the_customer_about_the_grace_period(self):
         src = open(os.path.join(os.path.dirname(__file__), '..', 'services',
                                 'order_executor.py'), encoding='utf-8').read()
-        self.assertIn('یک روز بعد خارج می‌شوند', src)
+        self.assertIn('یک هفته بعد خارج می‌شوند', src)
         self.assertNotIn('اکانت‌ها از تماس و گروه خارج شدند.', src)
 
     def test_cancel_report_mentions_deferred_leave(self):
@@ -297,10 +294,10 @@ class MessageAndConfigTests(unittest.TestCase):
 
     def test_defaults_are_documented_and_registered(self):
         import config
-        self.assertEqual(config.Config.GROUP_LEAVE_DELAY_MINUTES, 24 * 60)
-        self.assertEqual(config.Config.GROUP_LEAVE_POLL_MINUTES, 5)
+        self.assertEqual(config.Config.GROUP_LEAVE_DELAY_MINUTES, 7 * 24 * 60)
+        self.assertEqual(config.Config.GROUP_LEAVE_POLL_MINUTES, 10)
         env = open(os.path.join(os.path.dirname(__file__), '..', '.env.example'), encoding='utf-8').read()
-        self.assertIn('GROUP_LEAVE_DELAY_MINUTES=1440', env)
+        self.assertIn('GROUP_LEAVE_DELAY_MINUTES=10080', env)
 
     def test_new_table_is_part_of_backups(self):
         from services.backup_manager import TABLE_ORDER

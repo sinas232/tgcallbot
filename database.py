@@ -82,6 +82,7 @@ class User(Base):
     kyc_reject_reason = Column(Text, nullable=True)
     exempt_phone_verify = Column(Boolean, default=False)
     kyc_card_number = Column(String(20), nullable=True)
+    last_order_cancel_at = Column(DateTime, nullable=True)
     __table_args__ = (UniqueConstraint('telegram_id', 'bot_id', name='uq_user_bot'),)
 
 class BankCard(Base):
@@ -369,6 +370,7 @@ class DatabaseManager:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS username VARCHAR(255);",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_order_cancel_at TIMESTAMP WITHOUT TIME ZONE;",
         ]
         async with engine.connect() as conn:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -677,6 +679,17 @@ class DatabaseManager:
             if u:
                 u.is_banned = is_banned
                 await db_session.commit()
+
+    @staticmethod
+    async def touch_user_order_cancel(internal_id: int) -> bool:
+        """مهر زمان لغو دستی سفارش توسط خود کاربر (قفل ضد بن)."""
+        async with AsyncSessionLocal() as db_session:
+            u = await db_session.get(User, internal_id)
+            if not u:
+                return False
+            u.last_order_cancel_at = datetime.utcnow()
+            await db_session.commit()
+            return True
 
     @staticmethod
     async def update_user_exempt_phone(internal_id: int, exempt: bool):
@@ -1304,11 +1317,12 @@ class DatabaseManager:
     # ─── 🚪 خروج تأخیری از گروه (Deferred Group Leave) ───────────────
 
     @staticmethod
-    async def schedule_group_leaves(bot_id: int, order_id, target: str, rows, due_at):
+    async def schedule_group_leaves(bot_id: int, order_id, target: str, rows, due_at=None):
         """ثبت/تمدید خروج تأخیری؛ هر (ربات، اکانت، گروه) فقط یک رکورد pending دارد.
 
         مهلت همیشه «دیرترین» مقدار است تا بعد از پایان آخرین سفارش گروه،
-        یک روز کامل صبر شود.
+        یک هفته کامل صبر شود. هر ردیف می‌تواند ``due_at`` جدا داشته باشد
+        تا خروج‌ها هم‌زمان سر نرسند.
         """
         from sqlalchemy import select as _select
         target = str(target or "").strip()
@@ -1330,10 +1344,11 @@ class DatabaseManager:
                     continue
                 account_id = int(account_id)
                 chat_id = row.get("chat_id") or None
+                row_due = row.get("due_at") or due_at
                 current = by_account.get(account_id)
                 if current is not None:
-                    if due_at and (current.due_at is None or due_at > current.due_at):
-                        current.due_at = due_at
+                    if row_due and (current.due_at is None or row_due > current.due_at):
+                        current.due_at = row_due
                     if chat_id:
                         current.chat_id = int(chat_id)
                     current.order_id = order_id or current.order_id
@@ -1342,7 +1357,7 @@ class DatabaseManager:
                     record = GroupLeave(bot_id=int(bot_id or 1), order_id=order_id,
                                         account_id=account_id,
                                         chat_id=int(chat_id) if chat_id else None,
-                                        target=target, due_at=due_at)
+                                        target=target, due_at=row_due)
                     session.add(record)
                     by_account[account_id] = record
                 affected += 1

@@ -4,7 +4,7 @@ constants.py
 """
 
 # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
-BOT_VERSION = "2.2.22"
+BOT_VERSION = "2.2.23"
 
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
@@ -112,6 +112,7 @@ TICKET_AUTOCLOSE_HOURS = 48
 AWAITING_RESTORE_FILE = 210
 AWAITING_BACKUP_CHANNEL = 211
 AWAITING_BACKUP_INTERVAL = 212
+AWAITING_ANTIBAN_VALUE = 213  # مقدار ضد بن (مهلت خروج / قفل لغو سفارش)
 
 # 💎 وضعیت‌های ایموجی پریمیوم (جایگزینی شناسهٔ ایموجی توسط ادمین)
 AWAITING_PREMIUM_EMOJI_OVERRIDE = 220
@@ -125,6 +126,7 @@ BTN_EXIT_ADMIN = "🔙 خروج از پنل ادمین"
 BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضافه شد
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
 BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
+BTN_ANTIBAN = "🛡 ضد بن تلگرام"  # خروج تأخیری + قفل ثبت سفارش بعد از لغو
 
 REGEX_BACK = r".*بازگشت.*" 
 REGEX_CANCEL = r".*انصراف.*"

@@ -751,6 +751,7 @@ def register_handlers(application: Application) -> None:
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
         r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|🛡 ضد بن تلگرام|ضد بن"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
@@ -967,6 +968,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
             CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
             CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+            CallbackQueryHandler(antiban_settings_callback, pattern="^antiban_"),
             CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
@@ -1008,10 +1010,12 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت|🛡 ضد بن تلگرام)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+                MessageHandler(filters.Regex(f"^{BTN_ANTIBAN}$"), antiban_settings_menu),
+                CallbackQueryHandler(antiban_settings_callback, pattern="^antiban_"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
 
@@ -1113,6 +1117,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            AWAITING_ANTIBAN_VALUE: [MessageHandler(STD_TEXT, set_antiban_value_handler)],
 
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
@@ -1392,7 +1397,7 @@ async def main_loop():
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         # بازیابی مالیِ سفارش‌های نیمه‌کاره (اندکی بعد از بالا آمدن ربات‌ها)
         main_app.job_queue.run_repeating(startup_recovery_job, interval=60, first=20)
-        # 🚪 خروج تأخیری اکانت‌ها از گروه (پیش‌فرض: بعد از یک روز و بدون سفارش فعال)
+        # 🚪 خروج تأخیری اکانت‌ها از گروه (پیش‌فرض: بعد از یک هفته، یکی‌یکی، بدون سفارش فعال)
         main_app.job_queue.run_repeating(
             process_deferred_leaves_job,
             interval=max(60, deferred_leave.poll_minutes() * 60), first=45,

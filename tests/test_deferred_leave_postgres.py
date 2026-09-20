@@ -109,9 +109,8 @@ class DeferredLeavePostgresTests(unittest.IsolatedAsyncioTestCase):
             left.append(row['account_id'])
             return True, ''
         with patch.object(deferred_leave, '_leave_one', AsyncMock(side_effect=leave_once)), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MIN', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_STAGGER_MAX', 0.0), \
-                patch.object(deferred_leave.Config, 'VOICE_LEAVE_JITTER_MAX', 0.0):
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MIN', 0.0), \
+                patch.object(deferred_leave.Config, 'GROUP_LEAVE_STAGGER_MAX', 0.0):
             summary = await deferred_leave.process_due_leaves()
         self.assertEqual(left, [2])                    # فقط گروه بدون سفارش
         self.assertEqual((summary['left'], summary['postponed']), (1, 1))

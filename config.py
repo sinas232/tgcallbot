@@ -83,15 +83,23 @@ class Config:
     # لینک نمونه‌ای که در راهنما/پیام خطا نمایش داده می‌شود (اختیاری).
     # مثال: ORDER_LINK_EXAMPLE=https://t.me/+8hR1-wquL2liMTVk
     ORDER_LINK_EXAMPLE = os.getenv('ORDER_LINK_EXAMPLE', '').strip()
-    # ─── 🚪 خروج تأخیری اکانت‌ها از گروه ─────────────────────────────
+    # ─── 🚪 خروج تأخیری اکانت‌ها از گروه (ضد بن / حذف اکانت) ────────
     # پس از پایان/لغو سفارش، اکانت فوراً از گروه خارج نمی‌شود (خروج فوری
     # باعث join/leave پشت‌سرهم و ریسک بن/حذف اکانت می‌شود). مهلت پیش‌فرض
-    # یک روز است و اگر سفارشی برای همان گروه باز باشد، دوباره تمدید می‌شود.
-    # مقدار ۰ = رفتار قدیمی (خروج فوری).
-    GROUP_LEAVE_DELAY_MINUTES = int(os.getenv('GROUP_LEAVE_DELAY_MINUTES', str(24 * 60)))
-    GROUP_LEAVE_POLL_MINUTES = int(os.getenv('GROUP_LEAVE_POLL_MINUTES', '5'))
-    GROUP_LEAVE_BATCH_LIMIT = int(os.getenv('GROUP_LEAVE_BATCH_LIMIT', '200'))
+    # یک هفته است و اگر سفارشی برای همان گروه باز باشد، دوباره تمدید می‌شود.
+    # مقدار ۰ = رفتار قدیمی (خروج فوری). از پنل سوپرادمین هم قابل تنظیم است.
+    GROUP_LEAVE_DELAY_MINUTES = int(os.getenv('GROUP_LEAVE_DELAY_MINUTES', str(7 * 24 * 60)))
+    GROUP_LEAVE_POLL_MINUTES = int(os.getenv('GROUP_LEAVE_POLL_MINUTES', '10'))
+    # در هر نوبت فقط چند خروج؛ بقیه در تیک بعدی. خروج‌ها یکی‌یکی و با فاصله‌اند.
+    GROUP_LEAVE_BATCH_LIMIT = int(os.getenv('GROUP_LEAVE_BATCH_LIMIT', '6'))
     GROUP_LEAVE_MAX_ATTEMPTS = int(os.getenv('GROUP_LEAVE_MAX_ATTEMPTS', '3'))
+    # فاصلهٔ انسانی بین خروج دو اکانت از گروه (ثانیه). هرگز هم‌زمان نیستند.
+    GROUP_LEAVE_STAGGER_MIN = float(os.getenv('GROUP_LEAVE_STAGGER_MIN', '60'))
+    GROUP_LEAVE_STAGGER_MAX = float(os.getenv('GROUP_LEAVE_STAGGER_MAX', '180'))
+    GROUP_LEAVE_MAX_CONCURRENCY = int(os.getenv('GROUP_LEAVE_MAX_CONCURRENCY', '1'))
+    # اگر کاربر سفارش را لغو کند، تا این مدت نمی‌تواند سفارش جدید ثبت کند.
+    # ۰ = قفل خاموش. از پنل سوپرادمین هم قابل تنظیم است.
+    CANCEL_ORDER_COOLDOWN_MINUTES = int(os.getenv('CANCEL_ORDER_COOLDOWN_MINUTES', '20'))
     # 🔎 تعداد چرخهٔ متوالی «غیبت تأییدشده» پیش از هر تلاش بازیابی/جایگزینی.
     # روی شبکه‌های بی‌ثبات (WARP/VPN) عدد بزرگ‌تر = خروج دیرتر و امن‌تر.
     CONFIRMED_DISCONNECT_THRESHOLD = int(os.getenv('CONFIRMED_DISCONNECT_THRESHOLD', '8'))

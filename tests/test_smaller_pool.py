@@ -235,7 +235,7 @@ class DocsTests(unittest.TestCase):
         constants = open(os.path.join(ROOT, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8').read()
         env = open(os.path.join(ROOT, '.env.example'), encoding='utf-8').read()
-        self.assertIn('BOT_VERSION = "2.2.22"', constants)
+        self.assertIn('BOT_VERSION = "2.2.23"', constants)
         self.assertIn('نسخهٔ ۲.۲.۲۲', changelog)
         self.assertTrue(os.path.exists(os.path.join(ROOT, 'docs', 'NO_COUNT_PROBLEM_2.2.22_FA.md')))
         self.assertIn('VOICE_REFILL_RETRY_SECONDS=90', env)
