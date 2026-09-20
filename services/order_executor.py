@@ -4,6 +4,7 @@ import math
 import json
 from telegram.error import BadRequest
 from services.billing import ActiveClock, money, prorate
+from services import deferred_leave
 import random
 import re
 import time
@@ -1307,7 +1308,8 @@ class OrderExecutor:
 						f"مدت خدمت خریداری‌شده: {timer_str}\n"
 						f"اکانت‌های موفق: {final_live}\n"
 						f"هزینهٔ کل از پیش پرداخت شده؛ کسر مجددی انجام نشد.\n"
-						f"اکانت‌ها از تماس و گروه خارج شدند."
+						"🔒 اکانت‌ها از تماس خارج شدند و برای جلوگیری از ریسک محدودیت، فعلاً در گروه می‌مانند؛ "
+						"اگر سفارش دیگری برای همین گروه نباشد، یک روز بعد خارج می‌شوند."
 					)
 					if await DatabaseManager.claim_order_report(order_id, "customer", "completed"):
 						await app.bot.send_message(user["telegram_id"], msg)
@@ -1341,15 +1343,47 @@ class OrderExecutor:
 			vcm = _get_voice_call_manager()
 			if vcm:
 				try:
-					n = await vcm.stop_all_for_order(order_id, leave_group=True)
-					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
+					# تماس قطع می‌شود، ولی عضویت گروه حفظ می‌شود (ضد بن/حذف اکانت).
+					n = await vcm.stop_all_for_order(order_id, leave_group=False)
+					logger.info(f"Order {order_id}: paced voice stop finished ({n} accounts); group kept")
 				except Exception as exc:
 					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
-		else:
-			try:
-				await self._eject_all_fast(order_id, joined_accounts, data)
-			except Exception as exc:
-				logger.exception(f"Order {order_id}: cleanup failed: {exc}")
+		# 🚪 خروج از گروه فوری نیست: به صف «خروج تأخیری» می‌رود تا اکانت‌ها به
+		# خاطر join/leave پشت‌سرهم بن/حذف نشوند.
+		try:
+			await self._defer_group_leave(order_id, joined_accounts, data)
+		except Exception as exc:
+			logger.exception(f"Order {order_id}: deferred leave scheduling failed: {exc}")
+
+	async def _defer_group_leave(self, order_id, entries, data):
+		"""خروج اکانت‌ها از گروه را به تعویق می‌اندازد (پیش‌فرض: یک روز).
+
+		خروج فوری فقط وقتی انجام می‌شود که ادمین صریحاً
+		``GROUP_LEAVE_DELAY_MINUTES=0`` گذاشته باشد. در حالت عادی، عضویت اکانت
+		در گروه/کانال حفظ می‌شود و اگر سفارش دیگری برای همان گروه نباشد، پس از
+		پایان مهلت با فاصله (stagger) خارج می‌شود.
+		"""
+		order_type = (data or {}).get("order_type")
+		delay = deferred_leave.leave_delay_minutes()
+		accounts = deferred_leave.accounts_from_entries(entries)
+		if delay <= 0:
+			if order_type == "voice_chat":
+				vcm = _get_voice_call_manager()
+				if vcm:
+					try:
+						await vcm.stop_all_for_order(order_id, leave_group=True)
+					except Exception as exc:
+						logger.warning(f"Order {order_id}: immediate voice leave failed: {exc}")
+			else:
+				await self._eject_all_fast(order_id, entries, data)
+			return 0
+		if not accounts:
+			return 0
+		return await deferred_leave.schedule_for_order(
+			bot_id=int((data or {}).get("bot_id") or 1),
+			target=(data or {}).get("target_link") or "",
+			accounts=accounts, order_id=order_id, delay_minutes=delay,
+		)
 
 	async def _leave_single(self, entry, order_id, order_type, target, sem):
 		async with sem:
@@ -1403,7 +1437,21 @@ class OrderExecutor:
 		vcm = _get_voice_call_manager()
 		n = 0
 		if vcm:
-			n = await vcm.stop_all_for_order(order_id, leave_group=True)
+			n = await vcm.stop_all_for_order(order_id, leave_group=False)
+		# 🚪 بدون خروج فوری از گروه: خروج به صف تأخیری می‌رود.
+		try:
+			order_row = await DatabaseManager.get_order(order_id) or {}
+			entries = []
+			if vcm:
+				for aid, rec in (vcm.joined_accounts_by_order.get(order_id) or {}).items():
+					entries.append({"acc": {"id": aid}, "chat_id": (rec or {}).get("chat_id")})
+			await self._defer_group_leave(order_id, entries, {
+				"bot_id": order_row.get("bot_id", 1),
+				"target_link": order_row.get("target_link"),
+				"order_type": order_row.get("order_type"),
+			})
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: deferred leave scheduling failed: {exc}")
 		# 🐛 فیکس حیاتی: وضعیت باید همیشه بسته شود، نه فقط وقتی که VCM کالی پیدا کند.
 		# قبلاً اگر سفارش در حافظه نبود (مثلاً سفارش زمان‌بندی‌شده یا
 		# بعد از ری‌استارت) و کالی هم فعال نبود، هیچ UPDATEای روی دیتابیس
@@ -1501,7 +1549,39 @@ class OrderExecutor:
 	        canceled_by_role='سیستم', cancellation_reason='تسویهٔ خدمت ارائه‌نشده پس از توقف اجرا')
 	    if result.get('claimed'):
 	        await self._notify_automatic_refund(order['id'], order, result)
+	    # 🚪 اکانت‌های سفارش متوقف‌شده هم فوراً از گروه خارج نمی‌شوند؛ به صف تأخیری می‌روند.
+	    await self._schedule_interrupted_leave(order)
 	    return result
+
+	async def _schedule_interrupted_leave(self, order):
+	    """اکانت‌های سفارش نیمه‌کاره (بعد از ری‌استارت/کرش) را به صف خروج تأخیری می‌فرستد.
+
+	    اگر در زمان اجرا اکانتی وارد گروه شده باشد و اجرا متوقف شود، بدون این کار
+	    عضویت آن اکانت هرگز پاک نمی‌شد. خروج هم مثل حالت عادی یک روز بعد و فقط
+	    وقتی اتفاق می‌افتد که سفارش دیگری برای همان گروه باز نباشد.
+	    """
+	    order = order or {}
+	    if deferred_leave.leave_delay_minutes() <= 0:
+	        return 0
+	    try:
+	        row = await DatabaseManager.get_order(order.get('id'))
+	        row = row or order
+	        try:
+	            delivered = json.loads(((row.get('_billing') or {}).get('delivered_ids')) or '[]')
+	        except Exception:
+	            delivered = []
+	        accounts = [{'account_id': int(a), 'chat_id': 0} for a in delivered if a is not None]
+	        if not accounts:
+	            return 0
+	        return await deferred_leave.schedule_for_order(
+	            bot_id=int(row.get('bot_id') or 1),
+	            target=row.get('target_link') or '',
+	            accounts=accounts,
+	            order_id=row.get('id'),
+	        )
+	    except Exception as exc:
+	        logger.warning(f"Order {order.get('id')}: interrupted-leave scheduling failed: {exc}")
+	        return 0
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))
@@ -1773,6 +1853,10 @@ class OrderExecutor:
 				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
 				f"└ 👛 **موجودی کیف‌پول پس از تسویه:** `{_p(wallet_balance)}` تومان",
 				sep,
+				# 🚪 ضد بن/حذف اکانت: خروج از گروه فوری نیست (پیش‌فرض: یک روز بعد، فقط اگر سفارشی برای
+				# همین گروه نباشد). مقدار GROUP_LEAVE_DELAY_MINUTES=0 رفتار قدیمی را برمی‌گرداند.
+				("🚪 *اکانت‌های این سفارش فوراً از گروه خارج نمی‌شوند؛ بدون سفارش دیگر برای همین گروه، "
+				 "یک روز بعد با فاصله خارج می‌شوند (ضد بن/حذف اکانت).*"),
 				("⚡ *ماندهٔ قابل‌عودت بدون کارمزد به کیف پول اضافه شد.*" if extra.get('do_refund', True)
 				 else f"⚠️ *لغو بدون عودت توسط ادمین؛ مبلغ خدمت ارائه‌نشدهٔ نگه‌داشته‌شده: {_p(extra.get('withheld_unused_cost', 0))} تومان.*"),
 			]

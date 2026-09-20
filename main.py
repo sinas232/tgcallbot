@@ -62,6 +62,7 @@ from telegram.request import HTTPXRequest
 
 from config import Config
 from database import DatabaseManager
+from services import deferred_leave
 from services.order_executor import order_executor
 from services.payment_service import payment_service
 from services.health_checker import health_checker_service
@@ -590,6 +591,16 @@ async def startup_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             await order_executor.refund_interrupted_order(order, full=True)
     except Exception:
         logger.exception("stale pending settlement failed; will retry")
+
+
+async def process_deferred_leaves_job(context: ContextTypes.DEFAULT_TYPE):
+    """🚪 خروج تأخیری اکانت‌ها از گروه‌هایی که دیگر سفارشی ندارند."""
+    try:
+        summary = await deferred_leave.process_due_leaves()
+        if summary.get("due"):
+            logger.info("🚪 deferred group leave: %s", summary)
+    except Exception:
+        logger.exception("deferred group leave job failed; retrying next tick")
 
 
 async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1381,6 +1392,11 @@ async def main_loop():
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         # بازیابی مالیِ سفارش‌های نیمه‌کاره (اندکی بعد از بالا آمدن ربات‌ها)
         main_app.job_queue.run_repeating(startup_recovery_job, interval=60, first=20)
+        # 🚪 خروج تأخیری اکانت‌ها از گروه (پیش‌فرض: بعد از یک روز و بدون سفارش فعال)
+        main_app.job_queue.run_repeating(
+            process_deferred_leaves_job,
+            interval=max(60, deferred_leave.poll_minutes() * 60), first=45,
+        )
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).

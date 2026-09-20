@@ -3967,7 +3967,12 @@ class VoiceCallManager:
         return len(keys)
 
     async def cleanup_all(self) -> None:
-        """Cleanup everything — for shutdown (also paced, not a burst)."""
+        """Cleanup everything — for shutdown (also paced, not a burst).
+
+        Group membership is deliberately NOT dropped here: the deferred-leave
+        queue decides later (default 24h, and only when no order needs the
+        group), because join/leave churn is what gets accounts banned.
+        """
         order_ids = set()
         for oid, _aid in list(self.active_calls.keys()):
             order_ids.add(oid)
@@ -3975,7 +3980,7 @@ class VoiceCallManager:
             order_ids.add(oid)
         for oid in order_ids:
             try:
-                await self.stop_all_for_order(oid, leave_group=True)
+                await self.stop_all_for_order(oid, leave_group=False)
             except Exception as exc:
                 logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
 

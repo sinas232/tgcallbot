@@ -53,6 +53,7 @@ TABLE_ORDER = [
     ("payment_gateways", "PaymentGateway"),
     ("payment_transactions", "PaymentTransaction"),
     ("voice_call_sessions", "VoiceCallSession"),
+    ("group_leaves", "GroupLeave"),
     ("tickets", "Ticket"),
     ("ticket_messages", "TicketMessage"),
 ]

@@ -199,6 +199,24 @@ class OrderReport(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class GroupLeave(Base):
+    """خروج تأخیری اکانت از گروه/کانال (پس از پایان سفارش و بدون سفارش جدید)."""
+    __tablename__ = "group_leaves"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bot_id = Column(Integer, nullable=False, default=1)
+    order_id = Column(Integer, nullable=True)
+    account_id = Column(Integer, nullable=False)
+    chat_id = Column(BigInteger, nullable=True)
+    target = Column(String, nullable=False)
+    due_at = Column(DateTime, nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending|left|failed|cancelled
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class VoiceCallSession(Base):
     __tablename__ = "voice_call_sessions"
     id = Column(Integer, primary_key=True, index=True)
@@ -801,6 +819,21 @@ class DatabaseManager:
             session.add(Transaction(bot_id=bot_id, user_id=user_id, amount=-float(price), type='order',
                                     description=f"خرید سفارش #{order.id} | {current.name}"))
             session.add(OrderPurchase(request_key=request_key, order_id=order.id, user_id=user_id, bot_id=bot_id))
+            # 👥 سفارش جدید برای همین گروه: خروج‌های در انتظارِ اکانت‌ها لغو می‌شود.
+            # مقایسه با کلید نرمال‌شده انجام می‌شود تا @Group و https://t.me/Group
+            # یک گروه دیده شوند (مطابق منطق services/deferred_leave.py).
+            from services.deferred_leave import normalize_target as _normalize_target
+            _target_key = _normalize_target(target_link)
+            _pending_rows = (await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.bot_id == bot_id,
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            for _row in _pending_rows:
+                if _normalize_target(_row.target) == _target_key:
+                    _row.status = "cancelled"
+                    _row.updated_at = datetime.utcnow()
             session.add(OrderBilling(order_id=order.id, served_seconds=0, delivered_ids='[]'))
             return dict(to_dict(order), _created=True)
 
@@ -1258,6 +1291,143 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"❌ update_account_profile_cache error: {e}")
                 return False
+
+    # ─── 🚪 خروج تأخیری از گروه (Deferred Group Leave) ───────────────
+
+    @staticmethod
+    async def schedule_group_leaves(bot_id: int, order_id, target: str, rows, due_at):
+        """ثبت/تمدید خروج تأخیری؛ هر (ربات، اکانت، گروه) فقط یک رکورد pending دارد.
+
+        مهلت همیشه «دیرترین» مقدار است تا بعد از پایان آخرین سفارش گروه،
+        یک روز کامل صبر شود.
+        """
+        from sqlalchemy import select as _select
+        target = str(target or "").strip()
+        if not target:
+            return 0
+        affected = 0
+        async with AsyncSessionLocal() as session, session.begin():
+            existing = (await session.execute(
+                _select(GroupLeave).where(
+                    GroupLeave.bot_id == int(bot_id or 1),
+                    GroupLeave.target == target,
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            by_account = {int(r.account_id): r for r in existing}
+            for row in rows or []:
+                account_id = row.get("account_id")
+                if account_id is None:
+                    continue
+                account_id = int(account_id)
+                chat_id = row.get("chat_id") or None
+                current = by_account.get(account_id)
+                if current is not None:
+                    if due_at and (current.due_at is None or due_at > current.due_at):
+                        current.due_at = due_at
+                    if chat_id:
+                        current.chat_id = int(chat_id)
+                    current.order_id = order_id or current.order_id
+                    current.updated_at = datetime.utcnow()
+                else:
+                    record = GroupLeave(bot_id=int(bot_id or 1), order_id=order_id,
+                                        account_id=account_id,
+                                        chat_id=int(chat_id) if chat_id else None,
+                                        target=target, due_at=due_at)
+                    session.add(record)
+                    by_account[account_id] = record
+                affected += 1
+        return affected
+
+    @staticmethod
+    async def due_group_leaves(now=None, limit: int = 200):
+        now = now or datetime.utcnow()
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.status == "pending", GroupLeave.due_at <= now,
+                ).order_by(GroupLeave.due_at).limit(int(limit))
+            )
+            return [to_dict(row) for row in res.scalars().all()]
+
+    @staticmethod
+    async def finish_group_leave(leave_id, status: str, error: str = None):
+        async with AsyncSessionLocal() as session, session.begin():
+            row = await session.get(GroupLeave, leave_id)
+            if not row:
+                return False
+            row.status = status
+            if error:
+                row.last_error = str(error)[:500]
+            row.updated_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def schedule_group_leave_retry(leave_id, due_at, error: str = None, attempts: int = None):
+        async with AsyncSessionLocal() as session, session.begin():
+            row = await session.get(GroupLeave, leave_id)
+            if not row:
+                return False
+            row.due_at = due_at
+            row.status = "pending"
+            if attempts is not None:
+                row.attempts = int(attempts)
+            if error:
+                row.last_error = str(error)[:500]
+            row.updated_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def cancel_group_leaves_for_target(bot_id: int, target: str):
+        """سفارش جدید برای همین گروه ⇒ خروج‌های در انتظار لغو می‌شوند."""
+        from services.deferred_leave import normalize_target as _normalize_target
+        key = _normalize_target(target)
+        if not key:
+            return 0
+        cancelled = 0
+        async with AsyncSessionLocal() as session, session.begin():
+            rows = (await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.bot_id == int(bot_id or 1),
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            for row in rows:
+                if _normalize_target(row.target) == key:
+                    row.status = "cancelled"
+                    row.updated_at = datetime.utcnow()
+                    cancelled += 1
+        return cancelled
+
+    @staticmethod
+    async def get_open_order_targets(bot_id: int = 1):
+        """گروه‌هایی که سفارش باز (در حال اجرا/رزرو/در انتظار) دارند."""
+        cutoff = datetime.utcnow() - timedelta(days=1)
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(
+                select(Order.target_link, Order.status, Order.created_at).where(
+                    Order.bot_id == int(bot_id or 1),
+                    Order.status.in_(DatabaseManager.OPEN_ORDER_STATUSES),
+                )
+            )
+            rows = res.all()
+        targets = set()
+        for target, status, created_at in rows:
+            if not target:
+                continue
+            # سفارش «در انتظار» کهنه (باقی‌ماندهٔ اجرای نیمه‌کاره) مانع خروج نمی‌شود.
+            if str(status) == "pending" and created_at and created_at < cutoff:
+                continue
+            targets.add(str(target))
+        return targets
+
+    @staticmethod
+    async def count_pending_group_leaves(bot_id: int = None):
+        async with AsyncSessionLocal() as session:
+            q = select(func.count(GroupLeave.id)).where(GroupLeave.status == "pending")
+            if bot_id is not None:
+                q = q.where(GroupLeave.bot_id == int(bot_id))
+            return (await session.execute(q)).scalar() or 0
 
     @staticmethod
     async def get_accounts_paginated(limit=10, offset=0, active_only=False, bot_id=1):

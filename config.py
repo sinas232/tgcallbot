@@ -74,6 +74,15 @@ class Config:
     # در هر بازهٔ زمانی حداکثر این تعداد سفارش فعال/هم‌پوشان پذیرفته می‌شود.
     # تعداد اکانت‌های هر سفارش و منابع سرور هیچ محدودیتی ایجاد نمی‌کنند.
     MAX_ACTIVE_ORDERS = int(os.getenv('MAX_ACTIVE_ORDERS', '5'))
+    # ─── 🚪 خروج تأخیری اکانت‌ها از گروه ─────────────────────────────
+    # پس از پایان/لغو سفارش، اکانت فوراً از گروه خارج نمی‌شود (خروج فوری
+    # باعث join/leave پشت‌سرهم و ریسک بن/حذف اکانت می‌شود). مهلت پیش‌فرض
+    # یک روز است و اگر سفارشی برای همان گروه باز باشد، دوباره تمدید می‌شود.
+    # مقدار ۰ = رفتار قدیمی (خروج فوری).
+    GROUP_LEAVE_DELAY_MINUTES = int(os.getenv('GROUP_LEAVE_DELAY_MINUTES', str(24 * 60)))
+    GROUP_LEAVE_POLL_MINUTES = int(os.getenv('GROUP_LEAVE_POLL_MINUTES', '5'))
+    GROUP_LEAVE_BATCH_LIMIT = int(os.getenv('GROUP_LEAVE_BATCH_LIMIT', '200'))
+    GROUP_LEAVE_MAX_ATTEMPTS = int(os.getenv('GROUP_LEAVE_MAX_ATTEMPTS', '3'))
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)

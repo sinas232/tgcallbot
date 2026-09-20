@@ -96,22 +96,34 @@ class ConfigLeaveKeysTests(unittest.TestCase):
         self.assertIn("return", body)
         self.assertIn("VOICE_LEAVE_STAGGER", body)
 
-    def test_cleanup_order_voice_uses_vcm_only(self):
+    def test_cleanup_keeps_group_membership(self):
+        """v2.2.16: خروج از گروه فوری نیست؛ فقط تماس قطع و خروج به صف تأخیری سپرده می‌شود."""
         src = _read_source("services/order_executor.py")
         start = src.index("async def _cleanup_order")
-        body = src[start:start + 1800]
+        body = src[start:src.index("async def _defer_group_leave", start)]
         self.assertIn("stop_all_for_order", body)
+        self.assertIn("leave_group=False", body)
+        self.assertNotIn("leave_group=True", body)
+        self.assertIn("_defer_group_leave", body)
         # Voice branch must not *call* _eject_all_fast (comment may mention it).
-        voice_branch = body.split("else:")[0]
+        voice_branch = body.split('if order_type == "voice_chat":', 1)[1]
         self.assertNotRegex(
             voice_branch,
             r"await\s+self\._eject_all_fast\s*\(",
-            "voice cleanup must not call _eject_all_fast (double-leave)",
+            "voice cleanup must not eject immediately",
         )
+
+    def test_deferral_helper_defers_by_default_and_can_be_disabled(self):
+        src = _read_source("services/order_executor.py")
+        start = src.index("async def _defer_group_leave")
+        body = src[start:start + 2200]
+        self.assertIn("schedule_for_order", body)
+        self.assertIn("leave_delay_minutes", body)
+        self.assertIn("if delay <= 0", body)  # صریحاً ۰ ⇒ رفتار قدیمی
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.15"', src)
+        self.assertIn('BOT_VERSION = "2.2.16"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -328,7 +340,7 @@ class StopAllPacingLogicTests(unittest.TestCase):
             await self.mgr.cleanup_all()
             oids = {c[0] for c in calls}
             self.assertEqual(oids, {1, 2, 3})
-            self.assertTrue(all(c[1] is True for c in calls))
+            self.assertTrue(all(c[1] is False for c in calls))  # عضویت گروه حفظ می‌شود
 
         _run(scenario())
 

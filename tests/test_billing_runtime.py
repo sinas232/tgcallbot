@@ -97,12 +97,12 @@ class RuntimeAccountingTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.set()
         task = ex._spawn_child(42, child())
         await started.wait()
-        async def eject(*args):
+        async def defer(*args):
             self.assertTrue(cancelled.is_set())
-        with patch.object(ex, '_eject_all_fast', AsyncMock(side_effect=eject)) as eject_mock:
+        with patch.object(ex, '_defer_group_leave', AsyncMock(side_effect=defer)) as defer_mock:
             await asyncio.gather(ex._cleanup_order(42, [], {'order_type': 'group_join'}),
                                  ex._cleanup_order(42, [], {'order_type': 'group_join'}))
-            eject_mock.assert_awaited_once()
+            defer_mock.assert_awaited_once()
         self.assertTrue(task.done())
 
     async def test_repeated_stop_does_not_cancel_cleanup_twice(self):
