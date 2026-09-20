@@ -2038,6 +2038,25 @@ class VoiceCallManager:
             pass
 
     # ─── Engine event handlers (stream-end / kicked observability) ───
+    def _closed_chat_is_engine_local(self, order_id: Optional[int], account_id: int,
+                                     status: object) -> bool:
+        """True when CLOSED_VOICE_CHAT is local ntgcalls noise, not a real end.
+
+        If other accounts of the same order are still JOINED in that chat, the
+        voice chat is open — ntgcalls just dropped this account's local call
+        object. Treating that as a real drop used to spam VoiceDrop every ~15s
+        (order 812) while the rest of the accounts kept joining successfully.
+        """
+        if "CLOSED_VOICE_CHAT" not in str(status).upper():
+            return False
+        if not order_id:
+            return False
+        states = self._account_states_by_order.get(int(order_id)) or {}
+        return any(
+            aid != account_id and st in ("JOINED", "MONITORING", "TEMPORARILY_UNKNOWN")
+            for aid, st in states.items()
+        )
+
     def _order_id_for_account(self, account_id: int, chat_id: int = 0) -> Optional[int]:
         """Find the order this account is serving right now (if any)."""
         for (oid, aid), info in self.active_calls.items():
@@ -2081,6 +2100,25 @@ class VoiceCallManager:
                 cid = int(getattr(update, "chat_id", 0) or 0)
                 order_id = self._order_id_for_account(account_id, cid)
                 status = getattr(update, "status", "?")
+                # CLOSED_VOICE_CHAT از ntgcalls اغلب نویز محلی موتور است:
+                # بقیهٔ اکانت‌های همان سفارش همچنان در همان چت join می‌شوند.
+                # اگر خواهرها هنوز JOINED باشند تماس واقعاً بسته نشده؛ media را
+                # بازمی‌گردانیم و به‌عنوان افت واقعی لاگ نمی‌کنیم (قبلاً هر ۱۵ث
+                # VoiceDrop می‌نوشت و سفارش «خراب» دیده می‌شد).
+                if self._closed_chat_is_engine_local(order_id, account_id, status):
+                    logger.debug(
+                        "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s "
+                        "(engine-local; siblings still in the same chat — restoring media)",
+                        order_id, account_id, cid, status,
+                    )
+                    if order_id and cid:
+                        try:
+                            asyncio.create_task(
+                                self._schedule_media_restore(order_id, account_id, cid)
+                            )
+                        except Exception:
+                            pass
+                    return
                 logger.warning(
                     "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                     order_id, account_id, cid, status,

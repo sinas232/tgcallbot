@@ -88,7 +88,7 @@ class BuildCompletionTests(unittest.IsolatedAsyncioTestCase):
         ex, data, events, sent, fail_reasons = await self.run_build(delivered=2, monitor_count=2)
         self.assertEqual(events, ['build', 'paid', 'finish'])
         self.assertNotIn('fail', events)
-        self.assertTrue(any('2 از 5' in m for m in sent), sent)
+        self.assertEqual(sent, [])   # تعداد کمتر از سفارش به مشتری اعلام نمی‌شود
 
     async def test_monitor_counting_zero_cannot_cancel_a_delivered_order(self):
         # شبکهٔ بی‌ثبات (WARP) می‌تواند لحظه‌ای صفر گزارش کند؛ نباید سفارش را ببندد.
@@ -126,22 +126,18 @@ class BuildCompletionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UnderfillNoticeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_notice_is_sent_once_per_order(self):
+    async def test_notice_is_never_sent_to_the_customer(self):
         ex, data = executor_with_order()
-        claims = {'first': True}
         sent = []
         bot = SimpleNamespace(send_message=AsyncMock(side_effect=lambda chat, text, **kw: sent.append(text)))
-        async def claim(oid, audience, kind):
-            return claims.pop('first', False)
         with patch.dict(bot_manager.active_bots, {2: SimpleNamespace(bot=bot)}, clear=True), \
                 patch.object(DB, 'get_user_by_id', AsyncMock(return_value={'telegram_id': 999})), \
-                patch.object(DB, 'claim_order_report', AsyncMock(side_effect=claim)), \
+                patch.object(DB, 'claim_order_report', AsyncMock(return_value=True)), \
                 patch.object(DB, 'mark_order_report', AsyncMock()) as mark:
             await ex._notify_underfill(77, data, 2, 5)
             await ex._notify_underfill(77, data, 2, 5)
-        self.assertEqual(len(sent), 1)
-        self.assertIn('2 از 5', sent[0])
-        mark.assert_awaited_once()
+        self.assertEqual(sent, [])
+        mark.assert_not_awaited()
 
     async def test_notice_never_raises_and_needs_a_live_bot(self):
         ex, data = executor_with_order()
@@ -239,7 +235,7 @@ class SourceGuardTests(unittest.TestCase):
             self.assertIn(key, env)
 
     def test_version_and_changelog(self):
-        self.assertIn('BOT_VERSION = "2.2.21"', self.read('constants.py'))
+        self.assertIn('BOT_VERSION = "2.2.22"', self.read('constants.py'))
         self.assertIn('نسخهٔ ۲.۲.۱۷', self.read('CHANGELOG.md'))
 
 

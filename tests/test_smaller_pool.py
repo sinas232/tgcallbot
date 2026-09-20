@@ -1,4 +1,4 @@
-"""نسخهٔ ۲.۲.۲۱ — «تعداد اکانت کمتر از سفارش» هیچ مشکلی ایجاد نمی‌کند.
+"""نسخهٔ ۲.۲.۲۲ — «تعداد اکانت کمتر از سفارش» هیچ مشکلی ایجاد نمی‌کند.
 
 قرارداد ادمین:
     • سفارش ۵۰ اکانتی با ۳۰ اکانتِ قابل استفاده هم کامل اجرا می‌شود: همان
@@ -80,16 +80,14 @@ class SmallerPoolRunsTheWholeOrder(unittest.IsolatedAsyncioTestCase):
         _ex, _data, events, sent, failures = await self.run_order(USABLE)
         self.assertEqual(events, ['build', 'paid', 'finish'])   # نه لغو، نه fail
         self.assertEqual(failures, [])
-        self.assertTrue(any('30 از 50' in m for m in sent), sent)
-        self.assertTrue(any('زمان و قیمت سفارش دقیقاً مطابق خرید شماست' in m for m in sent), sent)
+        self.assertEqual(sent, [])   # هیچ پیام «کمبود اکانت» به مشتری نمی‌رود
 
-    async def test_notice_never_sounds_like_a_problem_and_never_says_cancelled(self):
+    async def test_smaller_pool_is_not_a_customer_facing_problem(self):
         _ex, _data, _events, sent, _failures = await self.run_order(USABLE)
-        notice = [m for m in sent if '30 از 50' in m][0]
-        self.assertNotIn('⚠️', notice)                 # هشدار نگران‌کننده حذف شده
-        self.assertNotIn('لغو', notice)                # هیچ حرفی از لغو سفارش نیست
-        self.assertIn('هزینه فقط بر مبنای زمان فعال سفارش', notice)
-        self.assertIn('تعداد اکانت روی مبلغ هیچ اثری ندارد', notice)
+        self.assertEqual(sent, [])
+        joined = inspect.getsource(OrderExecutor._execute_order_logic)
+        self.assertNotIn('await self._notify_underfill', joined)
+        self.assertIn('account count does not affect cost', joined)
 
     async def test_one_usable_account_is_still_a_running_order(self):
         _ex, _data, events, _sent, _failures = await self.run_order(1, monitor=1)
@@ -150,11 +148,14 @@ class NoAccountCountGate(unittest.TestCase):
         self.assertIn('_voice_batched_fill', source)      # تلاش دوباره حذف نشده
         self.assertIn('VOICE_REFILL_RETRY_SECONDS', source)
         self.assertGreaterEqual(Config.VOICE_REFILL_RETRY_SECONDS, 30)
+        # چرخهٔ «forgotten → registered window=1» حذف شده
+        self.assertNotIn('_voice_forget_order', source)
 
-    def test_completion_report_mentions_requested_vs_delivered(self):
+    def test_completion_report_does_not_frame_count_as_a_problem(self):
         source = inspect.getsource(OrderExecutor._finish_order)
-        self.assertIn('درخواستی', source)
-        self.assertIn('مدت و قیمت بدون تغییر', source)
+        self.assertIn('اکانت‌های داخل تماس', source)
+        self.assertIn('تعداد اکانت روی مبلغ هیچ اثری ندارد', source)
+        self.assertNotIn('بیشتر از این نبود', source)
 
 
 class VolumePlanCompletion(unittest.TestCase):
@@ -210,6 +211,18 @@ class DropLedgerDedupeTests(unittest.TestCase):
         self.mgr._record_drop(812, 17, -1001510845853, 'stream_audio_ended', reason='y')
         self.assertEqual(len(self.lines()), 3)
 
+    def test_closed_voice_chat_is_engine_local_when_siblings_are_still_in(self):
+        self.mgr._account_states_by_order[812] = {
+            17: 'JOINED', 64: 'JOINED', 13: 'JOINED',
+        }
+        self.assertTrue(self.mgr._closed_chat_is_engine_local(
+            812, 17, 'Status.CLOSED_VOICE_CHAT'))
+        self.assertFalse(self.mgr._closed_chat_is_engine_local(
+            812, 17, 'Status.LEFT_CALL'))
+        self.mgr._account_states_by_order[812] = {17: 'JOINED'}
+        self.assertFalse(self.mgr._closed_chat_is_engine_local(
+            812, 17, 'Status.CLOSED_VOICE_CHAT'))
+
     def test_dedupe_window_can_be_disabled(self):
         with patch.object(Config, 'VOICE_DROP_DEDUPE_SECONDS', 0):
             for _ in range(3):
@@ -222,9 +235,9 @@ class DocsTests(unittest.TestCase):
         constants = open(os.path.join(ROOT, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8').read()
         env = open(os.path.join(ROOT, '.env.example'), encoding='utf-8').read()
-        self.assertIn('BOT_VERSION = "2.2.21"', constants)
-        self.assertIn('نسخهٔ ۲.۲.۲۱', changelog)
-        self.assertTrue(os.path.exists(os.path.join(ROOT, 'docs', 'SMALLER_POOL_2.2.21_FA.md')))
+        self.assertIn('BOT_VERSION = "2.2.22"', constants)
+        self.assertIn('نسخهٔ ۲.۲.۲۲', changelog)
+        self.assertTrue(os.path.exists(os.path.join(ROOT, 'docs', 'NO_COUNT_PROBLEM_2.2.22_FA.md')))
         self.assertIn('VOICE_REFILL_RETRY_SECONDS=90', env)
 
 

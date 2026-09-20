@@ -494,11 +494,15 @@ class OrderExecutor:
 	            return
 
 	        if effective_live < requested:
-	            logger.warning(
+	            # تعداد کمتر از سفارش هیچ مشکلی نیست: همان اکانت‌های قابل استفاده
+	            # سرویس می‌دهند، سفارش تا پایان زمان خریداری‌شده کامل اجرا می‌شود
+	            # و هزینه فقط زمانی است. به مشتری هیچ پیامی بابت «کمبود» فرستاده
+	            # نمی‌شود — این یک وضعیت عادی است، نه خطا.
+	            logger.info(
 	                f"Order {order_id}: {effective_live}/{requested} account(s) present after build — "
-	                "order continues to the end of its purchased duration (no auto-cancel)"
+	                "all usable accounts are serving; order runs the full purchased duration "
+	                "(no auto-cancel, price is time-only, account count does not affect cost)"
 	            )
-	            await self._notify_underfill(order_id, data, effective_live, requested)
 
 	        if duration > 0:
 	            await self._persist_billing(order_id)
@@ -767,12 +771,21 @@ class OrderExecutor:
 	                # این «سقف تعداد اکانت» نیست؛ در طول فاز زمان خریداری‌شده
 	                # استخر دوباره بارگذاری و تکمیل ادامه پیدا می‌کند.
 	                _pool = self._voice_pool.get(order_id) or []
-	                logger.warning(
-	                    f"Order {order_id}: no usable account left to try right now "
-	                    f"(pool={len(_pool)}, excluded={len(self._voice_banned.get(order_id) or ())}, "
-	                    f"joined={len(joined_ids)}, live={live}/{target_count}) — "
-	                    f"order keeps running; top-up retries continue for the whole duration"
-	                )
+	                _banned = self._voice_banned.get(order_id) or ()
+	                usable = max(0, len(_pool) - len(_banned))
+	                if usable and live >= min(usable, target_count):
+	                    logger.info(
+	                        f"Order {order_id}: all {usable} usable account(s) are already in "
+	                        f"(live={live}/{target_count}) — order keeps running for the full duration "
+	                        f"(price is time-only, account count does not affect cost)"
+	                    )
+	                else:
+	                    logger.warning(
+	                        f"Order {order_id}: no usable account left to try right now "
+	                        f"(pool={len(_pool)}, excluded={len(_banned)}, "
+	                        f"joined={len(joined_ids)}, live={live}/{target_count}) — "
+	                        f"order keeps running; top-up retries continue for the whole duration"
+	                    )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -1039,11 +1052,32 @@ class OrderExecutor:
 
 	    if not slots and shortfall:
 	        # استخر کوچک‌تر از سفارش است (مثلاً ۳۰ اکانت برای سفارش ۵۰ تایی):
-	        # هیچ مشکلی نیست — همان اکانت‌ها سرویس می‌دهند و تا پایان زمان
-	        # خریداری‌شده دوباره برای تکمیل تلاش می‌شود. تلاش‌ها با فاصله انجام
-	        # می‌شوند تا چرخهٔ هر ۲۰ ثانیه به لاگ/دیتابیس فشار نیاورد.
+	        # هیچ مشکلی نیست — همان اکانت‌ها سرویس می‌دهند. JoinBrain را
+	        # فراموش نمی‌کنیم (قبلاً هر چرخه window را به ۱ برمی‌گرداند و
+	        # لاگ forgotten/registered می‌نوشت). استخر را فقط refresh می‌کنیم
+	        # تا اگر اکانت جدیدی فعال شد، تکمیل ادامه یابد.
 	        _now_ts = time.time()
 	        if _now_ts < float(self._voice_refill_cooldown.get(order_id) or 0.0):
+	            return 0
+	        try:
+	            await self._voice_load_pool(int((data or {}).get("bot_id", 1)), order_id)
+	        except Exception:
+	            pass
+	        joined_now = set(vcm.get_active_account_ids(order_id))
+	        banned_now = self._voice_banned.get(order_id) or set()
+	        usable_now = {
+	            acc.get("id") for acc in (self._voice_pool.get(order_id) or [])
+	            if acc.get("id") and acc.get("id") not in banned_now
+	        }
+	        if usable_now and usable_now.issubset(joined_now):
+	            logger.info(
+	                f"Order {order_id}: all {len(usable_now)} usable account(s) are in "
+	                f"(requested {exact}) — serving the full purchased duration "
+	                f"(price/time unchanged)"
+	            )
+	            self._voice_refill_cooldown[order_id] = time.time() + max(
+	                30, int(getattr(Config, "VOICE_REFILL_RETRY_SECONDS", 90))
+	            )
 	            return 0
 	        _before_fill = len(self._present_ids(order_id))
 	    else:
@@ -1072,13 +1106,6 @@ class OrderExecutor:
 
 	    if released <= 0 and not shortfall:
 	        return 0
-	    if not slots and shortfall:
-	        # Retry an unfilled replacement slot on later maintenance cycles.
-	        # Telegram's persistent FloodWait deadlines are NOT cleared here and
-	        # sessions Telegram already revoked stay excluded (keep_excluded=True):
-	        # every healthy account is re-offered, nothing is capped by count/CPU.
-	        self._voice_forget_order(order_id, keep_excluded=True)
-
 	    # Track how many slots were hot-swapped over the order's lifetime so the
 	    # completion/cancellation report can show {swapped_accounts}. Counted at
 	    # the moment unrecoverable slots are released for replacement.
@@ -1096,8 +1123,9 @@ class OrderExecutor:
 	        )
 	    else:
 	        logger.info(
-	            f"Order {order_id}: only {len(self._present_ids(order_id))} of {exact} slot(s) are in — "
-	            f"trying to top up from the remaining pool (order keeps running, price/time unchanged)"
+	            f"Order {order_id}: topping up from remaining pool "
+	            f"({len(self._present_ids(order_id))} of {exact} in; "
+	            f"order keeps running, price/time unchanged)"
 	        )
 	    more, _d2 = await self._voice_batched_fill(
 	        order_id=order_id,
@@ -1418,16 +1446,12 @@ class OrderExecutor:
 				if user:
 					duration_min = int(data.get("duration_minutes") or 0)
 					timer_str = _format_timer(duration_min * 60) if duration_min else "-"
-					requested = int(data.get("accounts_count") or 0)
-					count_line = f"اکانت‌های موفق: {final_live}"
-					if requested and final_live != requested:
-						count_line += (f" از {requested} درخواستی — تعداد اکانتِ قابل استفاده در استخر "
-						               f"بیشتر از این نبود (مدت و قیمت بدون تغییر)")
 					msg = (
 						f"✅ سفارش #{order_id} تکمیل شد.\n"
 						f"مدت خدمت خریداری‌شده: {timer_str}\n"
-						f"{count_line}\n"
-						f"هزینهٔ کل از پیش پرداخت شده؛ کسر مجددی انجام نشد.\n"
+						f"اکانت‌های داخل تماس: {final_live}\n"
+						f"هزینهٔ کل از پیش پرداخت شده (مبنای محاسبه فقط زمان فعال سفارش است؛ "
+						f"تعداد اکانت روی مبلغ هیچ اثری ندارد).\n"
 						"🔒 اکانت‌ها از تماس خارج شدند و برای جلوگیری از ریسک محدودیت، فعلاً در گروه می‌مانند؛ "
 						"اگر سفارش دیگری برای همین گروه نباشد، یک روز بعد خارج می‌شوند."
 					)
@@ -1638,41 +1662,17 @@ class OrderExecutor:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
 	async def _notify_underfill(self, order_id, data, live, requested):
-	    """یک‌بار به مشتری اطلاع می‌دهد که تعداد حاضر کمتر از سفارش است و سفارش ادامه دارد.
+	    """عمداً هیچ پیامی به مشتری نمی‌فرستد.
 
-	    متن عمداً تأکید می‌کند که سفارش لغو نشده و تا پایان زمان خریداری‌شده فعال
-	    می‌ماند و در صورت لغو، فقط زمان استفاده‌شده کسر می‌شود.
+	    تعداد اکانت کمتر از سفارش یک وضعیت عادی است (استخر کوچک‌تر)، نه خطا.
+	    سفارش تا پایان زمان خریداری‌شده اجرا می‌شود و هزینه فقط زمانی است.
+	    متد برای سازگاری با تست‌های قدیمی باقی مانده و no-op است.
 	    """
-	    try:
-	        from services.bot_manager import bot_manager
-	        app = bot_manager.active_bots.get((data or {}).get("bot_id", 1))
-	        if not app:
-	            return
-	        user = await DatabaseManager.get_user_by_id((data or {}).get("user_id"))
-	        if not user:
-	            return
-	        if not await DatabaseManager.claim_order_report(order_id, "customer", "underfilled"):
-	            return
-	        try:
-	            pool_size = len(self._voice_pool.get(order_id) or [])
-	        except Exception:
-	            pool_size = 0
-	        excluded = len(self._voice_banned.get(order_id) or ())
-	        usable = max(0, pool_size - excluded)
-	        await app.bot.send_message(
-	            user["telegram_id"],
-	            f"🔔 سفارش #{order_id} فعال است.\n"
-	            f"اکانت‌های داخل تماس/گروه: {live} از {requested} درخواستی.\n"
-	            f"همهٔ {usable} اکانتِ قابل استفادهٔ موجود در حال سرویس‌دهی هستند و سفارش "
-	            "تا پایان زمان خریداری‌شده کامل اجرا می‌شود (اگر اکانت جدیدی فعال شود، "
-	            "تعداد تکمیل هم ادامه دارد).\n"
-	            "زمان و قیمت سفارش دقیقاً مطابق خرید شماست؛ هزینه فقط بر مبنای زمان فعال "
-	            "سفارش محاسبه می‌شود — تعداد اکانت روی مبلغ هیچ اثری ندارد.",
-	            parse_mode=None,
-	        )
-	        await DatabaseManager.mark_order_report(order_id, "customer", "underfilled", "sent")
-	    except Exception:
-	        logger.exception("Order %s underfill notice failed", order_id)
+	    logger.info(
+	        "Order %s: underfill notice suppressed (live=%s requested=%s) — "
+	        "account count is not a customer-facing problem",
+	        order_id, live, requested,
+	    )
 
 	async def _fail_order(self, order_id, reason):
 	    info = self.active_orders.get(order_id) or {}
