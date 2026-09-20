@@ -842,6 +842,25 @@ class VoiceCallManager:
         except Exception:
             pass
 
+        # 📣 رویدادهای «بازیابی/سلامت» روی کنسول هم دیده می‌شوند تا با
+        # `docker logs` بتوان دقیقاً دید سفارش چطور حاضر نگه داشته می‌شود.
+        try:
+            if order_id and event in (
+                "confirmed_disconnect", "unrecoverable_drop", "rejoin_failed",
+            ):
+                logger.warning(
+                    "[VoiceRecovery] order=%s acc=%s event=%s details=%s",
+                    order_id, account_id, event, details or {},
+                )
+            elif order_id and event in ("media_restored", "engine_rebuild",
+                                        "confirmed_joined_after_transport_warning"):
+                logger.info(
+                    "[VoiceRecovery] order=%s acc=%s event=%s details=%s",
+                    order_id, account_id, event, details or {},
+                )
+        except Exception:
+            pass
+
         try:
             if event in (
                 "transient_join_error", "join_timeout", "floodwait", "join_failed_final",
@@ -874,6 +893,24 @@ class VoiceCallManager:
         try:
             if not bool(getattr(Config, "VOICE_DROP_LEDGER", True)):
                 return
+        except Exception:
+            pass
+        # 🔁 یک رویدادِ یکسان برای یک اکانت (مثلاً CLOSED_VOICE_CHAT موتور
+        # ntgcalls که هر ۱۵ ثانیه دوباره تحویل می‌شود) نباید لاگ و دفترِ
+        # drop را پر کند؛ فقط یک‌بار در هر بازهٔ کوتاه ثبت می‌شود.
+        try:
+            dedupe_key = (order_id, account_id, int(chat_id or 0), str(event))
+            now_ts = time.time()
+            last = getattr(self, "_drop_dedupe", None)
+            if last is None:
+                last = self._drop_dedupe = {}
+            window = max(0.0, float(getattr(Config, "VOICE_DROP_DEDUPE_SECONDS", 120)))
+            if window and now_ts - float(last.get(dedupe_key) or 0.0) < window:
+                return
+            last[dedupe_key] = now_ts
+            if len(last) > 4000:
+                for key in sorted(last, key=lambda k: last[k])[:1000]:
+                    last.pop(key, None)
         except Exception:
             pass
         try:

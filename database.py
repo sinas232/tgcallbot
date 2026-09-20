@@ -1141,10 +1141,11 @@ class DatabaseManager:
                 return False
             billing = await session.get(OrderBilling, order_id)
             if billing:
-                if order.duration_minutes:
-                    if billing.served_seconds < order.duration_minutes * 60:
-                        return False
-                elif len(json.loads(billing.delivered_ids)) < order.accounts_count:
+                # ⛔ هیچ گیتی بر اساس «تعداد اکانت» نیست: اگر استخر کوچک‌تر از
+                # سفارش باشد (مثلاً ۳۰ اکانت برای سفارش ۵۰ تایی) سفارش با همان
+                # اکانت‌ها اجرا و در پایان زمان خریداری‌شده تکمیل می‌شود.
+                # فقط سفارش‌های زمان‌دار نیاز به اتمام زمان دارند (مبنای هزینه).
+                if order.duration_minutes and billing.served_seconds < order.duration_minutes * 60:
                     return False
             order.status = 'completed'
             order.completed_at = datetime.utcnow()

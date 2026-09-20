@@ -73,6 +73,10 @@ class OrderExecutor:
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
+		# زمانِ «تلاش بعدی برای تکمیل تعداد» در فاز زمان خریداری‌شده. اگر استخر
+		# اکانت کوچک‌تر از سفارش باشد، تلاش‌ها با فاصله انجام می‌شوند تا نه لاگ
+		# پر شود و نه دیتابیس بی‌دلیل زیر بار برود (بدون هیچ سقف تعداد اکانت).
+		self._voice_refill_cooldown: Dict[int, float] = {}
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
 		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
@@ -547,6 +551,7 @@ class OrderExecutor:
 	    if not keep_excluded:
 	        self._voice_banned.pop(order_id, None)
 	        self._voice_retry_after.pop(order_id, None)
+	        self._voice_refill_cooldown.pop(order_id, None)
 
 	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
 	    """Load (or refresh) the eligible-account pool for an order.
@@ -1032,6 +1037,18 @@ class OrderExecutor:
 	    if not slots and not shortfall:
 	        return 0
 
+	    if not slots and shortfall:
+	        # استخر کوچک‌تر از سفارش است (مثلاً ۳۰ اکانت برای سفارش ۵۰ تایی):
+	        # هیچ مشکلی نیست — همان اکانت‌ها سرویس می‌دهند و تا پایان زمان
+	        # خریداری‌شده دوباره برای تکمیل تلاش می‌شود. تلاش‌ها با فاصله انجام
+	        # می‌شوند تا چرخهٔ هر ۲۰ ثانیه به لاگ/دیتابیس فشار نیاورد.
+	        _now_ts = time.time()
+	        if _now_ts < float(self._voice_refill_cooldown.get(order_id) or 0.0):
+	            return 0
+	        _before_fill = len(self._present_ids(order_id))
+	    else:
+	        _before_fill = None
+
 	    released = 0
 	    # 🛡 v2.2.17: رهاسازی اسلات‌ها «قطره‌ای» انجام می‌شود تا در قطعی شبکه
 	    # (WARP) اکانت‌ها پشت‌سرهم از تماس بیرون نیفتند؛ بقیه در چرخهٔ بعد.
@@ -1072,10 +1089,16 @@ class OrderExecutor:
 	    exact = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
 	    if exact <= 0:
 	        return 0
-	    logger.warning(
-	        f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
-	        f"replacing to keep presence until deadline"
-	    )
+	    if released:
+	        logger.warning(
+	            f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
+	            f"replacing to keep presence until deadline"
+	        )
+	    else:
+	        logger.info(
+	            f"Order {order_id}: only {len(self._present_ids(order_id))} of {exact} slot(s) are in — "
+	            f"trying to top up from the remaining pool (order keeps running, price/time unchanged)"
+	        )
 	    more, _d2 = await self._voice_batched_fill(
 	        order_id=order_id,
 	        target=str((data or {}).get("target_link") or ""),
@@ -1094,6 +1117,13 @@ class OrderExecutor:
 	                have.add(acc_id)
 	        info["joined_accounts"] = current
 	        info["live_count"] = self._live_count(order_id, "voice_chat", current)
+	    if _before_fill is not None:
+	        _after_fill = len(self._present_ids(order_id))
+	        _cooldown = max(30, int(getattr(Config, "VOICE_REFILL_RETRY_SECONDS", 90)))
+	        # اگر چیزی اضافه نشد، مدتی صبر می‌کنیم (اکانت‌های سالمِ آزادشده یا
+	        # اکانت‌های تازه‌فعال‌شده بعداً دوباره امتحان می‌شوند).
+	        self._voice_refill_cooldown[order_id] = 0.0 if _after_fill > _before_fill \
+	            else time.time() + _cooldown
 	    return released
 
 	async def _progressive_fill(
@@ -1388,10 +1418,15 @@ class OrderExecutor:
 				if user:
 					duration_min = int(data.get("duration_minutes") or 0)
 					timer_str = _format_timer(duration_min * 60) if duration_min else "-"
+					requested = int(data.get("accounts_count") or 0)
+					count_line = f"اکانت‌های موفق: {final_live}"
+					if requested and final_live != requested:
+						count_line += (f" از {requested} درخواستی — تعداد اکانتِ قابل استفاده در استخر "
+						               f"بیشتر از این نبود (مدت و قیمت بدون تغییر)")
 					msg = (
 						f"✅ سفارش #{order_id} تکمیل شد.\n"
 						f"مدت خدمت خریداری‌شده: {timer_str}\n"
-						f"اکانت‌های موفق: {final_live}\n"
+						f"{count_line}\n"
 						f"هزینهٔ کل از پیش پرداخت شده؛ کسر مجددی انجام نشد.\n"
 						"🔒 اکانت‌ها از تماس خارج شدند و برای جلوگیری از ریسک محدودیت، فعلاً در گروه می‌مانند؛ "
 						"اگر سفارش دیگری برای همین گروه نباشد، یک روز بعد خارج می‌شوند."
@@ -1626,12 +1661,13 @@ class OrderExecutor:
 	        usable = max(0, pool_size - excluded)
 	        await app.bot.send_message(
 	            user["telegram_id"],
-	            f"⚠️ سفارش #{order_id}: در حال حاضر {live} از {requested} اکانت داخل تماس/گروه هستند.\n"
-	            "سفارش لغو نشد و تا پایان زمان خریداری‌شده فعال می‌ماند؛ تلاش برای تکمیل تعداد ادامه دارد.\n"
-	            f"اکانت‌های قابل استفاده در استخر: {usable} (کل {pool_size}، خارج‌شده {excluded}).\n"
-	            "بدون محدودیت تعداد اکانت یا پردازنده: هر اکانتِ قابل استفاده تا رسیدن به تعداد "
-	            "خریداری‌شده دوباره تلاش می‌شود.\n"
-	            "هزینه بر مبنای زمان فعال سفارش محاسبه می‌شود و در صورت لغو، فقط زمان استفاده‌شده کسر می‌گردد.",
+	            f"🔔 سفارش #{order_id} فعال است.\n"
+	            f"اکانت‌های داخل تماس/گروه: {live} از {requested} درخواستی.\n"
+	            f"همهٔ {usable} اکانتِ قابل استفادهٔ موجود در حال سرویس‌دهی هستند و سفارش "
+	            "تا پایان زمان خریداری‌شده کامل اجرا می‌شود (اگر اکانت جدیدی فعال شود، "
+	            "تعداد تکمیل هم ادامه دارد).\n"
+	            "زمان و قیمت سفارش دقیقاً مطابق خرید شماست؛ هزینه فقط بر مبنای زمان فعال "
+	            "سفارش محاسبه می‌شود — تعداد اکانت روی مبلغ هیچ اثری ندارد.",
 	            parse_mode=None,
 	        )
 	        await DatabaseManager.mark_order_report(order_id, "customer", "underfilled", "sent")
@@ -1723,6 +1759,10 @@ class OrderExecutor:
 	    if order.get('status') in ('pending', 'scheduled') and not order.get('started_at'):
 	        return 0., total, 0.
 	    if duration <= 0:
+	        # پلن «بدون مدت» (حجمی) مدل قیمت‌گذاری خودش را دارد: قیمت برای تعداد
+	        # اکانتِ پلن تعیین شده و در لغو، به‌نسبت تحویل محاسبه می‌شود.
+	        # ⚠️ سفارش‌های زمان‌دار (مثل سفارش ۸۱۲) ۱۰۰٪ زمانی محاسبه می‌شوند و
+	        # تعداد اکانت هیچ اثری روی مبلغ آن‌ها ندارد (شاخهٔ بالا).
 	        progress = int(order.get('progress') or 0)
 	        if billing:
 	            progress = max(progress, len(json.loads(billing.get('delivered_ids') or '[]')))

@@ -216,6 +216,13 @@ class Config:
     # Rejoin attempts for a CONFIRMED-disconnected account before the slot is
     # declared unrecoverable and REPLACED with a fresh account (duration phase).
     VOICE_RECOVERY_MAX_ATTEMPTS = int(os.getenv('VOICE_RECOVERY_MAX_ATTEMPTS', '3'))
+    # فاصلهٔ تلاش‌های دوباره برای «تکمیل تعداد» در فاز زمان خریداری‌شده وقتی
+    # استخر اکانت کوچک‌تر از سفارش است (فقط throttling لاگ/دیتابیس؛ نه سقف تعداد).
+    VOICE_REFILL_RETRY_SECONDS = int(os.getenv('VOICE_REFILL_RETRY_SECONDS', '90'))
+    # یک رویدادِ یکسان (مثل CLOSED_VOICE_CHAT موتور که هر ~۱۵ ثانیه تکرار
+    # می‌شود) در این بازهٔ زمانی فقط یک‌بار در دفتر/لاگ drop ثبت می‌شود.
+    # مقدار ۰ = ثبت هر رویداد (بدون dedupe).
+    VOICE_DROP_DEDUPE_SECONDS = float(os.getenv('VOICE_DROP_DEDUPE_SECONDS', '120'))
     # Replace unrecoverable slots during the paid duration phase?
     VOICE_DURATION_REPLACEMENT = os.getenv('VOICE_DURATION_REPLACEMENT', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # Keep at least this many seconds of paid time left before bothering to

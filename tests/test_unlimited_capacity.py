@@ -244,8 +244,9 @@ class UnderfillNoticeTests(unittest.IsolatedAsyncioTestCase):
         text = sent[0]
         self.assertIn('10 از 50', text)
         self.assertIn('50', text)                    # اندازهٔ استخر
-        self.assertIn('بدون محدودیت تعداد اکانت یا پردازنده', text)
-        self.assertIn('سفارش لغو نشد', text)
+        self.assertIn('در حال سرویس‌دهی هستند', text)
+        self.assertIn('هزینه فقط بر مبنای زمان فعال سفارش', text)
+        self.assertNotIn('لغو', text)
 
 
 class DocsTests(unittest.TestCase):
@@ -253,7 +254,7 @@ class DocsTests(unittest.TestCase):
         constants = open(os.path.join(ROOT, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8').read()
         env = open(os.path.join(ROOT, '.env.example'), encoding='utf-8').read()
-        self.assertIn('BOT_VERSION = "2.2.20"', constants)
+        self.assertIn('BOT_VERSION = "2.2.21"', constants)   # نسخهٔ جاری
         self.assertIn('نسخهٔ ۲.۲.۲۰', changelog)
         self.assertTrue(os.path.exists(os.path.join(ROOT, 'docs', 'NO_ACCOUNT_LIMITS_2.2.20_FA.md')))
         self.assertIn('VOICE_ACCOUNT_ATTEMPT_LIMIT=0', env)
