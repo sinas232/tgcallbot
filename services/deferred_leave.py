@@ -65,6 +65,10 @@ def normalize_target(target: Any) -> str:
     value = str(target or "").strip()
     if not value:
         return ""
+    # لینک داخلی اپ تلگرام: tg://join?invite=HASH ⇒ همان کلید لینک دعوت
+    _tg = re.match(r"^tg://join\?invite=([A-Za-z0-9_-]+)$", value, flags=re.I)
+    if _tg:
+        return "invite:" + _tg.group(1).lower()
     value = re.sub(r"^https?://", "", value, flags=re.I)
     value = re.sub(r"^(www\.)?(t|telegram)\.me/", "", value, flags=re.I)
     value = value.split("?")[0].strip().strip("/").strip()

@@ -786,6 +786,10 @@ class DatabaseManager:
 
     @staticmethod
     async def purchase_order_atomic(user_id, plan, target_link, request_key, *, bot_id=1, scheduled_for=None):
+        # 🛡 لینک همیشه در شکل استانداردِ «لینک خصوصی» ذخیره می‌شود تا مقایسهٔ
+        # گروه‌ها (قفل تداخل زمانی، خروج تأخیری، سفارش‌های هم‌زمان) دقیق باشد.
+        from services.link_validator import normalize_invite_link as _normalize_invite
+        target_link = _normalize_invite(target_link)
         """Debit + order + ledger + request receipt in ONE wallet-locked transaction."""
         async with AsyncSessionLocal() as session, session.begin():
             user = (await session.execute(select(User).where(User.id == user_id, User.bot_id == bot_id)
@@ -1170,18 +1174,22 @@ class DatabaseManager:
     @staticmethod
     async def has_time_overlap_order(link: str, new_start_time: datetime, new_duration_minutes: int, bot_id: int = 1) -> bool:
         """بررسی تداخل زمانی سفارش جدید با سفارشات موجود برای یک لینک"""
+        # مقایسه بر پایهٔ کلید نرمال‌شدهٔ گروه انجام می‌شود تا شکل‌های مختلف یک
+        # لینک (t.me/+HASH و https://t.me/+HASH/ و ...) یک گروه دیده شوند.
+        from services.deferred_leave import normalize_target as _normalize_target
+        link_key = _normalize_target(link)
         async with AsyncSessionLocal() as db_session:
             # محاسبه زمان پایان سفارش جدید
             new_end_time = new_start_time + timedelta(minutes=new_duration_minutes)
-            
-            # دریافت تمام سفارشات فعال/رزروی برای این لینک
+
+            # دریافت سفارشات فعال/رزروی این ربات و فیلتر بر اساس کلید گروه
             q = select(Order).filter(
-                Order.target_link == link,
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled'])
             )
             res = await db_session.execute(q)
-            existing_orders = res.scalars().all()
+            existing_orders = [o for o in res.scalars().all()
+                               if _normalize_target(o.target_link) == link_key]
             
             for order in existing_orders:
                 billing = await db_session.get(OrderBilling, order.id)

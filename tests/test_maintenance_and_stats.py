@@ -236,7 +236,7 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(application=app, bot_data=app.bot_data, user_data={
             'selected_plan': {'id': 1, 'name': 'test', 'price': 100, 'duration_minutes': 10,
                               'accounts_count': 1, 'service_type': 'voice_chat'},
-            'target_link': '@test',
+            'target_link': 'https://t.me/+AbCdEf123456',
             'checkout_message': (567, 9),
         })
         async def admission(*args):

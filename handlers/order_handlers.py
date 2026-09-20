@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timedelta
 import jdatetime
 from telegram.error import BadRequest
+from telegram.constants import ParseMode
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
@@ -24,6 +25,7 @@ from utils.helpers import clean_number, format_jalali_datetime, format_price, ge
 from services.order_executor import order_executor
 from services.order_admission import order_admission, active_order_limit
 from services.maintenance import maintenance, enforce_maintenance
+from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
 
 logger = logging.getLogger(__name__)
 
@@ -239,16 +241,30 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['selected_plan'] = plan
     
     await query.delete_message()
-    await send_safe(context.bot, update.effective_chat.id, "🔗 **لطفاً لینک (گروه/کانال/ویس) مقصد را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+    await send_safe(context.bot, update.effective_chat.id, link_help_text(),
+                    reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_ORDER_LINK
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = update.message.text
+    """دریافت لینک مقصد — فقط «لینک خصوصی» (دعوت) پذیرفته می‌شود.
+
+    اگر قالب لینک درست نباشد، سفارش اصلاً ساخته نمی‌شود؛ همان‌جا پیام
+    «لینک درست را بفرستید» با قالب صحیح نمایش داده می‌شود و منتظر لینک
+    بعدی می‌مانیم (بدون مصرف پرداخت/زمان‌بندی).
+    """
+    link = (update.message.text or "").strip()
     if BTN_CANCEL in link:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
-        
-    context.user_data['target_link'] = link
+
+    ok, normalized, error = validate_order_link(link)
+    if not ok:
+        logger.info("Order link rejected: %r", link[:80])
+        await send_safe(context.bot, update.effective_chat.id, rejection_message(error),
+                        reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+        return AWAITING_ORDER_LINK
+
+    context.user_data['target_link'] = normalized
     
     # انتخاب نوع زمان اجرا
     kb = ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True)
@@ -466,6 +482,16 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         bot_id = context.bot_data.get('bot_id', 1)
         plan = dict(context.user_data['selected_plan'])
         link = context.user_data['target_link']
+        # 🛡 اعتبارسنجی دوباره پیش از پرداخت (اگر لینک بین دو مرحله عوض شده باشد).
+        ok, link, error = validate_order_link(link)
+        if not ok:
+            context.user_data.pop('target_link', None)
+            try:
+                await query.edit_message_text(rejection_message(error), parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await query.message.reply_text(rejection_message(error), parse_mode=ParseMode.MARKDOWN)
+            return AWAITING_ORDER_LINK
+        context.user_data['target_link'] = link
         schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
         
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)

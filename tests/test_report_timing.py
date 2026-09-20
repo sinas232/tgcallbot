@@ -232,7 +232,7 @@ class ReportTimingTests(unittest.IsolatedAsyncioTestCase):
                                 message=SimpleNamespace(chat_id=567, message_id=8))
         plan = {'id': 1, 'price': 100, 'accounts_count': 1, 'duration_minutes': 0}
         context = SimpleNamespace(user_data={'checkout_message': (567, 8), 'selected_plan': plan,
-                                             'target_link': '@test'}, bot_data={'bot_id': 2})
+                                             'target_link': 'https://t.me/+AbCdEf123456'}, bot_data={'bot_id': 2})
         update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=567))
         with patch.object(DB, 'get_user', AsyncMock(return_value={'id': 1, 'credit': 1000})), \
                 patch.object(DB, 'get_checkout_order', AsyncMock(return_value=None)), \
