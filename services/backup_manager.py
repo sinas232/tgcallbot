@@ -46,9 +46,14 @@ TABLE_ORDER = [
     ("bank_cards", "BankCard"),
     ("orders", "Order"),
     ("transactions", "Transaction"),
+    ("order_settlements", "OrderSettlement"),
+    ("order_billing", "OrderBilling"),
+    ("order_purchases", "OrderPurchase"),
+    ("order_reports", "OrderReport"),
     ("payment_gateways", "PaymentGateway"),
     ("payment_transactions", "PaymentTransaction"),
     ("voice_call_sessions", "VoiceCallSession"),
+    ("group_leaves", "GroupLeave"),
     ("tickets", "Ticket"),
     ("ticket_messages", "TicketMessage"),
 ]
@@ -246,6 +251,8 @@ class BackupManager:
                 # 3) ریست سکوئنس‌ها تا id های جدید تداخل نداشته باشند
                 for json_key, model in models:
                     t = model.__tablename__
+                    if "id" not in model.__table__.columns:
+                        continue  # settlement uses the existing order_id, not a sequence
                     try:
                         await session.execute(sqltext(
                             f"SELECT setval(pg_get_serial_sequence('{t}','id'), "

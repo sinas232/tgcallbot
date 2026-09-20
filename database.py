@@ -9,6 +9,8 @@ database.py
 """
 import logging
 import json
+import uuid
+import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
@@ -18,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from config import Config
+from services.billing import money
 
 logger = logging.getLogger(__name__)
 Base = declarative_base()
@@ -79,6 +82,7 @@ class User(Base):
     kyc_reject_reason = Column(Text, nullable=True)
     exempt_phone_verify = Column(Boolean, default=False)
     kyc_card_number = Column(String(20), nullable=True)
+    last_order_cancel_at = Column(DateTime, nullable=True)
     __table_args__ = (UniqueConstraint('telegram_id', 'bot_id', name='uq_user_bot'),)
 
 class BankCard(Base):
@@ -159,6 +163,60 @@ class Transaction(Base):
     type = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderSettlement(Base):
+    """Durable receipt/idempotency key; created by init_db's create_all."""
+    __tablename__ = "order_settlements"
+    order_id = Column(Integer, primary_key=True, autoincrement=False)
+    bot_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    receipt = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderBilling(Base):
+    """Durable observed service; never derive crashed service from wall time."""
+    __tablename__ = "order_billing"
+    order_id = Column(Integer, primary_key=True, autoincrement=False)
+    served_seconds = Column(Float, nullable=False, default=0)
+    delivered_ids = Column(Text, nullable=False, default="[]")
+    checkpoint_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OrderPurchase(Base):
+    __tablename__ = "order_purchases"
+    request_key = Column(String(160), primary_key=True)
+    order_id = Column(Integer, nullable=False, unique=True)
+    user_id = Column(Integer, nullable=False)
+    bot_id = Column(Integer, nullable=False)
+
+
+class OrderReport(Base):
+    """Durable at-most-once send claim; ambiguous Telegram timeouts aren't retried."""
+    __tablename__ = "order_reports"
+    order_id = Column(Integer, primary_key=True)
+    audience = Column(String(64), primary_key=True)
+    kind = Column(String(20), nullable=False)
+    state = Column(String(20), nullable=False, default="sending")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class GroupLeave(Base):
+    """خروج تأخیری اکانت از گروه/کانال (پس از پایان سفارش و بدون سفارش جدید)."""
+    __tablename__ = "group_leaves"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bot_id = Column(Integer, nullable=False, default=1)
+    order_id = Column(Integer, nullable=True)
+    account_id = Column(Integer, nullable=False)
+    chat_id = Column(BigInteger, nullable=True)
+    target = Column(String, nullable=False)
+    due_at = Column(DateTime, nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending|left|failed|cancelled
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
 
 class VoiceCallSession(Base):
     __tablename__ = "voice_call_sessions"
@@ -312,6 +370,7 @@ class DatabaseManager:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS username VARCHAR(255);",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_order_cancel_at TIMESTAMP WITHOUT TIME ZONE;",
         ]
         async with engine.connect() as conn:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -554,6 +613,18 @@ class DatabaseManager:
             except: return default
             
     @staticmethod
+    async def get_settings(defaults: dict, bot_id=1) -> dict:
+        """Load a bounded set of settings in one tenant-scoped query."""
+        values = dict(defaults)
+        if not values:
+            return values
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(BotSetting.key, BotSetting.value).where(
+                BotSetting.bot_id == bot_id, BotSetting.key.in_(values)))
+            values.update({key: value for key, value in result.all() if value is not None})
+        return values
+
+    @staticmethod
     async def set_setting(key: str, value: str, bot_id=1):
         async with AsyncSessionLocal() as db_session:
             res = await db_session.execute(select(BotSetting).filter(BotSetting.bot_id == bot_id, BotSetting.key == key))
@@ -610,6 +681,17 @@ class DatabaseManager:
                 await db_session.commit()
 
     @staticmethod
+    async def touch_user_order_cancel(internal_id: int) -> bool:
+        """مهر زمان لغو دستی سفارش توسط خود کاربر (قفل ضد بن)."""
+        async with AsyncSessionLocal() as db_session:
+            u = await db_session.get(User, internal_id)
+            if not u:
+                return False
+            u.last_order_cancel_at = datetime.utcnow()
+            await db_session.commit()
+            return True
+
+    @staticmethod
     async def update_user_exempt_phone(internal_id: int, exempt: bool):
         async with AsyncSessionLocal() as db_session:
             u = await db_session.get(User, internal_id)
@@ -630,9 +712,14 @@ class DatabaseManager:
     @staticmethod
     async def update_user_credit(internal_user_id: int, amount: float, type: str, desc: str, bot_id=1):
         async with AsyncSessionLocal() as db_session:
-            user = await db_session.get(User, internal_user_id)
+            # Serialize all wallet writers (payments/admin/refunds) to avoid
+            # lost updates when two transactions read the same old balance.
+            user = (await db_session.execute(
+                select(User).where(User.id == internal_user_id, User.bot_id == bot_id)
+                .with_for_update()
+            )).scalar_one_or_none()
             if not user: return False, 0
-            user.credit += amount
+            user.credit = float(money(user.credit) + money(amount))
             trans = Transaction(bot_id=bot_id, user_id=internal_user_id, amount=amount, type=type, description=desc)
             db_session.add(trans)
             await db_session.commit()
@@ -701,6 +788,118 @@ class DatabaseManager:
             return False
 
     @staticmethod
+    async def get_checkout_order(request_key, user_id, bot_id=1):
+        async with AsyncSessionLocal() as session:
+            purchase = await session.get(OrderPurchase, request_key)
+            if not purchase:
+                return None
+            if purchase.user_id != user_id or purchase.bot_id != bot_id:
+                raise PermissionError("Checkout ownership mismatch")
+            return to_dict(await session.get(Order, purchase.order_id))
+
+    @staticmethod
+    async def purchase_order_atomic(user_id, plan, target_link, request_key, *, bot_id=1, scheduled_for=None):
+        # 🛡 لینک همیشه در شکل استانداردِ «لینک خصوصی» ذخیره می‌شود تا مقایسهٔ
+        # گروه‌ها (قفل تداخل زمانی، خروج تأخیری، سفارش‌های هم‌زمان) دقیق باشد.
+        from services.link_validator import normalize_invite_link as _normalize_invite
+        target_link = _normalize_invite(target_link)
+        """Debit + order + ledger + request receipt in ONE wallet-locked transaction."""
+        async with AsyncSessionLocal() as session, session.begin():
+            user = (await session.execute(select(User).where(User.id == user_id, User.bot_id == bot_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not user:
+                raise PermissionError("Wallet not found")
+            prior = await session.get(OrderPurchase, request_key)
+            if prior:
+                if prior.user_id != user_id or prior.bot_id != bot_id:
+                    raise PermissionError("Checkout ownership mismatch")
+                return dict(to_dict(await session.get(Order, prior.order_id)), _created=False)
+            current = await session.get(Plan, plan['id'])
+            if not current or current.bot_id != bot_id or not current.is_active:
+                raise ValueError("پلن دیگر قابل خرید نیست؛ دوباره انتخاب کنید.")
+            for key in ('price', 'accounts_count', 'duration_minutes', 'service_type'):
+                if getattr(current, key) != plan.get(key):
+                    raise ValueError("مشخصات یا قیمت پلن تغییر کرده؛ دوباره انتخاب کنید.")
+            price = money(current.price)
+            if current.accounts_count <= 0 or current.duration_minutes < 0:
+                raise ValueError("مشخصات پلن معتبر نیست.")
+            if price < 0 or money(user.credit) < price:
+                raise ValueError("موجودی کافی نیست.")
+            order = Order(bot_id=bot_id, user_id=user_id, plan_id=current.id,
+                          order_type=current.service_type, target_link=target_link,
+                          accounts_count=current.accounts_count, duration_minutes=current.duration_minutes,
+                          price_paid=float(price), status='scheduled' if scheduled_for else 'pending',
+                          scheduled_for=scheduled_for)
+            session.add(order)
+            await session.flush()
+            user.credit = float(money(user.credit) - price)
+            session.add(Transaction(bot_id=bot_id, user_id=user_id, amount=-float(price), type='order',
+                                    description=f"خرید سفارش #{order.id} | {current.name}"))
+            session.add(OrderPurchase(request_key=request_key, order_id=order.id, user_id=user_id, bot_id=bot_id))
+            # 👥 سفارش جدید برای همین گروه: خروج‌های در انتظارِ اکانت‌ها لغو می‌شود.
+            # مقایسه با کلید نرمال‌شده انجام می‌شود تا @Group و https://t.me/Group
+            # یک گروه دیده شوند (مطابق منطق services/deferred_leave.py).
+            from services.deferred_leave import normalize_target as _normalize_target
+            _target_key = _normalize_target(target_link)
+            _pending_rows = (await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.bot_id == bot_id,
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            for _row in _pending_rows:
+                if _normalize_target(_row.target) == _target_key:
+                    _row.status = "cancelled"
+                    _row.updated_at = datetime.utcnow()
+            session.add(OrderBilling(order_id=order.id, served_seconds=0, delivered_ids='[]'))
+            return dict(to_dict(order), _created=True)
+
+    @staticmethod
+    async def checkpoint_order_billing(order_id, served_seconds, delivered_ids=()):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running':
+                return False
+            if not math.isfinite(served_seconds) or served_seconds < 0:
+                raise ValueError("Invalid service time")
+            row = await session.get(OrderBilling, order_id)
+            if not row:
+                row = OrderBilling(order_id=order_id, served_seconds=0, delivered_ids='[]')
+                session.add(row)
+            row.served_seconds = min((order.duration_minutes or 0) * 60, max(row.served_seconds, served_seconds))
+            row.delivered_ids = json.dumps(sorted(set(json.loads(row.delivered_ids)) | set(delivered_ids)))
+            row.checkpoint_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def claim_order_report(order_id, audience, kind):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order:
+                return False
+            terminal = kind in ('completed', 'cancelled', 'failed')
+            expected = {'completed': 'completed', 'cancelled': 'stopped', 'failed': 'failed'}
+            if terminal and order.status != expected[kind]:
+                return False
+            if kind in ('started', 'scheduled') and order.status != {'started': 'running', 'scheduled': 'scheduled'}[kind]:
+                return False
+            key = audience + (':terminal' if terminal else ':' + kind)
+            if await session.get(OrderReport, (order_id, key)):
+                return False
+            session.add(OrderReport(order_id=order_id, audience=key, kind=kind))
+            return True
+
+    @staticmethod
+    async def mark_order_report(order_id, audience, kind, state):
+        key = audience + (':terminal' if kind in ('completed', 'cancelled', 'failed') else ':' + kind)
+        async with AsyncSessionLocal() as session:
+            await session.execute(update(OrderReport).where(OrderReport.order_id == order_id,
+                                  OrderReport.audience == key).values(state=state))
+            await session.commit()
+
+    @staticmethod
     async def create_order(user_id, order_type, target_link, accounts_count, duration_minutes, price_paid=0, plan_id=None, scheduled_for=None, bot_id=1):
         async with AsyncSessionLocal() as db_session:
             status = "scheduled" if scheduled_for else "pending"
@@ -719,7 +918,12 @@ class DatabaseManager:
     async def get_order(order_id: int):
         async with AsyncSessionLocal() as db_session:
             order = await db_session.get(Order, order_id)
-            return to_dict(order)
+            result = to_dict(order)
+            if result:
+                billing = await db_session.get(OrderBilling, order_id)
+                if billing:
+                    result['_billing'] = to_dict(billing)
+            return result
 
     @staticmethod
     async def get_user_running_voice_orders(user_id: int, bot_id: int = 1):
@@ -739,10 +943,18 @@ class DatabaseManager:
             return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
-    async def get_orders_history(user_id=None, limit=20, offset=0):
+    async def get_orders_history(user_id=None, limit=20, offset=0, bot_id=None):
+        """
+        تاریخچهٔ سفارش‌های کاربر.
+
+        `bot_id` اختیاری است: وقتی داده شود، فقط سفارش‌های همان ربات برگردانده
+        می‌شوند (ایمن‌سازیِ چندمستأجری: عدم اشتراک داده بین نمایندگی‌ها).
+        سازگاری با فراخوانی‌های قبلی حفظ شده است.
+        """
         async with AsyncSessionLocal() as db_session:
             q = select(Order).order_by(desc(Order.created_at)).limit(limit).offset(offset)
             if user_id: q = q.filter(Order.user_id == user_id)
+            if bot_id is not None: q = q.filter(Order.bot_id == bot_id)
             res = await db_session.execute(q)
             return [to_dict(o) for o in res.scalars().all()]
 
@@ -786,51 +998,171 @@ class DatabaseManager:
             await db_session.commit()
 
     @staticmethod
+    async def settle_order_atomic(order_id, calculator, *, bot_id=1,
+                                  expected_user_id=None, do_refund=True):
+        """Lock order then wallet; commit status, credit, ledger and receipt together.
+
+        calculator is synchronous: no Telegram/network I/O while holding locks.
+        A retry returns the stored receipt, never another credit. Any exception
+        (including commit failure) rolls back the ENTIRE operation.
+        """
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                order = (await session.execute(
+                    select(Order).where(Order.id == order_id, Order.bot_id == bot_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if not order or (expected_user_id is not None and order.user_id != expected_user_id):
+                    raise PermissionError("Order does not belong to this user/bot")
+                previous = await session.get(OrderSettlement, order_id)
+                if previous:
+                    return dict(json.loads(previous.receipt), claimed=False, already_settled=True)
+                if order.status not in DatabaseManager.OPEN_ORDER_STATUSES:
+                    return {"claimed": False, "already_settled": False, "status": order.status}
+                user = (await session.execute(
+                    select(User).where(User.id == order.user_id, User.bot_id == bot_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if not user:
+                    raise ValueError("Order wallet not found")
+                snapshot = to_dict(order)
+                billing = await session.get(OrderBilling, order_id)
+                if billing:
+                    snapshot['_billing'] = to_dict(billing)
+                snapshot['_settled_at'] = datetime.utcnow()
+                total = float(money(order.price_paid))
+                used, refund, elapsed = calculator(snapshot)
+                service_used_cost = used
+                if (not all(math.isfinite(v) for v in (total, used, refund, elapsed))
+                        or min(total, used, refund, elapsed) < 0
+                        or not math.isclose(used + refund, total, abs_tol=0.000001)):
+                    raise ValueError("Invalid order settlement")
+                if float(money(used)) != used or float(money(refund)) != refund:
+                    raise ValueError("Settlement amounts must use two decimal places")
+                if not do_refund:
+                    used, refund = total, 0.0
+                tx_id = f"TX-{uuid.uuid4().hex.upper()}" if refund > 0 else None
+                user.credit = float(money(user.credit) + money(refund))
+                if refund > 0:
+                    session.add(Transaction(
+                        bot_id=bot_id, user_id=user.id, amount=refund, type="order_refund",
+                        description=f"عودت لغو سفارش {order_id} | {tx_id}",
+                    ))
+                if billing and order.duration_minutes:
+                    billing.served_seconds = elapsed
+                    billing.checkpoint_at = snapshot['_settled_at']
+                order.status = "stopped"
+                order.completed_at = snapshot['_settled_at']
+                receipt = {
+                    "total_cost": total, "used_cost": used, "refund_amount": refund,
+                    "refund_tx_id": tx_id, "user_wallet_balance": user.credit,
+                    "elapsed_seconds": elapsed,
+                    "billing_basis": "active_time" if order.duration_minutes else "delivered_count",
+                    "requested_accounts": order.accounts_count,
+                    "active_seconds": elapsed if order.duration_minutes else 0.,
+                    "service_used_cost": service_used_cost,
+                    "do_refund": bool(do_refund),
+                    "withheld_unused_cost": float(money(total) - money(service_used_cost)) if not do_refund else 0.,
+                    "remaining_seconds": max(0., (order.duration_minutes or 0) * 60 - elapsed),
+                    "duration_seconds": (order.duration_minutes or 0) * 60,
+                    "settled_at": snapshot['_settled_at'].isoformat(),
+                }
+                session.add(OrderSettlement(
+                    order_id=order_id, bot_id=bot_id, user_id=user.id,
+                    receipt=json.dumps(receipt, ensure_ascii=False),
+                ))
+            return dict(receipt, claimed=True, already_settled=False)
+
+    @staticmethod
     async def cancel_order_once(order_id: int) -> bool:
-        """Atomically claim a running/scheduled order for cancellation."""
+        """Atomically claim an open order (pending/running/scheduled) for cancellation.
+
+        🐞 فیکس: «pending» قبلاً در این ادعا نبود؛ در نتیجه سفارشی که هنوز به
+        executor تحویل داده نشده بود (گیرکرده در صف) نه توسط کاربر و نه از
+        مسیرهای اتمیکِ لغو قابل بستن بود — برای همیشه «فعال» می‌ماند و در
+        لیست‌های ادمین/آمار به‌صورت سفارشِ زombie دیده می‌شد.
+        """
+        return await DatabaseManager.finalize_order_status(order_id, 'stopped')
+
+    # وضعیت‌هایی که یک سفارش را «باز/قابل‌لغو» می‌دانیم.
+    OPEN_ORDER_STATUSES = ('pending', 'running', 'scheduled')
+
+    @staticmethod
+    async def finalize_order_status(
+        order_id: int,
+        new_status: str = 'stopped',
+        allowed_statuses=('pending', 'running', 'scheduled'),
+    ) -> bool:
+        """انتقال اتمیکِ وضعیت، فقط اگر سفارش هنوز در یکی از وضعیت‌های مجاز باشد.
+
+        این «ادعا» (claim) ستون فقرات لغوِ ایمن است: هر مسیر لغو (کاربر،
+        پنل ادمین، تسویهٔ زمان‌بندی‌شده) اول سفارش را ادعا می‌کند و فقط در صورت
+        موفقیت وارد مرحلهٔ مالی می‌شود. در نتیجه:
+          • هیچ عودتِ دوبار‌ای رخ نمی‌دهد،
+          • سفارشِ «completed/stopped/failed» هرگز دوباره باز نمی‌شود،
+          • سفارش‌های لغوشده واقعاً از لیست فعال/زمان‌بندی خارج می‌شوند
+            (قبلاً لغوِ سفارش زمان‌بندی‌شده وضعیتش را عوض نمی‌کرد و جاب
+             زمان‌بندی همان سفارش را بعداً اجرا می‌کرد!).
+        """
         async with AsyncSessionLocal() as db_session:
             result = await db_session.execute(
                 update(Order)
-                .where(Order.id == order_id, Order.status.in_(['running', 'scheduled']))
-                .values(status='stopped')
+                .where(Order.id == order_id, Order.status.in_(list(allowed_statuses)))
+                .values(status=new_status)
             )
             await db_session.commit()
             return bool(result.rowcount)
 
     @staticmethod
-    async def start_order_duration(order_id: int) -> datetime:
-        """Set billable service start at the end of the build phase."""
-        async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
-            await db_session.execute(
-                update(Order).where(Order.id == order_id).values(started_at=now)
-            )
-            await db_session.commit()
-            return now
-    
+    async def start_order_duration(order_id: int):
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running':
+                return None
+            if not order.started_at:
+                order.started_at = datetime.utcnow()
+            return order.started_at
+
     @staticmethod
     async def mark_order_as_running(order_id: int):
         """Move the order to `running` WITHOUT starting the billable clock.
 
-        `started_at` stays NULL during the whole join/build phase so the
-        time accounts spend joining is never charged to the customer. The
-        executor stamps `started_at` (via start_order_duration) only after
-        the required accounts are present and the paid duration begins.
+        `started_at` is stamped when execution begins — the same moment the
+        order's billable active window starts — but money always comes from the
+        persisted billing checkpoint, never from recomputing this timestamp.
         """
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(
+            # 🔒 انتقال محافظت‌شده: اگر سفارش در فاصلهٔ ثبت تا تحویل
+            # لغو شده باشد (stopped)، دیگر به running برنمی‌گردد تا
+            # سفارش لغوشده زنده نشود.
+            result = await db_session.execute(
                 update(Order)
-                .where(Order.id == order_id)
+                .where(Order.id == order_id, Order.status.in_(['pending', 'scheduled']))
                 .values(status='running')
             )
             await db_session.commit()
+            return bool(result.rowcount)
 
     @staticmethod
-    async def complete_order(order_id: int):
-        async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
-            await db_session.execute(update(Order).where(Order.id == order_id).values(status='completed', completed_at=now))
-            await db_session.commit()
+    async def complete_order(order_id: int) -> bool:
+        """One terminal transition winner; observed delivery, not created_at, expires work."""
+        async with AsyncSessionLocal() as session, session.begin():
+            order = (await session.execute(select(Order).where(Order.id == order_id)
+                                          .with_for_update())).scalar_one_or_none()
+            if not order or order.status != 'running' or await session.get(OrderSettlement, order_id):
+                return False
+            billing = await session.get(OrderBilling, order_id)
+            if billing:
+                # ⛔ هیچ گیتی بر اساس «تعداد اکانت» نیست: اگر استخر کوچک‌تر از
+                # سفارش باشد (مثلاً ۳۰ اکانت برای سفارش ۵۰ تایی) سفارش با همان
+                # اکانت‌ها اجرا و در پایان زمان خریداری‌شده تکمیل می‌شود.
+                # فقط سفارش‌های زمان‌دار نیاز به اتمام زمان دارند (مبنای هزینه).
+                if order.duration_minutes and billing.served_seconds < order.duration_minutes * 60:
+                    return False
+            order.status = 'completed'
+            order.completed_at = datetime.utcnow()
+            return True
 
     @staticmethod
     async def get_due_scheduled_orders():
@@ -856,20 +1188,30 @@ class DatabaseManager:
     @staticmethod
     async def has_time_overlap_order(link: str, new_start_time: datetime, new_duration_minutes: int, bot_id: int = 1) -> bool:
         """بررسی تداخل زمانی سفارش جدید با سفارشات موجود برای یک لینک"""
+        # مقایسه بر پایهٔ کلید نرمال‌شدهٔ گروه انجام می‌شود تا شکل‌های مختلف یک
+        # لینک (t.me/+HASH و https://t.me/+HASH/ و ...) یک گروه دیده شوند.
+        from services.deferred_leave import normalize_target as _normalize_target
+        link_key = _normalize_target(link)
         async with AsyncSessionLocal() as db_session:
             # محاسبه زمان پایان سفارش جدید
             new_end_time = new_start_time + timedelta(minutes=new_duration_minutes)
-            
-            # دریافت تمام سفارشات فعال/رزروی برای این لینک
+
+            # دریافت سفارشات فعال/رزروی این ربات و فیلتر بر اساس کلید گروه
             q = select(Order).filter(
-                Order.target_link == link,
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled'])
             )
             res = await db_session.execute(q)
-            existing_orders = res.scalars().all()
+            existing_orders = [o for o in res.scalars().all()
+                               if _normalize_target(o.target_link) == link_key]
             
             for order in existing_orders:
+                billing = await db_session.get(OrderBilling, order.id)
+                if order.status == 'running' and billing:
+                    remaining = max(0, (order.duration_minutes or 0) * 60 - billing.served_seconds)
+                    if not order.duration_minutes or new_start_time < datetime.utcnow() + timedelta(seconds=remaining):
+                        return True
+                    continue
                 # تعیین زمان شروع سفارش موجود
                 existing_start = order.started_at if order.started_at else (order.scheduled_for if order.scheduled_for else order.created_at)
                 if not existing_start:
@@ -886,12 +1228,12 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    async def get_capacity_reservations(bot_id: int = 1) -> List[Dict[str, Any]]:
+    async def get_active_order_windows(bot_id: int = 1) -> List[Dict[str, Any]]:
         """
-        رزروهای فعال ظرفیت برای Capacity Guard (گارد منابع قبل از ثبت سفارش).
+        رزروهای فعال ظرفیت برای سقف سفارش‌های فعال هم‌زمان.
         سبک: فقط ستون‌های لازم از سفارش‌های running/scheduled/pending خوانده
         می‌شود؛ هر رکورد یعنی «accounts_count اکانت از شروع تا پایان مدت اشغال
-        است». محاسبهٔ تداخل/اوج در services/capacity_planner.py انجام می‌شود.
+        است». شمارش هم‌پوشانی در services/order_admission.py انجام می‌شود.
         """
         async with AsyncSessionLocal() as db_session:
             q = select(
@@ -903,7 +1245,8 @@ class DatabaseManager:
                 Order.started_at,
                 Order.scheduled_for,
                 Order.created_at,
-            ).filter(
+                OrderBilling.served_seconds,
+            ).outerjoin(OrderBilling, OrderBilling.order_id == Order.id).filter(
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled', 'pending']),
             )
@@ -918,6 +1261,7 @@ class DatabaseManager:
                     "started_at": row[5],
                     "scheduled_for": row[6],
                     "created_at": row[7],
+                    "served_seconds": row[8],
                 }
                 for row in res.all()
             ]
@@ -969,6 +1313,145 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"❌ update_account_profile_cache error: {e}")
                 return False
+
+    # ─── 🚪 خروج تأخیری از گروه (Deferred Group Leave) ───────────────
+
+    @staticmethod
+    async def schedule_group_leaves(bot_id: int, order_id, target: str, rows, due_at=None):
+        """ثبت/تمدید خروج تأخیری؛ هر (ربات، اکانت، گروه) فقط یک رکورد pending دارد.
+
+        مهلت همیشه «دیرترین» مقدار است تا بعد از پایان آخرین سفارش گروه،
+        یک هفته کامل صبر شود. هر ردیف می‌تواند ``due_at`` جدا داشته باشد
+        تا خروج‌ها هم‌زمان سر نرسند.
+        """
+        from sqlalchemy import select as _select
+        target = str(target or "").strip()
+        if not target:
+            return 0
+        affected = 0
+        async with AsyncSessionLocal() as session, session.begin():
+            existing = (await session.execute(
+                _select(GroupLeave).where(
+                    GroupLeave.bot_id == int(bot_id or 1),
+                    GroupLeave.target == target,
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            by_account = {int(r.account_id): r for r in existing}
+            for row in rows or []:
+                account_id = row.get("account_id")
+                if account_id is None:
+                    continue
+                account_id = int(account_id)
+                chat_id = row.get("chat_id") or None
+                row_due = row.get("due_at") or due_at
+                current = by_account.get(account_id)
+                if current is not None:
+                    if row_due and (current.due_at is None or row_due > current.due_at):
+                        current.due_at = row_due
+                    if chat_id:
+                        current.chat_id = int(chat_id)
+                    current.order_id = order_id or current.order_id
+                    current.updated_at = datetime.utcnow()
+                else:
+                    record = GroupLeave(bot_id=int(bot_id or 1), order_id=order_id,
+                                        account_id=account_id,
+                                        chat_id=int(chat_id) if chat_id else None,
+                                        target=target, due_at=row_due)
+                    session.add(record)
+                    by_account[account_id] = record
+                affected += 1
+        return affected
+
+    @staticmethod
+    async def due_group_leaves(now=None, limit: int = 200):
+        now = now or datetime.utcnow()
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.status == "pending", GroupLeave.due_at <= now,
+                ).order_by(GroupLeave.due_at).limit(int(limit))
+            )
+            return [to_dict(row) for row in res.scalars().all()]
+
+    @staticmethod
+    async def finish_group_leave(leave_id, status: str, error: str = None):
+        async with AsyncSessionLocal() as session, session.begin():
+            row = await session.get(GroupLeave, leave_id)
+            if not row:
+                return False
+            row.status = status
+            if error:
+                row.last_error = str(error)[:500]
+            row.updated_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def schedule_group_leave_retry(leave_id, due_at, error: str = None, attempts: int = None):
+        async with AsyncSessionLocal() as session, session.begin():
+            row = await session.get(GroupLeave, leave_id)
+            if not row:
+                return False
+            row.due_at = due_at
+            row.status = "pending"
+            if attempts is not None:
+                row.attempts = int(attempts)
+            if error:
+                row.last_error = str(error)[:500]
+            row.updated_at = datetime.utcnow()
+            return True
+
+    @staticmethod
+    async def cancel_group_leaves_for_target(bot_id: int, target: str):
+        """سفارش جدید برای همین گروه ⇒ خروج‌های در انتظار لغو می‌شوند."""
+        from services.deferred_leave import normalize_target as _normalize_target
+        key = _normalize_target(target)
+        if not key:
+            return 0
+        cancelled = 0
+        async with AsyncSessionLocal() as session, session.begin():
+            rows = (await session.execute(
+                select(GroupLeave).where(
+                    GroupLeave.bot_id == int(bot_id or 1),
+                    GroupLeave.status == "pending",
+                )
+            )).scalars().all()
+            for row in rows:
+                if _normalize_target(row.target) == key:
+                    row.status = "cancelled"
+                    row.updated_at = datetime.utcnow()
+                    cancelled += 1
+        return cancelled
+
+    @staticmethod
+    async def get_open_order_targets(bot_id: int = 1):
+        """گروه‌هایی که سفارش باز (در حال اجرا/رزرو/در انتظار) دارند."""
+        cutoff = datetime.utcnow() - timedelta(days=1)
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(
+                select(Order.target_link, Order.status, Order.created_at).where(
+                    Order.bot_id == int(bot_id or 1),
+                    Order.status.in_(DatabaseManager.OPEN_ORDER_STATUSES),
+                )
+            )
+            rows = res.all()
+        targets = set()
+        for target, status, created_at in rows:
+            if not target:
+                continue
+            # سفارش «در انتظار» کهنه (باقی‌ماندهٔ اجرای نیمه‌کاره) مانع خروج نمی‌شود.
+            if str(status) == "pending" and created_at and created_at < cutoff:
+                continue
+            targets.add(str(target))
+        return targets
+
+    @staticmethod
+    async def count_pending_group_leaves(bot_id: int = None):
+        async with AsyncSessionLocal() as session:
+            q = select(func.count(GroupLeave.id)).where(GroupLeave.status == "pending")
+            if bot_id is not None:
+                q = q.where(GroupLeave.bot_id == int(bot_id))
+            return (await session.execute(q)).scalar() or 0
 
     @staticmethod
     async def get_accounts_paginated(limit=10, offset=0, active_only=False, bot_id=1):
@@ -1215,17 +1698,51 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             # شمارنده، سفارش جدید در آمار کلاً غایب بود.
             pending = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'pending', Order.bot_id == bot_id))).scalar() or 0
             completed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'completed', Order.bot_id == bot_id))).scalar() or 0
-            # سفارش‌های ثبت‌شدهٔ امروز (به وقت UTC — مبنای created_at دیتابیس)
-            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            stopped = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'stopped', Order.bot_id == bot_id))).scalar() or 0
+            failed = (await db_session.execute(select(func.count(Order.id)).filter(Order.status == 'failed', Order.bot_id == bot_id))).scalar() or 0
+            # 🐞 فیکس «امروزِ اشتباه»: created_at در دیتابیس UTC است؛ مرزِ روز
+            # باید به وقت ایران (تهران، UTC+3:30) باشد وگرنه از ساعت ۰۰:۰۰
+            # تهران تا ۰۳:۳۰ بامداد، سفارش‌های امروز به‌اشتباه متعلق به دیروز
+            # دیده می‌شدند و آمارِ روزانه غلط بود.
+            tehran_now = datetime.utcnow() + timedelta(hours=3, minutes=30)
+            tehran_midnight = tehran_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_start = tehran_midnight - timedelta(hours=3, minutes=30)
             today = (await db_session.execute(select(func.count(Order.id)).filter(Order.bot_id == bot_id, Order.created_at >= today_start))).scalar() or 0
-            return {'total': total, 'running': running, 'scheduled': scheduled, 'pending': pending, 'completed': completed, 'today': today}
+            return {
+                'total': total, 'running': running, 'scheduled': scheduled,
+                'pending': pending, 'completed': completed, 'today': today,
+                'stopped': stopped, 'failed': failed,
+            }
 
     @staticmethod
     async def reset_stuck_orders():
+        """Read interrupted work; atomic settlement, not this query, closes it."""
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(select(Order).where(Order.status == 'running'))).scalars().all()
+            result = []
+            for order in rows:
+                item = to_dict(order)
+                billing = await session.get(OrderBilling, order.id)
+                if billing:
+                    item['_billing'] = to_dict(billing)
+                result.append(item)
+            return result
+
+    @staticmethod
+    async def get_stale_pending_orders(minutes: int = 10):
+        """سفارش‌های «در صف» (pending) که از عمرشان بیش از `minutes` گذشته است.
+
+        یک سفارش آنی در حالت عادی باید ظرف چند ثانیه توسط executor تحویل
+        گرفته شود؛ اگر pending بماند یعنی تحویل شکست خورده (خطا/ری‌استارت).
+        این‌ها باید بسته و کاملاً عودت داده شوند تا نه پول کاربر بلوکه شود و
+        نه ظرفیت سرور در محاسبات Capacity Guard برای همیشه اشغال بماند.
+        """
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(Order).where(Order.status == 'running').values(status='stopped'))
-            await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.status == 'joined').values(status='reset'))
-            await db_session.commit()
+            cutoff = datetime.utcnow() - timedelta(minutes=max(1, int(minutes)))
+            res = await db_session.execute(
+                select(Order).where(Order.status == 'pending', Order.created_at <= cutoff)
+            )
+            return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
     async def get_gateway(slug: str, bot_id=1):
@@ -1352,7 +1869,7 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
     @staticmethod
     async def delete_reseller(bot_id):
         async with AsyncSessionLocal() as db_session:
-            tables = [User, Plan, TelegramAccount, Order, Transaction, VoiceCallSession, PaymentGateway, PaymentTransaction, BotSetting]
+            tables = [User, Plan, TelegramAccount, Order, Transaction, OrderSettlement, VoiceCallSession, PaymentGateway, PaymentTransaction, BotSetting]
             for table in tables:
                 if hasattr(table, 'bot_id'):
                     await db_session.execute(delete(table).where(table.bot_id == bot_id))

@@ -4,7 +4,7 @@ constants.py
 """
 
 # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
-BOT_VERSION = "2.2.3"
+BOT_VERSION = "2.2.23"
 
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
@@ -112,6 +112,7 @@ TICKET_AUTOCLOSE_HOURS = 48
 AWAITING_RESTORE_FILE = 210
 AWAITING_BACKUP_CHANNEL = 211
 AWAITING_BACKUP_INTERVAL = 212
+AWAITING_ANTIBAN_VALUE = 213  # مقدار ضد بن (مهلت خروج / قفل لغو سفارش)
 
 # 💎 وضعیت‌های ایموجی پریمیوم (جایگزینی شناسهٔ ایموجی توسط ادمین)
 AWAITING_PREMIUM_EMOJI_OVERRIDE = 220
@@ -125,6 +126,7 @@ BTN_EXIT_ADMIN = "🔙 خروج از پنل ادمین"
 BTN_LEAVE_ALL_CHATS = "🗑 خروج همگانی از چت‌ها" # ✅ اضافه شد
 BTN_BACKUP_RESTORE = "💾 پشتیبان‌گیری و بازیابی" # فیچر بازگردانده شده
 BTN_PREMIUM_EMOJI = "💎 ایموجی پریمیوم"  # پنل ایموجی پریمیوم (Custom Emoji)
+BTN_ANTIBAN = "🛡 ضد بن تلگرام"  # خروج تأخیری + قفل ثبت سفارش بعد از لغو
 
 REGEX_BACK = r".*بازگشت.*" 
 REGEX_CANCEL = r".*انصراف.*"
@@ -153,21 +155,10 @@ RESELLER_MANAGEMENT_MENU = [
     [BTN_BACK]
 ]
 
-ADMIN_SETTINGS_MENU = [
-    ["🔒 تنظیمات امنیتی", "💳 مدیریت درگاه پرداخت"], 
-    ["📝 تنظیم متن پشتیبانی", "📝 تنظیم متن استارت"],
-    ["🆔 تنظیم کانال‌های لاگ", "🆔 متن احراز هویت"],
-    ["🤖 مدیریت نمایندگی‌ها", "🩺 تنظیمات بررسی سلامت"],
-    [BTN_PREMIUM_EMOJI, "📊 گزارش کلی"],
-    [BTN_BACK]
-]
-
-SECURITY_SETTINGS_MENU = [
-    ["🔗 اجبار حضور در کانال"],
-    ["📱 اجبار ارسال شماره", "🇮🇷 اجبار شماره ایرانی"],
-    ["🔐 اجبار احراز هویت (KYC)"],
-    [BTN_BACK]
-]
+# توجه: منوی امنیت دیگر به‌صورت ReplyKeyboard نیست؛ در کنال‌های اینلاین
+# (admin_handlers.security_settings_menu) با کال‌بک‌های sec_toggle_* ساخته می‌شود. ثابتٔ
+# SECURITY_SETTINGS_MENU که قبلاً اینجا بود هیچ استفاده‌ای نداشت و در
+# ممیزی دکمه‌ها (tests/test_menu_audit.py) به‌عنوان «دکمهٔ مرده» شناسایی شد.
 
 PLAN_MANAGEMENT_MENU = [
     ["➕ ایجاد پلن جدید", "✏️ ویرایش پلن"],
@@ -176,8 +167,6 @@ PLAN_MANAGEMENT_MENU = [
 ]
 
 PLAN_TYPES_MENU = [["🎙 ویس‌کال", "👥 عضویت گروه"], ["📢 عضویت کانال", BTN_CANCEL]]
-USER_MANAGEMENT_MENU = [["🔎 جستجوی کاربر (پیشرفته)", "➕ افزودن ادمین جدید"], ["➖ حذف ادمین", "📋 لیست ادمین‌ها"], [BTN_BACK]]
-
 ACCOUNT_MENU = [
     ["➕ افزودن اکانت (شماره)", "📥 افزودن با سشن (String)"], 
     ["📋 لیست اکانت‌ها", "📩 دریافت کد ورود"], 
@@ -204,7 +193,6 @@ PRIVACY_LEVEL_MENU = [
     ["✅ همه (Everyone)", "👤 مخاطبین (Contacts)"],
     ["🚫 هیچکس (Nobody)", "🔙 بازگشت"]
 ]
-ORDER_MENU = [["🎙 ویس‌کال", "👥 عضویت گروه"], ["📢 عضویت کانال", BTN_BACK_MAIN]]
 WALLET_MENU = [["💳 شارژ حساب", "📈 تراکنش‌های اخیر"], [BTN_BACK_MAIN]]
 
 ORDER_TIMING_MENU = [

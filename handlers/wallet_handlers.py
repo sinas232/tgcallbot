@@ -12,7 +12,7 @@ from database import DatabaseManager
 from constants import WALLET_MENU, AWAITING_WALLET_ACTION, BTN_BACK_MAIN, AWAITING_CHARGE_AMOUNT, USER_MAIN_MENU
 from handlers.general_handlers import start_command
 from services.payment_service import payment_service
-from utils.helpers import clean_number
+from utils.helpers import clean_number, format_price
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ async def wallet_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     wallet_text = (
         f"💰 **کیف پول شخصی شما**\n➖➖➖➖➖➖➖➖\n\n"
-        f"💳 **موجودی قابل برداشت:**\n💎 `{int(user['credit']):,}` **تومان**\n\n"
+        f"💳 **موجودی قابل برداشت:**\n💎 `{format_price(user['credit'])}` **تومان**\n\n"
         f"📊 **گزارش مالی حساب:**\n"
         f"📉 مجموع هزینه‌ها: `{int(stats['total_paid']):,}` تومان\n"
         f"🛍 تعداد کل سفارشات: `{stats['orders_count']}` عدد\n\n"
