@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
-from services.billing import ServiceClock, prorate, money
+from services.billing import ActiveClock, prorate, money
 from services.order_executor import OrderExecutor
 from database import DatabaseManager as DB
 from telegram.error import BadRequest, TimedOut
@@ -31,23 +31,20 @@ class ExactBillingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prorate(100, value, 60)
 
-    def test_build_pause_long_gap_and_resume(self):
+    def test_active_window_pauses_on_freeze_and_resumes_on_start(self):
         now = [0.]
-        clock = ServiceClock(now=lambda: now[0])
+        clock = ActiveClock(now=lambda: now[0])
         now[0] = 1000
-        self.assertEqual(clock.sample(False), 0)
-        clock.sample(True)
-        now[0] += 3
-        self.assertEqual(clock.sample(True), 3)
-        now[0] += 1
-        self.assertEqual(clock.sample(False), 3)  # observed interrupted interval gifted
-        now[0] += 600
-        self.assertEqual(clock.sample(False), 3)
-        clock.sample(True)
+        self.assertEqual(clock.served, 0)   # never started: build/queue is free
+        clock.start()
+        now[0] = 1003
+        self.assertEqual(clock.served, 3)
+        self.assertEqual(clock.freeze(), 3)
+        now[0] += 600                        # time after the cancel is not billed
+        self.assertEqual(clock.served, 3)
+        clock.start()
         now[0] += 2
-        self.assertEqual(clock.sample(True), 5)
-        now[0] += 60  # event loop could not observe service; no invented charge
-        self.assertEqual(clock.sample(True), 5)
+        self.assertEqual(clock.served, 5)
 
     def test_restart_uses_checkpoint_not_historical_start_time(self):
         ex = OrderExecutor()
@@ -57,16 +54,25 @@ class ExactBillingTests(unittest.TestCase):
         del order['_billing']
         self.assertEqual(ex.preview_order_settlement(order), (0, 1000, 0))
 
-    def test_presence_unknown_or_partial_is_not_full_count_health(self):
+    def test_presence_only_gates_health_never_the_meter(self):
+        now = [0.]
         ex = OrderExecutor()
-        ex.active_orders[42] = dict(serving=True, storage_ok=True, data={'order_type': 'voice_chat', 'accounts_count': 2})
-        vcm = SimpleNamespace(active_calls={(42, 1): {}, (42, 2): {}}, _account_states_by_order={42: {1: 'JOINED', 2: 'TEMPORARILY_UNKNOWN'}})
+        clock = ActiveClock(now=lambda: now[0])
+        ex.active_orders[42] = dict(clock=clock, serving=True, storage_ok=True,
+                                    data={'order_type': 'voice_chat', 'accounts_count': 2,
+                                          'duration_minutes': 10})
+        vcm = SimpleNamespace(active_calls={(42, 1): {}, (42, 2): {}},
+                              _account_states_by_order={42: {1: 'JOINED', 2: 'TEMPORARILY_UNKNOWN'}})
+        clock.start()
+        now[0] = 300
         with patch('services.order_executor._get_voice_call_manager', return_value=vcm):
-            self.assertFalse(ex._delivery_ok(42))
+            self.assertFalse(ex._delivery_ok(42))          # partial fill: health only
+            self.assertEqual(ex._sample_billing(42), 300)  # minutes are still billed
             vcm._account_states_by_order[42][2] = 'JOINED'
             self.assertTrue(ex._delivery_ok(42))
             del vcm.active_calls[(42, 2)]
             self.assertFalse(ex._delivery_ok(42))
+            self.assertEqual(ex._sample_billing(42), 300)
 
 
 class RuntimeAccountingTests(unittest.IsolatedAsyncioTestCase):
@@ -184,8 +190,8 @@ class RuntimeAccountingTests(unittest.IsolatedAsyncioTestCase):
     async def test_paid_timer_finishes_only_after_observed_remaining_seconds(self):
         ex = OrderExecutor()
         now = [0.]
-        clock = ServiceClock(59, now=lambda: now[0])
-        clock.sample(True)
+        clock = ActiveClock(59, now=lambda: now[0])
+        clock.start()
         data = dict(order_type='group_join', accounts_count=1, duration_minutes=1)
         ex.active_orders[42] = dict(clock=clock, serving=True, storage_ok=True, data=data,
                                     joined_accounts=[{'acc': {'id': 1}}], delivered_ids={1})
@@ -195,8 +201,9 @@ class RuntimeAccountingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(DB, 'checkpoint_order_billing', AsyncMock(return_value=True)) as persist:
             await ex._run_paid_duration(42, data)
         self.assertEqual(clock.served, 60)
+        self.assertFalse(clock.running)  # frozen when the plan window elapsed
         self.assertEqual(ex.active_orders[42]['remaining_seconds'], 0)
-        persist.assert_awaited_once_with(42, 60, {1}, first_delivery_at=ex.active_orders[42]['first_delivery_at'])
+        persist.assert_awaited_once_with(42, 60, {1})
 
     def test_financial_display_keeps_fractional_toman(self):
         from utils.helpers import format_price

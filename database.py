@@ -805,7 +805,7 @@ class DatabaseManager:
             return dict(to_dict(order), _created=True)
 
     @staticmethod
-    async def checkpoint_order_billing(order_id, served_seconds, delivered_ids=(), *, first_delivery_at=None):
+    async def checkpoint_order_billing(order_id, served_seconds, delivered_ids=()):
         async with AsyncSessionLocal() as session, session.begin():
             order = (await session.execute(select(Order).where(Order.id == order_id)
                                           .with_for_update())).scalar_one_or_none()
@@ -820,8 +820,6 @@ class DatabaseManager:
             row.served_seconds = min((order.duration_minutes or 0) * 60, max(row.served_seconds, served_seconds))
             row.delivered_ids = json.dumps(sorted(set(json.loads(row.delivered_ids)) | set(delivered_ids)))
             row.checkpoint_at = datetime.utcnow()
-            if first_delivery_at is not None and not order.started_at and order.duration_minutes:
-                order.started_at = first_delivery_at
             return True
 
     @staticmethod
@@ -1009,9 +1007,9 @@ class DatabaseManager:
                     "total_cost": total, "used_cost": used, "refund_amount": refund,
                     "refund_tx_id": tx_id, "user_wallet_balance": user.credit,
                     "elapsed_seconds": elapsed,
-                    "billing_basis": "account_seconds" if order.duration_minutes else "delivered_count",
+                    "billing_basis": "active_time" if order.duration_minutes else "delivered_count",
                     "requested_accounts": order.accounts_count,
-                    "account_seconds": elapsed * (order.accounts_count or 0) if order.duration_minutes else 0.,
+                    "active_seconds": elapsed if order.duration_minutes else 0.,
                     "service_used_cost": service_used_cost,
                     "do_refund": bool(do_refund),
                     "withheld_unused_cost": float(money(total) - money(service_used_cost)) if not do_refund else 0.,
@@ -1080,9 +1078,9 @@ class DatabaseManager:
     async def mark_order_as_running(order_id: int):
         """Move the order to `running` WITHOUT starting the billable clock.
 
-        `started_at` stays NULL until confirmed delivery is observed. The
-        checkpoint records the first observation, even during partial build.
-        Money is based on persisted account-time, never this wall timestamp.
+        `started_at` is stamped when execution begins — the same moment the
+        order's billable active window starts — but money always comes from the
+        persisted billing checkpoint, never from recomputing this timestamp.
         """
         async with AsyncSessionLocal() as db_session:
             # 🔒 انتقال محافظت‌شده: اگر سفارش در فاصلهٔ ثبت تا تحویل

@@ -12,7 +12,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
 from database import DatabaseManager as DB
 from services.order_executor import OrderExecutor
 from services.bot_manager import bot_manager
-from services.billing import ServiceClock
+from services.billing import ActiveClock
 from telegram.error import BadRequest
 
 
@@ -23,7 +23,7 @@ class ReportTimingTests(unittest.IsolatedAsyncioTestCase):
                     order_type=order_type, target_link='@test', status='running',
                     created_at=datetime(2020, 1, 1), started_at=None,
                     scheduled_for=datetime(2020, 1, 2) if scheduled else None)
-        ex.active_orders[42] = dict(status='running', data=data, clock=ServiceClock(),
+        ex.active_orders[42] = dict(status='running', data=data, clock=ActiveClock(),
                                     serving=False, storage_ok=True, children=set())
         return ex, data
 
@@ -32,6 +32,7 @@ class ReportTimingTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
         stack.enter_context(patch.dict(bot_manager.active_bots, {2: SimpleNamespace(bot=bot)}, clear=True))
         stack.enter_context(patch.object(DB, 'get_setting', AsyncMock(return_value='@reports')))
+        stack.enter_context(patch.object(DB, 'start_order_duration', AsyncMock(return_value=datetime.utcnow())))
         stack.enter_context(patch.object(DB, 'get_order', AsyncMock(side_effect=lambda _: dict(data))))
         stack.enter_context(patch.object(DB, 'get_user_by_id', AsyncMock(return_value={'telegram_id': 567, 'first_name': 'test'})))
         claims = set()

@@ -3,7 +3,7 @@ import logging
 import math
 import json
 from telegram.error import BadRequest
-from services.billing import ServiceClock, money, prorate
+from services.billing import ActiveClock, money, prorate
 import random
 import re
 import time
@@ -164,7 +164,7 @@ class OrderExecutor:
 		if not self._is_order_active(order_id):
 			return False  # cancelled while the database claim was in flight
 		info = self.active_orders[order_id]
-		info.update(clock=ServiceClock(), serving=False, storage_ok=True, children=set(), delivered_ids=set())
+		info.update(clock=ActiveClock(), serving=False, storage_ok=True, children=set(), delivered_ids=set())
 		try:
 			if not await DatabaseManager.checkpoint_order_billing(order_id, 0):
 				self.active_orders.pop(order_id, None)
@@ -201,13 +201,9 @@ class OrderExecutor:
 	            info['execution_done'] = True  # retry failed DB settlement, never bill this wait
 	        self._suppress_cancel_log.discard(order_id)
 
-	def _confirmed_delivery_ids(self, order_id):
+	def _present_ids(self, order_id):
+	    """Accounts verified present right now — health/replacement only, no money."""
 	    info = self.active_orders.get(order_id) or {}
-	    # Observation starts at build, not after the final requested slot arrives.
-	    if (not info.get('billing_started', info.get('serving', False))
-	            or info.get('cancel_requested') or info.get('execution_done')
-	            or info.get('terminal_committed')):
-	        return set()
 	    data = info.get('data') or {}
 	    if data.get('order_type') == 'voice_chat':
 	        vcm = _get_voice_call_manager()
@@ -220,46 +216,48 @@ class OrderExecutor:
 	            if (e.get('acc') or {}).get('id') is not None}
 
 	def _delivery_ok(self, order_id):
-	    # Full-count health is not the monetary predicate: partial service counts.
 	    info = self.active_orders.get(order_id) or {}
 	    required = int((info.get('data') or {}).get('accounts_count') or 0)
-	    return len(self._confirmed_delivery_ids(order_id)) >= required > 0
+	    return len(self._present_ids(order_id)) >= required > 0
 
 	def _sample_billing(self, order_id):
+	    """Billable seconds of a timed order = its active wall-clock window."""
 	    info = self.active_orders.get(order_id) or {}
 	    clock = info.get('clock')
 	    if not clock:
 	        return None
-	    data = info.get('data') or {}
-	    total = int(data.get('duration_minutes') or 0) * 60
+	    total = int((info.get('data') or {}).get('duration_minutes') or 0) * 60
 	    if total <= 0:
-	        return clock.sample(False)  # volume orders retain delivered-ID billing
-	    ids = self._confirmed_delivery_ids(order_id)
-	    if ids and not info.get('first_delivery_at'):
-	        info['first_delivery_at'] = datetime.utcnow()
-	        logger.info('Order %s: first confirmed service; partial account-time billing active (%s/%s)',
-	                    order_id, len(ids), data.get('accounts_count'))
-	    clock.sample_accounts(ids, int(data.get('accounts_count') or 0))
-	    if clock.served > total:
-	        clock.served = total
+	        return 0.  # volume plans are priced per delivered account, not per minute
+	    return min(total, clock.served)
+
+	def _start_billing(self, order_id):
+	    """The order is live: minutes start counting regardless of fill rate."""
+	    info = self.active_orders.get(order_id) or {}
+	    clock = info.get('clock')
+	    if not clock:
+	        return None
+	    info['billing_started'] = True
+	    clock.start()
 	    return clock.served
 
 	def _freeze_billing(self, order_id):
 	    info = self.active_orders.get(order_id) or {}
-	    self._sample_billing(order_id)
+	    clock = info.get('clock')
+	    if clock:
+	        clock.freeze()
 	    info['serving'] = False
 	    info['billing_started'] = False
-	    if info.get('clock'):
-	        info['clock'].sample(False)
 
 	async def _persist_billing(self, order_id):
 	    info = self.active_orders.get(order_id) or {}
 	    clock = info.get('clock')
 	    if not clock:
 	        return True
-	    kwargs = {'first_delivery_at': info['first_delivery_at']} if info.get('first_delivery_at') else {}
+	    # Whole seconds only: a partial second at a checkpoint boundary is gifted
+	    # instead of turning a fast cancel into a 0.01 toman charge.
 	    return await DatabaseManager.checkpoint_order_billing(
-	        order_id, clock.served, info.get('delivered_ids') or (), **kwargs)
+	        order_id, math.floor(clock.served), info.get('delivered_ids') or ())
 
 	async def _checkpoint_billing(self, order_id):
 	    info = self.active_orders.get(order_id) or {}
@@ -345,7 +343,6 @@ class OrderExecutor:
 	    joined = info.setdefault('joined_accounts', [])
 	    if not any((e.get('acc') or {}).get('id') == acc['id'] for e in joined):
 	        joined.append(entry)
-	    self._sample_billing(order_id)
 	    if info.get('clock') and not await self._persist_billing(order_id):
 	        return None
 	    return entry
@@ -368,6 +365,14 @@ class OrderExecutor:
 	        await self._announce_order_start(order_id, data)
 	        if not self._is_order_active(order_id):
 	            raise asyncio.CancelledError()
+	        # The order is live from here on: its active window — and with it the
+	        # billable base — starts now, however slowly the slots fill in. Time
+	        # spent notifying about the start is never part of the service window.
+	        self._start_billing(order_id)
+	        try:
+	            await DatabaseManager.start_order_duration(order_id)
+	        except Exception:
+	            logger.exception('Order %s: service-start stamp failed; billing clock unaffected', order_id)
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
 	        exact = requested if eligible_count else 0
 	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
@@ -380,15 +385,14 @@ class OrderExecutor:
 	            self.active_orders[order_id]["target_count"] = exact
 
 	        # ────────────────────────────────────────────────────────────
-	        # BUILD PHASE — waiting is free; confirmed partial delivery consumes
-	        # account-seconds even while remaining slots are still joining.
+	        # BUILD PHASE — the order is already live and billable; this loop
+	        # only decides when every requested slot is finally present.
 	        # Voice orders: ADAPTIVE BATCH fill — waves of N accounts join &
 	        # get verified CONCURRENTLY; N adapts to FloodWait/failure rates
 	        # (Join Brain); failed accounts are retried (bounded) and then
 	        # replaced from the pool; next wave starts only after the
 	        # previous one fully resolved.
 	        # ────────────────────────────────────────────────────────────
-	        self.active_orders[order_id]['billing_started'] = True
 	        if order_type == "voice_chat":
 	            joined_list, dead_count = await self._voice_batched_fill(
 	                order_id=order_id,
@@ -458,7 +462,6 @@ class OrderExecutor:
 	            return
 
 	        if duration > 0:
-	            self._sample_billing(order_id)
 	            await self._persist_billing(order_id)
 	            started_at = await DatabaseManager.start_order_duration(order_id)
 	            if not started_at:
@@ -943,7 +946,7 @@ class OrderExecutor:
 	    remaining = (end_time - datetime.utcnow()).total_seconds()
 	    grace = max(0, int(getattr(Config, "VOICE_REPLACEMENT_GRACE_SECONDS", 60)))
 	    target = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
-	    delivered = len(self._confirmed_delivery_ids(order_id))
+	    delivered = len(self._present_ids(order_id))
 	    if remaining < grace and delivered >= target > 0:
 	        return 0  # every slot still healthy: a late replacement would be pointless
 	    if not self._is_order_active(order_id):
@@ -1712,13 +1715,13 @@ class OrderExecutor:
 				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
 				f"└ 🚀 **{time_label}:** `{format_jalali_datetime(event_time)}`",
 				sep,
-				(("⏳ *ورود اکانت‌ها آغاز می‌شود؛ هزینه از حضور تأییدشدهٔ هر اکانت، متناسب با زمان و تعداد، محاسبه می‌شود.*"
+				(("⏳ *زمان فعال سفارش از همین حالا نسبت به مدت پلن محاسبه می‌شود؛ در لغو فقط زمان فعال کسر و ماندهٔ مصرف‌نشده عودت می‌شود.*"
 				  if plan_minutes else "⏳ *عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود.*")
 				 if kind == 'started' else "📅 *این پیام ثبت رزرو است، نه شروع اجرا.*"),
 			]
 			return "\n".join(lines)
 
-		# مدت کارکرد واقعی (ثانیه‌ای دقیق)
+		# زمان فعال سفارش — مبنای مالی تسویه
 		try:
 			real_seconds = max(0, (ended_at - started_at).total_seconds()) if (started_at and ended_at) else 0
 		except Exception:
@@ -1758,10 +1761,10 @@ class OrderExecutor:
 				f"├ 🚫 **لغو شده توسط:** `{canceled_by_role}` ({canceled_by_name})",
 				f"├ 📝 **علت لغو:** `{cancellation_reason}`",
 				f"├ 🚀 **شروع خدمت ثبت‌شده:** `{format_jalali_datetime(started_at)}`",
-				f"├ ⏱️ **زمان مصرف معادل کل پلن:** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
+				f"├ ⏱️ **زمان فعال سفارش (مبنای محاسبه):** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
 				"│",
 				"├ 💳 **جزئیات مالی و عودت وجه:**",
-				("│  مبنا: مجموع زمان حضور تأییدشدهٔ اکانت‌ها ÷ تعداد پلن"
+				("│  مبنا: زمان فعال سفارش از آغاز خدمت تا لغو، نسبت به مدت پلن"
 				 if plan_minutes else "│  مبنا: تعداد ورودهای موفق"),
 				f"│  ├ 💰 **هزینه کل پلن:** `{_p(total_cost)}` تومان",
 				f"│  ├ 📉 **هزینه مدت کارکرد:** `{_p(used_cost)}` تومان",
@@ -1846,7 +1849,7 @@ class OrderExecutor:
 	            return
 	        await app.bot.send_message(user['telegram_id'],
 	            f"⏰ اجرای سفارش زمان‌بندی‌شده #{order_id} آغاز شد.\n"
-	            + ("اکانت‌ها در حال ورود هستند؛ هزینه از حضور تأییدشدهٔ هر اکانت، متناسب با زمان و تعداد، محاسبه می‌شود."
+	            + ("اکانت‌ها در حال ورود هستند؛ زمان فعال سفارش نسبت به مدت پلن محاسبه می‌شود و در لغو، فقط زمان فعال کسر و ماندهٔ مصرف‌نشده عودت می‌گردد."
                if data.get('duration_minutes') else "عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود."),
 	            parse_mode=None, connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
 	        await DatabaseManager.mark_order_report(order_id, 'customer', 'started', 'sent')

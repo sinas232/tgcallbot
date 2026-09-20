@@ -25,52 +25,45 @@ def prorate(total, elapsed, duration):
     return float(used), float(total - used), float(elapsed)
 
 
-class ServiceClock:
-    """Sampled monotonic delivery clock, excluding unobserved/offline intervals.
+class ActiveClock:
+    """Wall-clock seconds an ORDER has been actively running.
 
-    Unknown long scheduling gaps are gifted rather than billed. At crash, only
-    the last persisted checkpoint is charged. Normally up to five recent seconds
-    are gifted; a storage outage may conservatively gift a longer interval.
+    The customer buys a plan duration; how many accounts manage to join does
+    not change the rate. Charging therefore follows the order's active window:
+    it starts when execution starts and stops at the terminal state (cancel,
+    completion, failure). A restart resumes from the persisted checkpoint plus
+    the time observed since resume; the unpersisted tail of a crash is gifted
+    to the customer, never invented.
     """
     def __init__(self, served=0, now=time.monotonic):
         self.now = now
-        self.served = served
-        self.account_ids = frozenset()
-        self.last = now()
-        self.delivering = False
+        self._observed = Decimal(str(served))
+        self._started_at = None
+
+    @property
+    def running(self):
+        return self._started_at is not None
+
+    def start(self):
+        if self._started_at is None:
+            self._started_at = self.now()
+        return self.served
+
+    def freeze(self):
+        if self._started_at is not None:
+            self._observed += Decimal(str(max(0., self.now() - self._started_at)))
+            self._started_at = None
+        return self.served
 
     @property
     def served(self):
-        return float(self._served)
+        if self._started_at is None:
+            return float(self._observed)
+        return float(self._observed + Decimal(str(max(0., self.now() - self._started_at))))
 
     @served.setter
     def served(self, value):
-        self._served = Decimal(str(value))
-
-    def sample_accounts(self, account_ids, required):
-        """Full-plan-equivalent seconds = observed account-seconds / plan count.
-
-        Only identities present at BOTH sample boundaries contribute. New joins,
-        replacements, unknown states and long observation gaps aren't backdated.
-        No per-tick money rounding; fractional service accumulates as Decimal.
-        """
-        now = self.now()
-        delta = max(0., now - self.last)
-        current = frozenset(account_ids)
-        if required > 0 and delta <= 5:
-            count = min(required, len(self.account_ids & current))
-            self._served += Decimal(str(delta)) * count / Decimal(required)
-        self.last = now
-        self.account_ids = current
-        self.delivering = bool(current)
-        return self.served
-
-    def sample(self, delivering):
-        now = self.now()
-        delta = max(0., now - self.last)
-        if self.delivering and delivering and delta <= 5:
-            self._served += Decimal(str(delta))
-        self.last = now
-        self.delivering = delivering
-        self.account_ids = frozenset()
-        return self.served
+        """Pin the observed total (checkpoint restore / tests)."""
+        if self._started_at is not None:
+            self._started_at = self.now()
+        self._observed = Decimal(str(value))

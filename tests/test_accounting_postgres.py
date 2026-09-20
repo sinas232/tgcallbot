@@ -181,7 +181,7 @@ class AccountingPostgresTests(unittest.IsolatedAsyncioTestCase):
             return entries, 0
         async def hold(oid, data):
             ex.active_orders[oid]['clock'].served = 150
-            ex.active_orders[oid]['clock'].now = lambda: ex.active_orders[oid]['clock'].last
+            ex.active_orders[oid]['clock'].freeze()  # cancel path freezes the window
             started.set()
             await asyncio.Event().wait()
         with patch.object(DB, 'count_active_accounts', AsyncMock(return_value=10)), \
