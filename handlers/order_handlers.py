@@ -231,6 +231,14 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.delete_message()
         from handlers.general_handlers import start_command
         return await start_command(update, context)
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    user_id = update.effective_user.id
+    user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+    blocked, remaining, minutes = await cancel_cooldown.check_user(user, user_id, bot_id)
+    if blocked:
+        await query.edit_message_text(cancel_cooldown.blocked_message(remaining, minutes))
+        return ConversationHandler.END
         
     try: plan_id = int(data.split("_")[2])
     except: return AWAITING_SELECT_PLAN
@@ -241,7 +249,6 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return AWAITING_SELECT_PLAN
 
     # بررسی مجدد فعال بودن سرویس (جلوگیری از دور زدن با لیست پلنِ قدیمی).
-    bot_id = context.bot_data.get('bot_id', 1)
     if not await DatabaseManager.is_service_active(plan['service_type'], bot_id=bot_id):
         await query.edit_message_text("⛔️ این سرویس در حال حاضر غیرفعال است.")
         return AWAITING_SELECT_PLAN

@@ -73,10 +73,12 @@ class WiringTests(unittest.TestCase):
     def test_order_start_and_pay_are_gated(self):
         src = open(os.path.join(os.path.dirname(__file__), '..', 'handlers',
                                 'order_handlers.py'), encoding='utf-8').read()
-        self.assertGreaterEqual(src.count('cancel_cooldown.check_user'), 2)
+        self.assertGreaterEqual(src.count('cancel_cooldown.check_user'), 3)
         self.assertIn('async def new_order_start', src)
         start = src[src.index('async def new_order_start'):src.index('async def show_plans_for_category')]
         self.assertIn('cancel_cooldown.check_user', start)
+        plan_cb = src[src.index('async def handle_plan_callback'):src.index('async def receive_order_link')]
+        self.assertIn('cancel_cooldown.check_user', plan_cb)
         self.assertIn('mark_user_cancelled', src)
 
     def test_admin_panel_exposes_antiban_settings(self):

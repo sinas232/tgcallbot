@@ -332,7 +332,10 @@ async def process_due_leaves(limit: Optional[int] = None, *, now: Optional[datet
 
 async def _postpone(row: Dict[str, Any], now: datetime, *, reason: str) -> None:
     from database import DatabaseManager
-    delay = leave_delay_minutes()
+    try:
+        delay = await resolved_leave_delay_minutes(int(row.get("bot_id") or 1))
+    except Exception:
+        delay = leave_delay_minutes()
     due = now + timedelta(minutes=max(delay, 1))
     try:
         await DatabaseManager.schedule_group_leave_retry(row.get("id"), due_at=due, error=reason)
