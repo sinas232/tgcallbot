@@ -111,11 +111,12 @@ class Config:
     # unrestricted and is limited only by eligible accounts, Telegram limits,
     # and server capacity.
     JOIN_CONCURRENCY = int(os.getenv('JOIN_CONCURRENCY', '4'))            # (legacy) other order types
-    # System-wide hard cap on simultaneous native join operations (across ALL
-    # orders). Bumped up so several 100-500-account orders can build in
-    # parallel without starving each other.
-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
+    # هم‌زمانی کل عملیات join (در همهٔ سفارش‌ها). این عدد یک «پردهٔ ایمنی
+    # Telegeram» است، نه سقف تعداد اکانت: هیچ سفارشی به‌خاطر تعداد اکانت یا
+    # توان پردازنده رد/متوقف نمی‌شود. برای سفارش‌های بزرگ (۱۰۰ تا ۵۰۰ اکانت)
+    # این مقدار بالا نگه داشته شده تا موازی‌سازی واقعی اتفاق بیفتد.
+    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '64'))
+    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '24'))  # parallel Pyrogram client creations
     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
@@ -133,18 +134,18 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
-    # First wave size. 2 is the safe default: combined with the staggered
-    # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
-    # WebRTC handshakes land several seconds apart, which keeps Telegram's
-    # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
-    # voice handshake. The Join Brain may still widen this (up to the max).
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
+    # ⚠️ هیچ‌کدام از این اعداد «سقف تعداد اکانت سفارش» نیستند؛ فقط تنظیم
+    # نرخ/هم‌زمانیِ شروع ورود هستند. تعداد اکانت سفارش، تعداد اکانت موجود و
+    # توان پردازنده هیچ محدودیتی ایجاد نمی‌کنند: سفارش با همان تعدادی که در
+    # استخر اکانت هست تا رسیدن به تعداد خریداری‌شده ادامه می‌دهد.
+    # اندازهٔ موج اول (به‌طور پیش‌فرض ۱۰): سفارش‌های بزرگ از همان ابتدا موازی
+    # پیش می‌روند و Join Brain در صورت FloodWait پنجره را کوچک می‌کند.
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '10'))  # first wave size
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~2 concurrent media setups is where transports start dying AND
-    # where Telegram's per-IP burst budget starts answering with FloodWait.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # سقف هم‌زمانیِ هر سفارش (پیش‌فرض ۳۰): فقط یک پردهٔ ایمنی برای شروع‌های
+    # پشت‌سرهم است؛ نه محدودیت تعداد اکانت. برای سفارش ۵۰ اکانتی، همهٔ ۵۰
+    # اکانت در چند موج (با فاصلهٔ کوتاه) وارد می‌شوند.
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '30'))         # per-order pacing ceiling (NOT an account cap)
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -205,9 +206,12 @@ class Config:
     # Telegram still answers with FloodWait (server-directed waits are always
     # respected first — this only paces NEW waves).
     VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
-    # Driver-level attempt budget per account (start_call itself already does
-    # bounded retries + respects FloodWait internally).
-    VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
+    # سقف تلاش برای هر اکانت در طول یک سفارش. ۰ = بدون سقف (پیش‌فرض):
+    # هیچ اکانتِ قابل استفاده‌ای «کنار گذاشته» نمی‌شود؛ با backoff کوتاه دوباره
+    # تلاش می‌شود تا سفارش به تعداد خریداری‌شده برسد. فقط اکانت‌هایی که تلگرام
+    # واقعاً باطل کرده (SESSION_REVOKED / AUTH_KEY_* / USER_DEACTIVATED) و
+    # FloodWait سروری کنار گذاشته می‌شوند.
+    VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '0'))
     VOICE_RETRY_BACKOFF_BASE = float(os.getenv('VOICE_RETRY_BACKOFF_BASE', '8'))
     # Rejoin attempts for a CONFIRMED-disconnected account before the slot is
     # declared unrecoverable and REPLACED with a fresh account (duration phase).

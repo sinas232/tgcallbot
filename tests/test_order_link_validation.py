@@ -1,4 +1,4 @@
-"""نسخهٔ ۲.۲.۱۸/۲.۲.۱۹ — فقط «لینک خصوصی» پذیرفته می‌شود.
+"""نسخهٔ ۲.۲.۱۸/۲.۲.۲۰ — فقط «لینک خصوصی» پذیرفته می‌شود.
 
 قاعده:
     ✔ https://t.me/+HASH  ·  https://t.me/joinchat/HASH  (و شکل‌های هم‌ارز)
@@ -367,7 +367,7 @@ class StorageTests(unittest.TestCase):
         constants = open(os.path.join(root, 'constants.py'), encoding='utf-8').read()
         changelog = open(os.path.join(root, 'CHANGELOG.md'), encoding='utf-8').read()
         docs = os.path.join(root, 'docs', 'LINK_FORMAT_2.2.19_FA.md')
-        self.assertTrue('BOT_VERSION = "2.2.19"' in constants)
+        self.assertTrue('BOT_VERSION = "2.2.20"' in constants)   # نسخهٔ جاری
         self.assertTrue('نسخهٔ ۲.۲.۱۹' in changelog)
         self.assertTrue(os.path.exists(docs))
         self.assertTrue(os.path.exists(os.path.join(root, 'docs', 'LINK_FORMAT_2.2.18_FA.md')))

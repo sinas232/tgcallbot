@@ -374,9 +374,17 @@ class OrderExecutor:
 	            await DatabaseManager.start_order_duration(order_id)
 	        except Exception:
 	            logger.exception('Order %s: service-start stamp failed; billing clock unaffected', order_id)
+	        # ⚠️ هدفِ سفارش هرگز با تعداد اکانت موجود «کوچک» نمی‌شود: اگر استخر کوچک‌تر از
+	        # سفارش باشد، ربات با همهٔ اکانت‌های موجود کار می‌کند و تا پایان زمان
+	        # خریداری‌شده برای تکمیل تعداد تلاش می‌کند (بدون سقف تعداد اکانت / CPU).
+	        # عدد Eligible فقط برای شفافیت لاگ است.
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
 	        exact = requested if eligible_count else 0
-	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
+	        logger.info(
+	            f"Order {order_id}: Requested={requested}, Eligible(active in DB)={eligible_count}, "
+	            f"Target={exact} — target is NOT capped by the pool; every usable account is used "
+	            f"and top-up retries continue for the whole order"
+	        )
 
 	        if exact <= 0:
 	            await self._fail_order(order_id, "No eligible active accounts available.")
@@ -521,17 +529,24 @@ class OrderExecutor:
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
-	def _voice_forget_order(self, order_id: int) -> None:
-	    """Release all Join-Brain scratch state for an order (idempotent)."""
+	def _voice_forget_order(self, order_id: int, *, keep_excluded: bool = False) -> None:
+	    """Release all Join-Brain scratch state for an order (idempotent).
+
+	    ``keep_excluded`` فقط استخر/شمارنده‌ها را پاک می‌کند و فهرست
+	    «اکانت‌های باطل‌شده» و زمان‌های retry را نگه می‌دارد؛ در فاز زمان
+	    خریداری‌شده استفاده می‌شود تا هر چرخه، سشن‌های مردهٔ تلگرام دوباره
+	    تلاش نشوند (هزینهٔ بی‌مورد) ولی اکانت‌های سالم دوباره وارد چرخه شوند.
+	    """
 	    try:
 	        join_brain.forget_order(order_id)
 	    except Exception:
 	        pass
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
-	    self._voice_banned.pop(order_id, None)
-	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
+	    if not keep_excluded:
+	        self._voice_banned.pop(order_id, None)
+	        self._voice_retry_after.pop(order_id, None)
 
 	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
 	    """Load (or refresh) the eligible-account pool for an order.
@@ -577,6 +592,21 @@ class OrderExecutor:
 	        seen.add(aid)
 	    self._voice_pool[order_id] = merged
 
+	def _voice_attempt_budget(self) -> int:
+	    """سقف تلاش هر اکانت در یک سفارش؛ ۰ یا منفی یعنی «بدون سقف».
+
+	    طبق قرارداد ادمین، تعداد اکانت و توان پردازنده هیچ محدودیتی برای تکمیل
+	    سفارش ایجاد نمی‌کنند: هر اکانتِ قابل استفاده تا رسیدن به تعداد
+	    خریداری‌شده (با فاصلهٔ کوتاه) دوباره تلاش می‌شود. تنها استثنا اکانت‌هایی
+	    هستند که خود تلگرام باطل کرده (SESSION_REVOKED / AUTH_KEY_* /
+	    USER_DEACTIVATED) و FloodWait سروری.
+	    """
+	    try:
+	        raw = int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 0))
+	    except (TypeError, ValueError):
+	        raw = 0
+	    return raw if raw > 0 else 0
+
 	def _voice_candidates(self, order_id: int, window: int, joined_ids: Set[int],
 	                    in_flight: Set[int], now: float) -> List[Dict]:
 	    """Pick up to `window` pool accounts that are ready to try now."""
@@ -587,7 +617,7 @@ class OrderExecutor:
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    chosen: List[Dict] = []
 	    cursor = self._voice_cursor.get(order_id, 0)
 	    n = len(pool)
@@ -601,7 +631,7 @@ class OrderExecutor:
 	            continue
 	        if aid in banned or aid in joined_ids or aid in in_flight:
 	            continue
-	        if attempts.get(aid, 0) >= attempt_budget:
+	        if attempt_budget and attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        if retry_after.get(aid, 0) > now:
 	            continue
@@ -621,13 +651,13 @@ class OrderExecutor:
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    best: Optional[float] = None
 	    for acc in pool:
 	        aid = acc.get("id")
 	        if not aid or aid in banned or aid in joined_ids:
 	            continue
-	        if attempts.get(aid, 0) >= attempt_budget:
+	        if attempt_budget and attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        when = retry_after.get(aid, 0.0)
 	        # Mirror the persisted FloodWait timer in scheduling so waves
@@ -678,7 +708,7 @@ class OrderExecutor:
 	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
 	        join_brain.register_order(order_id, initial=fixed, min_window=fixed, max_window=fixed)
 
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
 	    live = int(vcm.get_active_count(order_id))
@@ -727,6 +757,17 @@ class OrderExecutor:
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # استخر تمام شد: هیچ اکانتِ قابل‌استفاده‌ای باقی نمانده (یا
+	                # همه وارد شده‌اند، یا سشن‌ها باطل/غیرقابل‌استفاده‌اند).
+	                # این «سقف تعداد اکانت» نیست؛ در طول فاز زمان خریداری‌شده
+	                # استخر دوباره بارگذاری و تکمیل ادامه پیدا می‌کند.
+	                _pool = self._voice_pool.get(order_id) or []
+	                logger.warning(
+	                    f"Order {order_id}: no usable account left to try right now "
+	                    f"(pool={len(_pool)}, excluded={len(self._voice_banned.get(order_id) or ())}, "
+	                    f"joined={len(joined_ids)}, live={live}/{target_count}) — "
+	                    f"order keeps running; top-up retries continue for the whole duration"
+	                )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -896,9 +937,10 @@ class OrderExecutor:
 	                attempts = self._voice_attempts.setdefault(order_id, {})
 	                n_att = attempts.get(aid, 0) + 1
 	                attempts[aid] = n_att
-	                if n_att >= attempt_budget:
-	                    # Retry budget exhausted → give up on this account; the
-	                    # next wave replaces it with a fresh pool member.
+	                if attempt_budget and n_att >= attempt_budget:
+	                    # فقط وقتی ادمین صریحاً یک سقف تلاش تعیین کرده باشد
+	                    # (VOICE_ACCOUNT_ATTEMPT_LIMIT>0) اکانت کنار گذاشته
+	                    # می‌شود؛ پیش‌فرض ۰ = بدون سقف.
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
 	                    logger.warning(
 	                        f"Order {order_id}: account {aid} gave up after {n_att} "
@@ -911,10 +953,15 @@ class OrderExecutor:
 	                        delay = min(max(delay * _fac, 1.0), 300.0)
 	                    except Exception:
 	                        pass
+	                    if not attempt_budget:
+	                        # بدون سقف تلاش: حداکثر ۲ دقیقه فاصله، سپس دوباره —
+	                        # تا سفارش با همهٔ اکانت‌های موجود کامل شود.
+	                        delay = min(delay, 120.0)
 	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
 	                    logger.info(
 	                        f"Order {order_id}: account {aid} attempt {n_att} failed "
 	                        f"({msg[:60]}); retry in {delay:.0f}s"
+	                        + (" [unlimited attempts]" if not attempt_budget else "")
 	                    )
 	                join_brain.report_result(order_id, outcome, msg)
 	                wave_fail += 1
@@ -1010,8 +1057,10 @@ class OrderExecutor:
 	        return 0
 	    if not slots and shortfall:
 	        # Retry an unfilled replacement slot on later maintenance cycles.
-	        # Telegram's persistent FloodWait deadlines are NOT cleared here.
-	        self._voice_forget_order(order_id)
+	        # Telegram's persistent FloodWait deadlines are NOT cleared here and
+	        # sessions Telegram already revoked stay excluded (keep_excluded=True):
+	        # every healthy account is re-offered, nothing is capped by count/CPU.
+	        self._voice_forget_order(order_id, keep_excluded=True)
 
 	    # Track how many slots were hot-swapped over the order's lifetime so the
 	    # completion/cancellation report can show {swapped_accounts}. Counted at
@@ -1569,10 +1618,19 @@ class OrderExecutor:
 	            return
 	        if not await DatabaseManager.claim_order_report(order_id, "customer", "underfilled"):
 	            return
+	        try:
+	            pool_size = len(self._voice_pool.get(order_id) or [])
+	        except Exception:
+	            pool_size = 0
+	        excluded = len(self._voice_banned.get(order_id) or ())
+	        usable = max(0, pool_size - excluded)
 	        await app.bot.send_message(
 	            user["telegram_id"],
 	            f"⚠️ سفارش #{order_id}: در حال حاضر {live} از {requested} اکانت داخل تماس/گروه هستند.\n"
 	            "سفارش لغو نشد و تا پایان زمان خریداری‌شده فعال می‌ماند؛ تلاش برای تکمیل تعداد ادامه دارد.\n"
+	            f"اکانت‌های قابل استفاده در استخر: {usable} (کل {pool_size}، خارج‌شده {excluded}).\n"
+	            "بدون محدودیت تعداد اکانت یا پردازنده: هر اکانتِ قابل استفاده تا رسیدن به تعداد "
+	            "خریداری‌شده دوباره تلاش می‌شود.\n"
 	            "هزینه بر مبنای زمان فعال سفارش محاسبه می‌شود و در صورت لغو، فقط زمان استفاده‌شده کسر می‌گردد.",
 	            parse_mode=None,
 	        )
