@@ -515,6 +515,27 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Auto backup job error: {e}")
 
+async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
+    """🛡 اجرای خروج‌های به‌تأخیرافتادهٔ گروه/کانال — دونه‌به‌دونه و به‌ترتیب.
+
+    با پایان/لغو سفارش، خروج اکانت‌ها از خودِ گروه در pending_group_leaves
+    زمان‌بندی می‌شود (پیش‌فرض یک هفته بعد). این جاب رکوردهای سررسید را با
+    فاصلهٔ تنظیم‌شده از پنل (پیش‌فرض ۶۰ ثانیه بین هر خروج) و با claim اتمیک
+    اجرا می‌کند؛ اگر برای همان مقصد سفارش جدید آمده باشد خروج‌ها قبلاً لغو
+    شده‌اند. هر ۶۰ ثانیه، برای همهٔ ربات‌ها (bot_id=None → کل صف) و بدون
+    بستن ربات روی خطا.
+    """
+    try:
+        from services.group_leave_scheduler import group_leave_scheduler
+        n = await group_leave_scheduler.process_due(
+            bot_id=None,
+            limit=int(getattr(Config, "GROUP_LEAVE_SWEEP_BATCH", 25) or 25),
+        )
+        if n:
+            logger.info("[GroupLeave] sweeper processed %s scheduled leave(s)", n)
+    except Exception as e:
+        logger.error(f"Group leave sweeper error: {e}")
+
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         due_orders = await DatabaseManager.get_due_scheduled_orders()
@@ -795,6 +816,7 @@ def register_handlers(application: Application) -> None:
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
         r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|🛡 ضد اسپم و محافظت|🛡 ضد اسپم"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
@@ -1001,6 +1023,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
             CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+            CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
             CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
@@ -1040,10 +1063,13 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت|🛡 ضد اسپم)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+                # 🛡 ضد اسپم و محافظت از اکانت‌ها (سوپرادمین) — منو از مسیر
+                # settings_menu_handler باز می‌شود؛ اینجا فقط کالبک‌های آن.
+                CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
 
@@ -1142,6 +1168,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            AWAITING_ANTISPAM_VALUE: [MessageHandler(STD_TEXT, receive_antispam_value)],
 
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
@@ -1422,6 +1449,8 @@ async def main_loop():
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        # 🛡 ضد اسپم: اجرای خروج‌های به‌تأخیرافتادهٔ دونه‌به‌دونه از گروه‌ها
+        main_app.job_queue.run_repeating(group_leave_sweeper_job, interval=60, first=45)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).

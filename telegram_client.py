@@ -35,6 +35,9 @@ class TelegramAccountClient:
         self.session_string = session_string
         self.account_id = account_id
         self.client = None
+        # 🛡 آی‌دی چتی که در آخرین join موفق وارد شدیم (برای خروج به‌تأخیرافتادهٔ
+        # دقیق — ضد اسپم — تا خروج بعداً با آی‌دی عددی انجام شود، نه حدس لینک).
+        self.last_joined_chat_id = None
 
     async def _get_api_credentials(self):
         """دریافت API ID/HASH اختصاصی یا پیش‌فرض"""
@@ -150,6 +153,7 @@ class TelegramAccountClient:
                 joined = getattr(res, 'chat', res)
                 if getattr(joined, 'id', None) is None:
                     return False, f"Join needs approval ({type(res).__name__})"
+                self.last_joined_chat_id = getattr(joined, 'id', None)
                 return True, "Joined"
         except UserAlreadyParticipant:
             return True, "Already Joined"

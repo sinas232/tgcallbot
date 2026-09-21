@@ -91,7 +91,9 @@ class ConfigLeaveKeysTests(unittest.TestCase):
     def test_eject_skips_voice_chat(self):
         src = _read_source("services/order_executor.py")
         start = src.index("async def _eject_all_fast")
-        body = src[start:start + 2500]
+        # Method grew (delayed-leave scheduling block): widen the window so
+        # the paced-fallback region (VOICE_LEAVE_STAGGER) is still covered.
+        body = src[start:start + 5000]
         self.assertIn('order_type == "voice_chat"', body)
         self.assertIn("return", body)
         self.assertIn("VOICE_LEAVE_STAGGER", body)
@@ -111,7 +113,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.3"', src)
+        self.assertIn('BOT_VERSION = "2.3.0"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):

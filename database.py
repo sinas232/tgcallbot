@@ -79,6 +79,9 @@ class User(Base):
     kyc_reject_reason = Column(Text, nullable=True)
     exempt_phone_verify = Column(Boolean, default=False)
     kyc_card_number = Column(String(20), nullable=True)
+    # 🛡 ممنوعیت ثبت سفارش جدید پس از لغو (ضد اسپم) — تا این لحظه (UTC) کاربر
+    # نمی‌تواند سفارش تازه‌ای ثبت کند. NULL یعنی بدون ممنوعیت.
+    cancel_cooldown_until = Column(DateTime, nullable=True)
     __table_args__ = (UniqueConstraint('telegram_id', 'bot_id', name='uq_user_bot'),)
 
 class BankCard(Base):
@@ -169,6 +172,33 @@ class VoiceCallSession(Base):
     chat_id = Column(BigInteger, nullable=False)
     status = Column(String(20), default="joining")
     join_time = Column(DateTime, default=datetime.utcnow)
+
+
+class PendingGroupLeave(Base):
+    """🛡 صف خروج به‌تأخیرافتادهٔ اکانت‌ها از گروه/کانال (ضد اسپم).
+
+    بعد از پایان/لغو سفارش، اکانت از ویس‌کال بلافاصله خارج می‌شود اما خروج از
+    خودِ گروه در این جدول زمان‌بندی می‌شود (پیش‌فرض: یک هفته بعد). جاب دوره‌ای
+    services/group_leave_scheduler رکوردهای سررسید را «دونه‌به‌دونه و به‌ترتیب»
+    (به‌ترتیب not_before سپس id، با فاصلهٔ زمانی بین هر خروج) اجرا می‌کند تا
+    خروج انبوه و یک‌جا — الگوی کلاسیک ربات — رخ ندهد. اگر کاربر برای همان مقصد
+    دوباره سفارش ثبت کند، رکوردهای pending همان مقصد لغو (cancelled) می‌شوند.
+    """
+    __tablename__ = "pending_group_leaves"
+    id = Column(Integer, primary_key=True, index=True)
+    bot_id = Column(Integer, default=1, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    chat_id = Column(BigInteger, nullable=True, index=True)     # وقتی شناخته‌شده (مسیر ویس‌کال)
+    target_link = Column(String(255), nullable=True)            # متن لینک سفارش (مسیر عضویت گروه/کانال)
+    canonical_target = Column(String(255), nullable=True, index=True)  # فرم نرمال‌شده برای تطبیق سفارش مجدد
+    order_id = Column(Integer, nullable=True)
+    # pending → processing → done / failed / cancelled
+    status = Column(String(20), default="pending", index=True)
+    attempts = Column(Integer, default=0)                       # دفعات تلاش برای خروج
+    not_before = Column(DateTime, nullable=False, index=True)   # زودتر از این لحظه خارج نشود
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
 
 
 class VoiceJoinAttempt(Base):
@@ -312,6 +342,28 @@ class DatabaseManager:
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);",
             "ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS username VARCHAR(255);",
+            # 🛡 ضد اسپم: مهلت ممنوعیتِ ثبت سفارش پس از لغو برای کاربر
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_cooldown_until TIMESTAMP WITHOUT TIME ZONE;",
+            # 🛡 ضد اسپم: صف خروج به‌تأخیرافتادهٔ دونه‌به‌دونه از گروه/کانال
+            """
+            CREATE TABLE IF NOT EXISTS pending_group_leaves (
+                id SERIAL PRIMARY KEY,
+                bot_id INTEGER DEFAULT 1,
+                account_id INTEGER NOT NULL,
+                chat_id BIGINT,
+                target_link VARCHAR(255),
+                canonical_target VARCHAR(255),
+                order_id INTEGER,
+                status VARCHAR(20) DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                not_before TIMESTAMP WITHOUT TIME ZONE,
+                last_error TEXT,
+                created_at TIMESTAMP WITHOUT TIME ZONE,
+                processed_at TIMESTAMP WITHOUT TIME ZONE
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_pgl_status_notbefore ON pending_group_leaves (status, not_before);",
+            "CREATE INDEX IF NOT EXISTS idx_pgl_bot_status ON pending_group_leaves (bot_id, status);",
         ]
         async with engine.connect() as conn:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -1292,6 +1344,190 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
     @staticmethod
     async def set_security_setting(key: str, value: bool, bot_id: int = 1):
         await DatabaseManager.set_setting(key, str(value).lower(), bot_id)
+
+    # ================= ANTI-SPAM: CANCEL COOLDOWN =================
+    @staticmethod
+    async def set_user_cancel_cooldown(internal_user_id: int, until: Optional[datetime]):
+        """ست/پاک کردن مهلت ممنوعیتِ ثبت سفارش جدید کاربر (UTC naive یا None)."""
+        async with AsyncSessionLocal() as db_session:
+            await db_session.execute(
+                update(User).where(User.id == internal_user_id).values(cancel_cooldown_until=until)
+            )
+            await db_session.commit()
+
+    # ================= ANTI-SPAM: PENDING GROUP LEAVES =================
+    @staticmethod
+    async def schedule_group_leave(bot_id: int, account_id: int, chat_id: Optional[int],
+                                   target_link: Optional[str], canonical_target: Optional[str],
+                                   order_id: Optional[int], not_before: datetime) -> int:
+        """زمان‌بندی خروج تأخیری یک اکانت از یک گروه/کانال.
+
+        رکوردهای pending قبلیِ همین اکانت/چت ابطال می‌شوند تا همیشه فقط یک
+        خروج زمان‌بندی‌شدهٔ معتبر برای هر (اکانت، گروه) وجود داشته باشد؛ وگرنه
+        با سفارش‌های پیاپی چند خروج تکراری صف می‌شد.
+        خروجی: id رکورد جدید.
+        """
+        async with AsyncSessionLocal() as db_session:
+            q = update(PendingGroupLeave).where(
+                PendingGroupLeave.bot_id == bot_id,
+                PendingGroupLeave.account_id == account_id,
+                PendingGroupLeave.status == "pending",
+            )
+            if chat_id:
+                q = q.where(PendingGroupLeave.chat_id == int(chat_id))
+            elif canonical_target:
+                q = q.where(PendingGroupLeave.canonical_target == canonical_target)
+            await db_session.execute(q.values(
+                status="cancelled", processed_at=datetime.utcnow(),
+                last_error="superseded by newer schedule",
+            ))
+            row = PendingGroupLeave(
+                bot_id=bot_id, account_id=account_id,
+                chat_id=int(chat_id) if chat_id else None,
+                target_link=(target_link or None),
+                canonical_target=(canonical_target or None),
+                order_id=order_id, status="pending", attempts=0,
+                not_before=not_before, created_at=datetime.utcnow(),
+            )
+            db_session.add(row)
+            await db_session.commit()
+            await db_session.refresh(row)
+            return row.id
+
+    @staticmethod
+    async def count_pending_group_leaves(bot_id: int, chat_id: Optional[int] = None,
+                                         canonical_target: Optional[str] = None) -> int:
+        """شمارش خروج‌های در صف؛ اگر چت/کانونیکال داده شود محدود به همان مقصد
+        (برای محاسبهٔ شمارهٔ نفر در صف همان گروه جهت فاصله‌گذاری خروج‌ها)."""
+        async with AsyncSessionLocal() as db_session:
+            q = select(func.count(PendingGroupLeave.id)).filter(
+                PendingGroupLeave.bot_id == bot_id,
+                PendingGroupLeave.status == "pending",
+            )
+            if chat_id:
+                q = q.filter(PendingGroupLeave.chat_id == int(chat_id))
+            elif canonical_target:
+                q = q.filter(PendingGroupLeave.canonical_target == canonical_target)
+            return (await db_session.execute(q)).scalar() or 0
+
+    @staticmethod
+    async def cancel_group_leaves_for_target(canonical_target: str, bot_id: int = 1) -> int:
+        """لغو همهٔ خروج‌های زمان‌بندی‌شدهٔ یک مقصد (سفارش مجدد برای همان گروه
+        → اکانت‌ها عضو می‌مانند؛ هیچ چرخهٔ مضر leave/rejoin رخ نمی‌دهد)."""
+        if not canonical_target:
+            return 0
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.bot_id == bot_id,
+                    PendingGroupLeave.status == "pending",
+                    PendingGroupLeave.canonical_target == canonical_target,
+                ).values(status="cancelled", processed_at=datetime.utcnow(),
+                         last_error="new order for this target")
+            )
+            await db_session.commit()
+            return int(res.rowcount or 0)
+
+    @staticmethod
+    async def cancel_group_leaves_for_account_chat(account_id: int, chat_id: Optional[int]) -> int:
+        """لغو خروج زمان‌بندی‌شدهٔ یک اکانت از یک چت (وقتی همان اکانت دوباره
+        وارد همان چت می‌شود، خروجش دیگر معنا ندارد)."""
+        if not chat_id:
+            return 0
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.account_id == account_id,
+                    PendingGroupLeave.chat_id == int(chat_id),
+                    PendingGroupLeave.status == "pending",
+                ).values(status="cancelled", processed_at=datetime.utcnow(),
+                         last_error="account rejoined chat")
+            )
+            await db_session.commit()
+            return int(res.rowcount or 0)
+
+    @staticmethod
+    async def cancel_all_pending_group_leaves(bot_id: int = 1) -> int:
+        """لغو دستیِ کل صف خروج (از پنل ادمین). خروجی: تعداد رکوردهای لغوشده."""
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.bot_id == bot_id,
+                    PendingGroupLeave.status == "pending",
+                ).values(status="cancelled", processed_at=datetime.utcnow(),
+                         last_error="cleared by admin")
+            )
+            await db_session.commit()
+            return int(res.rowcount or 0)
+
+    @staticmethod
+    async def get_due_group_leaves(now: datetime, limit: int = 25, bot_id: Optional[int] = None):
+        """رکوردهای سررسید خروج — به‌ترتیب زمانی (قدیمی‌ترین اول) تا خروج‌ها
+        دقیقاً «به‌ترتیب و دونه‌به‌دونه» انجام شوند."""
+        async with AsyncSessionLocal() as db_session:
+            q = select(PendingGroupLeave).filter(
+                PendingGroupLeave.status == "pending",
+                PendingGroupLeave.not_before <= now,
+            ).order_by(PendingGroupLeave.not_before.asc(), PendingGroupLeave.id.asc()).limit(max(1, int(limit)))
+            if bot_id is not None:
+                q = q.filter(PendingGroupLeave.bot_id == bot_id)
+            res = await db_session.execute(q)
+            return [to_dict(r) for r in res.scalars().all()]
+
+    @staticmethod
+    async def claim_group_leave(row_id: int) -> bool:
+        """claim اتمیک یک رکورد pending (جلوگیری از پردازش دوباره/موازی)."""
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.id == row_id,
+                    PendingGroupLeave.status == "pending",
+                ).values(status="processing")
+            )
+            await db_session.commit()
+            return bool(res.rowcount)
+
+    @staticmethod
+    async def finish_group_leave(row_id: int, status: str = "done", error: Optional[str] = None):
+        """نهایی کردن یک خروج (done / failed / cancelled) با زمان پردازش."""
+        async with AsyncSessionLocal() as db_session:
+            await db_session.execute(
+                update(PendingGroupLeave).where(PendingGroupLeave.id == row_id).values(
+                    status=status, processed_at=datetime.utcnow(),
+                    last_error=(str(error)[:400] if error else None),
+                )
+            )
+            await db_session.commit()
+
+    @staticmethod
+    async def reschedule_group_leave(row_id: int, not_before: datetime, error: Optional[str] = None):
+        """برگرداندن رکورد به صف (تلاش مجدد با تأخیر) پس از خطای موقت."""
+        async with AsyncSessionLocal() as db_session:
+            row = await db_session.get(PendingGroupLeave, row_id)
+            if not row:
+                return
+            await db_session.execute(
+                update(PendingGroupLeave).where(PendingGroupLeave.id == row_id).values(
+                    status="pending", attempts=int(row.attempts or 0) + 1,
+                    not_before=not_before,
+                    last_error=(str(error)[:400] if error else None),
+                )
+            )
+            await db_session.commit()
+
+    @staticmethod
+    async def purge_old_group_leaves(days: int = 30) -> int:
+        """پاک‌سازی سابقهٔ قدیمی خروج‌ها تا جدول سبک بماند."""
+        cutoff = datetime.utcnow() - timedelta(days=max(1, int(days)))
+        async with AsyncSessionLocal() as db_session:
+            res = await db_session.execute(
+                delete(PendingGroupLeave).where(
+                    PendingGroupLeave.status.in_(["done", "cancelled", "failed"]),
+                    PendingGroupLeave.created_at < cutoff,
+                )
+            )
+            await db_session.commit()
+            return int(res.rowcount or 0)
 
     # ================= RESELLER =================
     @staticmethod

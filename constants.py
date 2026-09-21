@@ -4,7 +4,7 @@ constants.py
 """
 
 # نسخهٔ جاری ربات (برای لاگ استارت، پنل ادمین و Release گیت‌هاب)
-BOT_VERSION = "2.2.3"
+BOT_VERSION = "2.3.0"
 
 GATEWAY_SLUG_AGHAYE_PARDAKHT = "aqayepardakht"
 GATEWAY_SLUG_ZARINPAL = "zarinpal"
@@ -115,6 +115,9 @@ AWAITING_BACKUP_INTERVAL = 212
 
 # 💎 وضعیت‌های ایموجی پریمیوم (جایگزینی شناسهٔ ایموجی توسط ادمین)
 AWAITING_PREMIUM_EMOJI_OVERRIDE = 220
+
+# 🛡 وضعیت دریافت مقدار عددی در پنل «ضد اسپم و محافظت» (سوپرادمین)
+AWAITING_ANTISPAM_VALUE = 230
 
 # ===================== BUTTONS =====================
 

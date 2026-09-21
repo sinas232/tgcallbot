@@ -22,6 +22,7 @@ from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
 from services.capacity_planner import capacity_planner
+from services.anti_spam import anti_spam
 
 logger = logging.getLogger(__name__)
 
@@ -171,11 +172,32 @@ async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user:
         tg_user = update.effective_user
         user = await DatabaseManager.create_or_update_user({
-            'id': user_id, 
-            'username': tg_user.username, 
-            'first_name': tg_user.first_name, 
+            'id': user_id,
+            'username': tg_user.username,
+            'first_name': tg_user.first_name,
             'last_name': tg_user.last_name
         }, bot_id=bot_id)
+
+    # 🛡 ضد اسپم: اگر کاربر اخیراً سفارشی را لغو کرده، تا پایان مهلتِ تنظیم‌شده
+    # (پیش‌فرض ۲۰ دقیقه — از پنل سوپرادمین قابل تغییر) نمی‌تواند سفارش جدید بزند.
+    try:
+        block_left = await anti_spam.user_order_block_seconds(user, bot_id=bot_id)
+    except Exception:
+        block_left = 0
+    if block_left > 0:
+        minutes_left = max(1, math.ceil(block_left / 60))
+        try:
+            cd_min = await anti_spam.get_cancel_cooldown_minutes(bot_id)
+        except Exception:
+            cd_min = 0
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "⏳ **ثبت سفارش جدید موقتاً برای شما محدود است.**\n\n"
+            f"به دلیل لغو سفارش قبلی، تا **{minutes_left} دقیقه** دیگر نمی‌توانید سفارش جدید ثبت کنید.\n"
+            + (f"(قانون: پس از هر لغو، {cd_min} دقیقه وقفهٔ اجباری)\n" if cd_min > 0 else "")
+            + "\nلطفاً کمی صبر کنید و دوباره تلاش کنید. 🙏",
+        )
+        return ConversationHandler.END
 
     kb = ReplyKeyboardMarkup(PLAN_TYPES_MENU, resize_keyboard=True)
     await send_safe(context.bot, update.effective_chat.id, "🛍 **خرید سرویس جدید**\n\nلطفاً نوع سرویس را انتخاب کنید:", reply_markup=kb)
@@ -482,6 +504,18 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         link = context.user_data['target_link']
         
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        # 🛡 گارد دوبارهٔ ممنوعیت پس از لغو — اگر کاربر وسط فلو یک سفارشِ دیگر
+        # را لغو کرده باشد، پرداخت نهایی این سفارش هم نباید انجام شود.
+        try:
+            block_left = await anti_spam.user_order_block_seconds(user, bot_id=bot_id)
+        except Exception:
+            block_left = 0
+        if block_left > 0:
+            await query.edit_message_text(
+                "⏳ **ثبت سفارش جدید موقتاً برای شما محدود است.**\n\n"
+                f"به دلیل لغو سفارش قبلی، تا **{max(1, math.ceil(block_left / 60))} دقیقه** دیگر نمی‌توانید سفارش ثبت کنید."
+            )
+            return ConversationHandler.END
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
             return ConversationHandler.END
@@ -651,6 +685,22 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         spent_amount = max(0.0, total_price - refund_amount)
 
+        # 🛡 ضد اسپم: بعد از لغو موفقِ کاربر، ثبت سفارش جدید برای مدتِ
+        # تنظیم‌شده (پیش‌فرض ۲۰ دقیقه — از پنل سوپرادمین قابل تغییر) مسدود است.
+        cd_until = None
+        try:
+            cd_until = await anti_spam.stamp_user_cancel_cooldown(user['id'], bot_id=bot_id)
+        except Exception:
+            cd_until = None
+        cd_note = ""
+        if cd_until is not None:
+            try:
+                cd_min = await anti_spam.get_cancel_cooldown_minutes(bot_id)
+            except Exception:
+                cd_min = 0
+            if cd_min > 0:
+                cd_note = f"\n\n⏳ توجه: تا **{cd_min} دقیقه** امکان ثبت سفارش جدید نخواهید داشت."
+
         txt = (
             f"{msg_prefix}\n\n"
             f"💰 مبلغ کل پلن: {format_price(total_price)} تومان\n"
@@ -658,6 +708,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"💵 مبلغ عودت داده شده به کیف پول: {format_price(refund_amount)} تومان\n"
             f"🧾 کد پیگیری عودت: {refund_tx_id}\n"
             f"👛 موجودی فعلی کیف‌پول: {format_price(new_balance)} تومان"
+            f"{cd_note}"
         )
 
         await query.edit_message_text(txt)

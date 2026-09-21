@@ -267,6 +267,50 @@ class Config:
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
+    # ═══════════════════════════════════════════════════════════════════
+    # 🛡 حالت ضد اسپم (Anti-Spam Protection) — services/anti_spam.py
+    # ═══════════════════════════════════════════════════════════════════
+    # این مقادیر «پیش‌فرضِ fallback» هستند؛ مقدارِ نهاییِ زنده از دیتابیس
+    # (پنل سوپرادمین → «🛡 ضد اسپم و محافظت») خوانده می‌شود و تغییر آن‌ها در
+    # پنل بدون ری‌استارت اعمال می‌شود. env فقط وقتی استفاده می‌شود که کلید
+    # متناظر در دیتابیس هنوز ست نشده باشد.
+    #
+    # سوییچ کلی حالت ضد اسپم (join آهسته‌تر + خروج انسانی‌تر + استراحت اکانت).
+    ANTISPAM_ENABLED = os.getenv('ANTISPAM_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # فاصلهٔ شروع join دو اکانت متوالی در حالت ضد اسپم (ثانیه) — پراکندگی RPC.
+    ANTISPAM_JOIN_GAP_MIN = float(os.getenv('ANTISPAM_JOIN_GAP_MIN', '3.0'))
+    ANTISPAM_JOIN_GAP_MAX = float(os.getenv('ANTISPAM_JOIN_GAP_MAX', '8.0'))
+    # jitter انسانیِ اضافه روی فاصلهٔ join (ضد fingerprint پریودیک).
+    ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
+    # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
+    ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
+    # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
+    ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
+    ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
+    ANTISPAM_LEAVE_JITTER_MAX = float(os.getenv('ANTISPAM_LEAVE_JITTER_MAX', '1.2'))
+    ANTISPAM_LEAVE_MAX_CONCURRENCY = int(os.getenv('ANTISPAM_LEAVE_MAX_CONCURRENCY', '2'))
+    # استراحت هر اکانت بین دو سفارش (دقیقه). 0 = خاموش. با مقدار >0 اکانتی که
+    # تازه کارش تمام شده تا پایان استراحت برای سفارش جدید انتخاب نمی‌شود.
+    ANTISPAM_ACCOUNT_REST_MINUTES = float(os.getenv('ANTISPAM_ACCOUNT_REST_MINUTES', '0'))
+
+    # ── خروج به‌تأخیرافتاده از گروه (services/group_leave_scheduler.py) ──
+    # پس از پایان/لغو سفارش، اکانت‌ها از «ویس‌کال» بلافاصله خارج می‌شوند ولی
+    # خروج از خودِ گروه/کانال زمان‌بندی می‌شود؛ اگر کاربر برای همان مقصد دوباره
+    # سفارش بزند خروج‌ها لغو می‌شوند (بدون چرخهٔ leave/rejoin مضر).
+    GROUP_LEAVE_ENABLED = os.getenv('GROUP_LEAVE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # تأخیر خروج از گروه بعد از پایان سفارش (ساعت). پیش‌فرض ۱۶۸ = یک هفته.
+    GROUP_LEAVE_DELAY_HOURS = float(os.getenv('GROUP_LEAVE_DELAY_HOURS', '168'))
+    # فاصلهٔ زمانی بین خروج دو اکانتِ متوالی از یک گروه (ثانیه) — دونه‌به‌دونه و
+    # به‌ترتیب، نه یک‌جا (مشهورترین الگوی ربات برای آنتی‌اسپم).
+    GROUP_LEAVE_INTERVAL_SEC = float(os.getenv('GROUP_LEAVE_INTERVAL_SEC', '60'))
+    # حداکثر تعداد خروج پردازش‌شده در هر اجرای زمان‌بند (job هر ۶۰ ثانیه).
+    GROUP_LEAVE_SWEEP_BATCH = int(os.getenv('GROUP_LEAVE_SWEEP_BATCH', '25'))
+
+    # ── ممنوعیت ثبت سفارش جدید پس از لغو (Cancel Cooldown) ──
+    # کاربری که سفارشش را لغو می‌کند تا این مدت (دقیقه) نمی‌تواند سفارش جدید
+    # ثبت کند. 0 = خاموش. از پنل سوپرادمین قابل تنظیم است.
+    CANCEL_COOLDOWN_MINUTES = int(os.getenv('CANCEL_COOLDOWN_MINUTES', '20'))
+
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
     # Accounts of one order join in waves of N (initial 5-10) concurrent

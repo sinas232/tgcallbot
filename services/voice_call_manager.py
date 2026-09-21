@@ -3759,6 +3759,15 @@ class VoiceCallManager:
                 acid = int(cf.get("chat_id") or chat_id)
                 self._group_refcount[(account_id, acid)] = self._group_refcount.get((account_id, acid), 0) + 1
 
+                # 🛡 این اکانت دوباره وارد همین چت شده → اگر خروج به‌تأخیرافتادهٔ
+                # قدیمی‌ای برایش در صف باشد (مثلاً از سفارش قبلی همین گروه)،
+                # باید لغو شود؛ وگرنه وسط سفارش جدید اکانت از گروه بیرون می‌رود.
+                try:
+                    from services.group_leave_scheduler import group_leave_scheduler as _gls
+                    await _gls.cancel_for_account_chat(account_id, int(acid))
+                except Exception:
+                    pass
+
                 # STEP 7: Ensure the SHARED per-order monitor is running.
                 self._ensure_monitor(order_id)
 
@@ -3847,15 +3856,49 @@ class VoiceCallManager:
             if self._group_refcount[ref_key] <= 0:
                 self._group_refcount.pop(ref_key, None)
                 if leave_group:
-                    app = self.pyrogram_clients.get(account_id)
-                    if app:
-                        for _ in range(2):
-                            try:
-                                await app.leave_chat(int(chat_id))
-                                break
-                            except Exception:
-                                await asyncio.sleep(0.5)
-                        self._clear_chat_cache(int(chat_id))
+                    # 🛡 ضد اسپم: خروج از خودِ گروه «بلافاصله» نیست — در صف
+                    # خروجِ به‌تأخیرافتاده (پیش‌فرض یک هفته بعد) ثبت می‌شود و
+                    # جاب زمان‌بند آن را دونه‌به‌دونه اجرا می‌کند. اگر کاربر برای
+                    # همان مقصد سفارش تازه بزند، خروج لغو می‌ماند. در صورت
+                    # غیرفعال بودن قابلیت یا خطای زمان‌بندی → رفتار قبلی (خروج
+                    # فوری) حفظ می‌شود.
+                    scheduled = False
+                    try:
+                        from services.group_leave_scheduler import group_leave_scheduler as _gls
+                        _order = None
+                        try:
+                            _order = await DatabaseManager.get_order(order_id)
+                        except Exception:
+                            _order = None
+                        scheduled = await _gls.schedule(
+                            account_id=account_id,
+                            chat_id=int(chat_id),
+                            target_link=(
+                                (_order or {}).get("target_link")
+                                or (info or {}).get("target")
+                                or (removed or {}).get("target")
+                            ),
+                            order_id=order_id,
+                            bot_id=int((_order or {}).get("bot_id") or 1),
+                        )
+                    except Exception as _sched_err:
+                        logger.debug("[VoiceLeave] delayed group-leave schedule failed acc=%s: %s", account_id, _sched_err)
+                        scheduled = False
+                    if scheduled:
+                        logger.info(
+                            "[VoiceLeave] order=%s acc=%s group exit SCHEDULED (delayed, one-by-one) chat=%s",
+                            order_id, account_id, chat_id,
+                        )
+                    else:
+                        app = self.pyrogram_clients.get(account_id)
+                        if app:
+                            for _ in range(2):
+                                try:
+                                    await app.leave_chat(int(chat_id))
+                                    break
+                                except Exception:
+                                    await asyncio.sleep(0.5)
+                            self._clear_chat_cache(int(chat_id))
 
         await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
@@ -3890,11 +3933,29 @@ class VoiceCallManager:
         self._stop_monitor(order_id)
 
         if keys:
-            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
-            jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
-            jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            # 🛡 ضد اسپم: وقتی «حالت ضد اسپم» فعال است، pacing خروج از ویس‌کال
+            # هم انسانی‌تر می‌شود (فاصله‌های بزرگ‌تر + jitter، سقف کمتر). در
+            # غیر این صورت دقیقاً مقادیر Config قبلی استفاده می‌شود.
+            _anti = None
+            _profile = None
+            _bid = 1
+            try:
+                from services.anti_spam import anti_spam as _anti_mod
+                _anti = _anti_mod
+                try:
+                    _o = await DatabaseManager.get_order(order_id)
+                    _bid = int((_o or {}).get("bot_id") or 1)
+                except Exception:
+                    _bid = 1
+                _profile = await _anti.get_profile(_bid)
+                gap_min, gap_max, jitter_min, jitter_max, max_conc = _anti.effective_leave_pacing(_profile)
+            except Exception:
+                _anti, _profile = None, None
+                gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+                gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+                jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+                jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+                max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
             # Shuffle so the leave order is not the same join order every time
             # (harder for anti-spam fingerprinting of a fixed sequence).
             random.shuffle(keys)
@@ -3933,6 +3994,16 @@ class VoiceCallManager:
                 tasks.append(asyncio.create_task(_one(oid, aid)))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 🛡 استراحت اکانت پس از اتمام کار (ضد اسپم): اکانتی که تازه کارش
+            # تمام شده، تا پایان مهلت استراحت برای سفارش بعدی انتخاب نمی‌شود.
+            # با rest=0 یا ضد اسپم خاموش، این حلقه no-op است.
+            if _anti is not None and keys:
+                for (_oid, _aid) in keys:
+                    try:
+                        await _anti.note_account_finished(_aid, _bid)
+                    except Exception:
+                        pass
 
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)
