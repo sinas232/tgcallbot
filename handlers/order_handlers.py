@@ -437,6 +437,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     bot_id = context.bot_data.get('bot_id', 1)
     tg_user_id = update.effective_user.id
+    logger.info("cancel_order_callback fired: user=%s order_id=%s", tg_user_id, order_id)
 
     try:
         user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)

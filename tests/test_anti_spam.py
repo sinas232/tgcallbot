@@ -265,5 +265,45 @@ class SourceLevelGuardTests(unittest.TestCase):
         self.assertIn("random.shuffle", body)
 
 
+class HandlerGroupRoutingTests(unittest.TestCase):
+    """رگرسیون v2.3.4 — باگ «دکمهٔ لغو بی‌پاسخ»:
+
+    در PTB نسخهٔ 20 به بعد، در هر گروه «فقط یک» هندلر اجرا می‌شود (پس از
+    اولین هندلرِ مچ‌شده حلقه break می‌شود و block فقط حالت زمان‌بندیِ
+    اجراست). پس گارد ضداسپم که یک TypeHandler روی کلاس Update است (با هر
+    آپدیتی مچ می‌شود) هرگز نباید با هندلر دیگری در یک گروه باشد. هر مرحلهٔ
+    سراسری باید گروهِ مستقل داشته باشد: لغو(4-) ← ضداسپم(3-) ← تعمیرات(2-)
+    ← پیش‌روتر(1-).
+    """
+
+    def setUp(self):
+        self.src = _read_source("main.py")
+
+    def test_cancel_only_once_and_in_group_minus4(self):
+        self.assertEqual(
+            self.src.count("CallbackQueryHandler(cancel_order_callback"), 1,
+            "هندلر لغو فقط یک‌بار ثبت شود (ثبت تکراری = اجرای دوباره/پیام اشتباه)")
+        i = self.src.index("CallbackQueryHandler(cancel_order_callback")
+        self.assertIn("group=-4", self.src[i:i + 400])
+
+    def test_cancel_registered_before_spam_guard(self):
+        i_cancel = self.src.index("CallbackQueryHandler(cancel_order_callback")
+        i_guard = self.src.index("TypeHandler(Update, _spam_guard), group=-3")
+        self.assertLess(i_cancel, i_guard,
+                        "ثبت لغو باید قبل از گارد باشد تا گروه‌هایشان به همین ترتیب پردازش شوند")
+
+    def test_each_guard_has_dedicated_group(self):
+        self.assertIn("TypeHandler(Update, _spam_guard), group=-3", self.src)
+        self.assertIn("MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),", self.src)
+        self.assertIn('CommandHandler("start", _maintenance_guard), group=-2', self.src)
+        self.assertIn("CallbackQueryHandler(_maintenance_guard), group=-2", self.src)
+
+    def test_broken_block_false_pattern_never_returns(self):
+        # block=False روی گارد در PTB>=v20 هیچ اثری روی عبور ندارد و فقط
+        # معنای غلط «هندلرهای هم‌گروه هم اجرا می‌شوند» را القا می‌کند.
+        self.assertNotIn("_spam_guard, block=False", self.src)
+        self.assertNotIn("_maintenance_guard, block=False", self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
