@@ -429,8 +429,6 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await safe_answer(query)
 
     data = query.data or ""
-    _eu = update.effective_user
-    logger.info("cancel pressed: data=%s user=%s", data, _eu.id if _eu else None)
     try:
         # فرمت: cancel_order_<id>
         order_id = int(data.split("_")[2])

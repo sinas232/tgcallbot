@@ -673,7 +673,12 @@ def register_handlers(application: Application) -> None:
     _spam_guard._hits = _spam_hits
     _spam_guard._muted = _spam_muted_until
     _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
-    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+    # مهم: block=False — این گارد «عبوری» است؛ با مکث نکردن (غیر از کاربران
+    # محدود که با ApplicationHandlerStop سخت‌Stop می‌شوند)، اجازه می‌دهد
+    # update به هندلرهای باکی در group=-1 برسد (لغو سفارش، نگهبان تعمیرات،
+    # پیش‌روتر منوها). با block پیش‌فرض (True) گارد همهٔ آپدیت‌ها را می‌بلعید
+    # و دکمهٔ «لغو سفارش» هرگز اجرا نمی‌شد.
+    application.add_handler(TypeHandler(Update, _spam_guard, block=False), group=-1)
 
     # ─────────────────────────────────────────────────────────────
     # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
@@ -769,12 +774,15 @@ def register_handlers(application: Application) -> None:
         group=-1,
     )
 
+    # block=False: وقتی تعمیرات خاموش است (یا کاربر سوپرادمین است) گارد فقط
+    # عبور می‌دهد و نباید مانع رسیدن آپدیت به پیش‌روتر منوها شود. حالت مسدودکننده
+    # همچنان با raise ApplicationHandlerStop سخت متوقف می‌کند.
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard, block=False),
         group=-1,
     )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+    application.add_handler(CommandHandler("start", _maintenance_guard, block=False), group=-1)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard, block=False), group=-1)
 
     # ─────────────────────────────────────────────────────────────
     # 🧭 پیش‌روتر منوها (group=-1): رفع ریشه‌ای «دکمه‌ها جواب نمی‌دهند».
