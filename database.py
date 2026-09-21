@@ -938,43 +938,6 @@ class DatabaseManager:
             return False
 
     @staticmethod
-    async def get_capacity_reservations(bot_id: int = 1) -> List[Dict[str, Any]]:
-        """
-        رزروهای فعال ظرفیت برای Capacity Guard (گارد منابع قبل از ثبت سفارش).
-        سبک: فقط ستون‌های لازم از سفارش‌های running/scheduled/pending خوانده
-        می‌شود؛ هر رکورد یعنی «accounts_count اکانت از شروع تا پایان مدت اشغال
-        است». محاسبهٔ تداخل/اوج در services/capacity_planner.py انجام می‌شود.
-        """
-        async with AsyncSessionLocal() as db_session:
-            q = select(
-                Order.id,
-                Order.user_id,
-                Order.accounts_count,
-                Order.duration_minutes,
-                Order.status,
-                Order.started_at,
-                Order.scheduled_for,
-                Order.created_at,
-            ).filter(
-                Order.bot_id == bot_id,
-                Order.status.in_(['running', 'scheduled', 'pending']),
-            )
-            res = await db_session.execute(q)
-            return [
-                {
-                    "id": row[0],
-                    "user_id": row[1],
-                    "accounts_count": row[2],
-                    "duration_minutes": row[3],
-                    "status": row[4],
-                    "started_at": row[5],
-                    "scheduled_for": row[6],
-                    "created_at": row[7],
-                }
-                for row in res.all()
-            ]
-
-    @staticmethod
     async def add_telegram_account(user_id, phone, session_str, bot_id=1, api_id=None, api_hash=None,
                                    first_name=None, last_name=None, username=None):
         async with AsyncSessionLocal() as db_session:

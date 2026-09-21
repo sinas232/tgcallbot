@@ -85,23 +85,57 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
     start_text = await DatabaseManager.get_setting("start_text", default_text, bot_id=bot_id)
 
-    # جایگذاری متغیرها در متن
+    # ─── جایگذاری متغیرها در متن استارت ─────────────────────────────────
+    # جایگذاری دستی (نه str.format) تا هیچ متغیر ناشناخته‌ای رندر را نشکند و
+    # هیچ {placeholder} خامی دیده نشود. متغیرهای قالب: {name}, {first_name},
+    # {id}, {user_id}, {username}, {credit} + متغیرهای محتوایی برندینگ:
+    # {brand} {tagline} {intro} {services} {benefits} {guide} {support}
+    # {support_hours} {cta} — هر کدام به‌ترتیب از bot_settings با کلید
+    # start_<var> قابل بازنویسی است (بدون ست‌کردن → پیش‌فرض فارسی زیر).
     credit_val = int(db_user.get("credit", 0) or 0)
     credit_fmt = f"{credit_val:,}"
+    tg_username = ("@" + user.username) if user.username else ""
     try:
-        final_text = start_text.format(
-            name=safe_name,
-            id=user.id,
-            username=user.username or "None",
-            credit=credit_fmt,
-        )
+        _bot_uname = getattr(context.bot, "username", "") or ""
     except Exception:
-        final_text = (
-            start_text.replace("{name}", safe_name)
-            .replace("{credit}", credit_fmt)
-            .replace("{id}", str(user.id))
-            .replace("{username}", user.username or "None")
-        )
+        _bot_uname = ""
+    brand_fallback = (f"@{_bot_uname}" if _bot_uname else "ربات ما")
+    try:
+        # ربات نمایندگی → نام داخلی‌اش برند است
+        _reseller = await DatabaseManager.get_reseller(bot_id)
+        brand_fallback = ((_reseller or {}).get("name") or brand_fallback)
+    except Exception:
+        pass
+
+    start_var_defaults = {
+        "brand": f"✨ {brand_fallback}",
+        "tagline": "پلتفرم هوشمند سرویس‌های لایو و عضویت تلگرام",
+        "intro": "هر آنچه برای دیده‌شدن صفحهٔ شما لازم است، این‌جاست.",
+        "services": "🎙 حضور در ویس‌کال · 👥 عضویت گروه · 📢 عضویت کانال",
+        "benefits": "⚙️ اجرای مدیریت‌شده · ⏱ زمان‌بندی دقیق · 🛡 کیفیت و پایداری",
+        "guide": "۱. سرویس را انتخاب کنید\n۲. لینک را بفرستید\n۳. نتیجه را تحویل بگیرید",
+        "support": "از مسیر 🆘 پشتیبانی سریع در کنارتان هستیم و پاسخ می‌دهیم.",
+        "support_hours": "همه‌روزه، ۹ صبح تا ۱۲ شب",
+        "cta": "از منوی پایین، شروع کنید 👇",
+    }
+    start_vars = {
+        "name": safe_name,
+        "first_name": safe_name,
+        "id": str(user.id),
+        "user_id": str(user.id),
+        "username": tg_username or str(user.id),
+        "credit": credit_fmt,
+    }
+    for _key, _default in start_var_defaults.items():
+        try:
+            start_vars[_key] = await DatabaseManager.get_setting(
+                f"start_{_key}", _default, bot_id=bot_id)
+        except Exception:
+            start_vars[_key] = _default
+
+    final_text = start_text
+    for _vk, _vv in start_vars.items():
+        final_text = final_text.replace("{" + _vk + "}", str(_vv))
 
     # اگر متن سفارشی ادمین Markdown قدیمی باشد، لایهٔ پریمیوم تبدیلش می‌کند؛
     # برای قالب پیش‌فرض HTML می‌فرستیم تا ظاهر رنگی/تمیز بماند.
