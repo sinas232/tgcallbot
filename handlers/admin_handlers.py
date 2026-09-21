@@ -369,9 +369,15 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
             txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
             for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
             if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            kb_dead = [[InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")], [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            kb_dead = (
+                [[InlineKeyboardButton("🔄 سینک مجدد سشن‌ها (بازگردانی خودکار)", callback_data="acc_resync_all")],
+                 [InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")],
+                 [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            )
             await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_dead))
             return AWAITING_SETTINGS_ACTION
+        elif data == "acc_resync_all":
+            return await account_resync_dead_sessions(update, context, query, bot_id)
         elif data == "dead_del_all":
             accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
             if not accounts:
@@ -407,10 +413,108 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
     dead_count = len(dead_accs)
     txt = (f"🚑 **گزارش سلامت اکانت‌ها**\n\n🤖 کل اکانت‌ها: `{accs_stats['total']}`\n✅ فعال و سالم: `{accs_stats['active']}`\n⛔️ محدود (Limited): `{accs_stats['limited']}`\n💀 غیرفعال (سوخته/نشست بسته): `{dead_count}`\n\n👇 برای مشاهده جزئیات کلیک کنید:")
     kb = [[InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")], [InlineKeyboardButton("⛔️ مشاهده لیست محدودها", callback_data="view_limited_accounts")]]
+    if dead_count > 0:
+        kb.insert(0, [InlineKeyboardButton("🔄 سینک مجدد سشن‌ها (بازگردانی خودکار)", callback_data="acc_resync_all")])
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else:
         if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
         await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
+    return AWAITING_SETTINGS_ACTION
+
+async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE, query, bot_id: int = 1) -> int:
+    """🔄 سینک مجدد اکانت‌های «سوخته» — تست واقعی سشن و بازگردانی خودکار.
+
+    اکانت‌هایی که ظاهراً «سوخته» شده‌اند اما در واقع فقط اتصالشان قطع/ناسازگار
+    شده (نوسان شبکه/WARP، AUTH_KEY_DUPLICATED رقابتی ری‌استارت کانتینر، خطای
+    موقت تلگرام و ...) با یک اتصال سبک (start + get_me) دوباره سنجیده می‌شوند؛
+    اگر سشن زنده جواب بدهد، به‌صورت خودکار to وضعیت ``active`` برمی‌گردند و
+    همزمان پرچم اسپمِ ``dead`` پاک می‌شود تا بدون وقفه وارد پول سفارش شوند.
+
+    امنیت: اتصال دوم با سشنِ مشغول حق ندارد — اگر موتور ویس‌کال سشن را نگه
+    داشته (SessionInUseError)، اکانت بی‌خطر رد می‌شود (NoAuthKeyDuplicated).
+    هرگز چیز بیرون‌کشیدنی علامت نمی‌زنیم: فقط اکانتی که جوابِ مستقیم داده
+    فعال می‌شود؛ بقیه در حالت قبل می‌مانند.
+    """
+    from telegram_client import TelegramAccountClient
+    from services.session_ownership import SessionInUseError
+
+    accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+    if not accounts:
+        await query.edit_message_text(
+            "✅ هیچ اکانت غیرفعالی برای سینک نیست؛ همه سالم‌اند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]),
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    total = len(accounts)
+
+    try:
+        await query.edit_message_text(
+            f"🔄 **سینک مجدد سشن‌ها آغاز شد…**\n\n⏳ تست {total} اکانت غیرفعال با اتصال واقعی؛"
+            " این به‌ازای هر اکانت ~۱–۲ ثانیه طول می‌کشد، لطفاً صبر کنید.\n"
+            f"پیشرفت: 0/{total}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]),
+        )
+    except Exception:
+        pass
+
+    revived: list = []
+    still_dead: list = []
+    busy = 0
+    errors = 0
+    for idx, acc in enumerate(accounts, 1):
+        aid = acc.get('id')
+        try:
+            client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
+            me = await asyncio.wait_for(client.fetch_me(), timeout=45)
+            if me:
+                # سشن جواب داد → فعال‌سازی مجدد و پاک‌سازی پرچم dead اسپمی
+                await DatabaseManager.update_account_status(aid, 'active')
+                try:
+                    if (acc.get('spam_status') or '') == 'dead':
+                        await DatabaseManager.update_account_spam_status(
+                            aid, 'clean', '✅ resynced: session valid')
+                except Exception:
+                    pass
+                revived.append(acc)
+            else:
+                still_dead.append(acc)
+        except SessionInUseError:
+            # سشن در اختیار موتور ویس‌کال است — خطر AUTH_KEY_DUPLICATED؛ رد می‌کنیم.
+            busy += 1
+        except Exception:
+            errors += 1
+        if idx % 5 == 0 or idx == total:
+            try:
+                await query.edit_message_text(
+                    f"🔄 **سینک مجدد سشن‌ها…**\n\n⏳ پیشرفت: {idx}/{total}\n"
+                    f"✅ بازگردانده شد: {len(revived)}\n💀 هنوز مرده: {len(still_dead)}\n"
+                    f"🎙 در ویس کال (رد شد): {busy}\n⚠️ خطای اتصال: {errors}",
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(1.2)
+
+    lines = [
+        "🔄 **گزارش سینک مجدد سشن‌ها**\n",
+        f"🤖 اکانت‌های بررسی‌شده: `{total}`",
+        f"✅ بازگردانده شدند به فعال: **{len(revived)}**",
+        f"💀 هنوز سشنِ مرده: `{len(still_dead)}`",
+        f"🎙 مشغول در ویس‌کال (دست‌نخورده): `{busy}`",
+        f"⚠️ خطای غیرمنتظره: `{errors}`",
+    ]
+    if revived:
+        lines.append("\n🔋 اکانت‌های بازگردانده‌شده از همان لحظه دوباره در پول سفارش‌ها فعال‌اند — نیازی به ثبت سفارش مجدد نیست.")
+    if still_dead:
+        lines.append("💡 اکانت‌های هنوز مرده واقعاً سشن نامعتبر دارند (AUTH_KEY_INVALID/SESSION_REVOKED) — باید دوباره سشن شان را بسازید.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")],
+    ])
+    try:
+        await query.edit_message_text("\n".join(lines), reply_markup=kb)
+    except Exception:
+        await send_safe(context.bot, update.effective_chat.id, "\n".join(lines), reply_markup=kb)
     return AWAITING_SETTINGS_ACTION
 
 @require_admin

@@ -709,14 +709,6 @@ def register_handlers(application: Application) -> None:
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user:
             return
-        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
-        try:
-            _q0 = update.callback_query
-            if _q0 is not None:
-                _u0 = update.effective_user
-                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
-        except Exception:
-            pass
         try:
             # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
             # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
@@ -768,19 +760,21 @@ def register_handlers(application: Application) -> None:
             # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
             return
 
+    # 🔝 هندلر سراسری لغو سفارش کاربر — باید حتماً *قبل* از نگهبان تعمیرات
+    # (CallbackQueryHandler بدون فیلتر) ثبت شود: در یک گروهِ واحد PTB فقط
+    # اولین هندلرِ تطبیق‌یافته را اجرا می‌کند و نگهبانِ catch-all همهٔ
+    # کال‌بک‌ها را می‌بلعد؛ وگرنه دکمهٔ «لغو سفارش» کاربر بی‌پاسخ می‌ماند.
+    application.add_handler(
+        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
+        group=-1,
+    )
+
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
         group=-1,
     )
     application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
     application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
-
-
-    # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
-    application.add_handler(
-        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
-        group=-1,
-    )
 
     # ─────────────────────────────────────────────────────────────
     # 🧭 پیش‌روتر منوها (group=-1): رفع ریشه‌ای «دکمه‌ها جواب نمی‌دهند».
@@ -1026,7 +1020,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
-            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
             CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
         ],
         states={
@@ -1104,7 +1098,7 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
-                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
@@ -1291,7 +1285,7 @@ def register_handlers(application: Application) -> None:
             # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
             CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
             CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
-            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
         ],
         states={
             AWAITING_SELECT_PLAN: [
@@ -1305,7 +1299,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$")]
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
