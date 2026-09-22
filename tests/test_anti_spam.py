@@ -397,5 +397,28 @@ class SingletonInstanceLockTests(unittest.TestCase):
         self.assertLess(i_lock, i_db)
 
 
+class WarpFullTunnelTests(unittest.TestCase):
+    """رگرسیون v2.3.8 — مدیا/UDP ویس‌کال (ntgcalls) پروکسی نمی‌فهمد؛ تنها راهِ
+    عبورش از WARP، تونل کامل لایهٔ۳ (TUN) است. بدون WARP_ENABLE_NAT ایمیج
+    caomingjun/warp صرفاً پروکسی SOCKS5 می‌سازد و ترافیک UDP مستقیم و فیلترشده
+    از IP هاست بیرون می‌زند ← علت ghost/media_transport_lost."""
+
+    def setUp(self):
+        self.compose = _read_source("docker-compose.yml")
+
+    def test_nat_full_tunnel_enabled(self):
+        self.assertIn("WARP_ENABLE_NAT=1", self.compose)
+        self.assertIn("net.ipv4.ip_forward=1", self.compose)
+
+    def test_healthcheck_requires_tun_iface(self):
+        # فقط warp=on از SOCKS5 کافی نیست؛ باید اینترفیس TUN هم موجود باشد.
+        self.assertIn("/sys/class/net/CloudflareWARP", self.compose)
+        self.assertIn("warp=on", self.compose)
+
+    def test_bot_shares_warp_netns(self):
+        # کل ترافیک ربات (از جمله UDP) باید از فضای شبکهٔ warp خارج شود.
+        self.assertIn('network_mode: "service:warp"', self.compose)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
