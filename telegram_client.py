@@ -326,14 +326,20 @@ class TelegramAccountClient:
         except:
             return None
 
-    async def fetch_me(self):
-        """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند.
+    async def fetch_me_status(self):
+        """(ok: bool, reason: str|None, data: dict|None) — مثل fetch_me ولی
+        دلیل شکست را هم دسته‌بندی می‌کند تا ادمین بفهمد چه باید بکند:
 
-        نسخهٔ مقاوم به لغو (cancel-safe): اگر صداکننده (مثلاً با wait_for) این
-        تسک را وسط اتصال بکند، context manager شانسِ اجرای stop() را ندارد و
-        رزروی ad-hoc می‌ریخت و اکانت برای همیشه «مشغول» می‌ماند (وارد ویس‌کال
-        نمی‌شد) و اتصال نیمه‌باز هم می‌توانست سشن را Duplicate کند. اینجا
-        اتصال/قطع را صریح مدیریت می‌کنیم و آزادسازی رزرو در finally تضمین است.
+        * ``None`` — موفق (data برمی‌گردد)
+        * ``duplicated_in_use`` — 406 AUTH_KEY_DUPLICATED: سشن همین حالا در
+          یک پروسس/سرور/پنل دیگری فعال است؛ تا آن نمونه قطع نشود هیچ اتصالی
+          دوام نمی‌آورد (و لاگین مجدد کلید تازه می‌سازد و آن نمونه را می‌کشد).
+        * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
+        * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
+        * ``error`` — سایر خطاها.
+
+        SessionInUseError (سشن در اختیار موتور ویس‌کال) بدون بلع به بیرون
+        پرتاب می‌شود تا صداکننده «مشغول بودن» را با «مرده بودن» اشتباه نگیرد.
         """
         client = None
         try:
@@ -342,14 +348,29 @@ class TelegramAccountClient:
             # لازم نیست و سربار/ریسک زامبی هم دارد.
             await asyncio.wait_for(client.connect(), timeout=40)
             me = await client.get_me()
-            return {
+            return True, None, {
                 'first_name': getattr(me, 'first_name', None),
                 'last_name': getattr(me, 'last_name', None),
                 'username': getattr(me, 'username', None),
             }
+        except SessionInUseError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(f"fetch_me timeout for acc {self.account_id}")
+            return False, "timeout", None
         except Exception as e:
-            logger.warning(f"fetch_me failed for acc {self.account_id}: {e}")
-            return None
+            up = str(e).upper()
+            if "AUTH_KEY_DUPLICATED" in up or "406" in up:
+                reason = "duplicated_in_use"
+            elif any(k in up for k in (
+                "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED", "AUTH_KEY_INVALID",
+                "USER_DEACTIVATED", "401",
+            )):
+                reason = "relogin_required"
+            else:
+                reason = "error"
+            logger.warning(f"fetch_me failed for acc {self.account_id}: {e} -> {reason}")
+            return False, reason, None
         finally:
             if client is not None:
                 try:
@@ -358,6 +379,11 @@ class TelegramAccountClient:
                 except Exception:
                     pass
                 session_ownership.end_ad_hoc(self.account_id)
+
+    async def fetch_me(self):
+        """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""
+        ok, _reason, data = await self.fetch_me_status()
+        return data if ok else None
 
     async def set_privacy(self, key_name, level):
         """

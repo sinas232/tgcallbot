@@ -595,6 +595,9 @@ class OrderExecutor:
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
+	    # شمارش پیاپی 406: سیل «همه به یک خطا می‌میرند» یعنی سشن‌ها در
+	    # پروسس/سرور دیگری زنده‌اند — با abort موج جلوی سوخت بیهوده گرفته می‌شود.
+	    dup406_streak = 0
 	    live = int(vcm.get_active_count(order_id))
 
 	    while self._is_order_active(order_id) and live < target_count:
@@ -735,6 +738,7 @@ class OrderExecutor:
 	                    joined_list.append(res)
 	                    joined_ids.add(aid)
 	                wave_ok += 1
+	                dup406_streak = 0
 	                join_brain.report_result(order_id, OUTCOME_OK)
 	                try:
 	                    self_healing.report("", True, key=f"{order_id}:{aid}")
@@ -780,6 +784,10 @@ class OrderExecutor:
 	                    wave_dead += 1
 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    if "AUTH_KEY_DUPLICATED" in upper:
+	                        dup406_streak += 1
+	                    else:
+	                        dup406_streak = 0
 	                    try:
 	                        await self._mark_account_dead(aid)
 	                    except Exception:
@@ -842,6 +850,18 @@ class OrderExecutor:
 	                    exc_info=True,
 	                )
 	                wave_fail += 1
+
+	        if dup406_streak >= 5:
+	            logger.error(
+	                f"Order {order_id}: {dup406_streak} consecutive AUTH_KEY_DUPLICATED - "
+	                "sessions are alive in ANOTHER process/server; aborting build waves "
+	                "to stop pointless key burns (kill the other instance or re-login)"
+	            )
+	            try:
+	                self.active_orders[order_id]["build_abort_reason"] = "AUTH_KEY_DUPLICATED_SYSTEMIC"
+	            except Exception:
+	                pass
+	            break
 
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))

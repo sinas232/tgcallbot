@@ -350,5 +350,31 @@ class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
         self.assertNotIn("await app.start()", body)
 
 
+class SessionDuplicationDiagnosticsTests(unittest.TestCase):
+    """رگرسیون v2.3.6 — تشخیص «سشن در مکان دیگر فعال است» (406 مداوم):
+
+    وقتی کلید سشن توسط نمونهٔ دیگری (سرور/پنل/پروسس) آنلاین نگه داشته شود،
+    تکرار اتصال فقط ابطالِ مکرر می‌سازد. باید: (۱) resync دلیل شکست را
+    دسته‌بندی کند، (۲) موج ساخت با ۵ پیاپیِ 406 متوقف شود."""
+
+    def test_fetch_me_status_classifies(self):
+        tc = _read_source("telegram_client.py")
+        self.assertIn("async def fetch_me_status", tc)
+        self.assertIn("duplicated_in_use", tc)
+        self.assertIn("relogin_required", tc)
+        self.assertIn("except SessionInUseError", tc)
+
+    def test_resync_reports_duplication_category(self):
+        ah = _read_source("handlers/admin_handlers.py")
+        self.assertIn("fetch_me_status", ah)
+        self.assertIn("dup_elsewhere", ah)
+        self.assertIn("406 AUTH_KEY_DUPLICATED", ah)
+
+    def test_wave_streak_abort_exists(self):
+        exc = _read_source("services/order_executor.py")
+        self.assertGreaterEqual(exc.count("dup406_streak"), 5)
+        self.assertIn("AUTH_KEY_DUPLICATED_SYSTEMIC", exc)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

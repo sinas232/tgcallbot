@@ -459,15 +459,17 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
         pass
 
     revived: list = []
-    still_dead: list = []
+    relogin: list = []       # واقعاً باطل‌شده → فقط لاگین مجدد
+    dup_elsewhere: list = [] # 406: سشن همین حالا جای دیگری فعال است
+    timeouts = 0
     busy = 0
     errors = 0
     for idx, acc in enumerate(accounts, 1):
         aid = acc.get('id')
         try:
             client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
-            me = await asyncio.wait_for(client.fetch_me(), timeout=45)
-            if me:
+            ok, reason, me = await asyncio.wait_for(client.fetch_me_status(), timeout=50)
+            if ok:
                 # سشن جواب داد → فعال‌سازی مجدد و پاک‌سازی پرچم dead اسپمی
                 await DatabaseManager.update_account_status(aid, 'active')
                 try:
@@ -477,8 +479,14 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
                 except Exception:
                     pass
                 revived.append(acc)
+            elif reason == "duplicated_in_use":
+                dup_elsewhere.append(acc)
+            elif reason == "relogin_required":
+                relogin.append(acc)
+            elif reason == "timeout":
+                timeouts += 1
             else:
-                still_dead.append(acc)
+                errors += 1
         except SessionInUseError:
             # سشن در اختیار موتور ویس‌کال است — خطر AUTH_KEY_DUPLICATED؛ رد می‌کنیم.
             busy += 1
@@ -488,8 +496,11 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
             try:
                 await query.edit_message_text(
                     f"🔄 **سینک مجدد سشن‌ها…**\n\n⏳ پیشرفت: {idx}/{total}\n"
-                    f"✅ بازگردانده شد: {len(revived)}\n💀 هنوز مرده: {len(still_dead)}\n"
-                    f"🎙 در ویس کال (رد شد): {busy}\n⚠️ خطای اتصال: {errors}",
+                    f"✅ بازگردانده شد: {len(revived)}\n"
+                    f"⚠️ فعال در مکان دیگر (406): {len(dup_elsewhere)}\n"
+                    f"💀 نیازمند لاگین مجدد: {len(relogin)}\n"
+                    f"🎙 در ویس کال (رد شد): {busy}\n"
+                    f"⏱ تایم‌اوت شبکه: {timeouts} | ⚠️ خطا: {errors}",
                 )
             except Exception:
                 pass
@@ -499,14 +510,22 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
         "🔄 **گزارش سینک مجدد سشن‌ها**\n",
         f"🤖 اکانت‌های بررسی‌شده: `{total}`",
         f"✅ بازگردانده شدند به فعال: **{len(revived)}**",
-        f"💀 هنوز سشنِ مرده: `{len(still_dead)}`",
         f"🎙 مشغول در ویس‌کال (دست‌نخورده): `{busy}`",
-        f"⚠️ خطای غیرمنتظره: `{errors}`",
     ]
+    if dup_elsewhere:
+        lines += [
+            f"⚠️ **{len(dup_elsewhere)} اکانت سشن‌شان همین حالا از جای دیگری (سرور/پنل/پروسس دیگر) آنلاین است** (406 AUTH_KEY_DUPLICATED).",
+            "تا وقتی آن نمونهٔ دیگر قطع نشود، هر اتصال از این ربات بلافاصله باطل می‌شود. آن نمونه را پیدا و خاموش کنید؛"
+            " یا روی همین اکانت‌ها «لاگین مجدد» بزنید تا کلید تازه ساخته شود و نسخهٔ دیگر نابود شود.",
+        ]
+    if relogin:
+        lines.append(f"💀 `{len(relogin)}` اکانت واقعاً باطل شده‌اند (SESSION_REVOKED/401) — باید دوباره سشن شان را بسازید (لاگین مجدد).")
+    if timeouts:
+        lines.append(f"⏱ `{timeouts}` اکانت به‌خاطر کندی شبکه/WARP تایم‌اوت شدند — کمی بعد دوباره سینک کنید.")
+    if errors:
+        lines.append(f"⚠️ `{errors}` خطای غیرمنتظره — لاگ سرور را ببینید.")
     if revived:
         lines.append("\n🔋 اکانت‌های بازگردانده‌شده از همان لحظه دوباره در پول سفارش‌ها فعال‌اند — نیازی به ثبت سفارش مجدد نیست.")
-    if still_dead:
-        lines.append("💡 اکانت‌های هنوز مرده واقعاً سشن نامعتبر دارند (AUTH_KEY_INVALID/SESSION_REVOKED) — باید دوباره سشن شان را بسازید.")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")],
