@@ -376,5 +376,26 @@ class SessionDuplicationDiagnosticsTests(unittest.TestCase):
         self.assertIn("AUTH_KEY_DUPLICATED_SYSTEMIC", exc)
 
 
+class SingletonInstanceLockTests(unittest.TestCase):
+    """رگرسیون v2.3.7 — قفل تک‌نمونه (ضدِ AUTH_KEY_DUPLICATED ناشی از
+    اجرای هم‌زمان دو کپی ربات، مثل `python main.py` دستی کنار کانتینر)."""
+
+    def setUp(self):
+        self.src = _read_source("main.py")
+
+    def test_lock_function_and_call(self):
+        self.assertIn("def _acquire_instance_singleton_lock", self.src)
+        self.assertIn("_acquire_instance_singleton_lock()", self.src)
+        self.assertIn(".bot_instance.lock", self.src)
+        self.assertIn("fcntl.flock", self.src)
+        self.assertIn("LOCK_EX", self.src)
+
+    def test_lock_called_before_db_init(self):
+        # قبل از هر اتصال/دی‌بی: نمونهٔ دوم نباید اصلاً به پول سشن برسد.
+        i_lock = self.src.index("_acquire_instance_singleton_lock()\n")
+        i_db = self.src.index("await DatabaseManager.init_db()", i_lock)
+        self.assertLess(i_lock, i_db)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1366,8 +1366,68 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(account_picker_close_callback, pattern=r"^acc_pickclose$"), group=0)
 
 
+# ─────────────────────────────────────────────────────────────
+# 🔒 قفل تک‌نمونه‌ای (singleton) — جلوی فاجعهٔ AUTH_KEY_DUPLICATED
+#
+# ریشهٔ مستندِ سیل 406 (مشاهده‌شده در سرور): یک `python main.py` مستقیم روی
+# هاست (خارج از داکر) کنار کانتینر بالا مانده بود و هر دو با سشن‌های مشترک
+# وصل می‌شدند؛ تلگرام کلید تکراری را بازی‌خورده می‌کرد و ده‌ها اکانت
+# پشت سر هم از سشن بیرون پرتاب شدند.
+#
+# این قفل OS-level (flock) روی همان فایلِ مشترک هاست و کانتینر
+# (./data/.bot_instance.lock — volume `.:/app` هر دو را به یک‌جا می‌بندد)
+# کار می‌کند: هر پروسسِ دوم، به‌جای وصل‌شدن و سوزاندن اکانت‌ها، با هشدارِ
+# بلند صبر می‌کند تا نمونهٔ قبلی آزاد شود. قفل با مرگ پروسس خودکار آزاد
+# می‌شود (بدون lock بیایه بعد از kill/reboot).
+_INSTANCE_LOCK_FILE = None
+
+
+def _acquire_instance_singleton_lock() -> None:
+    """قفل تک‌نمونه را بگیر؛ در صورت نبود flock (ویندوز/خطا) fail-open."""
+    global _INSTANCE_LOCK_FILE
+    try:
+        import fcntl
+    except Exception:
+        logger.warning("instance-lock: fcntl unavailable on this platform (skipped)")
+        return
+    try:
+        os.makedirs("data", exist_ok=True)
+        fh = open(os.path.join("data", ".bot_instance.lock"), "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.critical(
+                "🔒🔴 یک نمونهٔ دیگر از ربات همین حالا در حال اجراست "
+                "(data/.bot_instance.lock قفل است). اجرای هم‌زمانِ دو نسخه "
+                "با سشن‌های مشترک = AUTH_KEY_DUPLICATED و ابطال انبوه سشن‌ها. "
+                "این نمونه صبر می‌کند تا نمونهٔ قبلی آزاد شود… "
+                "(روی هاست بگرد: ps aux | grep 'python main.py')"
+            )
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    logger.critical("🔒 نمونهٔ قبلی آزاد شد — این نمونه ادامه می‌دهد.")
+                    break
+                except OSError:
+                    time.sleep(30)
+                    logger.critical(
+                        "🔒 هنوز در انتظار: نمونهٔ دیگر ربات قفل تک‌نمونه را نگه داشته…"
+                    )
+        _INSTANCE_LOCK_FILE = fh
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fh.flush()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"instance-lock skipped: {e}")
+
+
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
+    _acquire_instance_singleton_lock()
     # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
     # docker kill -s USR1 telegram_bot_container
     try:
