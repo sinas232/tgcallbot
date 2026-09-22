@@ -738,7 +738,7 @@ class OrderExecutor:
 	                    joined_list.append(res)
 	                    joined_ids.add(aid)
 	                wave_ok += 1
-	                dup406_streak = 0
+	                dup406_streak = 0  # success breaks the streak
 	                join_brain.report_result(order_id, OUTCOME_OK)
 	                try:
 	                    self_healing.report("", True, key=f"{order_id}:{aid}")
@@ -769,32 +769,45 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
-	                # NOTE: AUTH_KEY_DUPLICATED means Telegram INVALIDATED the
-	                # session key (used in 2 places at once) — the account is
-	                # burned until re-login, so mark it dead immediately instead
-	                # of wasting retries/backoffs on a session that can never
-	                # connect again.
+	                # v2.3.9: AUTH_KEY_DUPLICATED (406) یعنی «همین لحظه جای دیگری
+	                # با همین کلید آنلاین است» — کلید باطل نشده و اکانت به‌هیچ‌وجه
+	                # غیرفعال نمی‌شود؛ فقط برای همین سفارش کنار گذاشته می‌شود و
+	                # سیلاب 406 با همان شمارندهٔ متوالی متوقف می‌ماند.
+	                if "AUTH_KEY_DUPLICATED" in upper or "406" in upper:
+	                	dead_count += 1  # برای آمار سفارش (نه غیرفعال‌سازی دیتابیس)
+	                	wave_dead += 1
+	                	wave_fail += 1
+	                	self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                	self._voice_banned.setdefault(order_id, set()).add(aid)
+	                	dup406_streak += 1
+	                	try:
+	                		await DatabaseManager.update_account_spam_status(
+	                			aid, "cooldown", "406 duplicate-in-use (transient, NOT disabled)")
+	                	except Exception:
+	                		pass
+	                	logger.warning(
+	                		f"Order {order_id}: account {aid} 406 duplicate-in-use - "
+	                		"transient; account NOT marked dead (external live connection)"
+	                	)
+	                	join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                	continue
 	                if status == "dead" or any(x in upper for x in (
-	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-	                    "AUTH_KEY_DUPLICATED",
-	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
+	                	"SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+	                	"USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
 	                )):
-	                    # Account itself is dead — mark inactive & replace.
-	                    dead_count += 1
-	                    wave_dead += 1
-	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
-	                    self._voice_banned.setdefault(order_id, set()).add(aid)
-	                    if "AUTH_KEY_DUPLICATED" in upper:
-	                        dup406_streak += 1
-	                    else:
-	                        dup406_streak = 0
-	                    try:
-	                        await self._mark_account_dead(aid)
-	                    except Exception:
-	                        pass
-	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
-	                    wave_fail += 1
-	                    continue
+	                	dup406_streak = 0  # non-dup fatal event breaks the streak
+	                	# Account itself is dead — mark inactive & replace.
+	                	dead_count += 1
+	                	wave_dead += 1
+	                	self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                	self._voice_banned.setdefault(order_id, set()).add(aid)
+	                	try:
+	                		await self._mark_account_dead(aid)
+	                	except Exception:
+	                		pass
+	                	join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                	wave_fail += 1
+	                	continue
 
 	                outcome = join_brain.classify_message(msg)
 	                if outcome == OUTCOME_FLOOD:
@@ -1264,7 +1277,7 @@ class OrderExecutor:
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
 					if ok: return {"success": True, "acc": acc, "chat_id": cid}
-					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):
+					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 						await self._mark_account_dead(acc["id"])
 						return {"success": False, "status": "dead"}
 					return {"success": False, "status": "failed", "msg": msg, "retry_managed": True}
@@ -1276,7 +1289,7 @@ class OrderExecutor:
 				# دقیقاً با همان chat_id زمان‌بندی شود (وابسته به حدس لینک نباشد).
 				_cid = getattr(client, "last_joined_chat_id", None) if ok else None
 				if ok: return {"success": True, "acc": acc, "chat_id": _cid}
-				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):
+				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 					await self._mark_account_dead(acc["id"])
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}

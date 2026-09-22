@@ -464,6 +464,8 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
     timeouts = 0
     busy = 0
     errors = 0
+    dup_streak = 0
+    aborted = 0
     for idx, acc in enumerate(accounts, 1):
         aid = acc.get('id')
         try:
@@ -479,13 +481,18 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
                 except Exception:
                     pass
                 revived.append(acc)
+                dup_streak = 0
             elif reason == "duplicated_in_use":
                 dup_elsewhere.append(acc)
+                dup_streak += 1
             elif reason == "relogin_required":
+                dup_streak = 0
                 relogin.append(acc)
             elif reason == "timeout":
+                dup_streak = 0
                 timeouts += 1
             else:
+                dup_streak = 0
                 errors += 1
         except SessionInUseError:
             # سشن در اختیار موتور ویس‌کال است — خطر AUTH_KEY_DUPLICATED؛ رد می‌کنیم.
@@ -504,6 +511,13 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
                 )
             except Exception:
                 pass
+        if dup_streak >= 5:
+            aborted = total - idx
+            logger.critical(
+                "resync: %s consecutive 406s — aborting remaining %s probes "
+                "(probing duplicated keys risks burning BOTH sides)",
+                dup_streak, aborted)
+            break
         await asyncio.sleep(1.2)
 
     lines = [
@@ -514,10 +528,12 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
     ]
     if dup_elsewhere:
         lines += [
-            f"⚠️ **{len(dup_elsewhere)} اکانت سشن‌شان همین حالا از جای دیگری (سرور/پنل/پروسس دیگر) آنلاین است** (406 AUTH_KEY_DUPLICATED).",
-            "تا وقتی آن نمونهٔ دیگر قطع نشود، هر اتصال از این ربات بلافاصله باطل می‌شود. آن نمونه را پیدا و خاموش کنید؛"
-            " یا روی همین اکانت‌ها «لاگین مجدد» بزنید تا کلید تازه ساخته شود و نسخهٔ دیگر نابود شود.",
+            f"⚠️ **{len(dup_elsewhere)} اکانت کلید سالم دارند ولی همین لحظه از جای دیگری آنلاین‌اند** (406 AUTH_KEY_DUPLICATED) — کلید باطل نشده و از v2.3.9 دیگر غیرفعال هم نمی‌شوند.",
+            "مقصر قطعی: یک اتصالِ زندهٔ دیگر با همین کلیدها. محتمل‌ترین‌ها: ۱) سرور/هاست قدیمی که هنوز روشن است و کانتینر رباتش (restart: always) بالاست ۲) پروسس stray روی همین هاست (`ps aux | grep main.py`) ۳) فروشنده‌ای که همان سشن را به چند نفر فروخته.",
+            "راه‌حل قطعی برای هر اکانت: «دریفات کد / لاگین مجدد» از پنل — با کلیدِ تازه، اتصال این ربات دیگر با نسخهٔ بیگانه تداخل نمی‌کند. بعد از قطع‌کردن نمونهٔ بیگانه، این سینک را دوباره بزنید تا خودکار فعال شوند.",
         ]
+    if aborted:
+        lines.append(f"🛑 برای جلوگیری از سوختن کلیدها، پس از ۵ خطای 406 متوالی، {aborted} پروب باقی‌مانده انجام نشد (توقف محافظتی).")
     if relogin:
         lines.append(f"💀 `{len(relogin)}` اکانت واقعاً باطل شده‌اند (SESSION_REVOKED/401) — باید دوباره سشن شان را بسازید (لاگین مجدد).")
     if timeouts:

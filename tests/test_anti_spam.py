@@ -420,5 +420,54 @@ class WarpFullTunnelTests(unittest.TestCase):
         self.assertIn('network_mode: "service:warp"', self.compose)
 
 
+class NeverAutoDisableOn406Tests(unittest.TestCase):
+    """رگرسیون v2.3.9 — 406 AUTH_KEY_DUPLICATED یعنی «اتصال زندهٔ هم‌زمان»
+    نه «کلید باطل»؛ غیرفعال‌سازی خودکار انبوه اکانت‌ها به‌خاطر 406 ممنوع.
+    فقط نشانه‌های مرگ واقعی (revoked/unregistered/deactivated/401) میتوانند
+    اکانت را inactive کنند."""
+
+    def test_vcm_dead_mark_gated_by_fatal_markers(self):
+        vcm = _read_source("services/voice_call_manager.py")
+        self.assertIn("_FATAL_SESSION_MARKERS", vcm)
+        self.assertIn("_is_fatal_session_reason", vcm)
+        self.assertIn("NOT disabled", vcm)
+        # نزدیکِ update_account_status(inactive) باید ابتدا فیلتر fatal بیاید
+        i_fatal = vcm.index("_is_fatal_session_reason(reason)")
+        i_inactive = vcm.index('update_account_status(int(account_id), "inactive")')
+        self.assertLess(i_fatal, i_inactive)
+        # شرط عکس: اگر fatal نیست return می‌خورد قبل از inactive
+        self.assertIn("if not _is_fatal_session_reason(reason):", vcm)
+
+    def test_health_checker_disables_only_on_fatal(self):
+        hc = _read_source("services/health_checker.py")
+        # بلوک غیرفعال‌سازی فقط بعد از محاسبه fatal و بدون AUTH_KEY_DUPLICATED در fatal
+        fatal_part = hc.split("fatal = any(k in up for k in (", 1)[1].split("))", 1)[0]
+        self.assertNotIn("AUTH_KEY_DUPLICATED", fatal_part)
+        self.assertIn('"406" in up', hc)
+        self.assertIn("transient", hc)
+        self.assertIn("check_spambot()", hc)
+        # نتیجهٔ موفق باید ذخیره شود (بلوک مرده قبلی حذف شده)
+        self.assertIn("await DatabaseManager.update_account_spam_status(account['id'], status, result_text)", hc)
+
+    def test_order_flow_never_disables_on_dup(self):
+        exe = _read_source("services/order_executor.py")
+        # لیست fatalِ تکی دیگر ۴۰۶/duplicated ندارد
+        self.assertGreaterEqual(
+            exe.count('["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]'), 2)
+        old = 'if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):'
+        self.assertNotIn(old, exe)
+        # شاخهٔ گذرای 406 در موج موجود است و _mark_account_dead در آن نیست
+        dup_branch = exe.split('if "AUTH_KEY_DUPLICATED" in upper or "406" in upper:', 1)[1].split("continue", 1)[0]
+        self.assertNotIn("_mark_account_dead", dup_branch)
+        self.assertIn("dup406_streak += 1", dup_branch)
+        self.assertIn("NOT disabled", exe)
+
+    def test_resync_protective_abort(self):
+        adm = _read_source("handlers/admin_handlers.py")
+        self.assertIn("dup_streak", adm)
+        self.assertIn("aborted = total - idx", adm)
+        self.assertIn("consecutive 406s", adm)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

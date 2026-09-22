@@ -214,15 +214,48 @@ GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
 
 
-async def _mark_session_dead(account_id: int, reason: str) -> None:
-    """اکانت را بعد از خطای مرگبار سشن (406/401/revoked) از چرخه خارج می‌کند.
+# فقط این نشانه‌ها یعنی کلید سشن واقعاً از سمت تلگرام نابود است (کلاس‌های
+# Kurigram بدون آندرلاین هم پوشش داده می‌شوند: AuthKeyInvalid → AUTHKEYINVALID).
+_FATAL_SESSION_MARKERS = (
+    "SESSION_REVOKED", "SESSIONREVOKED",
+    "AUTH_KEY_UNREGISTERED", "AUTHKEYUNREGISTERED",
+    "AUTH_KEY_INVALID", "AUTHKEYINVALID",
+    "USER_DEACTIVATED", "USERDEACTIVATED",
+    "401", "UNAUTHORIZED",
+)
 
-    AUTH_KEY_DUPLICATED یعنی کلید از سمت سرور باطل شده و دیگر هیچ اتصالی با
-    آن ممکن نیست؛ ادامهٔ retry/recovery فقط موجب چرخهٔ «چندبار از سشن خارج
-    شدن» می‌شود. یک‌بار علامت می‌زنیم و تمام (idempotent).
+
+def _is_fatal_session_reason(reason: str) -> bool:
+    up = (reason or "").upper()
+    return any(m in up for m in _FATAL_SESSION_MARKERS)
+
+
+async def _mark_session_dead(account_id: int, reason: str) -> None:
+    """اکانت را فقط در «مرگ واقعی کلید» (401/revoked/unregistered/deactivated)
+    از چرخه خارج می‌کند — هرگز برای 406.
+
+    AUTH_KEY_DUPLICATED (406) به‌معنای «همین لحظه یک اتصالِ زندهٔ دیگر با
+    همین کلید وجود دارد» است — نه باطل‌شدن کلید. غیرفعال‌کردنِ انبوه اکانت‌ها
+    به‌خاطر 406 دقیقاً همان باگی بود که استخر اکانت‌ها را خالی می‌کرد در حالی
+    که کلیدها سالم بودند (Resync آن‌ها را duplicated می‌دید نه relogin).
+    در این حالت فقط یادداشت نرم می‌گذاریم؛ اکانت active می‌ماند و سفارش‌های
+    بعدی وقتی آن نمونهٔ بیگانه قطع شد دوباره از آن استفاده می‌کنند.
+    هرگز چیز بیرون‌کشیدنی علامت نمی‌زنیم مگر تلگرام صراحتاً گفته باشد کلید رفته.
     """
     try:
         from database import DatabaseManager as _DB
+        if not _is_fatal_session_reason(reason):
+            logger.warning(
+                "Session %s held elsewhere (%s) — account NOT disabled; "
+                "stop the other live connection (old server/stray process/"
+                "panel/vendor session) or re-login to mint a fresh key.",
+                account_id, reason,
+            )
+            await _DB.update_account_spam_status(
+                int(account_id), "cooldown",
+                f"duplicate-in-use transient, NOT disabled ({reason})"[:180],
+            )
+            return
         await _DB.update_account_status(int(account_id), "inactive")
         await _DB.update_account_spam_status(
             int(account_id), "dead", f"fatal session error ({reason})")
