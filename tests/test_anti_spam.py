@@ -305,5 +305,50 @@ class HandlerGroupRoutingTests(unittest.TestCase):
         self.assertNotIn("_maintenance_guard, block=False", self.src)
 
 
+class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
+    """رگرسیون v2.3.5 — چرخهٔ «چندبار از سشن خارج شدن» (AUTH_KEY_DUPLICATED):
+
+    کلید باطل‌شدهٔ 406 باید مرگبار تلقی شود (یک‌بار علامت مرده، بدون retry)،
+    ساخت کلاینت‌ها pacing داشته باشد، و رزروهای ad-hoc لیک‌شده با TTL
+    منقضی شوند تا اکانت‌ها «وارد ویس‌کال نشدن» نگیرند."""
+
+    def test_duplicated_is_fatal_everywhere(self):
+        vcm = _read_source("services/voice_call_manager.py")
+        self.assertIn("AuthKeyDuplicated", vcm)
+        self.assertIn("_mark_session_dead", vcm)
+        exc = _read_source("services/order_executor.py")
+        self.assertGreaterEqual(exc.count("AUTH_KEY_DUPLICATED"), 3)
+        brain = _read_source("services/join_brain.py")
+        self.assertIn("AUTH_KEY_DUPLICATED", brain)
+        hc = _read_source("services/health_checker.py")
+        self.assertIn("AUTH_KEY_DUPLICATED", hc)
+
+    def test_client_create_is_paced_and_tight(self):
+        vcm = _read_source("services/voice_call_manager.py")
+        self.assertIn("'CLIENT_CREATE_CONCURRENCY', 2", vcm)
+        self.assertGreaterEqual(vcm.count("random.uniform(0.8, 2.0)"), 2)
+
+    def test_adhoc_reservation_has_ttl_and_bounded_acquire(self):
+        so = _read_source("services/session_ownership.py")
+        self.assertIn("SESSION_ADHOC_TTL_SEC", so)
+        self.assertIn("VOICE_ACQUIRE_WAIT_SEC", so)
+        self.assertIn("_sweep_ad_hoc", so)
+
+    def test_fetch_me_is_cancel_safe(self):
+        tc = _read_source("telegram_client.py")
+        start = tc.index("async def fetch_me")
+        body = tc[start:start + 2600]
+        self.assertIn("finally:", body)
+        self.assertIn("end_ad_hoc", body)
+        self.assertIn("client.connect()", body)
+        self.assertNotIn("async with await self.get_client", body)
+
+    def test_spambot_no_double_start(self):
+        tc = _read_source("telegram_client.py")
+        start = tc.index("async def check_spambot")
+        body = tc[start:start + 1500]
+        self.assertNotIn("await app.start()", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

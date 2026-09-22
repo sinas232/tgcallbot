@@ -113,7 +113,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.3.4"', src)
+        self.assertIn('BOT_VERSION = "2.3.5"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -141,8 +141,8 @@ class StopAllPacingLogicTests(unittest.TestCase):
             pyro.Client = type("Client", (), {})
             err = _mod("pyrogram.errors")
             for name in (
-                "AuthKeyInvalid", "AuthKeyUnregistered", "FloodWait",
-                "GroupCallInvalid", "RPCError", "SessionRevoked",
+                "AuthKeyDuplicated", "AuthKeyInvalid", "AuthKeyUnregistered",
+                "FloodWait", "GroupCallInvalid", "RPCError", "SessionRevoked",
                 "UserAlreadyParticipant",
             ):
                 setattr(err, name, type(name, (Exception,), {}))

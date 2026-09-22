@@ -1244,7 +1244,7 @@ class OrderExecutor:
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
 					if ok: return {"success": True, "acc": acc, "chat_id": cid}
-					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
+					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):
 						await self._mark_account_dead(acc["id"])
 						return {"success": False, "status": "dead"}
 					return {"success": False, "status": "failed", "msg": msg, "retry_managed": True}
@@ -1256,7 +1256,7 @@ class OrderExecutor:
 				# دقیقاً با همان chat_id زمان‌بندی شود (وابسته به حدس لینک نباشد).
 				_cid = getattr(client, "last_joined_chat_id", None) if ok else None
 				if ok: return {"success": True, "acc": acc, "chat_id": _cid}
-				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
+				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):
 					await self._mark_account_dead(acc["id"])
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}

@@ -49,6 +49,7 @@ from collections import deque
 
 from pyrogram import Client
 from pyrogram.errors import (
+    AuthKeyDuplicated,
     AuthKeyInvalid,
     AuthKeyUnregistered,
     FloodWait,
@@ -204,9 +205,29 @@ VOICE_FLOOD_INLINE_WAIT_MAX = max(
     0, int(getattr(Config, "VOICE_FLOOD_INLINE_WAIT_MAX", 30))
 )
 
-CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
+# 406/AUTH_KEY_DUPLICATED بعد از هر ری‌استارت/کرش دیده می‌شد: ساخت هم‌زمانِ
+# زیادی کلاینت (پیش‌فرض قدیمی ۸) در لحظهٔ resume ده‌ها اتصال تکراری برای
+# کلیدهای نیمه‌بازِ قبلی می‌ساخت و تلگرام کلیدها را باطل می‌کرد. پیش‌فرض
+# محافظه‌کار ۲ + مکث تصادفی بین هر ساخت — از .env قابل تنظیم است.
+CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 2)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
+
+
+async def _mark_session_dead(account_id: int, reason: str) -> None:
+    """اکانت را بعد از خطای مرگبار سشن (406/401/revoked) از چرخه خارج می‌کند.
+
+    AUTH_KEY_DUPLICATED یعنی کلید از سمت سرور باطل شده و دیگر هیچ اتصالی با
+    آن ممکن نیست؛ ادامهٔ retry/recovery فقط موجب چرخهٔ «چندبار از سشن خارج
+    شدن» می‌شود. یک‌بار علامت می‌زنیم و تمام (idempotent).
+    """
+    try:
+        from database import DatabaseManager as _DB
+        await _DB.update_account_status(int(account_id), "inactive")
+        await _DB.update_account_spam_status(
+            int(account_id), "dead", f"fatal session error ({reason})")
+    except Exception:
+        pass
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -1877,7 +1898,12 @@ class VoiceCallManager:
                             **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
-                    except Exception:
+                        # مکث کوتاه تصادفی: اتصال‌های پشت سر هم در حجم بالا
+                        # (مثلاً resume بعد از ری‌استارت کانتینر) الگوی سیلابی
+                        # می‌سازند که تلگرام را به باطل‌کردن کلید (406) حساس
+                        # می‌کند.
+                        await asyncio.sleep(random.uniform(0.8, 2.0))
+                    except Exception as _ce:
                         # Best-effort teardown of the half-open client: without
                         # this, our own lingering connection can DUPLICATE the
                         # session key of the next retry and burn a healthy
@@ -1893,6 +1919,12 @@ class VoiceCallManager:
                             pass
                         if held:
                             session_ownership.release_voice(account_id)
+                        if isinstance(_ce, AuthKeyDuplicated):
+                            # 406: کلید از سمت سرور باطل است؛ علامت مرده تا
+                            # حلقه‌های retry/recovery دوباره همین کلید مرده را
+                            # سرو نکنند و اکانت پیاپی «از سشن خارج» نشود.
+                            await _mark_session_dead(
+                                account_id, "AUTH_KEY_DUPLICATED client_start")
                         raise
                     self.pyrogram_clients[account_id] = app
 
@@ -3565,6 +3597,8 @@ class VoiceCallManager:
                                 **_client_device_fingerprint(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)
+                            # پیسینگ تصادفی بین ساخت کلاینت‌ها (ضد سیلاب 406 در resume).
+                            await asyncio.sleep(random.uniform(0.8, 2.0))
                         except FloodWait as e:
                             if held:
                                 session_ownership.release_voice(account_id)
@@ -3576,6 +3610,13 @@ class VoiceCallManager:
                             self._vc_event_log(None, account_id, "warmup_floodwait",
                                                {"wait_s": wait_s})
                             return
+                        except AuthKeyDuplicated as e:
+                            if held:
+                                session_ownership.release_voice(account_id)
+                            self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
+                            # خطای مرگبار: اکانت را از چرخهٔ warmup خارج/مرده علامت بزن.
+                            await _mark_session_dead(account_id, f"AUTH_KEY_DUPLICATED warmup: {e}")
+                            return
                         except Exception:
                             if held:
                                 session_ownership.release_voice(account_id)
@@ -3583,8 +3624,9 @@ class VoiceCallManager:
                         self.pyrogram_clients[account_id] = app
                         self._session_cache[account_id] = session_string
                         warmed += 1
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as _se:
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
+                await _mark_session_dead(account_id, f"warmup {type(_se).__name__}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -3658,8 +3700,10 @@ class VoiceCallManager:
             logger.info(f"[VoiceScheduler] Order {order_id}: creating Pyrogram client for account {account_id}")
             try:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
+                # مرگبار است (حتی 406): اکانت از چرخهٔ سفارش‌ها خارج و علامت می‌خورد.
+                await _mark_session_dead(account_id, f"start_call {type(e).__name__}")
                 return False, f"SESSION_REVOKED: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)

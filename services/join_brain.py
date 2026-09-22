@@ -64,6 +64,7 @@ def classify_message(msg: str) -> str:
     text = (msg or "").upper()
     if any(k in text for k in (
         "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
+        "AUTH_KEY_DUPLICATED", "406",
         "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401", "DEAD",
     )):
         return OUTCOME_DEAD

@@ -33,7 +33,7 @@ class HealthChecker:
             return
             
             # 🔥 بررسی مرگ اکانت
-            if "SESSION_REVOKED" in result_text or "Auth Key Invalid" in result_text or "UserDeactivated" in result_text:
+            if "SESSION_REVOKED" in result_text or "Auth Key Invalid" in result_text or "UserDeactivated" in result_text or "AUTH_KEY_DUPLICATED" in result_text:
                 logger.warning(f"⚰️ Account {account['id']} is DEAD. Disabling...")
                 await DatabaseManager.update_account_status(account['id'], 'inactive')
                 # وضعیت اسپم هم روی error ست شود

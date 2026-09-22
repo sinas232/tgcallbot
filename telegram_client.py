@@ -233,9 +233,9 @@ class TelegramAccountClient:
     async def check_spambot(self):
         """بررسی وضعیت محدودیت اکانت (SpamBot)"""
         try:
+            # توجه: async with خودش start/stop امن انجام می‌دهد؛ فراخوانی دوبارهٔ
+            # app.start() داخلش (نسخهٔ قبلی) دیسپچر را دوبار بالا می‌آورد.
             async with await self.get_client(no_updates=False) as app:
-                if not app.is_connected: await app.start()
-                
                 # ارسال پیام استارت به بات
                 try:
                     await app.send_message("SpamBot", "/start")
@@ -327,18 +327,37 @@ class TelegramAccountClient:
             return None
 
     async def fetch_me(self):
-        """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""
+        """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند.
+
+        نسخهٔ مقاوم به لغو (cancel-safe): اگر صداکننده (مثلاً با wait_for) این
+        تسک را وسط اتصال بکند، context manager شانسِ اجرای stop() را ندارد و
+        رزروی ad-hoc می‌ریخت و اکانت برای همیشه «مشغول» می‌ماند (وارد ویس‌کال
+        نمی‌شد) و اتصال نیمه‌باز هم می‌توانست سشن را Duplicate کند. اینجا
+        اتصال/قطع را صریح مدیریت می‌کنیم و آزادسازی رزرو در finally تضمین است.
+        """
+        client = None
         try:
-            async with await self.get_client() as app:
-                me = await app.get_me()
-                return {
-                    'first_name': getattr(me, 'first_name', None),
-                    'last_name': getattr(me, 'last_name', None),
-                    'username': getattr(me, 'username', None),
-                }
+            client = await self.get_client()
+            # connect به‌تنهایی برای get_me کافی است؛ start کامل (دیسپچر رخداد)
+            # لازم نیست و سربار/ریسک زامبی هم دارد.
+            await asyncio.wait_for(client.connect(), timeout=40)
+            me = await client.get_me()
+            return {
+                'first_name': getattr(me, 'first_name', None),
+                'last_name': getattr(me, 'last_name', None),
+                'username': getattr(me, 'username', None),
+            }
         except Exception as e:
             logger.warning(f"fetch_me failed for acc {self.account_id}: {e}")
             return None
+        finally:
+            if client is not None:
+                try:
+                    # shield: حتی اگر همین تسک لغو شود، قطع تمیز اتصال به پایان برسد.
+                    await asyncio.shield(asyncio.wait_for(client.disconnect(), timeout=10))
+                except Exception:
+                    pass
+                session_ownership.end_ad_hoc(self.account_id)
 
     async def set_privacy(self, key_name, level):
         """
