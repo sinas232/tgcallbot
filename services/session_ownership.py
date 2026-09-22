@@ -33,9 +33,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Dict, Set
+import time
+from typing import Dict
 
 logger = logging.getLogger(__name__)
+
+# رزروی ad-hoc که به‌هر دلیلی (مثلاً لغو تسک وسط اتصال — wait_for/تایم‌اوت)
+# آزاد نشده باشد، نباید اکانت را «برای همیشه» قفل کند؛ آن‌وقت اکانت‌ها هنگام
+# join ویس‌کال در انتظار می‌مانند و «وارد ویس‌کال نمی‌شوند». هر رزرو یک TTL
+# دارد (پیش‌فرض ۵ دقیقه — مسیرهای کام سالم، چندثانیه‌ای‌اند) و در دسترسی‌ها
+# به‌صورت تنبل جارو می‌شود. با env قابل تغییر است.
+AD_HOC_TTL_SEC = float(os.getenv("SESSION_ADHOC_TTL_SEC", "300"))
+# صبر acquire_voice روی پایان رزروهای ad-hoc: محدود و قابل‌پیش‌بینی؛ سپس خطای
+# کنترل‌شدهٔ SessionInUseError (به‌جای هنگ بی‌نهایت که سفارش را گیر می‌انداخت).
+ACQUIRE_WAIT_SEC = float(os.getenv("VOICE_ACQUIRE_WAIT_SEC", "90"))
 
 
 class SessionInUseError(RuntimeError):
@@ -68,7 +79,7 @@ class SessionInUseError(RuntimeError):
 class SessionOwnership:
     def __init__(self) -> None:
         self._voice_refs: Dict[int, int] = {}
-        self._ad_hoc: Set[int] = set()
+        self._ad_hoc: Dict[int, float] = {}
 
     @staticmethod
     def enabled() -> bool:
@@ -78,6 +89,20 @@ class SessionOwnership:
             )
         except Exception:
             return True
+
+    def _sweep_ad_hoc(self) -> None:
+        """رزروهای ad-hoc کهنه (لیک‌شده) را منقضی می‌کند."""
+        try:
+            now = time.monotonic()
+            stale = [aid for aid, ts in self._ad_hoc.items() if now - ts > AD_HOC_TTL_SEC]
+            for aid in stale:
+                self._ad_hoc.pop(aid, None)
+                logger.warning(
+                    "[SessionOwnership] acc=%s stale ad-hoc reservation expired (>%ss)",
+                    aid, int(AD_HOC_TTL_SEC),
+                )
+        except Exception:
+            pass
 
     def is_voice_held(self, account_id: int) -> bool:
         return self._voice_refs.get(int(account_id), 0) > 0
@@ -89,18 +114,26 @@ class SessionOwnership:
     async def acquire_voice(self, account_id: int) -> bool:
         """Reserve the session exclusively for the long-lived voice client.
 
-        Waits for any short ad-hoc operation to finish first. Reference
-        counted: only the FIRST acquisition creates the hold, so client
-        warm-up and the join path can nest acquisitions. Returns True when
-        this call created the hold.
+        Waits (bounded) for any short ad-hoc operation to finish first.
+        Reference counted: only the FIRST acquisition creates the hold, so
+        client warm-up and the join path can nest acquisitions. Returns True
+        when this call created the hold. Raises SessionInUseError instead of
+        hanging forever if the ad-hoc user does not finish in time.
         """
         account_id = int(account_id)
         refs = self._voice_refs.get(account_id, 0)
         if refs > 0:
             self._voice_refs[account_id] = refs + 1
             return False
-        # Wait out any in-flight ad-hoc client (they live only seconds).
-        while account_id in self._ad_hoc:
+        # Wait out any in-flight ad-hoc client (they live only seconds), with
+        # a hard ceiling + stale-reservation sweeps so nothing hangs forever.
+        deadline = time.monotonic() + ACQUIRE_WAIT_SEC
+        while True:
+            self._sweep_ad_hoc()
+            if account_id not in self._ad_hoc:
+                break
+            if time.monotonic() >= deadline:
+                raise SessionInUseError(account_id, "adhoc")
             await asyncio.sleep(0.1)
         self._voice_refs[account_id] = 1
         logger.debug("[SessionOwnership] acc=%s voice hold acquired", account_id)
@@ -132,15 +165,16 @@ class SessionOwnership:
             return True
         if self.is_voice_held(account_id):
             raise SessionInUseError(account_id, "voice")
+        self._sweep_ad_hoc()
         if account_id in self._ad_hoc:
             raise SessionInUseError(account_id, "adhoc")
-        self._ad_hoc.add(account_id)
+        self._ad_hoc[account_id] = time.monotonic()
         return True
 
     def end_ad_hoc(self, account_id: int) -> None:
-        self._ad_hoc.discard(int(account_id))
+        self._ad_hoc.pop(int(account_id), None)
 
-    def voice_held_accounts(self) -> Set[int]:
+    def voice_held_accounts(self):
         return {aid for aid, refs in self._voice_refs.items() if refs > 0}
 
 

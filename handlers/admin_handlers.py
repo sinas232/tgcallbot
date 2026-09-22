@@ -206,11 +206,15 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
             _is_super_maint = False
     if _is_super_maint:
         kb.insert(5, ["🛠 حالت تعمیرات"])
-    
+    # 🛡 پنل ضد اسپم/محافظت اکانت‌ها فقط برای سوپرادمین‌ها نمایش داده می‌شود.
+    if _is_super_maint:
+        kb.insert(6, ["🛡 ضد اسپم و محافظت"])
+
     if update.message:
         text = update.message.text
         if "مدیریت سفارشات" in text: return await admin_orders_menu(update, context)
         if "حالت تعمیرات" in text: return await maintenance_menu(update, context)
+        if "ضد اسپم" in text: return await anti_spam_menu(update, context)
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
@@ -365,9 +369,15 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
             txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
             for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
             if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            kb_dead = [[InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")], [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            kb_dead = (
+                [[InlineKeyboardButton("🔄 سینک مجدد سشن‌ها (بازگردانی خودکار)", callback_data="acc_resync_all")],
+                 [InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")],
+                 [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            )
             await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_dead))
             return AWAITING_SETTINGS_ACTION
+        elif data == "acc_resync_all":
+            return await account_resync_dead_sessions(update, context, query, bot_id)
         elif data == "dead_del_all":
             accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
             if not accounts:
@@ -403,10 +413,143 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
     dead_count = len(dead_accs)
     txt = (f"🚑 **گزارش سلامت اکانت‌ها**\n\n🤖 کل اکانت‌ها: `{accs_stats['total']}`\n✅ فعال و سالم: `{accs_stats['active']}`\n⛔️ محدود (Limited): `{accs_stats['limited']}`\n💀 غیرفعال (سوخته/نشست بسته): `{dead_count}`\n\n👇 برای مشاهده جزئیات کلیک کنید:")
     kb = [[InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")], [InlineKeyboardButton("⛔️ مشاهده لیست محدودها", callback_data="view_limited_accounts")]]
+    if dead_count > 0:
+        kb.insert(0, [InlineKeyboardButton("🔄 سینک مجدد سشن‌ها (بازگردانی خودکار)", callback_data="acc_resync_all")])
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else:
         if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
         await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
+    return AWAITING_SETTINGS_ACTION
+
+async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE, query, bot_id: int = 1) -> int:
+    """🔄 سینک مجدد اکانت‌های «سوخته» — تست واقعی سشن و بازگردانی خودکار.
+
+    اکانت‌هایی که ظاهراً «سوخته» شده‌اند اما در واقع فقط اتصالشان قطع/ناسازگار
+    شده (نوسان شبکه/WARP، AUTH_KEY_DUPLICATED رقابتی ری‌استارت کانتینر، خطای
+    موقت تلگرام و ...) با یک اتصال سبک (start + get_me) دوباره سنجیده می‌شوند؛
+    اگر سشن زنده جواب بدهد، به‌صورت خودکار to وضعیت ``active`` برمی‌گردند و
+    همزمان پرچم اسپمِ ``dead`` پاک می‌شود تا بدون وقفه وارد پول سفارش شوند.
+
+    امنیت: اتصال دوم با سشنِ مشغول حق ندارد — اگر موتور ویس‌کال سشن را نگه
+    داشته (SessionInUseError)، اکانت بی‌خطر رد می‌شود (NoAuthKeyDuplicated).
+    هرگز چیز بیرون‌کشیدنی علامت نمی‌زنیم: فقط اکانتی که جوابِ مستقیم داده
+    فعال می‌شود؛ بقیه در حالت قبل می‌مانند.
+    """
+    from telegram_client import TelegramAccountClient
+    from services.session_ownership import SessionInUseError
+
+    accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
+    if not accounts:
+        await query.edit_message_text(
+            "✅ هیچ اکانت غیرفعالی برای سینک نیست؛ همه سالم‌اند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]),
+        )
+        return AWAITING_SETTINGS_ACTION
+
+    total = len(accounts)
+
+    try:
+        await query.edit_message_text(
+            f"🔄 **سینک مجدد سشن‌ها آغاز شد…**\n\n⏳ تست {total} اکانت غیرفعال با اتصال واقعی؛"
+            " این به‌ازای هر اکانت ~۱–۲ ثانیه طول می‌کشد، لطفاً صبر کنید.\n"
+            f"پیشرفت: 0/{total}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]),
+        )
+    except Exception:
+        pass
+
+    revived: list = []
+    relogin: list = []       # واقعاً باطل‌شده → فقط لاگین مجدد
+    dup_elsewhere: list = [] # 406: سشن همین حالا جای دیگری فعال است
+    timeouts = 0
+    busy = 0
+    errors = 0
+    dup_streak = 0
+    aborted = 0
+    for idx, acc in enumerate(accounts, 1):
+        aid = acc.get('id')
+        try:
+            client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
+            ok, reason, me = await asyncio.wait_for(client.fetch_me_status(), timeout=50)
+            if ok:
+                # سشن جواب داد → فعال‌سازی مجدد و پاک‌سازی پرچم dead اسپمی
+                await DatabaseManager.update_account_status(aid, 'active')
+                try:
+                    if (acc.get('spam_status') or '') == 'dead':
+                        await DatabaseManager.update_account_spam_status(
+                            aid, 'clean', '✅ resynced: session valid')
+                except Exception:
+                    pass
+                revived.append(acc)
+                dup_streak = 0
+            elif reason == "duplicated_in_use":
+                dup_elsewhere.append(acc)
+                dup_streak += 1
+            elif reason == "relogin_required":
+                dup_streak = 0
+                relogin.append(acc)
+            elif reason == "timeout":
+                dup_streak = 0
+                timeouts += 1
+            else:
+                dup_streak = 0
+                errors += 1
+        except SessionInUseError:
+            # سشن در اختیار موتور ویس‌کال است — خطر AUTH_KEY_DUPLICATED؛ رد می‌کنیم.
+            busy += 1
+        except Exception:
+            errors += 1
+        if idx % 5 == 0 or idx == total:
+            try:
+                await query.edit_message_text(
+                    f"🔄 **سینک مجدد سشن‌ها…**\n\n⏳ پیشرفت: {idx}/{total}\n"
+                    f"✅ بازگردانده شد: {len(revived)}\n"
+                    f"⚠️ فعال در مکان دیگر (406): {len(dup_elsewhere)}\n"
+                    f"💀 نیازمند لاگین مجدد: {len(relogin)}\n"
+                    f"🎙 در ویس کال (رد شد): {busy}\n"
+                    f"⏱ تایم‌اوت شبکه: {timeouts} | ⚠️ خطا: {errors}",
+                )
+            except Exception:
+                pass
+        if dup_streak >= 5:
+            aborted = total - idx
+            logger.critical(
+                "resync: %s consecutive 406s — aborting remaining %s probes "
+                "(probing duplicated keys risks burning BOTH sides)",
+                dup_streak, aborted)
+            break
+        await asyncio.sleep(1.2)
+
+    lines = [
+        "🔄 **گزارش سینک مجدد سشن‌ها**\n",
+        f"🤖 اکانت‌های بررسی‌شده: `{total}`",
+        f"✅ بازگردانده شدند به فعال: **{len(revived)}**",
+        f"🎙 مشغول در ویس‌کال (دست‌نخورده): `{busy}`",
+    ]
+    if dup_elsewhere:
+        lines += [
+            f"⚠️ **{len(dup_elsewhere)} اکانت کلید سالم دارند ولی همین لحظه از جای دیگری آنلاین‌اند** (406 AUTH_KEY_DUPLICATED) — کلید باطل نشده و از v2.3.9 دیگر غیرفعال هم نمی‌شوند.",
+            "مقصر قطعی: یک اتصالِ زندهٔ دیگر با همین کلیدها. محتمل‌ترین‌ها: ۱) سرور/هاست قدیمی که هنوز روشن است و کانتینر رباتش (restart: always) بالاست ۲) پروسس stray روی همین هاست (`ps aux | grep main.py`) ۳) فروشنده‌ای که همان سشن را به چند نفر فروخته.",
+            "راه‌حل قطعی برای هر اکانت: «دریفات کد / لاگین مجدد» از پنل — با کلیدِ تازه، اتصال این ربات دیگر با نسخهٔ بیگانه تداخل نمی‌کند. بعد از قطع‌کردن نمونهٔ بیگانه، این سینک را دوباره بزنید تا خودکار فعال شوند.",
+        ]
+    if aborted:
+        lines.append(f"🛑 برای جلوگیری از سوختن کلیدها، پس از ۵ خطای 406 متوالی، {aborted} پروب باقی‌مانده انجام نشد (توقف محافظتی).")
+    if relogin:
+        lines.append(f"💀 `{len(relogin)}` اکانت واقعاً باطل شده‌اند (SESSION_REVOKED/401) — باید دوباره سشن شان را بسازید (لاگین مجدد).")
+    if timeouts:
+        lines.append(f"⏱ `{timeouts}` اکانت به‌خاطر کندی شبکه/WARP تایم‌اوت شدند — کمی بعد دوباره سینک کنید.")
+    if errors:
+        lines.append(f"⚠️ `{errors}` خطای غیرمنتظره — لاگ سرور را ببینید.")
+    if revived:
+        lines.append("\n🔋 اکانت‌های بازگردانده‌شده از همان لحظه دوباره در پول سفارش‌ها فعال‌اند — نیازی به ثبت سفارش مجدد نیست.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")],
+    ])
+    try:
+        await query.edit_message_text("\n".join(lines), reply_markup=kb)
+    except Exception:
+        await send_safe(context.bot, update.effective_chat.id, "\n".join(lines), reply_markup=kb)
     return AWAITING_SETTINGS_ACTION
 
 @require_admin
@@ -2191,3 +2334,260 @@ async def receive_backup_interval(update, context):
     await DatabaseManager.set_setting("auto_backup_interval_hours", text, bot_id=bot_id)
     await update.message.reply_text(f"✅ بازه پشتیبان‌گیری خودکار تنظیم شد: هر {text} ساعت.")
     return await backup_restore_menu(update, context)
+
+# ===================== 🛡 ANTI-SPAM PROTECTION PANEL (سوپرادمین) =====================
+#
+# پنل «ضد اسپم و محافظت از اکانت‌ها»:
+#   • تاگل کلی حالت ضد اسپم + تاگل خروج به‌تأخیرافتاده از گروه
+#   • تنظیم تأخیر خروج از گروه (پیش‌فرض ۱۶۸ ساعت = یک هفته)
+#   • تنظیم فاصلهٔ خروج دونه‌به‌دونه (پیش‌فرض ۶۰ ثانیه بین هر خروج)
+#   • تنظیم ممنوعیت ثبت سفارش جدید پس از لغو (پیش‌فرض ۲۰ دقیقه؛ ۰ = خاموش)
+#   • تنظیم استراحت اکانت بین دو سفارش (پیش‌فرض خاموش، دقیقه)
+#   • مشاهده/پاک‌سازی صف خروج‌های زمان‌بندی‌شده
+#
+# تنظیمات در bot_settings ذخیره و بلافاصله (با invalidate کش ۱۰ثانیه‌ای
+# services/anti_spam.py) روی موج‌های بعدی اعمال می‌شوند؛ بدون ری‌استارت.
+
+async def _antispam_is_super(update, context) -> bool:
+    """فقط گاد (ADMIN_IDS) یا ادمین با نقش super_admin اجازه دارد."""
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+    except Exception:
+        return False
+    if not uid:
+        return False
+    if uid in Config.ADMIN_IDS:
+        return True
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        u = await asyncio.wait_for(DatabaseManager.get_user(uid, bot_id=bot_id), timeout=10)
+    except Exception:
+        return False
+    return bool(u and u.get('admin_role') == 'super_admin')
+
+
+# نقشهٔ فیلدهای قابل ویرایش: callback → (کلید دیتابیس، عنوان فارسی، حداقل، حداکثر)
+ANTISPAM_FIELD_SPECS = {
+    "antispam_set_delay_hours": ("group_leave_delay_hours", "⏳ تأخیر خروج از گروه", "ساعت", 1, 720),
+    "antispam_set_interval_sec": ("group_leave_interval_sec", "👣 فاصلهٔ خروج دونه‌به‌دونه", "ثانیه", 5, 3600),
+    "antispam_set_cancel_cd": ("cancel_cooldown_minutes", "⛔️ ممنوعیت سفارش پس از لغو", "دقیقه", 0, 10080),
+    "antispam_set_rest_min": ("account_rest_minutes", "😴 استراحت اکانت بین سفارش‌ها", "دقیقه", 0, 1440),
+}
+
+
+async def _antispam_profile(bot_id: int):
+    """خواندن امن پروفایل ضد اسپم (fail-open: None → مقادیر پیش‌فرض Config)."""
+    try:
+        from services.anti_spam import anti_spam
+        return await anti_spam.get_profile(bot_id)
+    except Exception:
+        return None
+
+
+async def anti_spam_menu(update, context):
+    """منوی «🛡 ضد اسپم و محافظت» — وضعیت کلی + میان‌برهای تنظیم."""
+    if not await _antispam_is_super(update, context):
+        try:
+            if update.callback_query:
+                await safe_answer(update.callback_query)
+            await send_safe(context.bot, update.effective_chat.id, "⛔️ دسترسی محدود به سوپر ادمین.")
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    profile = await _antispam_profile(bot_id)
+
+    enabled = profile.enabled if profile else Config.ANTISPAM_ENABLED
+    status = "✅ فعال" if enabled else "❌ غیرفعال"
+    gleave_on = profile.group_leave_enabled if profile else Config.GROUP_LEAVE_ENABLED
+    gleave_txt = "✅ فعال" if gleave_on else "❌ غیرفعال"
+    delay_h = int(round((profile.group_leave_delay_seconds if profile else Config.GROUP_LEAVE_DELAY_HOURS * 3600) / 3600))
+    interval = int(round(profile.group_leave_interval_sec if profile else Config.GROUP_LEAVE_INTERVAL_SEC))
+    cd_min = profile.cancel_cooldown_minutes if profile else Config.CANCEL_COOLDOWN_MINUTES
+    rest_m = int(round((profile.rest_seconds if profile else Config.ANTISPAM_ACCOUNT_REST_MINUTES * 60) / 60))
+    if profile:
+        join_txt = f"{profile.join_gap_min:.1f}-{profile.join_gap_max:.1f}s (سقف موج {profile.max_join_concurrency})"
+        leave_txt = f"{profile.leave_gap_min:.1f}-{profile.leave_gap_max:.1f}s"
+    else:
+        join_txt = f"{Config.ANTISPAM_JOIN_GAP_MIN:.1f}-{Config.ANTISPAM_JOIN_GAP_MAX:.1f}s (سقف موج {Config.ANTISPAM_MAX_JOIN_CONCURRENCY})"
+        leave_txt = f"{Config.ANTISPAM_LEAVE_GAP_MIN:.1f}-{Config.ANTISPAM_LEAVE_GAP_MAX:.1f}s"
+
+    try:
+        pending_n = await DatabaseManager.count_pending_group_leaves(bot_id)
+    except Exception:
+        pending_n = 0
+
+    txt = (
+        "🛡 **ضد اسپم و محافظت از اکانت‌ها**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🔰 حالت ضد اسپم: **{status}**\n"
+        f"   🌊 آهنگ ورود به کال: `{join_txt}`\n"
+        f"   🚶 آهنگ خروج از کال: `{leave_txt}`\n"
+        f"   😴 استراحت اکانت بین سفارش‌ها: **{str(rest_m) + ' دقیقه' if rest_m > 0 else 'خاموش'}**\n\n"
+        f"🚪 خروج به‌تأخیرافتاده از گروه: **{gleave_txt}**\n"
+        f"   ⏳ تأخیر خروج: **{delay_h} ساعت** (پیش‌فرض ۱۶۸ = یک هفته)\n"
+        f"   👣 فاصلهٔ خروج: **هر {interval} ثانیه یک اکانت**\n"
+        f"   📋 خروج‌های زمان‌بندی‌شده در صف: **{pending_n}** مورد\n\n"
+        f"⛔️ ممنوعیت سفارش پس از لغو: **{str(cd_min) + ' دقیقه' if cd_min > 0 else 'خاموش'}**\n\n"
+        "ℹ️ با خروج تأخیری، اکانت‌ها در پایان سفارش فقط از «ویس‌کال» خارج\n"
+        "می‌شوند؛ اگر تا پایان مهلت سفارش مجددی برای همان گروه ثبت نشود،\n"
+        "به‌ترتیب و دونه‌به‌دونه (نه یک‌جا) از گروه خارج خواهند شد — این دو\n"
+        "مهم‌ترین الگوهایی هستند که باعث حذف اکانت توسط تلگرام می‌شوند."
+    )
+
+    kb = [
+        [InlineKeyboardButton(f"🔰 حالت ضد اسپم: {status}", callback_data="antispam_toggle_master")],
+        [InlineKeyboardButton(f"🚪 خروج تأخیری از گروه: {gleave_txt}", callback_data="antispam_toggle_gleave")],
+        [
+            InlineKeyboardButton(f"⏳ تأخیر خروج ({delay_h}h)", callback_data="antispam_set_delay_hours"),
+            InlineKeyboardButton(f"👣 فاصله خروج ({interval}s)", callback_data="antispam_set_interval_sec"),
+        ],
+        [
+            InlineKeyboardButton(f"⛔️ محدودیت لغو ({cd_min}m)", callback_data="antispam_set_cancel_cd"),
+            InlineKeyboardButton(f"😴 استراحت اکانت ({rest_m}m)", callback_data="antispam_set_rest_min"),
+        ],
+        [InlineKeyboardButton("🧹 لغو کل خروج‌های در صف", callback_data="antispam_clear_queue")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="antispam_back")],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, reply_markup=markup)
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=markup)
+    else:
+        await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=markup)
+    return AWAITING_SETTINGS_ACTION
+
+
+async def anti_spam_callback(update, context):
+    """کالبک‌های منوی ضد اسپم: تاگل‌ها، تنظیم اعداد، پاک‌سازی صف، بازگشت."""
+    query = update.callback_query
+    await safe_answer(query)
+    if not await _antispam_is_super(update, context):
+        try:
+            await query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+
+    data = query.data or ""
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    if data == "antispam_back":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return await settings_menu_handler(update, context)
+
+    if data in ("antispam_toggle_master", "antispam_toggle_gleave"):
+        from services.anti_spam import anti_spam as _anti
+        key = _anti.K_ENABLED if data == "antispam_toggle_master" else _anti.K_GLEAVE_ENABLED
+        default = Config.ANTISPAM_ENABLED if data == "antispam_toggle_master" else Config.GROUP_LEAVE_ENABLED
+        try:
+            curr = (await DatabaseManager.get_setting(key, str(default).lower(), bot_id=bot_id)).lower() == "true"
+        except Exception:
+            curr = default
+        new_val = "false" if curr else "true"
+        await DatabaseManager.set_setting(key, new_val, bot_id=bot_id)
+        try:
+            _anti.invalidate(bot_id)
+        except Exception:
+            pass
+        try:
+            await query.answer("✅ فعال شد." if new_val == "true" else "❌ غیرفعال شد.")
+        except Exception:
+            pass
+        return await anti_spam_menu(update, context)
+
+    if data == "antispam_clear_queue":
+        try:
+            n = await DatabaseManager.cancel_all_pending_group_leaves(bot_id)
+        except Exception:
+            n = 0
+        try:
+            await query.answer(f"🧹 {n} خروجِ در صف لغو شد؛ اکانت‌ها عضو می‌مانند.", show_alert=True)
+        except Exception:
+            pass
+        return await anti_spam_menu(update, context)
+
+    if data in ANTISPAM_FIELD_SPECS:
+        _key_db, title_fa, unit_fa, lo, hi = ANTISPAM_FIELD_SPECS[data]
+        context.user_data['antispam_field'] = data
+        off_txt = " (۰ = خاموش)" if lo == 0 else ""
+        # همان الگوی set_spam_interval: پیام جدید با کیبورد انصراف (ReplyKeyboard
+        # در edit_message_text معتبر نیست — فقط InlineKeyboard ممکن است).
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            f"{title_fa}\n\n"
+            f"عدد جدید را به **{unit_fa}** وارد کنید{off_txt}:\n"
+            f"🔢 بازهٔ مجاز: {lo} تا {hi}\n\n"
+            "برای انصراف دکمهٔ «🔙 انصراف» را بزنید.",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    return AWAITING_SETTINGS_ACTION
+
+
+async def receive_antispam_value(update, context):
+    """دریافت مقدار عددیِ تنظیمات ضد اسپم (با اعتبارسنجی بازه)."""
+    if not await _antispam_is_super(update, context):
+        return AWAITING_SETTINGS_ACTION
+
+    raw = update.message.text or ""
+    if BTN_CANCEL in raw:
+        context.user_data.pop('antispam_field', None)
+        return await anti_spam_menu(update, context)
+
+    field = context.user_data.get('antispam_field')
+    spec = ANTISPAM_FIELD_SPECS.get(field)
+    if not spec:
+        context.user_data.pop('antispam_field', None)
+        return await anti_spam_menu(update, context)
+
+    key_db, title_fa, unit_fa, lo, hi = spec
+    text = clean_number(raw).strip()
+    if not text.replace(".", "", 1).isdigit():
+        await update.message.reply_text(
+            f"❌ مقدار نامعتبر است. لطفاً فقط عدد بفرستید (به {unit_fa}).",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    try:
+        value = int(float(text))
+    except Exception:
+        value = lo
+    if value < lo or value > hi:
+        await update.message.reply_text(
+            f"❌ خارج از بازهٔ مجاز است. مقدار باید بین **{lo}** و **{hi}** {unit_fa} باشد.",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    await DatabaseManager.set_setting(key_db, str(value), bot_id=bot_id)
+    try:
+        from services.anti_spam import anti_spam as _anti
+        _anti.invalidate(bot_id)
+    except Exception:
+        pass
+    context.user_data.pop('antispam_field', None)
+
+    friendly = {
+        "group_leave_delay_hours": f"⏳ تأخیر خروج از گروه روی **{value} ساعت** تنظیم شد.",
+        "group_leave_interval_sec": f"👣 فاصلهٔ خروج دونه‌به‌دونه روی **هر {value} ثانیه یک اکانت** تنظیم شد.",
+        "cancel_cooldown_minutes": (
+            f"⛔️ ممنوعیت ثبت سفارش پس از لغو روی **{value} دقیقه** تنظیم شد."
+            if value > 0 else "✅ ممنوعیت ثبت سفارش پس از لغو **خاموش** شد."
+        ),
+        "account_rest_minutes": (
+            f"😴 استراحت اکانت بین سفارش‌ها روی **{value} دقیقه** تنظیم شد."
+            if value > 0 else "✅ استراحت اکانت بین سفارش‌ها **خاموش** شد."
+        ),
+    }.get(key_db, "✅ تنظیم شد.")
+    await update.message.reply_text(f"✅ {friendly}")
+    return await anti_spam_menu(update, context)

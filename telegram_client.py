@@ -35,6 +35,9 @@ class TelegramAccountClient:
         self.session_string = session_string
         self.account_id = account_id
         self.client = None
+        # 🛡 آی‌دی چتی که در آخرین join موفق وارد شدیم (برای خروج به‌تأخیرافتادهٔ
+        # دقیق — ضد اسپم — تا خروج بعداً با آی‌دی عددی انجام شود، نه حدس لینک).
+        self.last_joined_chat_id = None
 
     async def _get_api_credentials(self):
         """دریافت API ID/HASH اختصاصی یا پیش‌فرض"""
@@ -150,6 +153,7 @@ class TelegramAccountClient:
                 joined = getattr(res, 'chat', res)
                 if getattr(joined, 'id', None) is None:
                     return False, f"Join needs approval ({type(res).__name__})"
+                self.last_joined_chat_id = getattr(joined, 'id', None)
                 return True, "Joined"
         except UserAlreadyParticipant:
             return True, "Already Joined"
@@ -229,9 +233,9 @@ class TelegramAccountClient:
     async def check_spambot(self):
         """بررسی وضعیت محدودیت اکانت (SpamBot)"""
         try:
+            # توجه: async with خودش start/stop امن انجام می‌دهد؛ فراخوانی دوبارهٔ
+            # app.start() داخلش (نسخهٔ قبلی) دیسپچر را دوبار بالا می‌آورد.
             async with await self.get_client(no_updates=False) as app:
-                if not app.is_connected: await app.start()
-                
                 # ارسال پیام استارت به بات
                 try:
                     await app.send_message("SpamBot", "/start")
@@ -322,19 +326,64 @@ class TelegramAccountClient:
         except:
             return None
 
+    async def fetch_me_status(self):
+        """(ok: bool, reason: str|None, data: dict|None) — مثل fetch_me ولی
+        دلیل شکست را هم دسته‌بندی می‌کند تا ادمین بفهمد چه باید بکند:
+
+        * ``None`` — موفق (data برمی‌گردد)
+        * ``duplicated_in_use`` — 406 AUTH_KEY_DUPLICATED: سشن همین حالا در
+          یک پروسس/سرور/پنل دیگری فعال است؛ تا آن نمونه قطع نشود هیچ اتصالی
+          دوام نمی‌آورد (و لاگین مجدد کلید تازه می‌سازد و آن نمونه را می‌کشد).
+        * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
+        * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
+        * ``error`` — سایر خطاها.
+
+        SessionInUseError (سشن در اختیار موتور ویس‌کال) بدون بلع به بیرون
+        پرتاب می‌شود تا صداکننده «مشغول بودن» را با «مرده بودن» اشتباه نگیرد.
+        """
+        client = None
+        try:
+            client = await self.get_client()
+            # connect به‌تنهایی برای get_me کافی است؛ start کامل (دیسپچر رخداد)
+            # لازم نیست و سربار/ریسک زامبی هم دارد.
+            await asyncio.wait_for(client.connect(), timeout=40)
+            me = await client.get_me()
+            return True, None, {
+                'first_name': getattr(me, 'first_name', None),
+                'last_name': getattr(me, 'last_name', None),
+                'username': getattr(me, 'username', None),
+            }
+        except SessionInUseError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(f"fetch_me timeout for acc {self.account_id}")
+            return False, "timeout", None
+        except Exception as e:
+            up = str(e).upper()
+            if "AUTH_KEY_DUPLICATED" in up or "406" in up:
+                reason = "duplicated_in_use"
+            elif any(k in up for k in (
+                "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED", "AUTH_KEY_INVALID",
+                "USER_DEACTIVATED", "401",
+            )):
+                reason = "relogin_required"
+            else:
+                reason = "error"
+            logger.warning(f"fetch_me failed for acc {self.account_id}: {e} -> {reason}")
+            return False, reason, None
+        finally:
+            if client is not None:
+                try:
+                    # shield: حتی اگر همین تسک لغو شود، قطع تمیز اتصال به پایان برسد.
+                    await asyncio.shield(asyncio.wait_for(client.disconnect(), timeout=10))
+                except Exception:
+                    pass
+                session_ownership.end_ad_hoc(self.account_id)
+
     async def fetch_me(self):
         """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""
-        try:
-            async with await self.get_client() as app:
-                me = await app.get_me()
-                return {
-                    'first_name': getattr(me, 'first_name', None),
-                    'last_name': getattr(me, 'last_name', None),
-                    'username': getattr(me, 'username', None),
-                }
-        except Exception as e:
-            logger.warning(f"fetch_me failed for acc {self.account_id}: {e}")
-            return None
+        ok, _reason, data = await self.fetch_me_status()
+        return data if ok else None
 
     async def set_privacy(self, key_name, level):
         """

@@ -49,6 +49,7 @@ from collections import deque
 
 from pyrogram import Client
 from pyrogram.errors import (
+    AuthKeyDuplicated,
     AuthKeyInvalid,
     AuthKeyUnregistered,
     FloodWait,
@@ -204,9 +205,62 @@ VOICE_FLOOD_INLINE_WAIT_MAX = max(
     0, int(getattr(Config, "VOICE_FLOOD_INLINE_WAIT_MAX", 30))
 )
 
-CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
+# 406/AUTH_KEY_DUPLICATED بعد از هر ری‌استارت/کرش دیده می‌شد: ساخت هم‌زمانِ
+# زیادی کلاینت (پیش‌فرض قدیمی ۸) در لحظهٔ resume ده‌ها اتصال تکراری برای
+# کلیدهای نیمه‌بازِ قبلی می‌ساخت و تلگرام کلیدها را باطل می‌کرد. پیش‌فرض
+# محافظه‌کار ۲ + مکث تصادفی بین هر ساخت — از .env قابل تنظیم است.
+CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 2)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
+
+
+# فقط این نشانه‌ها یعنی کلید سشن واقعاً از سمت تلگرام نابود است (کلاس‌های
+# Kurigram بدون آندرلاین هم پوشش داده می‌شوند: AuthKeyInvalid → AUTHKEYINVALID).
+_FATAL_SESSION_MARKERS = (
+    "SESSION_REVOKED", "SESSIONREVOKED",
+    "AUTH_KEY_UNREGISTERED", "AUTHKEYUNREGISTERED",
+    "AUTH_KEY_INVALID", "AUTHKEYINVALID",
+    "USER_DEACTIVATED", "USERDEACTIVATED",
+    "401", "UNAUTHORIZED",
+)
+
+
+def _is_fatal_session_reason(reason: str) -> bool:
+    up = (reason or "").upper()
+    return any(m in up for m in _FATAL_SESSION_MARKERS)
+
+
+async def _mark_session_dead(account_id: int, reason: str) -> None:
+    """اکانت را فقط در «مرگ واقعی کلید» (401/revoked/unregistered/deactivated)
+    از چرخه خارج می‌کند — هرگز برای 406.
+
+    AUTH_KEY_DUPLICATED (406) به‌معنای «همین لحظه یک اتصالِ زندهٔ دیگر با
+    همین کلید وجود دارد» است — نه باطل‌شدن کلید. غیرفعال‌کردنِ انبوه اکانت‌ها
+    به‌خاطر 406 دقیقاً همان باگی بود که استخر اکانت‌ها را خالی می‌کرد در حالی
+    که کلیدها سالم بودند (Resync آن‌ها را duplicated می‌دید نه relogin).
+    در این حالت فقط یادداشت نرم می‌گذاریم؛ اکانت active می‌ماند و سفارش‌های
+    بعدی وقتی آن نمونهٔ بیگانه قطع شد دوباره از آن استفاده می‌کنند.
+    هرگز چیز بیرون‌کشیدنی علامت نمی‌زنیم مگر تلگرام صراحتاً گفته باشد کلید رفته.
+    """
+    try:
+        from database import DatabaseManager as _DB
+        if not _is_fatal_session_reason(reason):
+            logger.warning(
+                "Session %s held elsewhere (%s) — account NOT disabled; "
+                "stop the other live connection (old server/stray process/"
+                "panel/vendor session) or re-login to mint a fresh key.",
+                account_id, reason,
+            )
+            await _DB.update_account_spam_status(
+                int(account_id), "cooldown",
+                f"duplicate-in-use transient, NOT disabled ({reason})"[:180],
+            )
+            return
+        await _DB.update_account_status(int(account_id), "inactive")
+        await _DB.update_account_spam_status(
+            int(account_id), "dead", f"fatal session error ({reason})")
+    except Exception:
+        pass
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -1877,7 +1931,12 @@ class VoiceCallManager:
                             **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
-                    except Exception:
+                        # مکث کوتاه تصادفی: اتصال‌های پشت سر هم در حجم بالا
+                        # (مثلاً resume بعد از ری‌استارت کانتینر) الگوی سیلابی
+                        # می‌سازند که تلگرام را به باطل‌کردن کلید (406) حساس
+                        # می‌کند.
+                        await asyncio.sleep(random.uniform(0.8, 2.0))
+                    except Exception as _ce:
                         # Best-effort teardown of the half-open client: without
                         # this, our own lingering connection can DUPLICATE the
                         # session key of the next retry and burn a healthy
@@ -1893,6 +1952,12 @@ class VoiceCallManager:
                             pass
                         if held:
                             session_ownership.release_voice(account_id)
+                        if isinstance(_ce, AuthKeyDuplicated):
+                            # 406: کلید از سمت سرور باطل است؛ علامت مرده تا
+                            # حلقه‌های retry/recovery دوباره همین کلید مرده را
+                            # سرو نکنند و اکانت پیاپی «از سشن خارج» نشود.
+                            await _mark_session_dead(
+                                account_id, "AUTH_KEY_DUPLICATED client_start")
                         raise
                     self.pyrogram_clients[account_id] = app
 
@@ -3565,6 +3630,8 @@ class VoiceCallManager:
                                 **_client_device_fingerprint(account_id),
                             )
                             await asyncio.wait_for(app.start(), timeout=15)
+                            # پیسینگ تصادفی بین ساخت کلاینت‌ها (ضد سیلاب 406 در resume).
+                            await asyncio.sleep(random.uniform(0.8, 2.0))
                         except FloodWait as e:
                             if held:
                                 session_ownership.release_voice(account_id)
@@ -3576,6 +3643,13 @@ class VoiceCallManager:
                             self._vc_event_log(None, account_id, "warmup_floodwait",
                                                {"wait_s": wait_s})
                             return
+                        except AuthKeyDuplicated as e:
+                            if held:
+                                session_ownership.release_voice(account_id)
+                            self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
+                            # خطای مرگبار: اکانت را از چرخهٔ warmup خارج/مرده علامت بزن.
+                            await _mark_session_dead(account_id, f"AUTH_KEY_DUPLICATED warmup: {e}")
+                            return
                         except Exception:
                             if held:
                                 session_ownership.release_voice(account_id)
@@ -3583,8 +3657,9 @@ class VoiceCallManager:
                         self.pyrogram_clients[account_id] = app
                         self._session_cache[account_id] = session_string
                         warmed += 1
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as _se:
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
+                await _mark_session_dead(account_id, f"warmup {type(_se).__name__}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -3658,8 +3733,10 @@ class VoiceCallManager:
             logger.info(f"[VoiceScheduler] Order {order_id}: creating Pyrogram client for account {account_id}")
             try:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
+                # مرگبار است (حتی 406): اکانت از چرخهٔ سفارش‌ها خارج و علامت می‌خورد.
+                await _mark_session_dead(account_id, f"start_call {type(e).__name__}")
                 return False, f"SESSION_REVOKED: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
@@ -3759,6 +3836,15 @@ class VoiceCallManager:
                 acid = int(cf.get("chat_id") or chat_id)
                 self._group_refcount[(account_id, acid)] = self._group_refcount.get((account_id, acid), 0) + 1
 
+                # 🛡 این اکانت دوباره وارد همین چت شده → اگر خروج به‌تأخیرافتادهٔ
+                # قدیمی‌ای برایش در صف باشد (مثلاً از سفارش قبلی همین گروه)،
+                # باید لغو شود؛ وگرنه وسط سفارش جدید اکانت از گروه بیرون می‌رود.
+                try:
+                    from services.group_leave_scheduler import group_leave_scheduler as _gls
+                    await _gls.cancel_for_account_chat(account_id, int(acid))
+                except Exception:
+                    pass
+
                 # STEP 7: Ensure the SHARED per-order monitor is running.
                 self._ensure_monitor(order_id)
 
@@ -3847,15 +3933,49 @@ class VoiceCallManager:
             if self._group_refcount[ref_key] <= 0:
                 self._group_refcount.pop(ref_key, None)
                 if leave_group:
-                    app = self.pyrogram_clients.get(account_id)
-                    if app:
-                        for _ in range(2):
-                            try:
-                                await app.leave_chat(int(chat_id))
-                                break
-                            except Exception:
-                                await asyncio.sleep(0.5)
-                        self._clear_chat_cache(int(chat_id))
+                    # 🛡 ضد اسپم: خروج از خودِ گروه «بلافاصله» نیست — در صف
+                    # خروجِ به‌تأخیرافتاده (پیش‌فرض یک هفته بعد) ثبت می‌شود و
+                    # جاب زمان‌بند آن را دونه‌به‌دونه اجرا می‌کند. اگر کاربر برای
+                    # همان مقصد سفارش تازه بزند، خروج لغو می‌ماند. در صورت
+                    # غیرفعال بودن قابلیت یا خطای زمان‌بندی → رفتار قبلی (خروج
+                    # فوری) حفظ می‌شود.
+                    scheduled = False
+                    try:
+                        from services.group_leave_scheduler import group_leave_scheduler as _gls
+                        _order = None
+                        try:
+                            _order = await DatabaseManager.get_order(order_id)
+                        except Exception:
+                            _order = None
+                        scheduled = await _gls.schedule(
+                            account_id=account_id,
+                            chat_id=int(chat_id),
+                            target_link=(
+                                (_order or {}).get("target_link")
+                                or (info or {}).get("target")
+                                or (removed or {}).get("target")
+                            ),
+                            order_id=order_id,
+                            bot_id=int((_order or {}).get("bot_id") or 1),
+                        )
+                    except Exception as _sched_err:
+                        logger.debug("[VoiceLeave] delayed group-leave schedule failed acc=%s: %s", account_id, _sched_err)
+                        scheduled = False
+                    if scheduled:
+                        logger.info(
+                            "[VoiceLeave] order=%s acc=%s group exit SCHEDULED (delayed, one-by-one) chat=%s",
+                            order_id, account_id, chat_id,
+                        )
+                    else:
+                        app = self.pyrogram_clients.get(account_id)
+                        if app:
+                            for _ in range(2):
+                                try:
+                                    await app.leave_chat(int(chat_id))
+                                    break
+                                except Exception:
+                                    await asyncio.sleep(0.5)
+                            self._clear_chat_cache(int(chat_id))
 
         await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
@@ -3890,11 +4010,29 @@ class VoiceCallManager:
         self._stop_monitor(order_id)
 
         if keys:
-            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
-            jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
-            jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            # 🛡 ضد اسپم: وقتی «حالت ضد اسپم» فعال است، pacing خروج از ویس‌کال
+            # هم انسانی‌تر می‌شود (فاصله‌های بزرگ‌تر + jitter، سقف کمتر). در
+            # غیر این صورت دقیقاً مقادیر Config قبلی استفاده می‌شود.
+            _anti = None
+            _profile = None
+            _bid = 1
+            try:
+                from services.anti_spam import anti_spam as _anti_mod
+                _anti = _anti_mod
+                try:
+                    _o = await DatabaseManager.get_order(order_id)
+                    _bid = int((_o or {}).get("bot_id") or 1)
+                except Exception:
+                    _bid = 1
+                _profile = await _anti.get_profile(_bid)
+                gap_min, gap_max, jitter_min, jitter_max, max_conc = _anti.effective_leave_pacing(_profile)
+            except Exception:
+                _anti, _profile = None, None
+                gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+                gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+                jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+                jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+                max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
             # Shuffle so the leave order is not the same join order every time
             # (harder for anti-spam fingerprinting of a fixed sequence).
             random.shuffle(keys)
@@ -3933,6 +4071,16 @@ class VoiceCallManager:
                 tasks.append(asyncio.create_task(_one(oid, aid)))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 🛡 استراحت اکانت پس از اتمام کار (ضد اسپم): اکانتی که تازه کارش
+            # تمام شده، تا پایان مهلت استراحت برای سفارش بعدی انتخاب نمی‌شود.
+            # با rest=0 یا ضد اسپم خاموش، این حلقه no-op است.
+            if _anti is not None and keys:
+                for (_oid, _aid) in keys:
+                    try:
+                        await _anti.note_account_finished(_aid, _bid)
+                    except Exception:
+                        pass
 
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)

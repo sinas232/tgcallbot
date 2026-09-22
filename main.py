@@ -515,6 +515,27 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Auto backup job error: {e}")
 
+async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
+    """🛡 اجرای خروج‌های به‌تأخیرافتادهٔ گروه/کانال — دونه‌به‌دونه و به‌ترتیب.
+
+    با پایان/لغو سفارش، خروج اکانت‌ها از خودِ گروه در pending_group_leaves
+    زمان‌بندی می‌شود (پیش‌فرض یک هفته بعد). این جاب رکوردهای سررسید را با
+    فاصلهٔ تنظیم‌شده از پنل (پیش‌فرض ۶۰ ثانیه بین هر خروج) و با claim اتمیک
+    اجرا می‌کند؛ اگر برای همان مقصد سفارش جدید آمده باشد خروج‌ها قبلاً لغو
+    شده‌اند. هر ۶۰ ثانیه، برای همهٔ ربات‌ها (bot_id=None → کل صف) و بدون
+    بستن ربات روی خطا.
+    """
+    try:
+        from services.group_leave_scheduler import group_leave_scheduler
+        n = await group_leave_scheduler.process_due(
+            bot_id=None,
+            limit=int(getattr(Config, "GROUP_LEAVE_SWEEP_BATCH", 25) or 25),
+        )
+        if n:
+            logger.info("[GroupLeave] sweeper processed %s scheduled leave(s)", n)
+    except Exception as e:
+        logger.error(f"Group leave sweeper error: {e}")
+
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         due_orders = await DatabaseManager.get_due_scheduled_orders()
@@ -590,12 +611,23 @@ def register_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    # 🛡 ضداسپم — گروهٔ جداگانهٔ 3- (بعد از دکمهٔ لغو در 4-، قبل از نگهبان
+    # تعمیرات در 2-).
+    #
+    # نکتهٔ حیاتی دربارهٔ PTB نسخهٔ 20 به بعد: در هر گروه «فقط یک» هندلر
+    # اجرا می‌شود — پس از اجرای اولین هندلرِ مچ‌شده، حلقهٔ همان گروه با
+    # break تمام می‌شود (پارامتر block فقط حالت زمان‌بندیِ اجراست و دیگر
+    # به معنای «عبور آپدیت به هندلر بعدیِ همان گروه» نیست). در نتیجه هر
+    # هندلری که با «هر» آپدیتی مچ شود (مانند همین گارد که TypeHandler
+    # روی کلاس Update است) اگر در یک گروه با بقیهٔ هندلرها باشد، آن‌ها را
+    # برای همیشه ساکت می‌کند — دقیقاً باگی که دکمهٔ «لغو سفارش»، نگهبان
+    # تعمیرات و پیش‌روتر منوها را مرده کرده بود. راه‌حل: هر مرحلهٔ
+    # سراسری در گروهِ مستقلِ خودش.
     #
     # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
     # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
     # آپدیت‌هایش بی‌صدا دور ریخته می‌شود تا ربات برای بقیه کند نشود.
-    # گادها (ADMIN_IDS) از این محدودیت معاف‌اند.
+    # سوپرادمین‌ها (ADMIN_IDS) از این محدودیت معاف‌اند.
     # ─────────────────────────────────────────────────────────────
     _SPAM_WINDOW_SEC = 2.0
     _SPAM_MAX_HITS = 5
@@ -652,10 +684,30 @@ def register_handlers(application: Application) -> None:
     _spam_guard._hits = _spam_hits
     _spam_guard._muted = _spam_muted_until
     _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
-    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+
+    # 🔝 دکمهٔ «لغو سفارش» کاربر — گروهٔ 4-، اولین چیزی که اصلاً پردازش
+    # می‌شود. باید در همهٔ حالت‌ها جواب بدهد (حتی برای کاربرِ میوت‌شده
+    # یا در حالت تعمیرات): لغوِ سفارشِ خودِ کاربر امن و idempotent است و
+    # چیزی از آن از دست نمی‌رود. چون در PTB>=v20 هر گروه فقط یک هندلر
+    # اجرا می‌کند، ثبت این هندلر در هر گروهِ مشترکِ دیگری (مثل گروهِ گارد
+    # ضداسپم که با هر آپدیتی مچ می‌شود) یعنی هیچ‌وقت اجرا نشدنش.
+    application.add_handler(
+        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
+        group=-4,
+    )
+
+    # گارد ضداسپم در گروهٔ مستقل 3-: تنها هندلرِ همین گروه است پس بلعیدنِ
+    # آپدیت فقط به همین گروه ختم می‌شود و گروه‌های بعدی (نگهبان تعمیرات،
+    # پیش‌روتر، مکالمه‌ها) سالم می‌مانند. توقفِ میوت با raise
+    # ApplicationHandlerStop اعمال می‌شود و چون کالبک await است
+    # (block پیش‌فرض)، توقف واقعاً در همین نقطه و قبل از گروه‌های بعدی
+    # اتفاق می‌افتد.
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-3)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
+    # 🛠 نگهبان «حالت تعمیرات» — group=-2 (بعد از ضداسپم، قبل از پیش‌روتر
+    # و مکالمه‌ها). سه الگوی این نگهبان متقابلاً انحصاری‌اند (پیام متنی /
+    # دستور استارت / کال‌بک)، پس یک گروه مشترک مشکلی ندارد.
     #
     # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
     # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
@@ -688,14 +740,6 @@ def register_handlers(application: Application) -> None:
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user:
             return
-        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
-        try:
-            _q0 = update.callback_query
-            if _q0 is not None:
-                _u0 = update.effective_user
-                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
-        except Exception:
-            pass
         try:
             # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
             # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
@@ -747,19 +791,16 @@ def register_handlers(application: Application) -> None:
             # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
             return
 
+    # نگهبان تعمیرات در گروهٔ مستقل 2- (هندلرهایش await می‌شوند تا
+    # raise ApplicationHandlerStop واقعاً در همین نقطه جلوی گروه‌های بعدی
+    # را بگیرد). در حالت خاموش/سوپرادمین فقط همین گروه مصرف می‌شود و آپدیت
+    # به پیش‌روتر و مکالمه‌ها می‌رسد.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
-        group=-1,
+        group=-2,
     )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
-
-
-    # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
-    application.add_handler(
-        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
-        group=-1,
-    )
+    application.add_handler(CommandHandler("start", _maintenance_guard), group=-2)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-2)
 
     # ─────────────────────────────────────────────────────────────
     # 🧭 پیش‌روتر منوها (group=-1): رفع ریشه‌ای «دکمه‌ها جواب نمی‌دهند».
@@ -771,9 +812,10 @@ def register_handlers(application: Application) -> None:
     # ست نمی‌شد و دکمه‌های بعدی هیچ handler فعالی نداشتند.
     #
     # این پیش‌روتر قبل از همهٔ مکالمه‌ها اجرا می‌شود، دکمه‌های شناخته‌شدهٔ
-    # منو را تشخیص می‌دهد و stateهای کهنه را تمیز می‌کند؛ سپس آپدیت را
-    # رها می‌کند تا به‌صورت عادی به handler درست برسد (جلوی انتشار را
-    # نمی‌گیرد و چیزی هم ارسال نمی‌کند).
+    # منو را تشخیص می‌دهد و stateهای کهنه را تمیز می‌کند؛ در گروهٔ مستقلِ
+    # -1 ثبت می‌شود تا با «تنها-یک-هندلر-در-هر-گروه» بودنِ PTB>=v20، آپدیت
+    # پس از تمیزکاری به گروه ۰ (مکالمه‌ها و هندلرهای عمومی) برسد.
+    # چیزی هم ارسال نمی‌کند.
     # ─────────────────────────────────────────────────────────────
     import re as _re
 
@@ -795,6 +837,7 @@ def register_handlers(application: Application) -> None:
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
         r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|🛡 ضد اسپم و محافظت|🛡 ضد اسپم"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
@@ -1001,9 +1044,10 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
             CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+            CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
-            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
             CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
         ],
         states={
@@ -1040,10 +1084,13 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت|🛡 ضد اسپم)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+                # 🛡 ضد اسپم و محافظت از اکانت‌ها (سوپرادمین) — منو از مسیر
+                # settings_menu_handler باز می‌شود؛ اینجا فقط کالبک‌های آن.
+                CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
 
@@ -1078,7 +1125,7 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
-                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
@@ -1142,6 +1189,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            AWAITING_ANTISPAM_VALUE: [MessageHandler(STD_TEXT, receive_antispam_value)],
 
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
@@ -1264,7 +1312,7 @@ def register_handlers(application: Application) -> None:
             # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
             CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
             CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
-            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
         ],
         states={
             AWAITING_SELECT_PLAN: [
@@ -1278,7 +1326,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$")]
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
@@ -1318,8 +1366,68 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(account_picker_close_callback, pattern=r"^acc_pickclose$"), group=0)
 
 
+# ─────────────────────────────────────────────────────────────
+# 🔒 قفل تک‌نمونه‌ای (singleton) — جلوی فاجعهٔ AUTH_KEY_DUPLICATED
+#
+# ریشهٔ مستندِ سیل 406 (مشاهده‌شده در سرور): یک `python main.py` مستقیم روی
+# هاست (خارج از داکر) کنار کانتینر بالا مانده بود و هر دو با سشن‌های مشترک
+# وصل می‌شدند؛ تلگرام کلید تکراری را بازی‌خورده می‌کرد و ده‌ها اکانت
+# پشت سر هم از سشن بیرون پرتاب شدند.
+#
+# این قفل OS-level (flock) روی همان فایلِ مشترک هاست و کانتینر
+# (./data/.bot_instance.lock — volume `.:/app` هر دو را به یک‌جا می‌بندد)
+# کار می‌کند: هر پروسسِ دوم، به‌جای وصل‌شدن و سوزاندن اکانت‌ها، با هشدارِ
+# بلند صبر می‌کند تا نمونهٔ قبلی آزاد شود. قفل با مرگ پروسس خودکار آزاد
+# می‌شود (بدون lock بیایه بعد از kill/reboot).
+_INSTANCE_LOCK_FILE = None
+
+
+def _acquire_instance_singleton_lock() -> None:
+    """قفل تک‌نمونه را بگیر؛ در صورت نبود flock (ویندوز/خطا) fail-open."""
+    global _INSTANCE_LOCK_FILE
+    try:
+        import fcntl
+    except Exception:
+        logger.warning("instance-lock: fcntl unavailable on this platform (skipped)")
+        return
+    try:
+        os.makedirs("data", exist_ok=True)
+        fh = open(os.path.join("data", ".bot_instance.lock"), "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.critical(
+                "🔒🔴 یک نمونهٔ دیگر از ربات همین حالا در حال اجراست "
+                "(data/.bot_instance.lock قفل است). اجرای هم‌زمانِ دو نسخه "
+                "با سشن‌های مشترک = AUTH_KEY_DUPLICATED و ابطال انبوه سشن‌ها. "
+                "این نمونه صبر می‌کند تا نمونهٔ قبلی آزاد شود… "
+                "(روی هاست بگرد: ps aux | grep 'python main.py')"
+            )
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    logger.critical("🔒 نمونهٔ قبلی آزاد شد — این نمونه ادامه می‌دهد.")
+                    break
+                except OSError:
+                    time.sleep(30)
+                    logger.critical(
+                        "🔒 هنوز در انتظار: نمونهٔ دیگر ربات قفل تک‌نمونه را نگه داشته…"
+                    )
+        _INSTANCE_LOCK_FILE = fh
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fh.flush()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"instance-lock skipped: {e}")
+
+
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
+    _acquire_instance_singleton_lock()
     # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
     # docker kill -s USR1 telegram_bot_container
     try:
@@ -1422,6 +1530,8 @@ async def main_loop():
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        # 🛡 ضد اسپم: اجرای خروج‌های به‌تأخیرافتادهٔ دونه‌به‌دونه از گروه‌ها
+        main_app.job_queue.run_repeating(group_leave_sweeper_job, interval=60, first=45)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).

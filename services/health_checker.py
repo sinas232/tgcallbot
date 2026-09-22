@@ -21,29 +21,50 @@ class HealthChecker:
         self.total_checks = 0
     
     async def check_single_account_spam(self, account: Dict[str, Any]):
-        """بررسی محدودیت اسپم برای یک اکانت"""
+        """بررسی محدودیت اسپم برای یک اکانت.
+
+        قانون طلایی v2.3.9: اکانت فقط با «مرگ واقعی کلید» (401/revoked/
+        unregistered/deactivated) غیرفعال می‌شود؛ AUTH_KEY_DUPLICATED (406)
+        یعنی اتصال زندهٔ هم‌زمان در جای دیگر — گذراست و هرگز غیرفعال نمی‌کند.
+        """
         try:
             client = TelegramAccountClient(account['phone_number'], account['session_string'], account['id'])
             status, result_text = await client.check_spambot()
-        except SessionInUseError as e:
+        except SessionInUseError:
             # The account is inside an active voice call — opening a second
             # connection would duplicate the MTProto session and revoke it.
             # Skip silently this cycle (NOT an error, NOT a dead account).
             logger.info("⏭ Spam check skipped for acc %s (session in voice call)", account['id'])
             return
-            
-            # 🔥 بررسی مرگ اکانت
-            if "SESSION_REVOKED" in result_text or "Auth Key Invalid" in result_text or "UserDeactivated" in result_text:
-                logger.warning(f"⚰️ Account {account['id']} is DEAD. Disabling...")
-                await DatabaseManager.update_account_status(account['id'], 'inactive')
-                # وضعیت اسپم هم روی error ست شود
-                await DatabaseManager.update_account_spam_status(account['id'], 'error', result_text)
-            else:
-                await DatabaseManager.update_account_spam_status(account['id'], status, result_text)
-                logger.info(f"🛡 Spam Check Acc {account['id']}: {status}")
-                
         except Exception as e:
             logger.error(f"❌ Spam check failed for acc {account['id']}: {e}")
+            return
+
+        rt = (result_text or "")
+        up = rt.upper()
+        fatal = any(k in up for k in (
+            "SESSION_REVOKED", "SESSIONREVOKED",
+            "AUTH_KEY_UNREGISTERED", "AUTHKEYUNREGISTERED",
+            "AUTH KEY INVALID", "AUTH_KEY_INVALID", "AUTHKEYINVALID",
+            "USERDEACTIVATED", "USER_DEACTIVATED",
+        ))
+        if fatal:
+            # 🔥 مرگ واقعی: خود تلگرام می‌گوید کلید باطل است — فقط همین‌جا غیرفعال می‌شود.
+            logger.warning(f"⚰️ Account {account['id']} session truly revoked. Disabling...")
+            await DatabaseManager.update_account_status(account['id'], 'inactive')
+            await DatabaseManager.update_account_spam_status(account['id'], 'error', result_text)
+            return
+        if "AUTH_KEY_DUPLICATED" in up or "406" in up:
+            # گذرا: کلید سالم است ولی همین لحظه جای دیگری آنلاین است؛ وضعیت اکانت دست نمی‌خورد.
+            logger.warning(
+                f"⚠️ Acc {account['id']} duplicate-in-use (406) — transient, "
+                "NOT disabled; external live connection must be stopped."
+            )
+            await DatabaseManager.update_account_spam_status(
+                account['id'], 'cooldown', rt[:180] or "406 duplicate-in-use")
+            return
+        await DatabaseManager.update_account_spam_status(account['id'], status, result_text)
+        logger.info(f"🛡 Spam Check Acc {account['id']}: {status}")
 
     async def run_auto_check(self):
         """اجرای بررسی خودکار"""
