@@ -160,8 +160,7 @@ class RuntimeAntiSpamTests(unittest.TestCase):
             return profile
 
         mgr.get_profile = _fake_profile  # type: ignore[assignment]
-        applied = asyncio.get_event_loop().run_until_complete(
-            mgr.note_account_finished(7, 1))
+        applied = asyncio.run(mgr.note_account_finished(7, 1))
         self.assertEqual(applied, 0.0)
         self.assertEqual(mgr.rest_remaining(7), 0.0)
 
@@ -175,8 +174,7 @@ class RuntimeAntiSpamTests(unittest.TestCase):
                 return profile
 
             mgr.get_profile = _fake_profile  # type: ignore[assignment]
-            applied = asyncio.get_event_loop().run_until_complete(
-                mgr.note_account_finished(7, 1))
+            applied = asyncio.run(mgr.note_account_finished(7, 1))
             # با jitter 0.8–1.2 → باید در بازهٔ [480, 720] باشد
             self.assertGreaterEqual(applied, 8 * 60 - 1)
             self.assertLessEqual(applied, 12 * 60 + 1)
@@ -326,7 +324,8 @@ class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
     def test_client_create_is_paced_and_tight(self):
         vcm = _read_source("services/voice_call_manager.py")
         self.assertIn("'CLIENT_CREATE_CONCURRENCY', 2", vcm)
-        self.assertGreaterEqual(vcm.count("random.uniform(0.8, 2.0)"), 2)
+        self.assertEqual(vcm.count("random.uniform(0.8, 2.0)"), 1)
+        self.assertGreaterEqual(vcm.count("_create_pyrogram_client_locked("), 3)  # definition + warmup + join
 
     def test_adhoc_reservation_has_ttl_and_bounded_acquire(self):
         so = _read_source("services/session_ownership.py")
@@ -336,10 +335,10 @@ class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
 
     def test_fetch_me_is_cancel_safe(self):
         tc = _read_source("telegram_client.py")
-        start = tc.index("async def fetch_me")
-        body = tc[start:start + 2600]
+        body = tc.split("async def fetch_me_status", 1)[1].split("async def fetch_me(", 1)[0]
         self.assertIn("finally:", body)
         self.assertIn("end_ad_hoc", body)
+        self.assertIn("close_pyrogram_client", body)
         self.assertIn("client.connect()", body)
         self.assertNotIn("async with await self.get_client", body)
 
@@ -421,16 +420,18 @@ class WarpFullTunnelTests(unittest.TestCase):
 
 
 class NeverAutoDisableOn406Tests(unittest.TestCase):
-    """رگرسیون v2.3.9 — 406 AUTH_KEY_DUPLICATED یعنی «اتصال زندهٔ هم‌زمان»
-    نه «کلید باطل»؛ غیرفعال‌سازی خودکار انبوه اکانت‌ها به‌خاطر 406 ممنوع.
-    فقط نشانه‌های مرگ واقعی (revoked/unregistered/deactivated/401) میتوانند
-    اکانت را inactive کنند."""
+    """406 AUTH_KEY_DUPLICATED is a conflict, not proof of a usable key.
+
+    Only explicit 401/revoked/unregistered/deactivated auto-disable rows;
+    stop reusing the conflicting key and ask for re-login if it stays invalid.
+    """
 
     def test_vcm_dead_mark_gated_by_fatal_markers(self):
         vcm = _read_source("services/voice_call_manager.py")
         self.assertIn("_FATAL_SESSION_MARKERS", vcm)
         self.assertIn("_is_fatal_session_reason", vcm)
-        self.assertIn("NOT disabled", vcm)
+        self.assertIn("AUTH_KEY_DUPLICATED", vcm)
+        self.assertIn('return False, f"AUTH_KEY_DUPLICATED:', vcm)
         # نزدیکِ update_account_status(inactive) باید ابتدا فیلتر fatal بیاید
         i_fatal = vcm.index("_is_fatal_session_reason(reason)")
         i_inactive = vcm.index('update_account_status(int(account_id), "inactive")')
@@ -443,8 +444,8 @@ class NeverAutoDisableOn406Tests(unittest.TestCase):
         # بلوک غیرفعال‌سازی فقط بعد از محاسبه fatal و بدون AUTH_KEY_DUPLICATED در fatal
         fatal_part = hc.split("fatal = any(k in up for k in (", 1)[1].split("))", 1)[0]
         self.assertNotIn("AUTH_KEY_DUPLICATED", fatal_part)
-        self.assertIn('"406" in up', hc)
-        self.assertIn("transient", hc)
+        self.assertIn("is_auth_key_duplicated(rt)", hc)
+        self.assertNotIn('"406" in up', hc)  # other 406 RPCs aren't auth-key errors
         self.assertIn("check_spambot()", hc)
         # نتیجهٔ موفق باید ذخیره شود (بلوک مرده قبلی حذف شده)
         self.assertIn("await DatabaseManager.update_account_spam_status(account['id'], status, result_text)", hc)
@@ -456,11 +457,11 @@ class NeverAutoDisableOn406Tests(unittest.TestCase):
             exe.count('["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]'), 2)
         old = 'if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):'
         self.assertNotIn(old, exe)
-        # شاخهٔ گذرای 406 در موج موجود است و _mark_account_dead در آن نیست
-        dup_branch = exe.split('if "AUTH_KEY_DUPLICATED" in upper or "406" in upper:', 1)[1].split("continue", 1)[0]
+        # Key conflict has its own wave branch, never calls dead-mark.
+        dup_branch = exe.split('if is_auth_key_duplicated(msg):', 1)[1].split("continue", 1)[0]
         self.assertNotIn("_mark_account_dead", dup_branch)
         self.assertIn("dup406_streak += 1", dup_branch)
-        self.assertIn("NOT disabled", exe)
+        self.assertIn("no auto-disable", exe)
 
     def test_resync_protective_abort(self):
         adm = _read_source("handlers/admin_handlers.py")

@@ -14,7 +14,7 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
-from services.session_ownership import SessionInUseError
+from services.session_ownership import SessionInUseError, is_auth_key_duplicated
 from services import self_healing
 from services.anti_spam import anti_spam
 
@@ -595,8 +595,9 @@ class OrderExecutor:
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
-	    # شمارش پیاپی 406: سیل «همه به یک خطا می‌میرند» یعنی سشن‌ها در
-	    # پروسس/سرور دیگری زنده‌اند — با abort موج جلوی سوخت بیهوده گرفته می‌شود.
+	    # A run of 406 errors suggests a systemic auth-key collision (including
+	    # same-process reseller copies), not proof of another server or a usable
+	    # key. Abort the wave to avoid hammering possibly invalidated keys.
 	    dup406_streak = 0
 	    live = int(vcm.get_active_count(order_id))
 
@@ -769,28 +770,28 @@ class OrderExecutor:
 	                    continue
 
 	                upper = msg.upper()
-	                # v2.3.9: AUTH_KEY_DUPLICATED (406) یعنی «همین لحظه جای دیگری
-	                # با همین کلید آنلاین است» — کلید باطل نشده و اکانت به‌هیچ‌وجه
-	                # غیرفعال نمی‌شود؛ فقط برای همین سفارش کنار گذاشته می‌شود و
-	                # سیلاب 406 با همان شمارندهٔ متوالی متوقف می‌ماند.
-	                if "AUTH_KEY_DUPLICATED" in upper or "406" in upper:
-	                	dead_count += 1  # برای آمار سفارش (نه غیرفعال‌سازی دیتابیس)
-	                	wave_dead += 1
-	                	wave_fail += 1
-	                	self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
-	                	self._voice_banned.setdefault(order_id, set()).add(aid)
-	                	dup406_streak += 1
-	                	try:
-	                		await DatabaseManager.update_account_spam_status(
-	                			aid, "cooldown", "406 duplicate-in-use (transient, NOT disabled)")
-	                	except Exception:
-	                		pass
-	                	logger.warning(
-	                		f"Order {order_id}: account {aid} 406 duplicate-in-use - "
-	                		"transient; account NOT marked dead (external live connection)"
-	                	)
-	                	join_brain.report_result(order_id, OUTCOME_DEAD, msg)
-	                	continue
+	                # AUTH_KEY_DUPLICATED (406) says the auth key was used twice;
+	                # it does NOT identify which process did it, and Telegram may
+	                # already have invalidated the key. Never mark it dead on a
+	                # guess; stop attempts for this order and investigate.
+	                if is_auth_key_duplicated(msg):
+	                    dead_count += 1  # order statistics, not a DB auto-disable
+	                    wave_dead += 1
+	                    wave_fail += 1
+	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    dup406_streak += 1
+	                    try:
+	                        await DatabaseManager.update_account_spam_status(
+	                            aid, "cooldown", "AUTH_KEY_DUPLICATED: investigate key conflict; re-login if invalid")
+	                    except Exception:
+	                        pass
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} AUTH_KEY_DUPLICATED - "
+	                        "no auto-disable; key may have been invalidated (check local copies/other connections)"
+	                    )
+	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                    continue
 	                if status == "dead" or any(x in upper for x in (
 	                	"SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
 	                	"USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
@@ -867,8 +868,8 @@ class OrderExecutor:
 	        if dup406_streak >= 5:
 	            logger.error(
 	                f"Order {order_id}: {dup406_streak} consecutive AUTH_KEY_DUPLICATED - "
-	                "sessions are alive in ANOTHER process/server; aborting build waves "
-	                "to stop pointless key burns (kill the other instance or re-login)"
+	                "aborting build waves to avoid further key conflicts. "
+	                "Check copied reseller sessions, other processes/servers; re-login if keys were invalidated"
 	            )
 	            try:
 	                self.active_orders[order_id]["build_abort_reason"] = "AUTH_KEY_DUPLICATED_SYSTEMIC"
@@ -1277,7 +1278,7 @@ class OrderExecutor:
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
 					if ok: return {"success": True, "acc": acc, "chat_id": cid}
-					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
+					if not is_auth_key_duplicated(msg) and any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 						await self._mark_account_dead(acc["id"])
 						return {"success": False, "status": "dead"}
 					return {"success": False, "status": "failed", "msg": msg, "retry_managed": True}
@@ -1289,7 +1290,7 @@ class OrderExecutor:
 				# دقیقاً با همان chat_id زمان‌بندی شود (وابسته به حدس لینک نباشد).
 				_cid = getattr(client, "last_joined_chat_id", None) if ok else None
 				if ok: return {"success": True, "acc": acc, "chat_id": _cid}
-				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
+				if not is_auth_key_duplicated(msg) and any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 					await self._mark_account_dead(acc["id"])
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}

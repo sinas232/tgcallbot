@@ -1,182 +1,243 @@
-"""
-session_ownership.py — one MTProto session, ONE connection at a time
-=====================================================================
+"""One MTProto *authorization key*, one connection.
 
-Telegram only allows a *limited* number of parallel MTProto main sessions
-per authorization key (``tmp_sessions``; normally one). Opening a second
-Pyrogram connection with the same session string while the voice-call
-engine holds a long-lived connection triggers ``AUTH_KEY_DUPLICATED`` —
-Telegram then invalidates the key and every connection of that account
-dies (``SESSION_REVOKED`` / the account is kicked out of the voice call).
-This used to happen whenever an admin ran a profile/SpamBot/get-code
-action, or a group/channel order, while the same account was in a voice
-call.
+An account can appear in more than one bot's account table (the reseller
+"sync accounts" action copies session strings). Those rows have different
+account IDs but the SAME auth key. Guarding only by row ID, as we used to,
+let a single bot process connect to Telegram twice with that key.
 
-This tiny registry makes the voice engine the exclusive owner of an
-account's session for the lifetime of its Pyrogram client:
-
-* ``acquire_voice`` / ``release_voice`` are reference counted (the shared
-  client survives engine rebuilds and multi-order reuse) and wait for any
-  short ad-hoc operation to finish first;
-* ``begin_ad_hoc`` is a NON-BLOCKING reservation for an unrelated
-  operation (profile update, SpamBot check, reading the login code, group
-  joins ...): while the voice engine holds the session it raises
-  :class:`SessionInUseError` instead of opening a duplicate connection.
-
-All state mutations are synchronous and happen on the event-loop thread,
-so the check-and-reserve sequence cannot race. Session strings never
-touch this module.
+Reservations are process-local; the bot also takes a database-wide instance
+lock at startup. Neither can protect against an unrelated, older process or a
+third-party program that connects using a copied session string.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import os
+import struct
 import time
-from typing import Dict
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# رزروی ad-hoc که به‌هر دلیلی (مثلاً لغو تسک وسط اتصال — wait_for/تایم‌اوت)
-# آزاد نشده باشد، نباید اکانت را «برای همیشه» قفل کند؛ آن‌وقت اکانت‌ها هنگام
-# join ویس‌کال در انتظار می‌مانند و «وارد ویس‌کال نمی‌شوند». هر رزرو یک TTL
-# دارد (پیش‌فرض ۵ دقیقه — مسیرهای کام سالم، چندثانیه‌ای‌اند) و در دسترسی‌ها
-# به‌صورت تنبل جارو می‌شود. با env قابل تغییر است.
+# Old versions forcibly EXPIRED reservations after five minutes even if the
+# Pyrogram socket was still connected. That made a second connection possible.
+# Now this is a warning threshold, NEVER an automatic unlock.
 AD_HOC_TTL_SEC = float(os.getenv("SESSION_ADHOC_TTL_SEC", "300"))
-# صبر acquire_voice روی پایان رزروهای ad-hoc: محدود و قابل‌پیش‌بینی؛ سپس خطای
-# کنترل‌شدهٔ SessionInUseError (به‌جای هنگ بی‌نهایت که سفارش را گیر می‌انداخت).
 ACQUIRE_WAIT_SEC = float(os.getenv("VOICE_ACQUIRE_WAIT_SEC", "90"))
+# Give Telegram time to forget a just-closed transport before using its key
+# again. A clean disconnect is not an instantaneous remote-side barrier.
+RECONNECT_QUIET_SEC = max(5.0, float(os.getenv("SESSION_RECONNECT_QUIET_SEC", "5")))
+
+
+def _session_key(account_id: int, session_string: Optional[str]) -> Tuple[str, object]:
+    """Fingerprint the auth key (not Fernet ciphertext, which has a random IV).
+
+    Pyrogram/Kurigram export three formats. A re-export may change the DC,
+    API ID or user metadata without changing the 256-byte authorization key.
+    Only a SHA-256 digest is held in memory; no session/key is logged. A
+    non-Pyrogram string falls back to its exact bytes. Missing strings are
+    supported for legacy callers, but all real connection paths pass a key.
+    """
+    if not session_string:
+        return ("account", int(account_id))
+    data = session_string.encode("utf-8")
+    try:
+        raw = base64.urlsafe_b64decode(session_string + "=" * (-len(session_string) % 4))
+        if len(raw) == struct.calcsize(">BI?256sQ?"):
+            data = raw[6:262]
+        elif len(raw) in (struct.calcsize(">B?256sI?"), struct.calcsize(">B?256sQ?")):
+            data = raw[2:258]
+    except (ValueError, UnicodeError, TypeError):
+        pass
+    return ("auth", hashlib.sha256(data).digest())
+
+
+def is_auth_key_duplicated(error: object) -> bool:
+    """406 alone is not enough: other Telegram errors also use HTTP/RPC 406."""
+    text = (type(error).__name__ + " " + str(error)).upper()
+    return "AUTH_KEY_DUPLICATED" in text or "AUTHKEYDUPLICATED" in text
 
 
 class SessionInUseError(RuntimeError):
-    """Raised when an ad-hoc client would duplicate a held session."""
+    """Opening another connection could duplicate a held authorization key."""
 
-    def __init__(self, account_id: int, reason: str = "voice") -> None:
+    def __init__(self, account_id: int, reason: str = "voice", owner_id: Optional[int] = None) -> None:
         self.account_id = int(account_id)
         self.reason = reason
-        base = (
-            "session is exclusively held by the voice call engine"
-            if reason == "voice"
-            else "session is busy with another short-lived operation"
-        )
-        self.technical = f"account {self.account_id} {base}; retry shortly"
-        # User-facing code paths stringify exceptions straight into Persian
-        # admin messages, so the default rendering is Persian; logs may use
-        # ``.technical`` for the English description.
+        self.owner_id = owner_id
+        self.technical = f"account {account_id}: {reason} session reservation (owner={owner_id}); no connection made"
         super().__init__(self.persian_message)
 
     @property
     def persian_message(self) -> str:
+        if self.reason == "shared":
+            return "همین کلید سشن در اکانت دیگری از همین ربات/نمایندگی در حال استفاده است؛ اتصال دوم باز نشد."
         if self.reason == "voice":
-            return (
-                "این اکانت هم‌اکنون در یک ویس‌کال فعال است و باز کردن هم‌زمان "
-                "سشن مجاز نیست؛ بعد از پایان سفارش دوباره تلاش کنید."
-            )
-        return "این اکانت هم‌اکنون در حال انجام عملیات دیگری است؛ چند لحظه بعد دوباره تلاش کنید."
+            return "این اکانت هم‌اکنون در ویس‌کال فعال است؛ اتصال دوم به همان سشن باز نشد."
+        if self.reason == "uncertain":
+            return "قطع اتصال قبلی این اکانت تأیید نشد؛ برای جلوگیری از تداخل سشن، اتصال تازه باز نشد."
+        if self.reason == "replaced":
+            return "سشن این اکانت در حین اتصال فعال تغییر کرده است؛ ابتدا اتصال قبلی باید پایان یابد."
+        if self.reason == "cooldown":
+            return "اتصال قبلی این سشن تازه بسته شده؛ چند ثانیه بعد دوباره تلاش کنید."
+        return "این سشن هم‌اکنون در حال انجام عملیات دیگری است؛ چند لحظه بعد دوباره تلاش کنید."
+
+
+@dataclass
+class _AdHocReservation:
+    key: Tuple[str, object]
+    token: object
+    started_at: float
+    warned: bool = False
 
 
 class SessionOwnership:
     def __init__(self) -> None:
         self._voice_refs: Dict[int, int] = {}
-        self._ad_hoc: Dict[int, float] = {}
+        self._voice_keys: Dict[int, Tuple[str, object]] = {}
+        self._voice_by_key: Dict[Tuple[str, object], int] = {}
+        self._ad_hoc: Dict[int, _AdHocReservation] = {}
+        self._ad_hoc_by_key: Dict[Tuple[str, object], int] = {}
+        self._quiet_until: Dict[Tuple[str, object], float] = {}
 
     @staticmethod
     def enabled() -> bool:
-        try:
-            return os.getenv("VOICE_SESSION_OWNERSHIP", "true").strip().lower() in (
-                "1", "true", "yes", "on",
-            )
-        except Exception:
-            return True
+        # Disabling the guard via .env caused real AUTH_KEY_DUPLICATED incidents.
+        # Keep the old setting readable for compatibility, but fail CLOSED.
+        if os.getenv("VOICE_SESSION_OWNERSHIP", "true").lower() in ("false", "0", "off", "no"):
+            logger.error("VOICE_SESSION_OWNERSHIP=false ignored: session exclusivity is mandatory")
+        return True
 
     def _sweep_ad_hoc(self) -> None:
-        """رزروهای ad-hoc کهنه (لیک‌شده) را منقضی می‌کند."""
-        try:
-            now = time.monotonic()
-            stale = [aid for aid, ts in self._ad_hoc.items() if now - ts > AD_HOC_TTL_SEC]
-            for aid in stale:
-                self._ad_hoc.pop(aid, None)
-                logger.warning(
-                    "[SessionOwnership] acc=%s stale ad-hoc reservation expired (>%ss)",
-                    aid, int(AD_HOC_TTL_SEC),
-                )
-        except Exception:
-            pass
+        """Report stale holds; NEVER expire one while its client might be live."""
+        now = time.monotonic()
+        for aid, hold in self._ad_hoc.items():
+            if not hold.warned and now - hold.started_at > AD_HOC_TTL_SEC:
+                hold.warned = True
+                logger.error("[SessionOwnership] acc=%s ad-hoc connection held >%ss; "
+                             "refusing to unlock without a confirmed disconnect", aid, AD_HOC_TTL_SEC)
+        for key, deadline in list(self._quiet_until.items()):
+            if deadline <= now:
+                self._quiet_until.pop(key, None)
+
+    def _note_disconnect(self, key: Tuple[str, object]) -> None:
+        if RECONNECT_QUIET_SEC:
+            self._quiet_until[key] = time.monotonic() + RECONNECT_QUIET_SEC
+
+    def note_login_disconnect(self, exported_session: str) -> None:
+        """Delay first reuse of a freshly exported phone-login auth key.
+
+        Phone login starts with a NEW Telegram key, so it cannot be reserved
+        from a stored session string beforehand. After its connect()-only
+        client has really disconnected, the same quiet period protects the
+        key that we are about to publish in the database.
+        """
+        self._note_disconnect(_session_key(0, exported_session))
 
     def is_voice_held(self, account_id: int) -> bool:
         return self._voice_refs.get(int(account_id), 0) > 0
 
     def is_busy(self, account_id: int) -> bool:
-        account_id = int(account_id)
-        return self.is_voice_held(account_id) or account_id in self._ad_hoc
+        aid = int(account_id)
+        return self.is_voice_held(aid) or aid in self._ad_hoc
 
-    async def acquire_voice(self, account_id: int) -> bool:
-        """Reserve the session exclusively for the long-lived voice client.
+    async def acquire_voice(self, account_id: int, session_string: Optional[str] = None) -> bool:
+        """Reserve one key for a long-lived client, waiting only for short ops.
 
-        Waits (bounded) for any short ad-hoc operation to finish first.
-        Reference counted: only the FIRST acquisition creates the hold, so
-        client warm-up and the join path can nest acquisitions. Returns True
-        when this call created the hold. Raises SessionInUseError instead of
-        hanging forever if the ad-hoc user does not finish in time.
+        Re-entrancy for the SAME account/key is reference counted (legacy
+        engine reuse). Another account ID with the same auth key is NEVER
+        allowed to create a second client while the first is connected.
         """
-        account_id = int(account_id)
-        refs = self._voice_refs.get(account_id, 0)
-        if refs > 0:
-            self._voice_refs[account_id] = refs + 1
+        aid = int(account_id)
+        key = _session_key(aid, session_string)
+        refs = self._voice_refs.get(aid, 0)
+        if refs:
+            if session_string and self._voice_keys[aid] != key:
+                raise SessionInUseError(aid, "replaced")
+            self._voice_refs[aid] = refs + 1
             return False
-        # Wait out any in-flight ad-hoc client (they live only seconds), with
-        # a hard ceiling + stale-reservation sweeps so nothing hangs forever.
         deadline = time.monotonic() + ACQUIRE_WAIT_SEC
         while True:
             self._sweep_ad_hoc()
-            if account_id not in self._ad_hoc:
+            owner = self._voice_by_key.get(key)
+            if owner is not None and owner != aid:
+                raise SessionInUseError(aid, "shared", owner_id=owner)
+            if aid not in self._ad_hoc and key not in self._ad_hoc_by_key and \
+                    self._quiet_until.get(key, 0) <= time.monotonic():
                 break
             if time.monotonic() >= deadline:
-                raise SessionInUseError(account_id, "adhoc")
+                reason = "cooldown" if key in self._quiet_until else "adhoc"
+                raise SessionInUseError(aid, reason, owner_id=self._ad_hoc_by_key.get(key))
             await asyncio.sleep(0.1)
-        self._voice_refs[account_id] = 1
-        logger.debug("[SessionOwnership] acc=%s voice hold acquired", account_id)
+        self._voice_refs[aid] = 1
+        self._voice_keys[aid] = key
+        self._voice_by_key[key] = aid
+        logger.debug("[SessionOwnership] acc=%s voice hold acquired", aid)
         return True
 
-    def release_voice(self, account_id: int) -> bool:
-        """Drop one voice reference; release the hold at zero."""
-        account_id = int(account_id)
-        refs = self._voice_refs.get(account_id, 0)
+    def release_voice(self, account_id: int, *, disconnected: bool = False) -> bool:
+        """Only call after the corresponding Pyrogram client is disconnected."""
+        aid = int(account_id)
+        refs = self._voice_refs.get(aid, 0)
         if refs <= 0:
             return False
-        refs -= 1
-        if refs > 0:
-            self._voice_refs[account_id] = refs
+        if refs > 1:
+            self._voice_refs[aid] = refs - 1
             return False
-        self._voice_refs.pop(account_id, None)
-        logger.debug("[SessionOwnership] acc=%s voice hold released", account_id)
+        self._voice_refs.pop(aid)
+        key = self._voice_keys.pop(aid)
+        self._voice_by_key.pop(key, None)
+        if disconnected:
+            self._note_disconnect(key)
+        logger.debug("[SessionOwnership] acc=%s voice hold released", aid)
         return True
 
-    def begin_ad_hoc(self, account_id: int) -> bool:
-        """Non-blocking reservation for a short-lived client.
+    def begin_ad_hoc(self, account_id: int, session_string: Optional[str] = None) -> object:
+        """Reserve before connecting. Return a token for release on close.
 
-        Raises SessionInUseError while a voice client holds the session or
-        another ad-hoc operation is in flight. MUST be paired with
-        :meth:`end_ad_hoc` (typically from the client's ``stop()``).
+        The token ensures a late callback from an old client cannot release a
+        NEW reservation for that same account after a retry.
         """
-        account_id = int(account_id)
-        if not self.enabled():
-            return True
-        if self.is_voice_held(account_id):
-            raise SessionInUseError(account_id, "voice")
+        self.enabled()
+        aid = int(account_id)
+        key = _session_key(aid, session_string)
         self._sweep_ad_hoc()
-        if account_id in self._ad_hoc:
-            raise SessionInUseError(account_id, "adhoc")
-        self._ad_hoc[account_id] = time.monotonic()
-        return True
+        if self.is_voice_held(aid):
+            raise SessionInUseError(aid, "voice")
+        owner = self._voice_by_key.get(key)
+        if owner is not None:
+            raise SessionInUseError(aid, "shared", owner_id=owner)
+        if aid in self._ad_hoc or key in self._ad_hoc_by_key:
+            raise SessionInUseError(aid, "adhoc", owner_id=self._ad_hoc_by_key.get(key))
+        if self._quiet_until.get(key, 0) > time.monotonic():
+            raise SessionInUseError(aid, "cooldown")
+        token = object()
+        self._ad_hoc[aid] = _AdHocReservation(key, token, time.monotonic())
+        self._ad_hoc_by_key[key] = aid
+        return token
 
-    def end_ad_hoc(self, account_id: int) -> None:
-        self._ad_hoc.pop(int(account_id), None)
+    def end_ad_hoc(self, account_id: int, token: object, *,
+                   disconnected: bool = False) -> bool:
+        aid = int(account_id)
+        hold = self._ad_hoc.get(aid)
+        if hold is None or hold.token is not token:
+            return False
+        self._ad_hoc.pop(aid)
+        self._ad_hoc_by_key.pop(hold.key, None)
+        if disconnected:
+            self._note_disconnect(hold.key)
+        return True
 
     def voice_held_accounts(self):
-        return {aid for aid, refs in self._voice_refs.items() if refs > 0}
+        return set(self._voice_refs)
+
+    def ad_hoc_held_accounts(self):
+        return set(self._ad_hoc)
 
 
-# Process-wide singleton.
 session_ownership = SessionOwnership()

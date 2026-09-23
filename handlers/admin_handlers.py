@@ -460,9 +460,10 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
 
     revived: list = []
     relogin: list = []       # واقعاً باطل‌شده → فقط لاگین مجدد
-    dup_elsewhere: list = [] # 406: سشن همین حالا جای دیگری فعال است
+    dup_elsewhere: list = [] # 406: تعارض کلید، منشأ نامعلوم (ممکن است باطل شده باشد)
     timeouts = 0
     busy = 0
+    busy_shared = 0
     errors = 0
     dup_streak = 0
     aborted = 0
@@ -494,9 +495,13 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
             else:
                 dup_streak = 0
                 errors += 1
-        except SessionInUseError:
-            # سشن در اختیار موتور ویس‌کال است — خطر AUTH_KEY_DUPLICATED؛ رد می‌کنیم.
-            busy += 1
+        except SessionInUseError as exc:
+            # 406 was previously blamed on another server even when our OWN
+            # reseller held an identical key under a different account ID.
+            if exc.reason == "shared":
+                busy_shared += 1
+            else:
+                busy += 1
         except Exception:
             errors += 1
         if idx % 5 == 0 or idx == total:
@@ -504,9 +509,9 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
                 await query.edit_message_text(
                     f"🔄 **سینک مجدد سشن‌ها…**\n\n⏳ پیشرفت: {idx}/{total}\n"
                     f"✅ بازگردانده شد: {len(revived)}\n"
-                    f"⚠️ فعال در مکان دیگر (406): {len(dup_elsewhere)}\n"
+                    f"⚠️ تداخل کلید سشن (406): {len(dup_elsewhere)}\n"
                     f"💀 نیازمند لاگین مجدد: {len(relogin)}\n"
-                    f"🎙 در ویس کال (رد شد): {busy}\n"
+                    f"🔒 همین ربات/نمایندگی: {busy_shared} | 🎙 مشغول: {busy}\n"
                     f"⏱ تایم‌اوت شبکه: {timeouts} | ⚠️ خطا: {errors}",
                 )
             except Exception:
@@ -524,13 +529,14 @@ async def account_resync_dead_sessions(update: Update, context: ContextTypes.DEF
         "🔄 **گزارش سینک مجدد سشن‌ها**\n",
         f"🤖 اکانت‌های بررسی‌شده: `{total}`",
         f"✅ بازگردانده شدند به فعال: **{len(revived)}**",
-        f"🎙 مشغول در ویس‌کال (دست‌نخورده): `{busy}`",
+        f"🎙 مشغولِ همین ربات (دست‌نخورده): `{busy}`",
+        f"🔒 کلید مشترک با اکانتِ دیگری از همین ربات/نمایندگی: `{busy_shared}`",
     ]
     if dup_elsewhere:
         lines += [
-            f"⚠️ **{len(dup_elsewhere)} اکانت کلید سالم دارند ولی همین لحظه از جای دیگری آنلاین‌اند** (406 AUTH_KEY_DUPLICATED) — کلید باطل نشده و از v2.3.9 دیگر غیرفعال هم نمی‌شوند.",
-            "مقصر قطعی: یک اتصالِ زندهٔ دیگر با همین کلیدها. محتمل‌ترین‌ها: ۱) سرور/هاست قدیمی که هنوز روشن است و کانتینر رباتش (restart: always) بالاست ۲) پروسس stray روی همین هاست (`ps aux | grep main.py`) ۳) فروشنده‌ای که همان سشن را به چند نفر فروخته.",
-            "راه‌حل قطعی برای هر اکانت: «دریفات کد / لاگین مجدد» از پنل — با کلیدِ تازه، اتصال این ربات دیگر با نسخهٔ بیگانه تداخل نمی‌کند. بعد از قطع‌کردن نمونهٔ بیگانه، این سینک را دوباره بزنید تا خودکار فعال شوند.",
+            f"⚠️ **{len(dup_elsewhere)} سشن خطای 406 AUTH_KEY_DUPLICATED دادند** — منشأ تداخل را از این خطا به‌تنهایی نمی‌شود تعیین کرد؛ تلگرام ممکن است کلید را باطل کرده باشد. حساب‌ها صرفاً به‌خاطر 406 خودکار غیرفعال نمی‌شوند، اما پروب پشت سر هم هم انجام ندهید.",
+            "ابتدا اکانت‌های کپی‌شده در نمایندگی، پروسس‌های همین هاست، کانتینرهای دیگر با همان دیتابیس و سرور/پنل دیگری که همان سشن را دارد بررسی شوند. قفل جدید جلوی کپی‌های این ربات را می‌گیرد؛ کد نمی‌تواند یک برنامۀ قدیمی یا شخص ثالث را متوقف کند.",
+            "پس از حذف تداخل، فقط یک‌بار بررسی کنید. اگر 401 یا خطای ابطال ماند، کلید باطل شده و ورود مجدد لازم است؛ اگر 406 ماند، احتمال اتصال ناشناخته یا کلید نامعتبر را بررسی کنید و در صورت نیاز سشن جدید بگیرید. کلید باطل‌شده با کد قابل تعمیر نیست.",
         ]
     if aborted:
         lines.append(f"🛑 برای جلوگیری از سوختن کلیدها، پس از ۵ خطای 406 متوالی، {aborted} پروب باقی‌مانده انجام نشد (توقف محافظتی).")
@@ -1914,7 +1920,14 @@ async def handle_reseller_action(update, context):
             for acc in main_accounts:
                 res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'), first_name=acc.get('first_name'), last_name=acc.get('last_name'), username=acc.get('username'))
                 if res: count += 1
-            await query.edit_message_text(f"✅ {count} اکانت کپی شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]))
+            await query.edit_message_text(
+                f"✅ {count} ردیف اکانت برای نمایندگی کپی شد.\n\n"
+                "⚠️ سشن‌ها هم کپی شده‌اند و کلیدشان با ربات اصلی مشترک است. "
+                "یک پروسس هم می‌تواند با دو ردیف، تداخل 406 بسازد! حالا "
+                "اتصال دوم به همان کلید مسدود می‌شود؛ برای استفادهٔ هم‌زمان "
+                "در دو ربات، هر اکانت باید در نمایندگی جداگانه لاگین شود.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]),
+            )
         except: pass
         return AWAITING_SETTINGS_ACTION
     await safe_answer(query)

@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
-from services.session_ownership import SessionInUseError
+from services.session_ownership import SessionInUseError, is_auth_key_duplicated
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +23,9 @@ class HealthChecker:
     async def check_single_account_spam(self, account: Dict[str, Any]):
         """بررسی محدودیت اسپم برای یک اکانت.
 
-        قانون طلایی v2.3.9: اکانت فقط با «مرگ واقعی کلید» (401/revoked/
-        unregistered/deactivated) غیرفعال می‌شود؛ AUTH_KEY_DUPLICATED (406)
-        یعنی اتصال زندهٔ هم‌زمان در جای دیگر — گذراست و هرگز غیرفعال نمی‌کند.
+        اکانت فقط با ابطال صریح کلید غیرفعال می‌شود. خطای
+        AUTH_KEY_DUPLICATED (406) منشأ برخورد یا اعتبار فعلی کلید را ثابت
+        نمی‌کند؛ خودکار غیرفعال نمی‌کنیم، اما دوباره‌پروب مکرر هم نمی‌زنیم.
         """
         try:
             client = TelegramAccountClient(account['phone_number'], account['session_string'], account['id'])
@@ -48,20 +48,20 @@ class HealthChecker:
             "AUTH KEY INVALID", "AUTH_KEY_INVALID", "AUTHKEYINVALID",
             "USERDEACTIVATED", "USER_DEACTIVATED",
         ))
-        if fatal:
-            # 🔥 مرگ واقعی: خود تلگرام می‌گوید کلید باطل است — فقط همین‌جا غیرفعال می‌شود.
+        if fatal and not is_auth_key_duplicated(rt):
+            # Explicit invalidation only; 406 has priority over fuzzy text markers.
             logger.warning(f"⚰️ Account {account['id']} session truly revoked. Disabling...")
             await DatabaseManager.update_account_status(account['id'], 'inactive')
             await DatabaseManager.update_account_spam_status(account['id'], 'error', result_text)
             return
-        if "AUTH_KEY_DUPLICATED" in up or "406" in up:
-            # گذرا: کلید سالم است ولی همین لحظه جای دیگری آنلاین است؛ وضعیت اکانت دست نمی‌خورد.
-            logger.warning(
-                f"⚠️ Acc {account['id']} duplicate-in-use (406) — transient, "
-                "NOT disabled; external live connection must be stopped."
-            )
+        if is_auth_key_duplicated(rt):
+            # 406 can mean Telegram already invalidated this key. Do not
+            # disable it on a guess, but do not call it healthy or keep
+            # probing it; first eliminate simultaneous connections.
+            logger.warning("Acc %s AUTH_KEY_DUPLICATED — no auto-disable; investigate shared keys / instances",
+                           account['id'])
             await DatabaseManager.update_account_spam_status(
-                account['id'], 'cooldown', rt[:180] or "406 duplicate-in-use")
+                account['id'], 'cooldown', rt[:180] or "AUTH_KEY_DUPLICATED (check session)")
             return
         await DatabaseManager.update_account_spam_status(account['id'], status, result_text)
         logger.info(f"🛡 Spam Check Acc {account['id']}: {status}")

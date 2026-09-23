@@ -62,9 +62,10 @@ def classify_message(msg: str) -> str:
     so it mirrors the important buckets without importing heavy modules.
     """
     text = (msg or "").upper()
+    if "AUTH_KEY_DUPLICATED" in text or "AUTHKEYDUPLICATED" in text:
+        return OUTCOME_DEAD  # skip this slot; 406 alone is NOT proof of a dead key
     if any(k in text for k in (
         "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-        "AUTH_KEY_DUPLICATED", "406",
         "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401", "DEAD",
     )):
         return OUTCOME_DEAD

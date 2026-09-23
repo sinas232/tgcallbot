@@ -67,7 +67,8 @@ from database import DatabaseManager
 from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
-from services.session_ownership import session_ownership
+from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated
+from services.session_client import close_pyrogram_client
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -89,6 +90,17 @@ from services.presence_reconciler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _disconnect_voice_app(app: Client, timeout: float = 5.0) -> bool:
+    """Tear down even after a join wave cancels our current task."""
+    try:
+        return await close_pyrogram_client(app, timeout=timeout)
+    except asyncio.CancelledError:
+        # close_pyrogram_client awaited its shielded cleanup before raising.
+        # The caller will re-raise its original CancelledError after it has
+        # decided whether to release or quarantine the auth-key reservation.
+        return not getattr(app, "is_connected", False) and getattr(app, "session", None) is None
 
 
 def _patch_pyrogram_channel_id_range() -> None:
@@ -227,34 +239,31 @@ _FATAL_SESSION_MARKERS = (
 
 def _is_fatal_session_reason(reason: str) -> bool:
     up = (reason or "").upper()
-    return any(m in up for m in _FATAL_SESSION_MARKERS)
+    # A 406 report may include other numbers; don't turn it into a 401 guess.
+    return not is_auth_key_duplicated(up) and any(m in up for m in _FATAL_SESSION_MARKERS)
 
 
 async def _mark_session_dead(account_id: int, reason: str) -> None:
     """اکانت را فقط در «مرگ واقعی کلید» (401/revoked/unregistered/deactivated)
     از چرخه خارج می‌کند — هرگز برای 406.
 
-    AUTH_KEY_DUPLICATED (406) به‌معنای «همین لحظه یک اتصالِ زندهٔ دیگر با
-    همین کلید وجود دارد» است — نه باطل‌شدن کلید. غیرفعال‌کردنِ انبوه اکانت‌ها
-    به‌خاطر 406 دقیقاً همان باگی بود که استخر اکانت‌ها را خالی می‌کرد در حالی
-    که کلیدها سالم بودند (Resync آن‌ها را duplicated می‌دید نه relogin).
-    در این حالت فقط یادداشت نرم می‌گذاریم؛ اکانت active می‌ماند و سفارش‌های
-    بعدی وقتی آن نمونهٔ بیگانه قطع شد دوباره از آن استفاده می‌کنند.
-    هرگز چیز بیرون‌کشیدنی علامت نمی‌زنیم مگر تلگرام صراحتاً گفته باشد کلید رفته.
+    AUTH_KEY_DUPLICATED (406) تداخل کلید را نشان می‌دهد؛ با این خطا نه می‌شود
+    محل اتصال دوم را مشخص کرد، نه ثابت کرد کلید هنوز معتبر است. این تداخل
+    حتی با دو ردیف نمایندگی در همان پردازه ممکن است. غیرفعال‌سازی حدسیِ 406
+    استخر اکانت‌ها را خالی می‌کرد؛ در عوض وضعیت cooldown و هشدار ثبت می‌شود.
+    پس از رفع تداخل اگر کلید واقعاً باطل شده باشد، باید دوباره لاگین کرد.
     """
     try:
         from database import DatabaseManager as _DB
         if not _is_fatal_session_reason(reason):
-            logger.warning(
-                "Session %s held elsewhere (%s) — account NOT disabled; "
-                "stop the other live connection (old server/stray process/"
-                "panel/vendor session) or re-login to mint a fresh key.",
-                account_id, reason,
-            )
-            await _DB.update_account_spam_status(
-                int(account_id), "cooldown",
-                f"duplicate-in-use transient, NOT disabled ({reason})"[:180],
-            )
+            if is_auth_key_duplicated(reason):
+                logger.warning(
+                    "Session %s AUTH_KEY_DUPLICATED — not auto-disabled. "
+                    "Check same-key reseller rows, old processes and other servers. "
+                    "Telegram may have invalidated the key; re-login if needed.", account_id)
+                await _DB.update_account_spam_status(
+                    int(account_id), "cooldown", "AUTH_KEY_DUPLICATED: check duplicate connection/key; re-login if invalid",
+                )
             return
         await _DB.update_account_status(int(account_id), "inactive")
         await _DB.update_account_spam_status(
@@ -669,6 +678,10 @@ class VoiceCallManager:
         self._order_accounts: Dict[int, Set[int]] = {}
         self._reservations: Dict[int, Set[int]] = {}
         self._session_cache: Dict[int, str] = {}
+        # A disconnect that could not be confirmed is NOT permission to
+        # reconnect. Keep its hold until shutdown (never burn the same key).
+        self._quarantined_accounts: Set[int] = set()
+        self._shutting_down = False
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._reservation_lock = asyncio.Lock()
         self._keepalive_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
@@ -1879,87 +1892,97 @@ class VoiceCallManager:
 
     # ─── Client management ───
 
+    async def _create_pyrogram_client_locked(
+        self, account_id: int, session_string: str, decrypted_session: str, timeout: float,
+    ) -> Client:
+        """Only call under the per-account lock (both warmup and join paths).
+
+        Hold the *auth-key* reservation until a confirmed disconnect. This
+        includes timeout/cancellation during start or the post-start pacing
+        sleep; those paths used to leak an untracked live MTProto transport.
+        """
+        async with CLIENT_CREATE_SEMAPHORE:
+            if self._shutting_down:
+                raise RuntimeError("voice engine shutting down")
+            held = await session_ownership.acquire_voice(account_id, decrypted_session)
+            if not held:
+                # A previous hold exists but the manager has no cached app:
+                # do not treat reference counting as permission to open one.
+                session_ownership.release_voice(account_id)
+                raise SessionInUseError(account_id, "uncertain")
+            app = None
+            try:
+                if self._shutting_down:
+                    raise RuntimeError("voice engine shutting down")
+                helper = TelegramAccountClient("temp", session_string, account_id)
+                api_id, api_hash = await helper._get_api_credentials()
+                app = Client(
+                    f"shared_client_{account_id}",
+                    session_string=decrypted_session,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    no_updates=False,  # PyTgCalls needs raw Telegram updates
+                    in_memory=True,
+                    proxy=_voice_proxy_config(),
+                    **_client_device_fingerprint(account_id),
+                )
+                await asyncio.wait_for(app.start(), timeout=timeout)
+                await asyncio.sleep(random.uniform(0.8, 2.0))
+                if self._shutting_down:
+                    raise RuntimeError("voice engine shutting down")
+            except BaseException as exc:
+                closed = app is None or await _disconnect_voice_app(app)
+                if closed:
+                    session_ownership.release_voice(account_id, disconnected=app is not None)
+                else:
+                    self._quarantined_accounts.add(account_id)
+                    self.pyrogram_clients[account_id] = app
+                    logger.critical("acc=%s MTProto teardown unconfirmed; quarantined until process exit", account_id)
+                if isinstance(exc, AuthKeyDuplicated):
+                    await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED client_start")
+                raise
+            self.pyrogram_clients[account_id] = app
+            self._session_cache[account_id] = session_string
+            return app
+
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
-        # Database sessions are encrypted. Passing the encrypted value to
-        # Pyrogram makes every account fail during client initialisation.
         decrypted_session = SecurityManager.decrypt_session(session_string)
         if not decrypted_session:
             raise ValueError(f"Invalid encrypted session for account {account_id}")
-        self._session_cache[account_id] = session_string
 
         async with self._lock(account_id):
-            # Check existing pyrogram client
+            if self._shutting_down:
+                raise RuntimeError("voice engine shutting down")
+            if account_id in self._quarantined_accounts:
+                raise SessionInUseError(account_id, "uncertain")
             app = self.pyrogram_clients.get(account_id)
             if app:
-                try:
-                    if not app.is_connected:
+                cached = self._session_cache.get(account_id)
+                if cached and SecurityManager.decrypt_session(cached) != decrypted_session:
+                    raise SessionInUseError(account_id, "replaced")
+                if not session_ownership.is_voice_held(account_id):
+                    self._quarantined_accounts.add(account_id)
+                    raise SessionInUseError(account_id, "uncertain")
+                if not app.is_connected:
+                    try:
+                        # Reconnect the SAME client; never create another
+                        # client while its previous transport might be alive.
                         await asyncio.wait_for(app.start(), timeout=15)
-                except FloodWait as e:
-                    wait_s = int(getattr(e, "value", 3) or 3)
-                    voice_cooldown.record(account_id, wait_s,
-                                         operation="client_start", source="pyrogram reconnect")
-                    raise
-                except Exception as e:
-                    logger.warning(f"reconnect pyrogram acc={account_id}: {e}")
-                    try:
-                        if hasattr(app, 'disconnect'):
-                            await app.disconnect()
-                    except Exception:
-                        pass
-                    app = None
-                    self.pyrogram_clients.pop(account_id, None)
-                    # The session tied to this dead client is gone; release
-                    # the exclusive hold so the fresh client below re-acquires.
-                    session_ownership.release_voice(account_id)
-
-            if not app:
-                async with CLIENT_CREATE_SEMAPHORE:
-                    held = await session_ownership.acquire_voice(account_id)
-                    try:
-                        helper = TelegramAccountClient("temp", session_string, account_id)
-                        api_id, api_hash = await helper._get_api_credentials()
-                        app = Client(
-                            f"shared_client_{account_id}",
-                            session_string=decrypted_session,
-                            api_id=api_id,
-                            api_hash=api_hash,
-                            # PyTgCalls needs raw Telegram updates to complete
-                            # the voice transport handshake and participant sync.
-                            no_updates=False,
-                            in_memory=True,
-                            proxy=_voice_proxy_config(),
-                            **_client_device_fingerprint(account_id),
-                        )
-                        await asyncio.wait_for(app.start(), timeout=20)
-                        # مکث کوتاه تصادفی: اتصال‌های پشت سر هم در حجم بالا
-                        # (مثلاً resume بعد از ری‌استارت کانتینر) الگوی سیلابی
-                        # می‌سازند که تلگرام را به باطل‌کردن کلید (406) حساس
-                        # می‌کند.
-                        await asyncio.sleep(random.uniform(0.8, 2.0))
-                    except Exception as _ce:
-                        # Best-effort teardown of the half-open client: without
-                        # this, our own lingering connection can DUPLICATE the
-                        # session key of the next retry and burn a healthy
-                        # account (AUTH_KEY_DUPLICATED invalidates the key
-                        # server-side, so the session can never be reused).
-                        try:
-                            if app is not None:
-                                try:
-                                    await asyncio.wait_for(app.disconnect(), timeout=5)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        if held:
-                            session_ownership.release_voice(account_id)
-                        if isinstance(_ce, AuthKeyDuplicated):
-                            # 406: کلید از سمت سرور باطل است؛ علامت مرده تا
-                            # حلقه‌های retry/recovery دوباره همین کلید مرده را
-                            # سرو نکنند و اکانت پیاپی «از سشن خارج» نشود.
-                            await _mark_session_dead(
-                                account_id, "AUTH_KEY_DUPLICATED client_start")
+                    except BaseException as exc:
+                        if isinstance(exc, FloodWait):
+                            voice_cooldown.record(account_id, int(getattr(exc, "value", 3) or 3),
+                                                  operation="client_start", source="pyrogram reconnect")
+                        if await _disconnect_voice_app(app):
+                            self.pyrogram_clients.pop(account_id, None)
+                            self.clients.pop(account_id, None)
+                            session_ownership.release_voice(account_id, disconnected=True)
+                        else:
+                            self._quarantined_accounts.add(account_id)
+                            logger.critical("acc=%s reconnect teardown unconfirmed; quarantined", account_id)
                         raise
-                    self.pyrogram_clients[account_id] = app
+            else:
+                app = await self._create_pyrogram_client_locked(
+                    account_id, session_string, decrypted_session, timeout=20)
 
             # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
             pytg = self.clients.get(account_id)
@@ -2003,46 +2026,38 @@ class VoiceCallManager:
             return pytg
 
     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
-        # Only cleanup if account is not used by any other active call
-        if not force:
-            still_active = any(
-                aid == account_id
-                for (oid, aid) in self.active_calls.keys()
-                if oid != order_id
-            )
-            if still_active:
+        # IMPORTANT: use the SAME per-account lock as the warmup/create path.
+        # Previously we popped the client (and even removed its lock) BEFORE
+        # disconnecting it. A new wave could connect to that key while the old
+        # transport was still open, even within a single bot process.
+        async with self._lock(account_id):
+            if not force and any(
+                aid == account_id and oid != order_id for (oid, aid) in self.active_calls
+            ):
                 return
-
-        pytg = self.clients.pop(account_id, None)
-        if pytg:
-            # PyTgCalls 2.x has NO stop() method (the old hasattr(pytg,'stop')
-            # check was a silent no-op — engines were NEVER torn down, so
-            # half-dead WebRTC connections outlived their calls and later
-            # caused 'Connection cannot be initialized more than once').
-            # leave_call() = engine stop + LeaveGroupCall, which is exactly
-            # what a real teardown should do.
-            try:
-                for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                    try:
-                        await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # Only remove pyrogram client if not used by any other order
-        if force or not self._account_in_any_order(account_id):
-            app = self.pyrogram_clients.pop(account_id, None)
-            if app:
+            pytg = self.clients.pop(account_id, None)
+            if pytg:
+                # PyTgCalls 2.x has no stop(); leave its held calls before
+                # closing the MTProto client (unless shutting down globally).
                 try:
-                    await asyncio.wait_for(app.disconnect(), timeout=5)
+                    for cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
+                        try:
+                            await asyncio.wait_for(pytg.leave_call(int(cid)), timeout=5)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-            # Session is no longer connected by the voice engine — release
-            # the exclusive hold so short-lived clients may use it again.
-            session_ownership.release_voice(account_id)
-            self._session_cache.pop(account_id, None)
-            self._client_locks.pop(account_id, None)
+
+            if force or not self._account_in_any_order(account_id):
+                app = self.pyrogram_clients.get(account_id)
+                if app and not await _disconnect_voice_app(app):
+                    self._quarantined_accounts.add(account_id)
+                    logger.critical("acc=%s cleanup disconnect unconfirmed; keeping auth-key hold", account_id)
+                    return
+                self.pyrogram_clients.pop(account_id, None)
+                session_ownership.release_voice(account_id, disconnected=app is not None)
+                self._session_cache.pop(account_id, None)
+                self._quarantined_accounts.discard(account_id)
 
     # ─── Protocol helpers ───
 
@@ -3597,73 +3612,38 @@ class VoiceCallManager:
 
         async def _warm_one(acc: Dict) -> None:
             nonlocal warmed
-            account_id = acc.get("id")
-            session_string = acc.get("session_string")
+            account_id = acc["id"]
+            session_string = acc["session_string"]
             try:
                 async with self._lock(account_id):
-                    # Re-check under the lock (a concurrent join may have
-                    # already created this client).
-                    if account_id in self.pyrogram_clients:
+                    if account_id in self.pyrogram_clients or account_id in self._quarantined_accounts:
                         return
-                    # Never warm an account whose server-directed FloodWait
-                    # timer is still active — warming opens a new connection
-                    # and would extend the wait for the whole IP.
                     if voice_cooldown.remaining(account_id) > 0:
                         return
-                    decrypted_session = SecurityManager.decrypt_session(session_string)
-                    if not decrypted_session:
+                    decrypted = SecurityManager.decrypt_session(session_string)
+                    if not decrypted:
                         return
-                    async with CLIENT_CREATE_SEMAPHORE:
-                        held = await session_ownership.acquire_voice(account_id)
-                        try:
-                            helper = TelegramAccountClient("temp", session_string, account_id)
-                            api_id, api_hash = await helper._get_api_credentials()
-                            app = Client(
-                                f"shared_client_{account_id}",
-                                session_string=decrypted_session,
-                                api_id=api_id,
-                                api_hash=api_hash,
-                                # Voice clients must receive raw updates from Telegram.
-                                no_updates=False,
-                                in_memory=True,
-                                proxy=_voice_proxy_config(),
-                                **_client_device_fingerprint(account_id),
-                            )
-                            await asyncio.wait_for(app.start(), timeout=15)
-                            # پیسینگ تصادفی بین ساخت کلاینت‌ها (ضد سیلاب 406 در resume).
-                            await asyncio.sleep(random.uniform(0.8, 2.0))
-                        except FloodWait as e:
-                            if held:
-                                session_ownership.release_voice(account_id)
-                            wait_s = int(getattr(e, "value", 3) or 3)
-                            voice_cooldown.record(
-                                account_id, wait_s,
-                                operation="warmup_start", source="client.start",
-                            )
-                            self._vc_event_log(None, account_id, "warmup_floodwait",
-                                               {"wait_s": wait_s})
-                            return
-                        except AuthKeyDuplicated as e:
-                            if held:
-                                session_ownership.release_voice(account_id)
-                            self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
-                            # خطای مرگبار: اکانت را از چرخهٔ warmup خارج/مرده علامت بزن.
-                            await _mark_session_dead(account_id, f"AUTH_KEY_DUPLICATED warmup: {e}")
-                            return
-                        except Exception:
-                            if held:
-                                session_ownership.release_voice(account_id)
-                            raise
-                        self.pyrogram_clients[account_id] = app
-                        self._session_cache[account_id] = session_string
-                        warmed += 1
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as _se:
+                    # Same lifecycle/cleanup as the real join path. There
+                    # must NOT be a second implementation of Client.start()
+                    # with its own incomplete CancelledError handling.
+                    await self._create_pyrogram_client_locked(
+                        account_id, session_string, decrypted, timeout=15)
+                    warmed += 1
+            except FloodWait as exc:
+                wait_s = int(getattr(exc, "value", 3) or 3)
+                voice_cooldown.record(account_id, wait_s, operation="warmup_start", source="client.start")
+                self._vc_event_log(None, account_id, "warmup_floodwait", {"wait_s": wait_s})
+            except AuthKeyDuplicated:
+                self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as exc:
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
-                await _mark_session_dead(account_id, f"warmup {type(_se).__name__}")
+                await _mark_session_dead(account_id, f"warmup {type(exc).__name__}")
+            except SessionInUseError as exc:
+                logger.info("warmup acc=%s skipped: %s", account_id, exc.technical)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                self._vc_event_log(None, account_id, "warmup_error", {"exc": str(e)[:60]})
+            except Exception as exc:
+                self._vc_event_log(None, account_id, "warmup_error", {"exc": str(exc)[:60]})
 
         if candidates:
             await asyncio.gather(*(_warm_one(acc) for acc in candidates), return_exceptions=True)
@@ -3733,11 +3713,20 @@ class VoiceCallManager:
             logger.info(f"[VoiceScheduler] Order {order_id}: creating Pyrogram client for account {account_id}")
             try:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid, AuthKeyDuplicated) as e:
+            except AuthKeyDuplicated as e:
+                # Do NOT label a 406 as SESSION_REVOKED: order_executor used
+                # that prefix to mark the account inactive regardless of the
+                # v2.3.9 non-fatal gate. Stop retries for this order instead.
+                self._set_state(order_id, account_id, FAILED, "AUTH_KEY_DUPLICATED")
+                await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED start_call")
+                return False, f"AUTH_KEY_DUPLICATED: {e}", 0
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
-                # مرگبار است (حتی 406): اکانت از چرخهٔ سفارش‌ها خارج و علامت می‌خورد.
                 await _mark_session_dead(account_id, f"start_call {type(e).__name__}")
                 return False, f"SESSION_REVOKED: {e}", 0
+            except SessionInUseError as e:
+                self._set_state(order_id, account_id, RETRY_PENDING, e.technical)
+                return False, f"SESSION_IN_USE: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
                 voice_cooldown.record(account_id, wait_s,
@@ -4126,11 +4115,14 @@ class VoiceCallManager:
 
         Without this, `docker restart` SIGKILLs the process with live
         connections; Telegram keeps them half-open and the fresh container's
-        reconnects trigger AUTH_KEY_DUPLICATED — which permanently burns the
-        accounts. Disconnecting cleanly prevents that race.
+        reconnects may trigger AUTH_KEY_DUPLICATED and invalidate their keys.
+        Disconnecting cleanly and holding the instance lock through shutdown
+        prevent an avoidable local restart race (not third-party key reuse).
 
         Returns the number of accounts disconnected.
         """
+        # Block new warmup/join connections before taking the client snapshot.
+        self._shutting_down = True
         # Stop monitors / keepalives / inflight joins first: nothing new may spawn.
         for oid in list(self._monitor_tasks.keys()):
             try:
@@ -4151,7 +4143,8 @@ class VoiceCallManager:
                     inf.cancel()
             except Exception:
                 pass
-        aids = list({*self.pyrogram_clients.keys(), *self.clients.keys()})
+        aids = list({*self.pyrogram_clients.keys(), *self.clients.keys(),
+                     *session_ownership.voice_held_accounts()})
         if not aids:
             return 0
         logger.info("[VoiceShutdown] disconnecting %d clients (fast path, no API leaves)...", len(aids))
@@ -4160,25 +4153,19 @@ class VoiceCallManager:
 
         async def _one(aid: int) -> None:
             nonlocal done
-            async with sem:
-                # Engine dies with its client; no leave_call on the shutdown
-                # path (Telegram purges dead call participants server-side).
+            async with sem, self._lock(aid):
+                # Fast path: do not leave Telegram groups on shutdown. But
+                # NEVER free the key until its Pyrogram client is closed.
                 self.clients.pop(aid, None)
-                app = self.pyrogram_clients.pop(aid, None)
-                if app is not None:
-                    try:
-                        await asyncio.wait_for(app.disconnect(), timeout=5)
-                    except Exception:
-                        pass
-                try:
-                    session_ownership.release_voice(aid)
-                except Exception:
-                    pass
-                try:
-                    self._session_cache.pop(aid, None)
-                    self._client_locks.pop(aid, None)
-                except Exception:
-                    pass
+                app = self.pyrogram_clients.get(aid)
+                if app is not None and not await _disconnect_voice_app(app):
+                    self._quarantined_accounts.add(aid)
+                    logger.critical("[VoiceShutdown] acc=%s still connected; session hold retained", aid)
+                    return
+                self.pyrogram_clients.pop(aid, None)
+                session_ownership.release_voice(aid, disconnected=app is not None)
+                self._session_cache.pop(aid, None)
+                self._quarantined_accounts.discard(aid)
                 done += 1
 
         try:

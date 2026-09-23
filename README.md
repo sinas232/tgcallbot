@@ -19,6 +19,7 @@
 | [`CHANGELOG.md`](CHANGELOG.md) | **تاریخچهٔ تغییرات** (آخرین قابلیت‌ها و رفع اشکال‌ها) |
 | [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md) | **راه‌اندازی درگاه پرداخت زرین‌پال** (دامنه، Referrer، callback، عیب‌یابی) |
 | [`docs/voice-reliability-deploy.fa.md`](docs/voice-reliability-deploy.fa.md) | پایداری تماس صوتی و استقرار |
+| [`docs/session-safety.fa.md`](docs/session-safety.fa.md) | جلوگیری از تداخل سشن، استقرار امن و بازیابی اکانت‌های ۴۰۶ |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
 | [`docs/premium-emoji.fa.md`](docs/premium-emoji.fa.md) | **💎 ایموجی پریمیوم (Custom Emoji)** در همهٔ منوها، دکمه‌ها، تیکت و بازنشر پیام کاربر |
 

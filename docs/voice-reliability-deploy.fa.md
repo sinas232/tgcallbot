@@ -41,6 +41,8 @@ VOICE_FLOOD_WAIT_MAX_SECONDS=86400
 VOICE_FLOOD_COOLDOWN_PATH=data/voice_flood_cooldown.json
 # محافظت «یک سشن، یک اتصال»
 VOICE_SESSION_OWNERSHIP=true
+# از v2.3.10 به بعد این محافظت اجباری است؛ false آن را غیرفعال نمی‌کند.
+# راهنمای جلوگیری از تداخل و بازیابی: docs/session-safety.fa.md
 # حلقهٔ بی‌نهایت فایل سکوت (فقط برای دیباگ باید خاموش شود)
 VOICE_SILENCE_LOOP=true
 ```

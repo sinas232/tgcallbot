@@ -63,6 +63,7 @@ from telegram.request import HTTPXRequest
 from config import Config
 from database import DatabaseManager
 from services.order_executor import order_executor
+from services.instance_lock import InstanceDatabaseLock, InstanceAlreadyRunning
 from services.payment_service import payment_service
 from services.health_checker import health_checker_service
 from services.bot_manager import bot_manager
@@ -1369,65 +1370,74 @@ def register_handlers(application: Application) -> None:
 # ─────────────────────────────────────────────────────────────
 # 🔒 قفل تک‌نمونه‌ای (singleton) — جلوی فاجعهٔ AUTH_KEY_DUPLICATED
 #
-# ریشهٔ مستندِ سیل 406 (مشاهده‌شده در سرور): یک `python main.py` مستقیم روی
-# هاست (خارج از داکر) کنار کانتینر بالا مانده بود و هر دو با سشن‌های مشترک
-# وصل می‌شدند؛ تلگرام کلید تکراری را بازی‌خورده می‌کرد و ده‌ها اکانت
-# پشت سر هم از سشن بیرون پرتاب شدند.
+# یک فرایند دیگر با همان دیتابیس *می‌تواند* باعث تداخل 406 شود؛ اما اجرای
+# هم‌زمانِ دو فرایند از لاگِ بوت به‌تنهایی ثابت نمی‌شود. کپی سشن در نمایندگی
+# حتی در همان یک پردازه نیز اتصال دوباره می‌ساخت (گارد auth-key جداگانه).
 #
-# این قفل OS-level (flock) روی همان فایلِ مشترک هاست و کانتینر
-# (./data/.bot_instance.lock — volume `.:/app` هر دو را به یک‌جا می‌بندد)
-# کار می‌کند: هر پروسسِ دوم، به‌جای وصل‌شدن و سوزاندن اکانت‌ها، با هشدارِ
-# بلند صبر می‌کند تا نمونهٔ قبلی آزاد شود. قفل با مرگ پروسس خودکار آزاد
-# می‌شود (بدون lock بیایه بعد از kill/reboot).
+# flock روی فایل ثابت پروژه برای هاست/کانتینر با volume مشترک است؛ قفل
+# advisory دیتابیس پایین‌تر، نمونه‌های نسخهٔ جدید روی فایل‌سیستم‌های جدا
+# را هم هماهنگ می‌کند. پس از مرگ فرایند هر دو خودکار آزاد می‌شوند.
 _INSTANCE_LOCK_FILE = None
 
 
 def _acquire_instance_singleton_lock() -> None:
-    """قفل تک‌نمونه را بگیر؛ در صورت نبود flock (ویندوز/خطا) fail-open."""
+    """Lock the real project data dir; NEVER run without flock on Linux.
+
+    A relative path depends on the caller's working directory. For example,
+    `cd /tmp; python /opt/tgcallbot/main.py` previously locked /tmp/data,
+    not /opt/tgcallbot/data, even though both processes used the same DB.
+    This local guard complements the DB-wide lock below.
+    """
     global _INSTANCE_LOCK_FILE
+    import errno
+    import fcntl
+
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "data", ".bot_instance.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "a+")
     try:
-        import fcntl
-    except Exception:
-        logger.warning("instance-lock: fcntl unavailable on this platform (skipped)")
-        return
-    try:
-        os.makedirs("data", exist_ok=True)
-        fh = open(os.path.join("data", ".bot_instance.lock"), "w")
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            logger.critical(
-                "🔒🔴 یک نمونهٔ دیگر از ربات همین حالا در حال اجراست "
-                "(data/.bot_instance.lock قفل است). اجرای هم‌زمانِ دو نسخه "
-                "با سشن‌های مشترک = AUTH_KEY_DUPLICATED و ابطال انبوه سشن‌ها. "
-                "این نمونه صبر می‌کند تا نمونهٔ قبلی آزاد شود… "
-                "(روی هاست بگرد: ps aux | grep 'python main.py')"
-            )
-            while True:
-                try:
-                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    logger.critical("🔒 نمونهٔ قبلی آزاد شد — این نمونه ادامه می‌دهد.")
-                    break
-                except OSError:
-                    time.sleep(30)
-                    logger.critical(
-                        "🔒 هنوز در انتظار: نمونهٔ دیگر ربات قفل تک‌نمونه را نگه داشته…"
-                    )
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise  # fail CLOSED on permission / unsupported filesystem
+                logger.critical(
+                    "🔒 نمونهٔ دیگری از ربات قفل %s را دارد؛ این نمونه بدون "
+                    "اتصال به سشن‌ها منتظر می‌ماند. A second bot is running; "
+                    "waiting rather than duplicating Telegram auth keys.", lock_path)
+                time.sleep(30)
         _INSTANCE_LOCK_FILE = fh
-        try:
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            fh.flush()
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning(f"instance-lock skipped: {e}")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.flush()
+        logger.info("Local singleton lock acquired: %s", lock_path)
+    except BaseException:
+        fh.close()
+        raise
 
 
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
     _acquire_instance_singleton_lock()
+
+    # A second checkout/container/server may share the PostgreSQL account
+    # table without sharing ./data. Acquire the DB-wide lock BEFORE bot/MTProto
+    # start. If its connection is lost, PostgreSQL releases our lock; exit
+    # immediately so a replacement cannot overlap our still-open sockets.
+    instance_lock = InstanceDatabaseLock(Config.get_normalized_database_url())
+    try:
+        await instance_lock.acquire(on_lost=lambda: os._exit(75))
+    except InstanceAlreadyRunning as exc:
+        logger.critical("🔒 %s", exc)
+        raise
+    # A killed container's old MTProto TCP connections may outlive the DB
+    # lock by a few seconds. Do not race them on a rapid Docker rebuild.
+    await asyncio.sleep(10)
+    instance_lock.ensure_held()
     # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
     # docker kill -s USR1 telegram_bot_container
     try:
@@ -1496,7 +1506,9 @@ async def main_loop():
         main_app.bot_data['maintenance_mode'] = False
     
     register_handlers(main_app)
+    instance_lock.ensure_held()
     await main_app.initialize()
+    instance_lock.ensure_held()
     await main_app.start()
 
     # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها
@@ -1615,6 +1627,20 @@ async def main_loop():
             await asyncio.wait(_pending, timeout=5)
     except Exception:
         pass
+    # If a disconnect was unconfirmed (or a task outlived the shutdown
+    # deadline), do NOT give up the DB lock with live local MTProto sockets.
+    # Exit the process so the OS closes its sockets and DB connection together;
+    # the next instance waits at startup before touching any auth keys.
+    from services.session_ownership import session_ownership
+    voice_holds = session_ownership.voice_held_accounts()
+    ad_hoc_holds = session_ownership.ad_hoc_held_accounts()
+    if voice_holds or ad_hoc_holds:
+        logger.critical("MTProto teardown unconfirmed: %d voice + %d ad-hoc holds; exiting fail-closed",
+                        len(voice_holds), len(ad_hoc_holds))
+        os._exit(75)
+    # Release the database-wide lock LAST: no replacement instance may
+    # connect to these session strings until our MTProto clients are gone.
+    await instance_lock.close()
     logger.info("🛑 Shutdown complete.")
 
 if __name__ == "__main__":

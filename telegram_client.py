@@ -23,7 +23,8 @@ from pyrogram.errors import (
 from config import Config
 from security import SecurityManager
 from database import DatabaseManager
-from services.session_ownership import session_ownership, SessionInUseError
+from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated
+from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
 
@@ -62,43 +63,71 @@ class TelegramAccountClient:
         دومی باز نمی‌شود. رزروِ انجام‌شده با stop() کلاینت (پایان
         context manager) آزاد می‌شود.
         """
-        # Non-blocking reservation: raises SessionInUseError while the voice
-        # engine (or another ad-hoc op) already holds this session.
-        session_ownership.begin_ad_hoc(self.account_id)
+        decrypted_session = SecurityManager.decrypt_session(self.session_string)
+        if not decrypted_session:
+            raise ValueError(f"Invalid Session for account {self.account_id}")
+
+        # Guard the decrypted AUTH KEY, not the row ID or Fernet ciphertext.
+        # A reseller can have a different account ID for the same key.
+        token = session_ownership.begin_ad_hoc(self.account_id, decrypted_session)
         try:
-            decrypted_session = SecurityManager.decrypt_session(self.session_string)
-            if not decrypted_session:
-                raise ValueError(f"Invalid Session for account {self.account_id}")
-
             api_id, api_hash = await self._get_api_credentials()
-
             client = Client(
                 name=f"client_{self.account_id}",
                 api_id=api_id,
                 api_hash=api_hash,
                 session_string=decrypted_session,
-                no_updates=no_updates,  # برای کاهش مصرف منابع
-                in_memory=True
+                no_updates=no_updates,
+                in_memory=True,
             )
-            self._bind_ownership_release(client)
+            self._bind_ownership_release(client, token)
             return client
-        except Exception:
-            # Construction failed (bad session/credentials) — release the
-            # reservation so the account is not left permanently busy.
-            session_ownership.end_ad_hoc(self.account_id)
+        except BaseException:
+            # CancelledError is a BaseException. A cancellation during the
+            # credential DB lookup previously leaked the reservation.
+            session_ownership.end_ad_hoc(self.account_id, token)
             raise
 
-    def _bind_ownership_release(self, client: Client) -> None:
-        """Release the ad-hoc session reservation when the client stops."""
-        original_stop = client.stop
+    def _bind_ownership_release(self, client: Client, token: object) -> None:
+        """Release ONLY when Pyrogram has really disconnected.
 
-        async def stop_and_release(*args, **kwargs):
+        Pyrogram's stop(block=False) schedules the disconnect in the future;
+        releasing at the end of stop() (as before) allows a second client to
+        connect while the first is still live. stop() eventually calls
+        disconnect(), which is the correct place to release the reservation.
+        """
+        original_disconnect = client.disconnect
+        original_start = client.start
+        client._ownership_token = token
+
+        async def start_with_cleanup(*args, **kwargs):
             try:
-                return await original_stop(*args, **kwargs)
-            finally:
-                session_ownership.end_ad_hoc(self.account_id)
+                return await original_start(*args, **kwargs)
+            except BaseException:
+                had_transport = bool(getattr(client, "is_connected", False) or
+                                     getattr(client, "session", None) is not None)
+                try:
+                    await close_pyrogram_client(client)
+                finally:
+                    if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                        session_ownership.end_ad_hoc(
+                            self.account_id, token, disconnected=had_transport)
+                raise
 
-        client.stop = stop_and_release
+        async def disconnect_and_release(*args, **kwargs):
+            was_connected = bool(getattr(client, "is_connected", False) or
+                                 getattr(client, "session", None) is not None)
+            try:
+                return await original_disconnect(*args, **kwargs)
+            finally:
+                if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                    session_ownership.end_ad_hoc(
+                        self.account_id, token, disconnected=was_connected)
+                else:
+                    logger.error("acc=%s disconnect incomplete; keeping session reservation", self.account_id)
+
+        client.start = start_with_cleanup
+        client.disconnect = disconnect_and_release
 
     @staticmethod
     async def preload_all_clients():
@@ -253,6 +282,10 @@ class TelegramAccountClient:
                     
                     return "limited", text[:100] # بازگرداندن بخشی از متن محدودیت
                     
+        except SessionInUseError:
+            # Auto-health must SKIP a key owned by the voice engine (or a
+            # reseller alias), not overwrite its spam status with an error.
+            raise
         except Exception as e:
             return "error", str(e)
         return "unknown", "No response"
@@ -331,9 +364,10 @@ class TelegramAccountClient:
         دلیل شکست را هم دسته‌بندی می‌کند تا ادمین بفهمد چه باید بکند:
 
         * ``None`` — موفق (data برمی‌گردد)
-        * ``duplicated_in_use`` — 406 AUTH_KEY_DUPLICATED: سشن همین حالا در
-          یک پروسس/سرور/پنل دیگری فعال است؛ تا آن نمونه قطع نشود هیچ اتصالی
-          دوام نمی‌آورد (و لاگین مجدد کلید تازه می‌سازد و آن نمونه را می‌کشد).
+        * ``duplicated_in_use`` — AUTH_KEY_DUPLICATED: همان کلید سشن در بیش از
+          یک اتصال استفاده شده است. این می‌تواند در همین پروسس (کپی نمایندگی)،
+          یا جای دیگر رخ دهد؛ تلگرام ممکن است کلید را باطل کرده باشد. پروبِ
+          مکرر نزنید؛ پس از حذف تداخل، در صورت لزوم دوباره لاگین کنید.
         * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
         * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
         * ``error`` — سایر خطاها.
@@ -360,7 +394,7 @@ class TelegramAccountClient:
             return False, "timeout", None
         except Exception as e:
             up = str(e).upper()
-            if "AUTH_KEY_DUPLICATED" in up or "406" in up:
+            if is_auth_key_duplicated(e):
                 reason = "duplicated_in_use"
             elif any(k in up for k in (
                 "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED", "AUTH_KEY_INVALID",
@@ -373,12 +407,20 @@ class TelegramAccountClient:
             return False, reason, None
         finally:
             if client is not None:
+                token = getattr(client, "_ownership_token", None)
+                had_transport = bool(getattr(client, "is_connected", False) or
+                                     getattr(client, "session", None) is not None)
                 try:
-                    # shield: حتی اگر همین تسک لغو شود، قطع تمیز اتصال به پایان برسد.
-                    await asyncio.shield(asyncio.wait_for(client.disconnect(), timeout=10))
-                except Exception:
-                    pass
-                session_ownership.end_ad_hoc(self.account_id)
+                    closed = await close_pyrogram_client(client)
+                finally:
+                    # Even if this probe is cancelled, the shared closer has
+                    # awaited cleanup. Never release if the socket is still
+                    # possibly open (no TTL-based forced unlock either).
+                    if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                        session_ownership.end_ad_hoc(
+                            self.account_id, token, disconnected=had_transport)
+                if not closed:
+                    logger.error("acc=%s probe disconnect unconfirmed; holding reservation", self.account_id)
 
     async def fetch_me(self):
         """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""

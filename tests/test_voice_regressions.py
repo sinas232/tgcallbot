@@ -143,11 +143,11 @@ class SilenceStreamCommandTests(unittest.TestCase):
         # The single-dash fake flag must be gone.
         self.assertNotIn(" -audio ", f" {joined} ")
         self.assertIn("-stream_loop", cmd)
-        self.assertIn("-1", cmd)
+        # A large finite loop count avoids ffmpeg's -1 quirks while keeping
+        # the stream alive for far longer than any order duration.
+        self.assertGreater(int(cmd[cmd.index("-stream_loop") + 1]), 10_000)
         # -stream_loop is an INPUT option: it must appear before -i.
         self.assertLess(cmd.index("-stream_loop"), cmd.index("-i"), joined)
-        # The loop count sits right next to the flag.
-        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "-1", joined)
         # Output format is the ntgcalls wire format.
         self.assertIn("s16le", joined)
 
@@ -162,10 +162,10 @@ class SilenceStreamCommandTests(unittest.TestCase):
         vcm_mod.SILENT_AUDIO_PATH = path
         vcm_mod._ensure_silence_file()
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), vcm_mod._SILENCE_RATE)
+            self.assertEqual(r.getnchannels(), vcm_mod._SILENCE_CHANNELS)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(r.getnframes(), vcm_mod._SILENCE_FRAMES)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).
@@ -296,8 +296,9 @@ class SessionOwnershipTests(unittest.TestCase):
         self.so = SessionOwnership()
 
     def test_ad_hoc_when_free(self):
-        self.assertTrue(self.so.begin_ad_hoc(100))
-        self.so.end_ad_hoc(100)
+        token = self.so.begin_ad_hoc(100)
+        self.assertTrue(token)
+        self.so.end_ad_hoc(100, token)
         self.assertFalse(self.so.is_voice_held(100))
 
     def test_ad_hoc_blocked_while_voice_held(self):
@@ -308,8 +309,9 @@ class SessionOwnershipTests(unittest.TestCase):
         with self.assertRaises(SessionInUseError):
             self.so.begin_ad_hoc(101)
         self.so.release_voice(101)
-        self.assertTrue(self.so.begin_ad_hoc(101))
-        self.so.end_ad_hoc(101)
+        token = self.so.begin_ad_hoc(101)
+        self.assertTrue(token)
+        self.so.end_ad_hoc(101, token)
 
     def test_voice_refcount(self):
         async def twice():
@@ -323,7 +325,7 @@ class SessionOwnershipTests(unittest.TestCase):
 
     def test_voice_waits_for_ad_hoc(self):
         async def scenario():
-            self.so.begin_ad_hoc(103)
+            token = self.so.begin_ad_hoc(103)
             acquired = asyncio.Event()
 
             async def voice():
@@ -333,7 +335,7 @@ class SessionOwnershipTests(unittest.TestCase):
             t = asyncio.create_task(voice())
             await asyncio.sleep(0.05)
             self.assertFalse(acquired.is_set())
-            self.so.end_ad_hoc(103)
+            self.so.end_ad_hoc(103, token)
             await asyncio.wait_for(acquired.wait(), timeout=2)
             self.so.release_voice(103)
             t.cancel()
@@ -439,6 +441,10 @@ class EngineLifecycleTests(unittest.TestCase):
         self.mgr._session_cache[1] = "fake-session"
         self._orig_decrypt = vcm_mod.SecurityManager.decrypt_session
         vcm_mod.SecurityManager.decrypt_session = staticmethod(lambda s: "decrypted")
+        import services.session_ownership as ownership_mod
+        self._orig_quiet = ownership_mod.RECONNECT_QUIET_SEC
+        ownership_mod.RECONNECT_QUIET_SEC = 0
+        self.loop.run_until_complete(session_ownership.acquire_voice(1, "decrypted"))
 
         async def fake_creds():
             return 123, "hash"
@@ -450,6 +456,11 @@ class EngineLifecycleTests(unittest.TestCase):
         vcm_mod.SecurityManager.decrypt_session = self._orig_decrypt
         vcm_mod.TelegramAccountClient._get_api_credentials = self._orig_cred
         self.loop.run_until_complete(self.mgr.cleanup_all())
+        self.loop.run_until_complete(self.mgr._cleanup_client(1, force=True))
+        if session_ownership.is_voice_held(1):
+            session_ownership.release_voice(1)
+        import services.session_ownership as ownership_mod
+        ownership_mod.RECONNECT_QUIET_SEC = self._orig_quiet
         self.loop.close()
 
     def test_healthy_engine_is_reused_not_rebuilt(self):
@@ -473,7 +484,9 @@ class EngineLifecycleTests(unittest.TestCase):
             self.mgr.clients[1] = engine
             got = await self.mgr._get_or_create_client(901, 1, "fake-session")
             self.assertIsNot(got, engine)
-            self.assertEqual(engine.stopped, 1)
+            # PyTgCalls 2.x has no stop(); unhealthy bindings are left,
+            # then the handle is replaced on the same Pyrogram transport.
+            self.assertEqual(engine.stopped, 0)
             self.assertEqual(got.started, 1)
             # stream-end + chat-update handlers attached on the fresh engine
             self.assertEqual(len(got.handlers), 2)
@@ -622,6 +635,15 @@ class SchedulerSimulationTests(unittest.TestCase):
         async def fake_warm(accounts, limit=0):
             return 0
         self.mgr.warmup_clients = fake_warm
+        # This is a scheduler simulation, not a database/profile or pacing
+        # integration test. Real get_profile() makes many sequential DB calls
+        # and each real wave adds seconds of stagger for 40 fake accounts.
+        self._orig_profile = order_executor_mod.anti_spam.get_profile
+        self._orig_pacing = order_executor_mod.anti_spam.effective_join_pacing
+        async def fake_profile(_bot_id):
+            return SimpleNamespace(enabled=False)
+        order_executor_mod.anti_spam.get_profile = fake_profile
+        order_executor_mod.anti_spam.effective_join_pacing = lambda _profile: (0, 0, 0, 0, 0)
 
         # Deterministic, fast brain for the test.
         order_executor_mod.join_brain.forget_order(777)
@@ -658,6 +680,8 @@ class SchedulerSimulationTests(unittest.TestCase):
         order_executor_mod.DatabaseManager = self._orig_db
         self.mgr.warmup_clients = self._orig_warm
         self.mgr.start_call = self._orig_start
+        order_executor_mod.anti_spam.get_profile = self._orig_profile
+        order_executor_mod.anti_spam.effective_join_pacing = self._orig_pacing
         self.mgr.joined_accounts_by_order.pop(777, None)
         from services.voice_cooldown import voice_cooldown
         for aid in self.flooded + self.healthy:
@@ -706,8 +730,10 @@ class TelegramClientGuardTests(unittest.TestCase):
         async def scenario():
             await session_ownership.acquire_voice(9001)
             try:
+                from unittest.mock import patch
                 tc = TelegramAccountClient("+98x", "fake-session", 9001)
-                with self.assertRaises(SessionInUseError):
+                with patch("telegram_client.SecurityManager.decrypt_session", return_value="key"), \
+                        self.assertRaises(SessionInUseError):
                     await tc.get_client()
             finally:
                 session_ownership.release_voice(9001)

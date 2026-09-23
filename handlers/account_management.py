@@ -17,15 +17,22 @@ from security import SecurityManager
 from constants import *
 from helpers.message_utils import send_safe
 from telegram_client import TelegramAccountClient
+from services.session_client import close_pyrogram_client
+from services.session_ownership import session_ownership, SessionInUseError
 
 logger = logging.getLogger(__name__)
 
 async def _cleanup_client(context):
-    c = context.user_data.get('temp_client')
-    if c:
-        try: await c.stop()
-        except: pass
-    context.user_data.pop('temp_client', None)
+    """Phone login uses connect(), not start(): stop() alone leaves it online."""
+    client = context.user_data.get('temp_client')
+    if client is None:
+        return True
+    closed = await close_pyrogram_client(client)
+    if closed:
+        context.user_data.pop('temp_client', None)
+    else:
+        logger.error("Phone-login MTProto client did not disconnect; refusing to expose its session")
+    return closed
 
 
 def _format_account_display(acc):
@@ -182,8 +189,20 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
     api_hash = context.user_data.get('import_api_hash') or Config.TELEGRAM_API_HASH
     
     msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال تست اتصال اکانت...")
-    client = Client(name="test_sess", api_id=api_id, api_hash=api_hash, session_string=sess_str, in_memory=True, no_updates=True)
+    # Imported strings may already be stored under another bot_id. Guard the
+    # auth key before even creating a Pyrogram client; DB account IDs alone
+    # cannot protect copies shared with a reseller.
+    probe_id = -int(update.effective_user.id)
+    token = None
+    client = None
+    error = None
+    profile_info = None
+    phone = None
+    closed = True
     try:
+        token = session_ownership.begin_ad_hoc(probe_id, sess_str)
+        client = Client(name="test_sess", api_id=api_id, api_hash=api_hash,
+                        session_string=sess_str, in_memory=True, no_updates=True)
         await client.start()
         me = await client.get_me()
         phone = f"+{me.phone_number}" if me.phone_number else "Unknown"
@@ -192,18 +211,35 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
             'last_name': getattr(me, 'last_name', None),
             'username': getattr(me, 'username', None),
         }
-        await client.stop()
-        return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
-    except Exception as e:
-        logger.error(f"Import Session Error: {e}")
-        try: await client.stop() 
-        except: pass
-        await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{e}")
+    except Exception as exc:
+        logger.warning("Import Session probe failed: %s", type(exc).__name__)
+        error = exc
+    finally:
+        if client is not None:
+            had_transport = bool(getattr(client, 'is_connected', False) or
+                                 getattr(client, 'session', None) is not None)
+            try:
+                closed = await close_pyrogram_client(client)
+            finally:
+                if token and not getattr(client, 'is_connected', False) and getattr(client, 'session', None) is None:
+                    session_ownership.end_ad_hoc(probe_id, token, disconnected=had_transport)
+        elif token:
+            session_ownership.end_ad_hoc(probe_id, token)
+    if not closed:
+        error = RuntimeError("قطع اتصال اکانت تأیید نشد؛ سشن ذخیره نشد.")
+    if error is not None:
+        if msg:
+            await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{error}")
+        else:
+            await send_safe(context.bot, update.effective_chat.id, f"❌ خطا در اتصال به اکانت: {error}")
         return AWAITING_SESSION_STRING
+    return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
 
 async def finalize_import(update, context, phone, session_string, profile_info=None):
     try:
         enc_sess = SecurityManager.encrypt_session(session_string)
+        if not enc_sess:
+            raise ValueError("رمزنگاری سشن ناموفق بود؛ اکانت ذخیره نشد")
         bot_id = context.bot_data.get('bot_id', 1)
         api_id = context.user_data.get('import_api_id')
         api_hash = context.user_data.get('import_api_hash')
@@ -236,8 +272,16 @@ async def finalize_import(update, context, phone, session_string, profile_info=N
 async def finalize_session(update, context, client):
     try:
         sess = await client.export_session_string()
-        enc_sess = SecurityManager.encrypt_session(sess)
         me = await client.get_me()
+        # Never publish an exported key to the DB while its login connection
+        # is still alive. connect() (used by the phone flow) must be closed
+        # with disconnect(), not stop().
+        if not await _cleanup_client(context):
+            raise RuntimeError("اتصال قبلی قطع نشد؛ سشن ذخیره نشد. کمی بعد دوباره تلاش کنید.")
+        session_ownership.note_login_disconnect(sess)
+        enc_sess = SecurityManager.encrypt_session(sess)
+        if not enc_sess:
+            raise ValueError("رمزنگاری سشن ناموفق بود؛ اکانت ذخیره نشد")
         phone = f"+{me.phone_number}" if me.phone_number else context.user_data.get('phone', 'Unknown')
         bot_id = context.bot_data.get('bot_id', 1)
         tg_user = update.effective_user
