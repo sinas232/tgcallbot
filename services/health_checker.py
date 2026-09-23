@@ -10,7 +10,8 @@ from typing import Dict, Any, Optional
 
 from database import DatabaseManager
 from telegram_client import TelegramAccountClient
-from services.session_ownership import SessionInUseError, is_auth_key_duplicated
+from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
+                                        is_fatal_auth_error, fatal_auth_category)
 
 logger = logging.getLogger(__name__)
 
@@ -41,27 +42,21 @@ class HealthChecker:
             return
 
         rt = (result_text or "")
-        up = rt.upper()
-        fatal = any(k in up for k in (
-            "SESSION_REVOKED", "SESSIONREVOKED",
-            "AUTH_KEY_UNREGISTERED", "AUTHKEYUNREGISTERED",
-            "AUTH KEY INVALID", "AUTH_KEY_INVALID", "AUTHKEYINVALID",
-            "USERDEACTIVATED", "USER_DEACTIVATED",
-        ))
-        if fatal and not is_auth_key_duplicated(rt):
-            # Explicit invalidation only; 406 has priority over fuzzy text markers.
-            logger.warning(f"⚰️ Account {account['id']} session truly revoked. Disabling...")
-            await DatabaseManager.update_account_status(account['id'], 'inactive')
-            await DatabaseManager.update_account_spam_status(account['id'], 'error', result_text)
+        fatal = status == 'error' and is_fatal_auth_error(rt)
+        if fatal:
+            # Only an RPC failure (not a SpamBot *message*) can invalidate
+            # an auth key, and only if this row still stores that same key.
+            await DatabaseManager.mark_account_auth_invalid(
+                account['id'], account['session_string'], fatal_auth_category(rt))
             return
-        if is_auth_key_duplicated(rt):
+        if status == 'error' and is_auth_key_duplicated(rt):
             # 406 can mean Telegram already invalidated this key. Do not
             # disable it on a guess, but do not call it healthy or keep
             # probing it; first eliminate simultaneous connections.
             logger.warning("Acc %s AUTH_KEY_DUPLICATED — no auto-disable; investigate shared keys / instances",
                            account['id'])
-            await DatabaseManager.update_account_spam_status(
-                account['id'], 'cooldown', rt[:180] or "AUTH_KEY_DUPLICATED (check session)")
+            await DatabaseManager.note_session_conflict_if_current(
+                account['id'], account['session_string'])
             return
         await DatabaseManager.update_account_spam_status(account['id'], status, result_text)
         logger.info(f"🛡 Spam Check Acc {account['id']}: {status}")

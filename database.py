@@ -948,6 +948,12 @@ class DatabaseManager:
                 if acc:
                     acc.session_string = session_str
                     acc.account_status = 'active'
+                    # A verified phone login/import replaces the prior key.
+                    # Never leave an old 'dead' flag on the new active session:
+                    # the dead-account menu also looks at spam_status.
+                    acc.spam_status = 'unknown'
+                    acc.spam_check_result = None
+                    acc.last_health_check = None
                     if api_id: acc.api_id = api_id
                     if api_hash: acc.api_hash = api_hash
                     if first_name is not None: acc.first_name = first_name
@@ -1119,6 +1125,52 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             await db_session.execute(update(TelegramAccount).where(TelegramAccount.id == aid).values(spam_status=status, spam_check_result=result_text, last_health_check=datetime.utcnow()))
             await db_session.commit()
+
+    @staticmethod
+    async def note_session_conflict_if_current(aid: int, encrypted_session: str) -> bool:
+        """Store 406 only on the matching active key; never disable it."""
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                update(TelegramAccount).where(
+                    TelegramAccount.id == int(aid),
+                    TelegramAccount.account_status == 'active',
+                    TelegramAccount.session_string == encrypted_session,
+                ).values(
+                    spam_status='cooldown',
+                    spam_check_result='AUTH_KEY_DUPLICATED: check shared key; validity unknown',
+                    last_health_check=datetime.utcnow(),
+                )
+            )
+            await db_session.commit()
+            return result.rowcount == 1
+
+    @staticmethod
+    async def mark_account_auth_invalid(aid: int, encrypted_session: str, category: str) -> bool:
+        """Atomically disable ONLY the auth key that produced a fatal RPC.
+
+        A stale voice task must not disable a fresh login saved to the same
+        account row meanwhile. Never store raw error text/session material.
+        """
+        allowed = {'SESSION_REVOKED', 'AUTH_KEY_UNREGISTERED', 'AUTH_KEY_INVALID',
+                   'USER_DEACTIVATED', 'RPC_401'}
+        if category not in allowed:
+            raise ValueError('Unverified auth failure category')
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                update(TelegramAccount).where(
+                    TelegramAccount.id == int(aid),
+                    TelegramAccount.account_status == 'active',
+                    TelegramAccount.session_string == encrypted_session,
+                ).values(
+                    account_status='inactive', spam_status='dead',
+                    spam_check_result='Explicit auth failure: ' + category,
+                    last_health_check=datetime.utcnow(),
+                )
+            )
+            await db_session.commit()
+            if result.rowcount == 1:
+                logger.warning('Account %s disabled: explicit auth failure %s', aid, category)
+            return result.rowcount == 1
 
     @staticmethod
     async def recover_account_after_verified_probe(aid: int, bot_id: int, encrypted_session: str) -> bool:

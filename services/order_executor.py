@@ -14,7 +14,8 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
-from services.session_ownership import SessionInUseError, is_auth_key_duplicated
+from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
+                                        is_fatal_auth_error, fatal_auth_category)
 from services import self_healing
 from services.anti_spam import anti_spam
 
@@ -769,7 +770,6 @@ class OrderExecutor:
 	                    wave_fail += 1
 	                    continue
 
-	                upper = msg.upper()
 	                # AUTH_KEY_DUPLICATED (406) says the auth key was used twice;
 	                # it does NOT identify which process did it, and Telegram may
 	                # already have invalidated the key. Never mark it dead on a
@@ -782,8 +782,8 @@ class OrderExecutor:
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
 	                    dup406_streak += 1
 	                    try:
-	                        await DatabaseManager.update_account_spam_status(
-	                            aid, "cooldown", "AUTH_KEY_DUPLICATED: investigate key conflict; re-login if invalid")
+	                        await DatabaseManager.note_session_conflict_if_current(
+	                            aid, acc["session_string"])
 	                    except Exception:
 	                        pass
 	                    logger.warning(
@@ -792,20 +792,18 @@ class OrderExecutor:
 	                    )
 	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
 	                    continue
-	                if status == "dead" or any(x in upper for x in (
-	                	"SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-	                	"USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
-	                )):
+	                if status == "dead" or is_fatal_auth_error(msg):
 	                	dup406_streak = 0  # non-dup fatal event breaks the streak
 	                	# Account itself is dead — mark inactive & replace.
 	                	dead_count += 1
 	                	wave_dead += 1
 	                	self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                	self._voice_banned.setdefault(order_id, set()).add(aid)
-	                	try:
-	                		await self._mark_account_dead(aid)
-	                	except Exception:
-	                		pass
+		                if status != "dead":  # already persisted by _join_single_account
+			                try:
+				                await self._mark_account_dead(aid, acc["session_string"], msg)
+			                except Exception:
+				                pass
 	                	join_brain.report_result(order_id, OUTCOME_DEAD, msg)
 	                	wave_fail += 1
 	                	continue
@@ -1278,8 +1276,8 @@ class OrderExecutor:
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
 					if ok: return {"success": True, "acc": acc, "chat_id": cid}
-					if not is_auth_key_duplicated(msg) and any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
-						await self._mark_account_dead(acc["id"])
+					if is_fatal_auth_error(msg):
+						await self._mark_account_dead(acc["id"], acc["session_string"], msg)
 						return {"success": False, "status": "dead"}
 					return {"success": False, "status": "failed", "msg": msg, "retry_managed": True}
 
@@ -1290,8 +1288,8 @@ class OrderExecutor:
 				# دقیقاً با همان chat_id زمان‌بندی شود (وابسته به حدس لینک نباشد).
 				_cid = getattr(client, "last_joined_chat_id", None) if ok else None
 				if ok: return {"success": True, "acc": acc, "chat_id": _cid}
-				if not is_auth_key_duplicated(msg) and any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
-					await self._mark_account_dead(acc["id"])
+				if is_fatal_auth_error(msg):
+					await self._mark_account_dead(acc["id"], acc["session_string"], msg)
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}
 			return None
@@ -1302,9 +1300,13 @@ class OrderExecutor:
 		except Exception as e:
 			return {"success": False, "status": "error", "msg": str(e)}
 
-	async def _mark_account_dead(self, account_id):
-		await DatabaseManager.update_account_status(account_id, "inactive")
-		await DatabaseManager.update_account_spam_status(account_id, "dead", "SESSION_REVOKED detected")
+	async def _mark_account_dead(self, account_id, encrypted_session, reason):
+		"""Never disable a replacement key because an old join failed."""
+		category = fatal_auth_category(reason)
+		if not category:
+			return False
+		return await DatabaseManager.mark_account_auth_invalid(
+			account_id, encrypted_session, category)
 
 	async def _finish_order(self, order_id, data, joined_accounts, dead_count):
 		# 1) IMMEDIATE exit from voice chat + group

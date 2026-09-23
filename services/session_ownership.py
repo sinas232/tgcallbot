@@ -63,6 +63,56 @@ def is_auth_key_duplicated(error: object) -> bool:
     return "AUTH_KEY_DUPLICATED" in text or "AUTHKEYDUPLICATED" in text
 
 
+_FATAL_AUTH_MARKERS = (
+    'SESSION_REVOKED', 'SESSIONREVOKED', 'SESSION REVOKED',
+    'AUTH_KEY_UNREGISTERED', 'AUTHKEYUNREGISTERED', 'AUTH KEY UNREGISTERED',
+    'AUTH_KEY_INVALID', 'AUTHKEYINVALID', 'AUTH KEY INVALID',
+    'USER_DEACTIVATED', 'USERDEACTIVATED',
+)
+
+
+def is_fatal_auth_error(error: object) -> bool:
+    """Only explicit auth revocation; never infer it from a numeric substring.
+
+    FloodWait:401 means a 401-SECOND rate limit, NOT a Telegram 401 RPC.
+    Similarly a chat ID, trace number or unrelated 406 may contain '401'.
+    Only an actual RPC exception with code 401 or a named auth error is safe
+    enough to change a persisted account status. Bare text '401' is ambiguous.
+    """
+    if is_auth_key_duplicated(error):
+        return False  # conflicting key is not proof of a revoked key
+    if not isinstance(error, str):
+        code = getattr(error, 'CODE', None)
+        if code is None:
+            code = getattr(error, 'code', None)
+        if code == 401:
+            return True
+        if type(error).__name__.upper() == 'UNAUTHORIZED':
+            return True
+    text = (type(error).__name__ + ' ' + str(error)).upper()
+    return any(marker in text for marker in _FATAL_AUTH_MARKERS)
+
+
+def fatal_auth_category(error: object) -> Optional[str]:
+    """Safe, fixed diagnostic label for persistence; never record raw RPC text."""
+    if not is_fatal_auth_error(error):
+        return None
+    text = (type(error).__name__ + ' ' + str(error)).upper()
+    for marker, label in (
+        ('SESSION_REVOKED', 'SESSION_REVOKED'), ('SESSIONREVOKED', 'SESSION_REVOKED'),
+        ('SESSION REVOKED', 'SESSION_REVOKED'),
+        ('AUTH_KEY_UNREGISTERED', 'AUTH_KEY_UNREGISTERED'),
+        ('AUTHKEYUNREGISTERED', 'AUTH_KEY_UNREGISTERED'),
+        ('AUTH KEY UNREGISTERED', 'AUTH_KEY_UNREGISTERED'),
+        ('AUTH_KEY_INVALID', 'AUTH_KEY_INVALID'), ('AUTHKEYINVALID', 'AUTH_KEY_INVALID'),
+        ('AUTH KEY INVALID', 'AUTH_KEY_INVALID'),
+        ('USER_DEACTIVATED', 'USER_DEACTIVATED'), ('USERDEACTIVATED', 'USER_DEACTIVATED'),
+    ):
+        if marker in text:
+            return label
+    return 'RPC_401'
+
+
 class SessionInUseError(RuntimeError):
     """Opening another connection could duplicate a held authorization key."""
 

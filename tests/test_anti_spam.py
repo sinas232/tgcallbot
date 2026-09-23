@@ -304,11 +304,10 @@ class HandlerGroupRoutingTests(unittest.TestCase):
 
 
 class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
-    """رگرسیون v2.3.5 — چرخهٔ «چندبار از سشن خارج شدن» (AUTH_KEY_DUPLICATED):
+    """406 is a per-order stop signal, NOT proof that the stored key is dead.
 
-    کلید باطل‌شدهٔ 406 باید مرگبار تلقی شود (یک‌بار علامت مرده، بدون retry)،
-    ساخت کلاینت‌ها pacing داشته باشد، و رزروهای ad-hoc لیک‌شده با TTL
-    منقضی شوند تا اکانت‌ها «وارد ویس‌کال نشدن» نگیرند."""
+    Pacing and ownership limit simultaneous connections; active reservations
+    never expire on a timer while an MTProto transport may still be live."""
 
     def test_duplicated_is_fatal_everywhere(self):
         vcm = _read_source("services/voice_call_manager.py")
@@ -317,7 +316,7 @@ class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
         exc = _read_source("services/order_executor.py")
         self.assertGreaterEqual(exc.count("AUTH_KEY_DUPLICATED"), 3)
         brain = _read_source("services/join_brain.py")
-        self.assertIn("AUTH_KEY_DUPLICATED", brain)
+        self.assertIn("is_auth_key_duplicated", brain)
         hc = _read_source("services/health_checker.py")
         self.assertIn("AUTH_KEY_DUPLICATED", hc)
 
@@ -428,22 +427,21 @@ class NeverAutoDisableOn406Tests(unittest.TestCase):
 
     def test_vcm_dead_mark_gated_by_fatal_markers(self):
         vcm = _read_source("services/voice_call_manager.py")
-        self.assertIn("_FATAL_SESSION_MARKERS", vcm)
+        self.assertIn("is_fatal_auth_error", vcm)
         self.assertIn("_is_fatal_session_reason", vcm)
         self.assertIn("AUTH_KEY_DUPLICATED", vcm)
         self.assertIn('return False, f"AUTH_KEY_DUPLICATED:', vcm)
-        # نزدیکِ update_account_status(inactive) باید ابتدا فیلتر fatal بیاید
+        # The only disable path is conditional on the same stored session.
         i_fatal = vcm.index("_is_fatal_session_reason(reason)")
-        i_inactive = vcm.index('update_account_status(int(account_id), "inactive")')
+        i_inactive = vcm.index('mark_account_auth_invalid(int(account_id), encrypted_session, category)')
         self.assertLess(i_fatal, i_inactive)
         # شرط عکس: اگر fatal نیست return می‌خورد قبل از inactive
         self.assertIn("if not _is_fatal_session_reason(reason):", vcm)
 
     def test_health_checker_disables_only_on_fatal(self):
         hc = _read_source("services/health_checker.py")
-        # بلوک غیرفعال‌سازی فقط بعد از محاسبه fatal و بدون AUTH_KEY_DUPLICATED در fatal
-        fatal_part = hc.split("fatal = any(k in up for k in (", 1)[1].split("))", 1)[0]
-        self.assertNotIn("AUTH_KEY_DUPLICATED", fatal_part)
+        # Only a strict auth classifier can deactivate (406 and waits are excluded).
+        self.assertIn("fatal = status == 'error' and is_fatal_auth_error(rt)", hc)
         self.assertIn("is_auth_key_duplicated(rt)", hc)
         self.assertNotIn('"406" in up', hc)  # other 406 RPCs aren't auth-key errors
         self.assertIn("check_spambot()", hc)
@@ -452,11 +450,9 @@ class NeverAutoDisableOn406Tests(unittest.TestCase):
 
     def test_order_flow_never_disables_on_dup(self):
         exe = _read_source("services/order_executor.py")
-        # لیست fatalِ تکی دیگر ۴۰۶/duplicated ندارد
-        self.assertGreaterEqual(
-            exe.count('["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]'), 2)
-        old = 'if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_DUPLICATED", "USER_DEACTIVATED", "401", "406"]):'
-        self.assertNotIn(old, exe)
+        # No naive '401' substring test (FloodWait:401 is not RPC 401).
+        self.assertGreaterEqual(exe.count('if is_fatal_auth_error(msg):'), 2)
+        self.assertNotIn('"401"]):', exe)
         # Key conflict has its own wave branch, never calls dead-mark.
         dup_branch = exe.split('if is_auth_key_duplicated(msg):', 1)[1].split("continue", 1)[0]
         self.assertNotIn("_mark_account_dead", dup_branch)

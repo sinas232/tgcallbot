@@ -136,11 +136,41 @@ class ProbeCloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ok, reason, data), (False, 'duplicated_in_use', None))
         self.assertFalse(self.guard.is_busy(7))
 
+    async def test_401_second_wait_is_not_classified_as_revoked(self):
+        self.transport.get_me.side_effect = RuntimeError('FloodWait:401')
+        self.assertEqual(await self._run(), (False, 'error', None))
+        self.assertFalse(self.guard.is_busy(7))
+
     async def test_get_me_without_identity_is_not_verified(self):
         self.transport.get_me.return_value = None
         ok, reason, data = await self._run()
         self.assertEqual((ok, reason, data), (False, 'error', None))
         self.assertFalse(self.guard.is_busy(7))
+
+
+class FreshLoginPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_new_login_clears_prior_dead_annotation(self):
+        acc = SimpleNamespace(session_string='old', account_status='inactive',
+                              spam_status='dead', spam_check_result='SESSION_REVOKED detected',
+                              last_health_check='old timestamp', api_id=1, api_hash='old')
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                pass
+            async def execute(self, _stmt):
+                return SimpleNamespace(scalar_one_or_none=lambda: acc)
+            async def commit(self):
+                pass
+
+        with patch.object(database, 'AsyncSessionLocal', return_value=FakeSession()):
+            self.assertEqual(
+                await database.DatabaseManager.add_telegram_account(2, '+100', 'new-key', bot_id=1),
+                (True, 'updated'))
+        self.assertEqual((acc.session_string, acc.account_status, acc.spam_status),
+                         ('new-key', 'active', 'unknown'))
+        self.assertIsNone(acc.spam_check_result)
+        self.assertIsNone(acc.last_health_check)
 
 
 class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
@@ -172,6 +202,63 @@ class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
         for value in (7, 1, 'encrypted-key', 'inactive', 'active', 'unknown'):
             self.assertIn(value, params)
         self.assertTrue(fake.committed)
+
+    async def test_conflict_note_only_touches_matching_active_key(self):
+        class FakeSession:
+            statement = None
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                pass
+            async def execute(self, stmt):
+                self.statement = stmt
+                return SimpleNamespace(rowcount=0)
+            async def commit(self):
+                pass
+
+        fake = FakeSession()
+        with patch.object(database, 'AsyncSessionLocal', return_value=fake):
+            self.assertFalse(await database.DatabaseManager.note_session_conflict_if_current(
+                7, 'old-encrypted-key'))
+        compiled = fake.statement.compile()
+        self.assertIn('telegram_accounts.session_string', str(compiled))
+        self.assertIn('telegram_accounts.account_status', str(compiled))
+        self.assertIn('old-encrypted-key', compiled.params.values())
+        self.assertIn('active', compiled.params.values())
+        self.assertIn('cooldown', compiled.params.values())
+        self.assertNotIn('inactive', compiled.params.values())
+
+    async def test_fatal_auth_update_requires_exact_old_key_and_records_category(self):
+        class FakeSession:
+            statement = None
+            rowcount = 1
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                pass
+            async def execute(self, stmt):
+                self.statement = stmt
+                return SimpleNamespace(rowcount=self.rowcount)
+            async def commit(self):
+                pass
+
+        fake = FakeSession()
+        with patch.object(database, 'AsyncSessionLocal', return_value=fake):
+            self.assertTrue(await database.DatabaseManager.mark_account_auth_invalid(
+                7, 'old-encrypted-key', 'AUTH_KEY_INVALID'))
+        stmt = fake.statement.compile()
+        self.assertIn('telegram_accounts.session_string', str(stmt))
+        self.assertIn('telegram_accounts.account_status', str(stmt))
+        for value in (7, 'old-encrypted-key', 'active', 'inactive', 'dead',
+                      'Explicit auth failure: AUTH_KEY_INVALID'):
+            self.assertIn(value, stmt.params.values())
+        fake.rowcount = 0  # concurrent re-login replaced the row/key
+        with patch.object(database, 'AsyncSessionLocal', return_value=fake):
+            self.assertFalse(await database.DatabaseManager.mark_account_auth_invalid(
+                7, 'old-encrypted-key', 'AUTH_KEY_INVALID'))
+        with self.assertRaises(ValueError):
+            await database.DatabaseManager.mark_account_auth_invalid(
+                7, 'old-encrypted-key', 'FloodWait:401')
 
     async def test_cas_zero_rows_means_no_promotion(self):
         class FakeSession:

@@ -17,7 +17,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 os.environ.setdefault("BOT_TOKEN", "test-token")
 
 from services.session_ownership import (  # noqa: E402
-    SessionInUseError, SessionOwnership, is_auth_key_duplicated,
+    SessionInUseError, SessionOwnership, is_auth_key_duplicated, is_fatal_auth_error,
+    fatal_auth_category,
 )
 from services.session_client import close_pyrogram_client  # noqa: E402
 from services.instance_lock import InstanceAlreadyRunning, InstanceDatabaseLock  # noqa: E402
@@ -39,6 +40,28 @@ class SessionKeyOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_auth_key_duplicated("406 BANNED_RIGHTS_INVALID"))
         self.assertEqual(classify_message("406 AUTH_KEY_DUPLICATED"), OUTCOME_DEAD)
         self.assertEqual(classify_message("406 BANNED_RIGHTS_INVALID"), OUTCOME_FAIL)
+
+    def test_numeric_401_is_not_a_reliable_auth_signal(self):
+        from services.join_brain import classify_message, OUTCOME_DEAD, OUTCOME_FLOOD
+        for text in ("FloodWait:401", "FloodWait:1401", "trace=401", "chat=-100401"):
+            with self.subTest(text=text):
+                self.assertFalse(is_fatal_auth_error(text))
+        self.assertEqual(classify_message('FloodWait:401'), OUTCOME_FLOOD)
+        self.assertTrue(is_fatal_auth_error('SESSION_REVOKED [401]'))
+        self.assertTrue(is_fatal_auth_error('AuthKeyUnregistered'))
+        self.assertFalse(is_fatal_auth_error('AUTH_KEY_DUPLICATED [406] trace=401'))
+
+        class Rpc401(Exception):
+            CODE = 401
+        class Wait401(Exception):
+            CODE = 420
+        self.assertTrue(is_fatal_auth_error(Rpc401()))
+        self.assertEqual(fatal_auth_category(Rpc401()), 'RPC_401')
+        self.assertFalse(is_fatal_auth_error(Wait401('FloodWait:401')))
+        self.assertIsNone(fatal_auth_category(Wait401('FloodWait:401')))
+        self.assertIsNone(fatal_auth_category('FloodWait:401'))
+        self.assertEqual(fatal_auth_category('AuthKeyInvalid'), 'AUTH_KEY_INVALID')
+        self.assertEqual(classify_message('SESSION_REVOKED [401]'), OUTCOME_DEAD)
 
     async def test_reseller_copy_of_same_key_cannot_open_another_client(self):
         so = SessionOwnership()
@@ -419,7 +442,30 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
             fake_mgr.start_call.return_value = (False, "SESSION_REVOKED [401]", 0)
             res = await ex._join_single_account(771, acc, "voice_chat", "t.me/a")
             self.assertEqual(res["status"], "dead")
-            mark_dead.assert_awaited_once_with(880)
+            mark_dead.assert_awaited_once_with(880, 'encrypted', 'SESSION_REVOKED [401]')
+
+    async def test_flood_wait_401_seconds_never_marks_session_dead(self):
+        """The old substring search mistook FloodWait:401 for RPC 401."""
+        import services.order_executor as module
+        import services.voice_call_manager as vcm
+        ex = module.OrderExecutor()
+        ex.active_orders[771] = {"cancel_requested": False}
+        acc = {"id": 880, "phone_number": "x", "session_string": "encrypted"}
+        mark_dead = AsyncMock()
+        fake_mgr = SimpleNamespace(start_call=AsyncMock(return_value=(False, "FloodWait:401", 0)))
+        fake_tac = SimpleNamespace(join_chat=AsyncMock(return_value=(False, "FloodWait:401")))
+        with patch.object(module, "_get_voice_call_manager", return_value=fake_mgr), \
+                patch.object(module, "TelegramAccountClient", return_value=fake_tac), \
+                patch.object(ex, "_mark_account_dead", mark_dead):
+            for kind in ("voice_chat", "group_join"):
+                res = await ex._join_single_account(771, acc, kind, "t.me/a")
+                self.assertEqual(res["status"], "failed")
+            mark_dead.assert_not_awaited()
+        self.assertFalse(vcm._is_fatal_session_reason("FloodWait:401"))
+        self.assertFalse(vcm._is_fatal_session_reason("other error (trace=401)"))
+        self.assertNotEqual(vcm._classify_error(Exception('network trace=401')),
+                            vcm.FAILURE_AUTHENTICATION)
+        self.assertTrue(vcm._is_fatal_session_reason("SESSION_REVOKED [401]"))
 
     async def test_406_is_not_relabelled_revoked_or_auto_disabled(self):
         from pyrogram.errors import AuthKeyDuplicated
@@ -432,14 +478,70 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
         async def fail_to_start(*_args, **_kwargs):
             raise AuthKeyDuplicated()
         with patch.object(mgr, "_get_or_create_client", side_effect=fail_to_start), \
-                patch.object(DatabaseManager, "update_account_status", db_inactive), \
-                patch.object(DatabaseManager, "update_account_spam_status", db_note):
+                patch.object(DatabaseManager, "mark_account_auth_invalid", db_inactive), \
+                patch.object(DatabaseManager, "note_session_conflict_if_current", db_note):
             ok, msg, _chat = await mgr.start_call(111111, 222222, "encrypted", "t.me/group", 0)
             self.assertFalse(ok)
             self.assertTrue(msg.startswith("AUTH_KEY_DUPLICATED:"), msg)
             self.assertNotIn("SESSION_REVOKED", msg)
             db_inactive.assert_not_called()
             db_note.assert_awaited()
+
+
+class AuthResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_voice_error_can_only_disable_the_key_that_failed(self):
+        from services.voice_call_manager import _mark_session_dead
+        from database import DatabaseManager
+        fatal = AsyncMock(return_value=True)
+        conflict = AsyncMock(return_value=True)
+        with patch.object(DatabaseManager, 'mark_account_auth_invalid', fatal), \
+             patch.object(DatabaseManager, 'note_session_conflict_if_current', conflict):
+            await _mark_session_dead(7, 'FloodWait:401', 'old-ciphertext')
+            fatal.assert_not_awaited()
+            conflict.assert_not_awaited()
+            await _mark_session_dead(7, 'AUTH_KEY_DUPLICATED', 'old-ciphertext')
+            conflict.assert_awaited_once_with(7, 'old-ciphertext')
+            await _mark_session_dead(7, 'AuthKeyInvalid', 'old-ciphertext')
+            fatal.assert_awaited_once_with(7, 'old-ciphertext', 'AUTH_KEY_INVALID')
+
+    async def test_spambot_message_is_not_a_session_revocation(self):
+        import services.health_checker as module
+        from database import DatabaseManager
+        acc = {'id': 7, 'phone_number': '+100', 'session_string': 'old-ciphertext'}
+        fatal = AsyncMock(return_value=True)
+        note = AsyncMock()
+        profile = SimpleNamespace(check_spambot=AsyncMock(return_value=('limited', 'SESSION_REVOKED in SpamBot text')))
+        with patch.object(module, 'TelegramAccountClient', return_value=profile), \
+             patch.object(DatabaseManager, 'mark_account_auth_invalid', fatal), \
+             patch.object(DatabaseManager, 'update_account_spam_status', note):
+            await module.HealthChecker().check_single_account_spam(acc)
+            fatal.assert_not_awaited()
+            note.assert_awaited_once_with(7, 'limited', 'SESSION_REVOKED in SpamBot text')
+
+    async def test_health_checker_floodwait_seconds_do_not_disable_key(self):
+        import services.health_checker as module
+        from database import DatabaseManager
+        acc = {'id': 7, 'phone_number': '+100', 'session_string': 'old-ciphertext'}
+        fatal = AsyncMock(return_value=True)
+        note = AsyncMock()
+        profile = SimpleNamespace(check_spambot=AsyncMock(return_value=('error', 'FloodWait:401')))
+        with patch.object(module, 'TelegramAccountClient', return_value=profile), \
+             patch.object(DatabaseManager, 'mark_account_auth_invalid', fatal), \
+             patch.object(DatabaseManager, 'update_account_spam_status', note):
+            await module.HealthChecker().check_single_account_spam(acc)
+            fatal.assert_not_awaited()
+            note.assert_awaited_once_with(7, 'error', 'FloodWait:401')
+
+    async def test_health_checker_fatal_requires_same_stored_session(self):
+        import services.health_checker as module
+        from database import DatabaseManager
+        acc = {'id': 7, 'phone_number': '+100', 'session_string': 'old-ciphertext'}
+        fatal = AsyncMock(return_value=True)
+        profile = SimpleNamespace(check_spambot=AsyncMock(return_value=('error', 'AuthKeyInvalid')))
+        with patch.object(module, 'TelegramAccountClient', return_value=profile), \
+             patch.object(DatabaseManager, 'mark_account_auth_invalid', fatal):
+            await module.HealthChecker().check_single_account_spam(acc)
+            fatal.assert_awaited_once_with(7, 'old-ciphertext', 'AUTH_KEY_INVALID')
 
 
 if __name__ == "__main__":

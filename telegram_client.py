@@ -23,7 +23,7 @@ from pyrogram.errors import (
 from config import Config
 from security import SecurityManager
 from database import DatabaseManager
-from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated
+from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated, is_fatal_auth_error
 from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
@@ -397,13 +397,9 @@ class TelegramAccountClient:
             logger.warning(f"fetch_me timeout for acc {self.account_id}")
             outcome = (False, "timeout", None)
         except Exception as e:
-            up = str(e).upper()
             if is_auth_key_duplicated(e):
                 reason = "duplicated_in_use"
-            elif any(k in up for k in (
-                "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED", "AUTH_KEY_INVALID",
-                "USER_DEACTIVATED", "401",
-            )):
+            elif is_fatal_auth_error(e):
                 reason = "relogin_required"
             else:
                 reason = "error"

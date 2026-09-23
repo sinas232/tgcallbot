@@ -81,7 +81,10 @@ def require_god_admin(func):
         user_id = update.effective_user.id
         if user_id in Config.ADMIN_IDS:
             return await func(update, context, *args, **kwargs)
-        await update.message.reply_text("⛔️ دسترسی محدود به مدیر کل.")
+        if update.callback_query:
+            await update.callback_query.answer("⛔️ دسترسی محدود به مدیر کل.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔️ دسترسی محدود به مدیر کل.")
         return AWAITING_SETTINGS_ACTION
     return wrapper
 
@@ -1679,6 +1682,7 @@ async def list_resellers_handler(update, context):
         await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
     return AWAITING_SETTINGS_ACTION
 
+@require_god_admin
 async def handle_reseller_action(update, context):
     query = update.callback_query
     data = query.data
@@ -1705,7 +1709,6 @@ async def handle_reseller_action(update, context):
         txt = (f"🤖 **مدیریت ربات #{reseller['id']}**\n\n👤 مدیر: `{reseller['owner_id']}`\n📅 انقضا: {exp_j}\n⏳ باقی‌مانده: {days_left} روز\n💡 وضعیت: {status_txt}")
         kb = [
             [InlineKeyboardButton("🔋 تمدید / شارژ", callback_data=f"reseller_renew_{rid}"), InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"reseller_edit_{rid}")],
-            [InlineKeyboardButton("➕ تزریق اکانت از ربات اصلی", callback_data=f"reseller_sync_accs_{rid}")],
             [InlineKeyboardButton("🗑 حذف کامل", callback_data=f"reseller_delete_{rid}")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_reseller_list")]
         ]
@@ -1761,33 +1764,20 @@ async def handle_reseller_action(update, context):
         except: pass
         return AWAITING_SETTINGS_ACTION
     elif data.startswith("reseller_sync_accs_"):
-        try:
-            rid = int(data.split("_")[3])
-            if rid == 1: return AWAITING_SETTINGS_ACTION
-            await query.answer("⏳ کپی...", show_alert=False)
-            main_accounts = await DatabaseManager.get_all_active_accounts(bot_id=1)
-            target_uid = None
-            reseller = await DatabaseManager.get_reseller(rid)
-            if reseller:
-                 u = await DatabaseManager.get_user(reseller['owner_id'], bot_id=rid)
-                 if not u: u = await DatabaseManager.create_or_update_user({'id': reseller['owner_id'], 'username': 'Owner', 'first_name': 'Reseller', 'last_name': 'Admin'}, bot_id=rid)
-                 target_uid = u['id']
-            if not target_uid:
-                await query.answer("ادمین یافت نشد.", show_alert=True)
-                return AWAITING_SETTINGS_ACTION
-            count = 0
-            for acc in main_accounts:
-                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'), first_name=acc.get('first_name'), last_name=acc.get('last_name'), username=acc.get('username'))
-                if res: count += 1
-            await query.edit_message_text(
-                f"✅ {count} ردیف اکانت برای نمایندگی کپی شد.\n\n"
-                "⚠️ سشن‌ها هم کپی شده‌اند و کلیدشان با ربات اصلی مشترک است. "
-                "یک پروسس هم می‌تواند با دو ردیف، تداخل 406 بسازد! حالا "
-                "اتصال دوم به همان کلید مسدود می‌شود؛ برای استفادهٔ هم‌زمان "
-                "در دو ربات، هر اکانت باید در نمایندگی جداگانه لاگین شود.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]),
-            )
-        except: pass
+        # Stale admin messages may still carry this button. Copying an
+        # encrypted string also copies the *same* MTProto auth key into a
+        # second bot; a second connection could invalidate BOTH sessions.
+        # There is no safe silent sync: log in separately on each bot.
+        await safe_answer(query)
+        await query.edit_message_text(
+            "⛔️ کپی سشن از ربات اصلی به نمایندگی غیرفعال است؛ هر دو ردیف "
+            "با همان کلید تلگرام وصل می‌شدند و خطر خروج اجباری داشتند. "
+            "اکانت را با شماره در خودِ ربات نمایندگی جداگانه لاگین کنید "
+            "تا کلید تازه بسازد؛ ایمپورتِ همان Session String کلید تازه نمی‌سازد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 فهرست نمایندگی‌ها", callback_data="back_to_reseller_list")],
+            ]),
+        )
         return AWAITING_SETTINGS_ACTION
     await safe_answer(query)
     return AWAITING_SETTINGS_ACTION

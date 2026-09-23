@@ -67,7 +67,9 @@ from database import DatabaseManager
 from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
-from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated
+from services.session_ownership import (session_ownership, SessionInUseError,
+                                        is_auth_key_duplicated, is_fatal_auth_error,
+                                        fatal_auth_category)
 from services.session_client import close_pyrogram_client
 from services.presence_reconciler import (
     PresenceReconciler,
@@ -226,26 +228,18 @@ GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
 
 
-# فقط این نشانه‌ها یعنی کلید سشن واقعاً از سمت تلگرام نابود است (کلاس‌های
-# Kurigram بدون آندرلاین هم پوشش داده می‌شوند: AuthKeyInvalid → AUTHKEYINVALID).
-_FATAL_SESSION_MARKERS = (
-    "SESSION_REVOKED", "SESSIONREVOKED",
-    "AUTH_KEY_UNREGISTERED", "AUTHKEYUNREGISTERED",
-    "AUTH_KEY_INVALID", "AUTHKEYINVALID",
-    "USER_DEACTIVATED", "USERDEACTIVATED",
-    "401", "UNAUTHORIZED",
-)
-
-
 def _is_fatal_session_reason(reason: str) -> bool:
-    up = (reason or "").upper()
-    # A 406 report may include other numbers; don't turn it into a 401 guess.
-    return not is_auth_key_duplicated(up) and any(m in up for m in _FATAL_SESSION_MARKERS)
+    # A number in an unrelated error (e.g. FloodWait:401 seconds) is not an
+    # authentication failure. Use the same strict predicate as the executor.
+    return is_fatal_auth_error(reason)
 
 
-async def _mark_session_dead(account_id: int, reason: str) -> None:
-    """اکانت را فقط در «مرگ واقعی کلید» (401/revoked/unregistered/deactivated)
-    از چرخه خارج می‌کند — هرگز برای 406.
+async def _mark_session_dead(account_id: int, reason: str, encrypted_session: str) -> None:
+    """Disable only an explicitly revoked *matching* stored key; never 406.
+
+    A concurrent phone login may replace this account's session while an
+    older voice client is failing. Compare-and-swap in the DB prevents that
+    OLD client's failure from disabling the NEW valid session.
 
     AUTH_KEY_DUPLICATED (406) تداخل کلید را نشان می‌دهد؛ با این خطا نه می‌شود
     محل اتصال دوم را مشخص کرد، نه ثابت کرد کلید هنوز معتبر است. این تداخل
@@ -261,15 +255,13 @@ async def _mark_session_dead(account_id: int, reason: str) -> None:
                     "Session %s AUTH_KEY_DUPLICATED — not auto-disabled. "
                     "Check same-key reseller rows, old processes and other servers. "
                     "Telegram may have invalidated the key; re-login if needed.", account_id)
-                await _DB.update_account_spam_status(
-                    int(account_id), "cooldown", "AUTH_KEY_DUPLICATED: check duplicate connection/key; re-login if invalid",
-                )
+                await _DB.note_session_conflict_if_current(int(account_id), encrypted_session)
             return
-        await _DB.update_account_status(int(account_id), "inactive")
-        await _DB.update_account_spam_status(
-            int(account_id), "dead", f"fatal session error ({reason})")
-    except Exception:
-        pass
+        category = fatal_auth_category(reason)
+        if category:
+            await _DB.mark_account_auth_invalid(int(account_id), encrypted_session, category)
+    except Exception as exc:
+        logger.warning('Unable to persist auth result for acc=%s: %s', account_id, type(exc).__name__)
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -582,8 +574,8 @@ def _classify_error(err: Exception, message: str = "") -> str:
        or "flood" in s or "slow_mode" in s:
         return FAILURE_RATE_LIMITED
     if isinstance(err, (AuthKeyInvalid, AuthKeyUnregistered, SessionRevoked)) or \
-       "session_revoked" in s or "auth_key" in s or "session revoked" in s or \
-       "401" in s or "user_deactivated" in s or "active user required" in s:
+       is_fatal_auth_error(err) or is_fatal_auth_error(message) or \
+       "auth_key" in s or "active user required" in s:
         return FAILURE_AUTHENTICATION
     # GROUPCALL_FORBIDDEN and GROUPCALL_INVALID are often transient if they occur
     # during join. Classify them as voice_call_state (retryable) rather than permanent.
@@ -1939,7 +1931,7 @@ class VoiceCallManager:
                     self.pyrogram_clients[account_id] = app
                     logger.critical("acc=%s MTProto teardown unconfirmed; quarantined until process exit", account_id)
                 if isinstance(exc, AuthKeyDuplicated):
-                    await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED client_start")
+                    await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED client_start", session_string)
                 raise
             self.pyrogram_clients[account_id] = app
             self._session_cache[account_id] = session_string
@@ -3637,7 +3629,7 @@ class VoiceCallManager:
                 self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as exc:
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
-                await _mark_session_dead(account_id, f"warmup {type(exc).__name__}")
+                await _mark_session_dead(account_id, f"warmup {type(exc).__name__}", session_string)
             except SessionInUseError as exc:
                 logger.info("warmup acc=%s skipped: %s", account_id, exc.technical)
             except asyncio.CancelledError:
@@ -3718,11 +3710,11 @@ class VoiceCallManager:
                 # that prefix to mark the account inactive regardless of the
                 # v2.3.9 non-fatal gate. Stop retries for this order instead.
                 self._set_state(order_id, account_id, FAILED, "AUTH_KEY_DUPLICATED")
-                await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED start_call")
+                await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED start_call", session_string)
                 return False, f"AUTH_KEY_DUPLICATED: {e}", 0
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
-                await _mark_session_dead(account_id, f"start_call {type(e).__name__}")
+                await _mark_session_dead(account_id, f"start_call {type(e).__name__}", session_string)
                 return False, f"SESSION_REVOKED: {e}", 0
             except SessionInUseError as e:
                 self._set_state(order_id, account_id, RETRY_PENDING, e.technical)
