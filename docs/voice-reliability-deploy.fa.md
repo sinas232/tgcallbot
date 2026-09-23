@@ -3,6 +3,9 @@
 > سند فنی اپراتور — بعد از به‌روزرسانی کد مخزن `sinas232/tgcallbot`.
 > این اصلاحات مربوط به مشکلات «فقط حدود ۱۰ اکانت وارد ویس می‌شوند» و
 > «اکانت‌ها چند ثانیه بعد از ورود از ویس خارج/کیک می‌شوند» است.
+> مقادیر ۴۸kHz/استریو در این سند مربوط به مرحلهٔ تاریخی رفع باگ‌اند؛ نسخهٔ
+> فعلی ۲.۳.۱۴ سکوت بهینهٔ ۲۴kHz/مونو دارد. دستور نصب فعلی فقط در
+> [راهنمای استقرار نهایی](deploy-final.fa.md) آمده است.
 
 ---
 
@@ -47,24 +50,17 @@ VOICE_SESSION_OWNERSHIP=true
 VOICE_SILENCE_LOOP=true
 ```
 
-## ۴) استقرار روی سرور (`/root/callmanager`)
+## ۴) استقرار روی سرور
 
-```bash
-cd /root/callmanager
-git pull origin main
-
-# چون requirements تغییر نکرده، ری‌استارت کافی است؛ برای اطمینان:
-docker compose up -d --build bot
-
-# وضعیت
-docker compose ps
-docker compose logs --tail=100 -f bot
-```
+این بخش، تاریخچهٔ رفع ویس است و **دستور قدیمی `git pull main` دیگر آخرین
+نسخه را نصب نمی‌کند**. روی سرور موجود با سفارش/سشن، پیش از هر fetch/تعویض فایل
+یا restart، طبق [دستورهای نهایی استقرار کامل](deploy-final.fa.md) حالت تعمیرات
+را فعال و سفارش‌ها/بکاپ را کنترل کنید. خودسرانه `docker compose up/down` نزنید.
 
 نشانهٔ بوت سالم:
 
 ```
-silence stream ready: 30s @ 48000 Hz 2ch (silence.wav)
+silence stream ready: 30s @ 24000 Hz 1ch (silence.wav)
 ```
 
 و در صورت وجود کول‌داون‌های باقی‌مانده:

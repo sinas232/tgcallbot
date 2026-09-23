@@ -67,12 +67,10 @@ docker compose version
 ```bash
 # مسیر دلخواه (این سند از /opt/tgcallbot استفاده می‌کند)
 cd /opt
-git clone https://github.com/sinas232/tgcallbot.git
+git clone --branch arena/01a0ccf5-tgcallbot https://github.com/sinas232/tgcallbot.git
 cd tgcallbot
-
-# روی برنچی که تغییرات پایداری ویس روی آن است:
-git checkout arena/01a0aeae-tgcallbot
-git pull origin arena/01a0aeae-tgcallbot
+# فقط برای نصب واقعاً تازه؛ اگر DB یا ربات قبلی دارید، ادامهٔ این سند
+# مناسب نیست: ابتدا docs/deploy-final.fa.md را برای استقرار ایمن بخوانید.
 ```
 
 ---
@@ -228,15 +226,11 @@ docker compose up -d --build
 docker compose ps
 ```
 
-یا ساده‌تر، از اسکریپت آماده استفاده کنید (پاک‌سازی orphanها + بیلد + بررسی سلامت
-تونل + تأیید warp=on + لاگ):
-
-```bash
-cd ~/callmanager
-bash deploy-warp.sh          # بیلد + اجرا + تأیید عبور از WARP + لاگ
-bash deploy-warp.sh logs     # فقط دیدن لاگ
-bash deploy-warp.sh down     # توقف
-```
+برای **نصب تازه** دستور مستقیم Compose بالا کافی است. `deploy-warp.sh` مخصوص
+**ارتقای نصب موجود** است و بدون DB موجود، تأیید تعمیرات و کنترل سفارش‌ها اجازهٔ
+اجرا نمی‌دهد؛ `down` در آن غیرفعال است. برای نصب موجود، [دستورهای نهایی](deploy-final.fa.md)
+را ببینید. روی سرور تازه پس از بالا آمدن، برای مشاهدهٔ لاگ (محرمانه) می‌توانید
+`bash deploy-warp.sh logs` اجرا کنید؛ لاگ خام را در چت/تیکت منتشر نکنید.
 
 بررسی این‌که ترافیک واقعاً از WARP رد می‌شود:
 
@@ -268,11 +262,11 @@ docker compose logs -f bot \
 
 ## توقف / راه‌اندازی دوباره
 
-```bash
-cd ~/callmanager
-docker compose down            # توقف کامل
-docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
-```
+**روی سرور تولیدی با سفارش فعال `docker compose down/restart/up --build` نزنید**؛
+راه‌اندازی مجدد می‌تواند سفارش پولی را `stopped` کند. برای تغییر نسخه روی
+نصب موجود، پس از تعیین وضعیت سفارش‌ها و بکاپ از [استقرار ایمن](deploy-final.fa.md)
+استفاده کنید. دستور اولیهٔ `docker compose up -d --build` در بالا فقط برای
+سرور واقعاً تازه و بدون سفارش/سشن مشترک است.
 
 ---
 
@@ -317,25 +311,23 @@ docker compose up -d --build   # اجرای دوباره (همیشه با WARP)
 > کلاینت‌های ویس عمداً با `no_updates=False` ساخته می‌شوند. (بار پردازشیِ این
 > آپدیت‌ها با `no_updates` حذف نمی‌شود، بلکه با خفه‌کردن لاگ‌ها و uvloop مهار شده.)
 
-بعد از هر تغییرِ `requirements.txt` (مثل افزودن uvloop) حتماً با `--build` بسازید:
-
-```bash
-cd ~/callmanager
-docker compose up -d --build
-docker compose logs bot | grep -E "uvloop|VoiceDiag|SOCKS5"
-```
+بعد از هر تغییرِ `requirements.txt` ایمیج باید دوباره ساخته شود. دستور
+`docker compose up -d --build` فقط روی **سرور تازه** بدون سفارش مجاز است؛ برای
+نصب موجود [دستور استقرار با کنترل سفارش و بکاپ](deploy-final.fa.md) را به‌جای
+ری‌استارت مستقیم اجرا کنید. لاگ خام می‌تواند حساس باشد؛ بدون پالایش منتشر نکنید.
 
 ---
 
 ## عیب‌یابی سریع
 
-- **خطای `port is already allocated` روی 8080:** یک کانتینر warp قدیمی/orphan
-  هنوز پورت را گرفته. با `docker compose down --remove-orphans` پاکش کنید و دوباره
-  بالا بیاورید (اسکریپت `deploy-warp.sh` این کار را خودکار انجام می‌دهد).
-- **خطای `Database not ready ... Name or service not known`:** یعنی ربات بدون
-  WARP یا با DNSِ شکسته بالا آمده. مطمئن شوید آخرین نسخهٔ مخزن را `git pull`
-  کرده‌اید (WARP و IP ثابت db/redis داخل `docker-compose.yml` ادغام شده‌اند) و
-  خطوط دستی `COMPOSE_FILE` را از `.env` **حذف** کنید (دیگر لازم نیست).
+- **خطای `port is already allocated` روی 8080:** با `docker ps` مالک واقعی
+  پورت/کانتینر را پیدا کنید؛ بدون بررسی سفارش زنده و کلیدهای سشن، `down
+  --remove-orphans` نزنید. اسکریپت جدید `deploy-warp.sh` دیگر هیچ کانتینری
+  را بی‌هدف پاک نمی‌کند.
+- **خطای `Database not ready ... Name or service not known`:** وضعیت DNS و
+  مسیر WARP را بررسی کنید؛ `git pull` کورکورانه روی شاخهٔ قدیمی جای عیب‌یابی
+  نیست. کد باید روی `arena/01a0ccf5-tgcallbot` باشد و مقادیر DB/Redis
+  در `.env` با همین Compose منطبق باشند.
 
 
 - **کانتینر warp بالا نمی‌آید / healthy نمی‌شود:**

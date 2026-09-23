@@ -113,7 +113,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.3.13"', src)
+        self.assertIn('BOT_VERSION = "2.3.14"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):

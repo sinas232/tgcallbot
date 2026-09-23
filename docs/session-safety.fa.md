@@ -20,22 +20,14 @@
 
 **محدودیت:** قفل PostgreSQL فقط نسخه‌های جدیدی را هماهنگ می‌کند که به همان دیتابیس وصل می‌شوند. فرایند قدیمی، ابزار مستقل یا پنل/فروشندهٔ شخص ثالث ممکن است همچنان همان سشن را استفاده کند. حتی کپی‌های نمایندگی، اگر قرار است هم‌زمان استفاده شوند، باید برای **هر ربات جداگانه** لاگین کنند و کلیدهای متفاوت بگیرند.
 
-## استقرار محتاطانه روی `/opt/tgcallbot`
+## استقرار محتاطانه روی سرور
 
-روی سروری که ربات در آن اجراست، پس از انتشار شاخهٔ `arena/01a0ccf5-tgcallbot`:
-
-```bash
-cd /opt/tgcallbot
-git status --short
-git branch --show-current
-# فقط اگر همین شاخه قبلاً روی سرور مستقر بوده و تغییرات محلیِ متعارض ندارید:
-git pull --ff-only origin arena/01a0ccf5-tgcallbot
-
-docker compose stop bot
-docker compose up -d --build bot
-docker compose ps bot
-docker compose logs --since=10m --no-color bot | grep -E 'Local singleton lock|Instance database lock|Main Bot Started|running commit|INSTANCE LOCK LOST|AUTH_KEY_DUPLICATED'
-```
+برای **آخرین نسخهٔ کامل** از [دستورهای نهایی استقرار ۲.۳.۱۴](deploy-final.fa.md)
+استفاده کنید؛ مستقیم `git pull`/`docker compose stop/up` وسط سفارش فعال
+نزنید. `reset_stuck_orders()` در بوت، سفارش `running` را `stopped` می‌کند.
+راهنمای نهایی قبل از تغییر فایل‌ها، وضعیت سفارش ۸۴۶ و سایر سفارش‌های پولی را
+فقط‌خواندنی بررسی می‌کند، بکاپ می‌گیرد و حالت تعمیرات را لازم می‌داند.
+حتی اگر برنامه بالا آمد، سلامت سشن‌های واقعی/UDP ثابت نشده است.
 
 اگر `git status` تغییرات محلی دارد، **آن‌ها را بررسی/پشتیبان‌گیری کنید**؛ دستور `git reset --hard` اجرا نکنید. فایل `.env` و کلید `SESSION_ENCRYPTION_KEY` را تغییر ندهید: با کلید جدید، سشن‌های قبلی از دیتابیس قابل رمزگشایی نیستند. نام/آدرس دیتابیس در کانتینر باید همان DB اصلی باشد. اگر `Another tgcallbot instance holds the same DATABASE_URL` دیدید، قفل را دور نزنید؛ نمونهٔ مالکِ همان دیتابیس را شناسایی کنید. هنگام بالا آمدن، ۱۰ ثانیه انتظار بعد از قفل طبیعی است.
 

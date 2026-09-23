@@ -20,7 +20,8 @@
 | [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md) | **راه‌اندازی درگاه پرداخت زرین‌پال** (دامنه، Referrer، callback، عیب‌یابی) |
 | [`docs/voice-reliability-deploy.fa.md`](docs/voice-reliability-deploy.fa.md) | پایداری تماس صوتی و استقرار |
 | [`docs/session-safety.fa.md`](docs/session-safety.fa.md) | جلوگیری از تداخل سشن، استقرار امن و بازیابی اکانت‌های ۴۰۶ |
-| [`docs/full-version.fa.md`](docs/full-version.fa.md) | **موجودی قابلیت‌های نسخهٔ کامل ۲.۳.۱۳**، تفاوت با main و نکات تحویل |
+| [`docs/full-version.fa.md`](docs/full-version.fa.md) | **موجودی قابلیت‌های نسخهٔ کامل ۲.۳.۱۴**، تفاوت با main و نکات تحویل |
+| [`docs/deploy-final.fa.md`](docs/deploy-final.fa.md) | **دستورات نهاییِ استقرار امن** روی سرور موجود، فقط پس از بررسی سفارش‌های فعال |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
 | [`docs/premium-emoji.fa.md`](docs/premium-emoji.fa.md) | **💎 ایموجی پریمیوم (Custom Emoji)** در همهٔ منوها، دکمه‌ها، تیکت و بازنشر پیام کاربر |
 
@@ -116,10 +117,9 @@
 apt-get update && apt-get install -y git curl ca-certificates
 curl -fsSL https://get.docker.com | sh
 
-# ۲) دریافت پروژه
-git clone <URL-REPO> callmanager
+# ۲) نصب تازه: دریافت شاخهٔ کامل (برای ارتقای نصب موجود، راهنمای زیر را ببینید)
+git clone --branch arena/01a0ccf5-tgcallbot https://github.com/sinas232/tgcallbot.git callmanager
 cd callmanager
-git checkout arena/01a08f7a-tgcallbot
 
 # ۳) ساخت فایل .env (نمونهٔ کامل در docs/new-server-setup.fa.md)
 nano .env
@@ -229,8 +229,8 @@ tgcallbot/
 </div>
 
 ```bash
-# ۱) دریافت کد (نام پوشهٔ پروژه طبق قرارداد: callmanager)
-git clone <REPO_URL> callmanager
+# ۱) دریافت کد روی سرور تازه (برای نصب موجود، روش استقرار ایمن جداگانه است)
+git clone --branch arena/01a0ccf5-tgcallbot https://github.com/sinas232/tgcallbot.git callmanager
 cd callmanager
 
 # ۲) ساخت فایل تنظیمات و پرکردن مقادیر واقعی
@@ -263,12 +263,12 @@ docker compose logs -f bot
 # مشاهدهٔ لاگ زندهٔ ربات
 docker compose logs -f bot
 
-# ری‌استارت فقط ربات
-docker compose restart bot
-
-# بازسازی و بالا آوردن پس از تغییر کد
-git pull
-docker compose up -d --build
+# ⚠️ روی سرور دارای سفارش پولی، این دستورات را مستقیماً اجرا نکنید:
+# docker compose restart bot / docker compose down / git pull origin main
+# ارتقای نصب موجود فقط طبق docs/deploy-final.fa.md، پس از فعال‌کردن
+# تعمیرات، بررسی سفارش‌های زنده و گرفتن بکاپِ بیرون از پروژه است.
+# پس از گرفتن شاخهٔ درست و طی‌کردن پیش‌شرط‌های راهنما:
+DEPLOY_CONFIRMED=yes bash deploy-warp.sh
 
 # بررسی مصرف منابع
 docker stats
@@ -322,7 +322,8 @@ MTProto). راهنمای کامل: [`docs/premium-emoji.fa.md`](docs/premium-emo
 
 ## 📄 نسخه و توسعه
 
-- نسخهٔ پایدار روی شاخهٔ `main` منتشر می‌شود.
+- `main` هنوز روی ۲.۲.۳ است. کد کامل ۲.۳.۱۴ روی شاخهٔ `arena/01a0ccf5-tgcallbot` است؛ درخواست ادغام آن جداگانه در انتظار بازبینی قرار دارد. تغییر شاخه یا ادغام GitHub، **سرور را خودکار به‌روز نمی‌کند**.
+- برای ارتقای سرور موجود فقط [دستورات نهایی و گارد سفارش فعال](docs/deploy-final.fa.md) را اجرا کنید.
 - تاریخچهٔ کامل تغییرات در [`CHANGELOG.md`](CHANGELOG.md) آمده است.
 
 </div>
