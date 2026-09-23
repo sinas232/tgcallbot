@@ -28,8 +28,28 @@ if [[ ! -f .env ]]; then
   echo "Missing .env. Preserve the existing encryption key and database; never generate new production credentials during an update." >&2
   exit 2
 fi
+if [[ ! -r .env ]]; then
+  echo "Cannot read .env; refusing deploy without checking compatibility." >&2
+  exit 2
+fi
+# These settings existed in a separate voice branch or were supplied by
+# operators, but this release does not implement them. Silently ignoring a
+# requested sequential/listener/second-chance policy is unsafe. This check
+# reads *names only*, never prints the credential-bearing .env or its values.
+# Do not bypass it by stripping the keys unless the operator has explicitly
+# approved losing those behaviours.
+if grep -Eq '^[[:space:]]*(VOICE_JOIN_SEQUENTIAL(_[A-Z0-9_]+)?|VOICE_JOIN_ACCOUNT_GAP_[A-Z0-9_]+|VOICE_SECOND_CHANCE_[A-Z0-9_]+|VOICE_SILENCE_MODE|VOICE_LISTENER_[A-Z0-9_]+|VOICE_SESSION_CONFLICT_RETRY_SECONDS|VOICE_IDLE_[A-Z0-9_]+|ORDER_LINK_MODE|BOT_(MEM|CPU)_LIMIT|VOICE_RAM_SOFT_LIMIT_MB)[[:space:]]*=' .env; then
+  echo "Refusing deploy: .env requests unsupported voice/order/resource settings in this draft. No values were printed. See docs/env-compatibility.fa.md; do not strip settings just to bypass this guard." >&2
+  exit 2
+else
+  env_check_status=$?
+  if (( env_check_status != 1 )); then
+    echo "Could not check .env safely; refusing deploy without reading secrets aloud." >&2
+    exit 2
+  fi
+fi
 if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.14"$' constants.py; then
-  echo "Wrong source tree: expected the complete v2.3.14 code. Do not deploy an older checkout." >&2
+  echo "Wrong source tree: expected the v2.3.14 draft. Do not deploy an older checkout." >&2
   exit 2
 fi
 if [[ -z "$(docker compose ps --status running --quiet db)" ]]; then

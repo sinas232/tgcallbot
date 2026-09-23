@@ -87,6 +87,48 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
                 self.assertNotIn('build bot', self.commands())
                 self.assertNotIn('up -d', self.commands())
 
+    def test_ignored_voice_knobs_refuse_before_docker_without_printing_env(self):
+        secret = 'PRIVATE_PLACEHOLDER_NOT_A_REAL_CREDENTIAL'
+        env_file = self.project / '.env'
+        original = ('BOT_TOKEN=' + secret + '\n'
+                    'VOICE_JOIN_SEQUENTIAL=true\n'
+                    'VOICE_JOIN_ACCOUNT_GAP_MIN=3\n'
+                    'VOICE_SECOND_CHANCE_ROUNDS=2\n'
+                    'VOICE_SILENCE_MODE=auto\n')
+        env_file.write_text(original)
+        result = self.run_script('deploy-warp.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Refusing deploy', result.stderr)
+        self.assertIn('docs/env-compatibility.fa.md', result.stderr)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertEqual(env_file.read_text(), original)
+        self.assertEqual(self.commands(), '')
+        self.assertFalse(list(self.backups.glob('*.dump')))
+
+    def test_guard_covers_the_different_unsupported_feature_families(self):
+        for name in ('VOICE_JOIN_SEQUENTIAL_GAP_MIN',
+                     'VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX',
+                     'VOICE_SECOND_CHANCE_COOLDOWN_SECONDS',
+                     'VOICE_LISTENER_MAX_DROPS',
+                     'VOICE_IDLE_REAPER',
+                     'ORDER_LINK_MODE', 'BOT_MEM_LIMIT', 'BOT_CPU_LIMIT'):
+            with self.subTest(key=name):
+                self.log.unlink(missing_ok=True)
+                (self.project / '.env').write_text(name + '=example_not_secret\n')
+                result = self.run_script('deploy-warp.sh')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Refusing deploy', result.stderr)
+                self.assertEqual(self.commands(), '')
+
+    def test_legacy_flags_in_comments_do_not_block(self):
+        (self.project / '.env').write_text(
+            '# VOICE_JOIN_SEQUENTIAL=true\n'
+            'VOICE_JOIN_MAX_CONCURRENCY=2\n'
+        )
+        result = self.run_script('deploy-warp.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('up -d --no-build', self.commands())
+
     def test_no_db_refuses_instead_of_initializing_new_volume(self):
         result = self.run_script('deploy-warp.sh', FAKE_NO_DB='1')
         self.assertNotEqual(result.returncode, 0)
