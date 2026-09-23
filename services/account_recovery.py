@@ -45,6 +45,14 @@ async def recover_one_account(account_id: int, bot_id: int) -> Tuple[bool, str]:
         return False, 'error'
 
     if not ok:
+        if reason == 'account_deleted':
+            # Only a typed USER_DEACTIVATED RPC in the guarded in-bot probe,
+            # followed by confirmed disconnect, can make a row eligible for
+            # the superadmin deletion menu. Never tag a replaced session.
+            changed = await DatabaseManager.mark_account_deleted_after_verified_probe(
+                int(account_id), int(bot_id), acc['session_string']
+            )
+            return (False, 'account_deleted') if changed else (False, 'changed_during_probe')
         return False, reason or 'error'
 
     # Avoid racing an administrator who imported/logged in with a NEW session
@@ -59,6 +67,7 @@ _RECOVERY_MESSAGES = {
     'recovered': '✅ اتصال و قطع سشن تأیید شد؛ همین اکانت به وضعیت فعال برگشت.',
     'duplicated_in_use': '⚠️ خطای ۴۰۶: تداخل کلید سشن. کلید سالم یا باطل بودنش معلوم نیست؛ دوباره‌پروب نکنید. کپی نمایندگی/برنامهٔ دیگر را بررسی کنید.',
     'relogin_required': '💀 تلگرام ابطال کلید را اعلام کرد؛ این اکانت فقط با ورود مجدد و سشن تازه بازیابی می‌شود.',
+    'account_deleted': '☠️ تلگرام حذف‌شدن حساب را صریحاً اعلام کرد. فقط این حساب در منوی سوپرادمین برای حذف قابل‌انتخاب است؛ سشن‌های دیگر دست‌نخورده‌اند.',
     'timeout': '⏱ اتصال تلگرام تایم‌اوت شد؛ هیچ تغییری در وضعیت اکانت ندادیم.',
     'disconnect_unconfirmed': '🔒 قطع اتصالِ پروب تأیید نشد؛ برای جلوگیری از تداخل، اکانت فعال نشد.',
     'shared': '🔒 همین کلید زیر ردیف دیگری از ربات/نمایندگی در حال استفاده است؛ اتصال دوم باز نشد.',

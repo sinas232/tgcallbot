@@ -23,7 +23,9 @@ from pyrogram.errors import (
 from config import Config
 from security import SecurityManager
 from database import DatabaseManager
-from services.session_ownership import session_ownership, SessionInUseError, is_auth_key_duplicated, is_fatal_auth_error
+from services.session_ownership import (session_ownership, SessionInUseError,
+                                        is_auth_key_duplicated, is_fatal_auth_error,
+                                        is_account_deleted_rpc)
 from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
@@ -368,6 +370,7 @@ class TelegramAccountClient:
           یک اتصال استفاده شده است. این می‌تواند در همین پروسس (کپی نمایندگی)،
           یا جای دیگر رخ دهد؛ تلگرام ممکن است کلید را باطل کرده باشد. پروبِ
           مکرر نزنید؛ پس از حذف تداخل، در صورت لزوم دوباره لاگین کنید.
+        * ``account_deleted`` — خطای تایپ‌شدهٔ USER_DEACTIVATED (نه BAN).
         * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
         * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
         * ``disconnect_unconfirmed`` — اتصالِ پروب بسته‌نشد؛ بازگردانی ممنوع.
@@ -399,11 +402,14 @@ class TelegramAccountClient:
         except Exception as e:
             if is_auth_key_duplicated(e):
                 reason = "duplicated_in_use"
+            elif is_account_deleted_rpc(e):
+                reason = "account_deleted"
             elif is_fatal_auth_error(e):
                 reason = "relogin_required"
             else:
                 reason = "error"
-            logger.warning(f"fetch_me failed for acc {self.account_id}: {e} -> {reason}")
+            logger.warning("fetch_me failed for acc %s: %s -> %s",
+                           self.account_id, type(e).__name__, reason)
             outcome = (False, reason, None)
         finally:
             if client is not None:

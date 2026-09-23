@@ -417,52 +417,23 @@ async def process_leave_all_chats(context, chat_id):
 
 # --- مدیریت اکانت‌های دلیت شده ---
 async def show_deleted_accounts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    bot_id = context.bot_data.get('bot_id', 1)
-    # دریافت همه اکانت‌ها برای فیلتر کردن دستی
-    # (در یک سیستم بهینه باید کوئری مستقیم زد، اما اینجا برای سازگاری از متد موجود استفاده می‌کنیم)
-    accounts, _ = await DatabaseManager.get_accounts_paginated(limit=10000, bot_id=bot_id)
-    
-    dead_accounts = [acc for acc in accounts if acc['account_status'] == 'inactive' or acc.get('spam_status') == 'dead']
-    
-    if not dead_accounts:
-        await send_safe(context.bot, update.effective_chat.id, "✅ **هیچ اکانت دلیت شده یا غیرفعالی یافت نشد.**", parse_mode=ParseMode.HTML)
-        return AWAITING_SETTINGS_ACTION
-        
-    txt = f"☠️ <b>لیست اکانت‌های غیرفعال/دلیت شده ({len(dead_accounts)}):</b>\n\n"
-    for i, acc in enumerate(dead_accounts[:50]):
-        name, phone, status, spam_info = _format_account_display(acc)
-        reason = acc.get('spam_check_result') or "Unknown"
-        txt += (
-            f"{i+1}. {name} | 📱 <code>{phone}</code> | ID: <code>{acc['id']}</code>\n"
-            f"   ⚠️ {reason[:30]}...\n"
-        )
-    if len(dead_accounts) > 50: txt += f"\n... و {len(dead_accounts)-50} مورد دیگر."
-        
-    kb = [[InlineKeyboardButton("🗑 حذف همه اکانت‌های دلیت شده", callback_data="confirm_delete_dead")], [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_acc_menu")]]
-    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return AWAITING_SETTINGS_ACTION
+    """Legacy entry point: delegate to the gated, evidence-only superadmin menu.
+
+    Do NOT bring back the old 'inactive OR dead' filter. Those flags can refer
+    to valid sessions, including the 25 historical rows on the live server.
+    """
+    from handlers.admin_handlers import deleted_account_cleanup_handler
+    return await deleted_account_cleanup_handler(update, context)
+
 
 async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "back_to_acc_menu":
-        await query.delete_message()
-        # اینجا چون کالبک است، نباید هندلر متنی را صدا بزنیم.
-        # پس مستقیماً منو را ارسال می‌کنیم.
-        await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
-        return AWAITING_SETTINGS_ACTION
-    if data == "confirm_delete_dead":
-        bot_id = context.bot_data.get('bot_id', 1)
-        accounts, _ = await DatabaseManager.get_accounts_paginated(limit=10000, bot_id=bot_id)
-        dead_accounts = [acc for acc in accounts if acc['account_status'] == 'inactive' or acc.get('spam_status') == 'dead']
-        count = 0
-        for acc in dead_accounts:
-            await DatabaseManager.delete_account(acc['id'], update.effective_user.id)
-            count += 1
-        await query.edit_message_text(f"✅ **{count} اکانت با موفقیت از دیتابیس حذف شدند.**")
-        return AWAITING_SETTINGS_ACTION
-    return AWAITING_SETTINGS_ACTION
+    """A stale 'confirm_delete_dead' button must NEVER delete on one click."""
+    if update.callback_query and update.callback_query.data == 'back_to_acc_menu':
+        from handlers.menu_handlers import account_management_handler
+        return await account_management_handler(update, context)
+    from handlers.admin_handlers import deleted_account_cleanup_handler
+    return await deleted_account_cleanup_handler(update, context)
+
 
 async def cancel_handler(update, context):
     await _cleanup_client(context)

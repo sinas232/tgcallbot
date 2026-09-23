@@ -4,6 +4,9 @@ handlers/admin_handlers.py
 """
 import asyncio
 import logging
+import hashlib
+import secrets
+import time
 import os
 import json
 import html
@@ -72,7 +75,10 @@ def require_super_admin(func):
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         if user and user.get('admin_role') == 'super_admin':
             return await func(update, context, *args, **kwargs)
-        await update.message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
+        if update.callback_query:
+            await update.callback_query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
         return AWAITING_SETTINGS_ACTION
     return wrapper
 
@@ -177,6 +183,7 @@ async def admin_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if is_main_bot and is_god: settings_and_admins.insert(0, "🤖 مدیریت نمایندگی‌ها")
         elif not is_main_bot: settings_and_admins.insert(0, "📅 وضعیت اعتبار ربات")
         menu.insert(3, settings_and_admins)
+        menu.insert(4, ["☠️ حذف اکانت‌های دلیت‌شده"])
         
     role_name = 'مدیر کل' if is_god else ('سوپر ادمین' if is_super else 'ادمین عادی')
     bot_name = f" (نمایندگی {bot_id})" if not is_main_bot else " (اصلی)"
@@ -353,6 +360,115 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text(_maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     except Exception:
         pass
+    return AWAITING_SETTINGS_ACTION
+
+
+@require_super_admin
+async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Explicit, short-lived preview of ONLY Telegram-deleted accounts.
+
+    Never derive cleanup eligibility from inactive/dead, 406, a historical
+    SESSION_REVOKED label, or a bare 401. All mutations are rechecked in a
+    single DB transaction by delete_confirmed_deleted_accounts().
+    """
+    query = update.callback_query
+    data = query.data if query else 'deleted_cleanup_menu'
+    bot_id = int(context.bot_data.get('bot_id', 1))
+    if query:
+        await safe_answer(query)
+
+    async def display(text, buttons=None):
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        if query:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode=None)
+        else:
+            await send_safe(context.bot, update.effective_chat.id, text,
+                            reply_markup=markup, parse_mode=None)
+
+    if data.startswith('deleted_cleanup_confirm_'):
+        pending = context.user_data.pop('deleted_cleanup_preview', None)
+        if (not pending or pending.get('nonce') != data.removeprefix('deleted_cleanup_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید نامعتبر یا منقضی است؛ دوباره پیش‌نمایش بگیرید.', [
+                [InlineKeyboardButton('🔙 بازگشت به منوی حذف', callback_data='deleted_cleanup_menu')]])
+            return AWAITING_SETTINGS_ACTION
+        try:
+            deleted, result = await DatabaseManager.delete_confirmed_deleted_accounts(
+                bot_id, pending['fingerprints'])
+        except Exception as exc:
+            logger.exception('Deleted-account cleanup failed (bot=%s, error=%s)',
+                             bot_id, type(exc).__name__)
+            await display('❌ خطای دیتابیس؛ حذف انجام نشد. وضعیت را بررسی کنید.')
+            return AWAITING_SETTINGS_ACTION
+        if result == 'deleted':
+            logger.warning('Superadmin %s removed %s verified-deleted accounts from bot %s',
+                           update.effective_user.id, deleted, bot_id)
+            await display(f'✅ {deleted} اکانت با تأیید حذف حساب تلگرام پاک شد. سشن‌های دیگر دست‌نخورده‌اند.')
+        else:
+            reason = {
+                'maintenance': 'ابتدا حالت تعمیرات سراسری را فعال کنید.',
+                'busy': 'سفارش در حال اجرا/در صف یا نزدیک وجود دارد؛ حذف متوقف شد.',
+                'changed': 'فهرست یا سشن‌ها پس از پیش‌نمایش تغییر کرده‌اند؛ دوباره بررسی کنید.',
+                'empty': 'هیچ حساب تأییدشده‌ای برای حذف موجود نیست.',
+            }.get(result, 'شرایط حذف فراهم نیست.')
+            await display(f'⛔️ هیچ حسابی حذف نشد. {reason}', [
+                [InlineKeyboardButton('🔙 بازگشت به منوی حذف', callback_data='deleted_cleanup_menu')]])
+        return AWAITING_SETTINGS_ACTION
+
+    if data == 'deleted_cleanup_cancel':
+        context.user_data.pop('deleted_cleanup_preview', None)
+    elif data == 'deleted_cleanup_preview':
+        # No ciphertext or session key may go to Telegram or PTB user_data.
+        accounts = await DatabaseManager.get_confirmed_deleted_accounts(bot_id)
+        if not accounts:
+            context.user_data.pop('deleted_cleanup_preview', None)
+            await display('هیچ حساب دلیت‌شدهٔ تأییدشده‌ای وجود ندارد؛ حساب‌های غیرفعال حذف نشدند.', [
+                [InlineKeyboardButton('🔙 بازگشت', callback_data='deleted_cleanup_menu')]])
+            return AWAITING_SETTINGS_ACTION
+        ids = '، '.join(str(acc['id']) for acc in accounts)
+        if len(ids) > 2400:
+            context.user_data.pop('deleted_cleanup_preview', None)
+            await display('فهرست برای یک پیش‌نمایش کامل بیش از حد بزرگ است؛ '
+                          'حذف گروهی متوقف شد. از حذف تک‌اکانتی استفاده کنید.')
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_preview'] = {
+            'nonce': nonce,
+            'expires': time.time() + 300,
+            'bot_id': bot_id,
+            'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id,
+            'fingerprints': {
+                int(acc['id']): hashlib.sha256(acc['session_string'].encode('utf-8')).hexdigest()
+                for acc in accounts
+            },
+        }
+        await display(
+            f'⚠️ تأیید نهایی حذف {len(accounts)} اکانت از ربات {bot_id}\n'
+            f'شناسه‌ها: {ids}\n\n'
+            'فقط اکانت‌های با پاسخ صریح USER_DEACTIVATED از بررسی زندهٔ تک‌اکانتی. '
+            'SESSION_REVOKED تاریخی، ۴۰۶، بن/مسدودی و صرفاً inactive شامل نمی‌شوند.\n'
+            'این کار غیرقابل‌بازگشت است. فقط با حالت تعمیرات روشن و بدون سفارش فعال/نزدیک '
+            'انجام می‌شود؛ تأیید تا ۵ دقیقه اعتبار دارد.', [
+                [InlineKeyboardButton(f'🗑 تأیید حذف همین {len(accounts)} مورد',
+                                      callback_data=f'deleted_cleanup_confirm_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
+        return AWAITING_SETTINGS_ACTION
+
+    context.user_data.pop('deleted_cleanup_preview', None)
+    accounts = await DatabaseManager.get_confirmed_deleted_accounts(bot_id)
+    await display(
+        f'☠️ حذف اکانت‌های دلیت‌شده | ربات {bot_id}\n\n'
+        f'تعداد با پاسخ تأییدشدهٔ حذف حساب: {len(accounts)}\n'
+        'اکانت‌های صرفاً غیرفعال، برچسب تاریخی یا سشن باطل‌شده در این فهرست نیستند.\n'
+        'برای حساب‌های مشکوک، از گزارش سلامت یک حساب را انتخاب و فقط همان را '
+        'در پردازهٔ ربات بررسی کنید؛ بررسی زندهٔ انبوه انجام نمی‌شود.',
+        [[InlineKeyboardButton('🧾 پیش‌نمایش و تأیید حذف',
+                               callback_data='deleted_cleanup_preview')]] if accounts else None)
     return AWAITING_SETTINGS_ACTION
 
 

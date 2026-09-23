@@ -152,7 +152,8 @@ logger = logging.getLogger(__name__)
 # الگوی دکمه‌های ناوبری که نباید به‌عنوان «متن آزاد» مصرف شوند.
 # نکته: 💬 (چت در ویس‌کال) هم جزو دکمه‌های اصلی است و باید از STD_TEXT مستثنا شود
 # تا وقتی کاربر داخل یک مکالمه (کیف پول/پروفایل/...) است، این دکمه بلعیده نشود.
-REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|☠️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+_DELETED_CLEANUP_CALLBACK_RE = r"^deleted_cleanup_(?:menu|preview|cancel|confirm_[0-9a-f]{16})$"
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
 FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
@@ -856,7 +857,7 @@ def register_handlers(application: Application) -> None:
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
         r"|👤 مدیریت کاربران|👤 ادمین عادی|⭐️ سوپر ادمین|➕ افزودن ادمین جدید|➖ حذف ادمین"
         r"|📋 لیست ادمین‌ها|🔎 جستجوی کاربر|📞 پیام خصوصی|📢 پیام همگانی"
-        r"|👥 مدیریت اکانت‌های ربات|📊 گزارش کلی|📉 آمار کل ربات|🚑 گزارش سلامت اکانت‌ها"
+        r"|👥 مدیریت اکانت‌های ربات|☠️ حذف اکانت‌های دلیت‌شده|📊 گزارش کلی|📉 آمار کل ربات|🚑 گزارش سلامت اکانت‌ها"
         r"|📅 وضعیت اعتبار ربات)"
     )
     _ACCOUNT_SUBMENU_RE = (
@@ -1061,6 +1062,8 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
             CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
+            CallbackQueryHandler(deleted_account_cleanup_handler, pattern=_DELETED_CLEANUP_CALLBACK_RE),
+            CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
             CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
         ],
         states={
@@ -1137,8 +1140,11 @@ def register_handlers(application: Application) -> None:
                 # آمار
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
+                MessageHandler(filters.Regex("^☠️ حذف اکانت‌های دلیت‌شده$"), deleted_account_cleanup_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
+                CallbackQueryHandler(deleted_account_cleanup_handler, pattern=_DELETED_CLEANUP_CALLBACK_RE),
+                CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 

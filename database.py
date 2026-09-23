@@ -8,19 +8,25 @@ database.py
 5. ✅ متدهای دریافت لیست اکانت‌های محدود و سوخته (Dead/Limited)
 """
 import logging
+import hashlib
+import hmac
 import json
 import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
     Column, Integer, String, Boolean, Float, DateTime, Text,
-    BigInteger, func, select, update, delete, desc, text, case, UniqueConstraint
+    BigInteger, func, select, update, delete, desc, text, case, or_, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# Only a typed USER_DEACTIVATED response from a guarded single-account probe
+# may set this new marker. Historic 'dead', revoked and 406 labels are ineligible.
+CONFIRMED_ACCOUNT_DELETED = 'Verified Telegram account deleted: USER_DEACTIVATED'
 Base = declarative_base()
 
 DB_URL_ASYNC = Config.get_normalized_database_url()
@@ -1303,7 +1309,7 @@ class DatabaseManager:
         account row meanwhile. Never store raw error text/session material.
         """
         allowed = {'SESSION_REVOKED', 'AUTH_KEY_UNREGISTERED', 'AUTH_KEY_INVALID',
-                   'USER_DEACTIVATED', 'RPC_401'}
+                   'USER_DEACTIVATED', 'USER_DEACTIVATED_BAN', 'RPC_401'}
         if category not in allowed:
             raise ValueError('Unverified auth failure category')
         async with AsyncSessionLocal() as db_session:
@@ -1322,6 +1328,101 @@ class DatabaseManager:
             if result.rowcount == 1:
                 logger.warning('Account %s disabled: explicit auth failure %s', aid, category)
             return result.rowcount == 1
+
+    @staticmethod
+    async def mark_account_deleted_after_verified_probe(aid: int, bot_id: int,
+                                                       encrypted_session: str) -> bool:
+        """Mark a deleted Telegram *account*, not an expired authorization key.
+
+        Caller must have received a typed USER_DEACTIVATED RPC from its own
+        guarded single-account probe AND confirmed disconnect. A replaced or
+        reactivated session must never inherit the deletion proof.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                update(TelegramAccount).where(
+                    TelegramAccount.id == int(aid),
+                    TelegramAccount.bot_id == int(bot_id),
+                    TelegramAccount.account_status == 'inactive',
+                    TelegramAccount.session_string == encrypted_session,
+                ).values(
+                    spam_status='dead',
+                    spam_check_result=CONFIRMED_ACCOUNT_DELETED,
+                    last_health_check=datetime.utcnow(),
+                )
+            )
+            await db_session.commit()
+            return result.rowcount == 1
+
+    @staticmethod
+    async def get_confirmed_deleted_accounts(bot_id: int) -> list[dict]:
+        """Return only fresh, explicit account-deletion evidence for this bot.
+
+        Session ciphertext stays server-side; callers must not send it in
+        Telegram messages or store it in callback data/user_data.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(TelegramAccount).where(
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.spam_status == 'dead',
+                TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED,
+            ).order_by(TelegramAccount.id))
+            return [{'id': account.id, 'session_string': account.session_string}
+                    for account in result.scalars().all()]
+
+    @staticmethod
+    async def delete_confirmed_deleted_accounts(bot_id: int,
+                                                expected_fingerprints: dict[int, str]) -> tuple[int, str]:
+        """All-or-nothing cleanup of the exact accounts shown to a superadmin.
+
+        This DB operation is deliberately narrower than delete_account(): it
+        locks/rechecks the bot, marker, status AND ciphertext fingerprint. No
+        historical dead/revoked/406 row qualifies, even if it was in a stale
+        preview. The handler separately enforces role, nonce and expiry.
+        """
+        if not expected_fingerprints:
+            return 0, 'empty'
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                # Main-bot maintenance is the global switch for every reseller
+                # bot too. Require it ON and no running/pending or imminent work.
+                setting = (await db_session.execute(select(BotSetting).where(
+                    BotSetting.bot_id == 1,
+                    BotSetting.key == 'maintenance_mode',
+                ).with_for_update())).scalar_one_or_none()
+                if setting is None or setting.value != '1':
+                    return 0, 'maintenance'
+                deadline = datetime.utcnow() + timedelta(minutes=30)
+                busy = (await db_session.execute(select(Order.id).where(
+                    Order.bot_id == int(bot_id),
+                    or_(Order.status.in_(('running', 'pending')),
+                        (Order.status == 'scheduled') & or_(
+                            Order.scheduled_for.is_(None),
+                            Order.scheduled_for <= deadline)),
+                ).limit(1))).first()
+                if busy:
+                    return 0, 'busy'
+
+                # Lock all eligible rows, not just the submitted IDs, so any
+                # changed candidate set aborts and requires a new preview.
+                result = await db_session.execute(select(TelegramAccount).where(
+                    TelegramAccount.bot_id == int(bot_id),
+                    TelegramAccount.account_status == 'inactive',
+                    TelegramAccount.spam_status == 'dead',
+                    TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED,
+                ).order_by(TelegramAccount.id).with_for_update())
+                rows = result.scalars().all()
+                if len(rows) != len(expected_fingerprints):
+                    return 0, 'changed'
+                for account in rows:
+                    fingerprint = hashlib.sha256(account.session_string.encode('utf-8')).hexdigest()
+                    expected = expected_fingerprints.get(account.id, '')
+                    if not hmac.compare_digest(fingerprint, expected):
+                        return 0, 'changed'
+                for account in rows:
+                    await db_session.delete(account)
+            return len(rows), 'deleted'
 
     @staticmethod
     async def recover_account_after_verified_probe(aid: int, bot_id: int, encrypted_session: str) -> bool:

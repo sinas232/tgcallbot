@@ -93,12 +93,31 @@ def is_fatal_auth_error(error: object) -> bool:
     return any(marker in text for marker in _FATAL_AUTH_MARKERS)
 
 
+def is_account_deleted_rpc(error: object) -> bool:
+    """Only a *typed* Telegram USER_DEACTIVATED RPC proves account deletion.
+
+    Old free-text annotations and USER_DEACTIVATED_BAN do not qualify. In
+    particular, never classify a 401 from an unrelated auth error as a deleted
+    Telegram account, or bulk cleanup could erase a recoverable session.
+    """
+    if isinstance(error, str):
+        return False
+    code = getattr(error, 'CODE', None)
+    if code is None:
+        code = getattr(error, 'code', None)
+    name = type(error).__name__.replace('_', '').upper()
+    return (code == 401 and name == 'USERDEACTIVATED'
+            and getattr(error, 'ID', None) == 'USER_DEACTIVATED')
+
+
 def fatal_auth_category(error: object) -> Optional[str]:
     """Safe, fixed diagnostic label for persistence; never record raw RPC text."""
     if not is_fatal_auth_error(error):
         return None
     text = (type(error).__name__ + ' ' + str(error)).upper()
     for marker, label in (
+        ('USER_DEACTIVATED_BAN', 'USER_DEACTIVATED_BAN'),
+        ('USERDEACTIVATEDBAN', 'USER_DEACTIVATED_BAN'),
         ('SESSION_REVOKED', 'SESSION_REVOKED'), ('SESSIONREVOKED', 'SESSION_REVOKED'),
         ('SESSION REVOKED', 'SESSION_REVOKED'),
         ('AUTH_KEY_UNREGISTERED', 'AUTH_KEY_UNREGISTERED'),
