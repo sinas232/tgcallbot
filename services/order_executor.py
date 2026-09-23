@@ -4,7 +4,6 @@ import math
 import random
 import re
 import time
-import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -131,9 +130,10 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+		"""Claim a paid open order and register its worker; False if settled."""
 		if order_id in self.active_orders:
-			return
+			return False
 		self.active_orders[order_id] = {
 			"status": "running",
 			"data": order_data,
@@ -147,10 +147,15 @@ class OrderExecutor:
 			"swapped_accounts": 0,
 		}
 		try:
-			await DatabaseManager.mark_order_as_running(order_id)
+			claimed = await DatabaseManager.mark_order_as_running(
+				order_id, expected_status=(
+					'scheduled' if order_data.get('scheduled_for') else 'pending'))
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
+		if not claimed:
+			self.active_orders.pop(order_id, None)
+			return False
 		# 🛡 ضد اسپم: سفارش جدید برای این مقصد → خروج‌های به‌تأخیرافتادهٔ قبلیِ
 		# همین مقصد لغو می‌شود؛ اکانت‌ها عضو باقی می‌مانند (بدون چرخهٔ مضر
 		# leave → rejoin که دلیل اصلی بن شدن اکانت‌هاست).
@@ -162,8 +167,15 @@ class OrderExecutor:
 			)
 		except Exception:
 			pass
+		# Cancellation/refund can happen while the async group-leave step runs.
+		# A cleared in-memory order must NEVER be resurrected by creating a
+		# worker after the wallet was already refunded.
+		if not self._is_order_active(order_id):
+			self.active_orders.pop(order_id, None)
+			return False
 		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
 		self.active_orders[order_id]["task"] = task
+		return True
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
 	    joined_list: List[Dict[str, Any]] = []
@@ -269,16 +281,35 @@ class OrderExecutor:
 	            return
 
 	        # ────────────────────────────────────────────────────────────
-	        # DURATION PHASE — the billable timer starts ONLY NOW that the
-	        # required accounts are present (join/build time is free).
+	        # DURATION PHASE — user-approved best-effort account count. Once at
+	        # least ONE account joined, start the clock at the FULL plan price;
+	        # the number joined does not discount time. Build time stays free.
 	        # ────────────────────────────────────────────────────────────
 	        if duration > 0:
-	            try:
-	                started_at = await DatabaseManager.start_order_duration(order_id)
-	            except Exception as exc:
-	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
-	                started_at = None
-	            started_at = started_at or datetime.utcnow()
+	            # A local timestamp is not a paid start: after a DB outage it
+	            # would be forgotten, making elapsed time/settlement incorrect.
+	            # Keep the joined call intact and retry persistence without
+	            # starting the paid clock until the DB confirms it.
+	            started_at = None
+	            while self._is_order_active(order_id):
+	                try:
+	                    started_at = await DatabaseManager.start_order_duration(order_id)
+	                    break
+	                except asyncio.CancelledError:
+	                    raise
+	                except Exception as exc:
+	                    logger.warning(
+	                        "Order %s: billable start not persisted (%s); "
+	                        "retrying without starting paid time",
+	                        order_id, type(exc).__name__,
+	                    )
+	                    await asyncio.sleep(5)
+	            if not started_at:
+	                # None = order no longer running (e.g. canceled mid-build).
+	                # Never overwrite an externally stopped/completed status.
+	                await self._cleanup_order(order_id, joined_list, data)
+	                self.active_orders.pop(order_id, None)
+	                return
 	            end_time = started_at + timedelta(minutes=duration)
 	            total_secs = duration * 60
 	            logger.info(
@@ -363,9 +394,18 @@ class OrderExecutor:
 	                    if order_id in self.active_orders:
 	                        self.active_orders[order_id]["live_count"] = live
 	                        self.active_orders[order_id]["joined_accounts"] = joined_list
+	                    # Durable live count is not continuous media presence.
+	                    # Surface the native binding signal separately (it too
+	                    # cannot guarantee end-to-end WebRTC packet delivery).
+	                    _binding = None
+	                    if order_type == "voice_chat":
+	                        _vcm = _get_voice_call_manager()
+	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
+	                            _binding = _vcm.get_binding_status_counts(order_id)
 	                    logger.info(
-	                        f"Order {order_id}: stable live={live}/{exact} "
-	                        f"(rejoin by monitor; unrecoverable slots replaced)"
+	                        "Order %s: durable_live=%s/%s | native_binding=%s "
+	                        "(not proof of UDP packet delivery)",
+	                        order_id, live, exact, _binding,
 	                    )
 
 	                await asyncio.sleep(min(1.0, max(0.0, remaining_now)))
@@ -793,20 +833,20 @@ class OrderExecutor:
 	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
 	                    continue
 	                if status == "dead" or is_fatal_auth_error(msg):
-	                	dup406_streak = 0  # non-dup fatal event breaks the streak
-	                	# Account itself is dead — mark inactive & replace.
-	                	dead_count += 1
-	                	wave_dead += 1
-	                	self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
-	                	self._voice_banned.setdefault(order_id, set()).add(aid)
-		                if status != "dead":  # already persisted by _join_single_account
-			                try:
-				                await self._mark_account_dead(aid, acc["session_string"], msg)
-			                except Exception:
-				                pass
-	                	join_brain.report_result(order_id, OUTCOME_DEAD, msg)
-	                	wave_fail += 1
-	                	continue
+	                        dup406_streak = 0  # non-dup fatal event breaks the streak
+	                        # Account itself is dead — mark inactive & replace.
+	                        dead_count += 1
+	                        wave_dead += 1
+	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                        self._voice_banned.setdefault(order_id, set()).add(aid)
+	                        if status != "dead":  # already persisted by _join_single_account
+	                                try:
+	                                        await self._mark_account_dead(aid, acc["session_string"], msg)
+	                                except Exception:
+	                                        pass
+	                        join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                        wave_fail += 1
+	                        continue
 
 	                outcome = join_brain.classify_message(msg)
 	                if outcome == OUTCOME_FLOOD:
@@ -1391,7 +1431,10 @@ class OrderExecutor:
 					pass
 				return True, "Order cancelled and accounts left."
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))
-			await self._fail_order(order_id, "Stopped.")
+			# A manual settlement already claimed 'stopped' atomically. Never
+			# turn it into 'failed' merely because the worker had no task handle.
+			await DatabaseManager.update_order_status(order_id, "stopped")
+			self.active_orders.pop(order_id, None)
 			return True, "Stopped"
 		vcm = _get_voice_call_manager()
 		if vcm:
@@ -1531,7 +1574,24 @@ class OrderExecutor:
 			except Exception as exc:
 				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
 		self._voice_forget_order(order_id)
-		await DatabaseManager.update_order_status(order_id, "failed")
+		# A failed build with no started_at provided ZERO billable time. The
+		# old path marked 'failed' but retained the whole prepayment and made
+		# the user unable to cancel/refund it. Claim status + prorated refund
+		# together; retries cannot pay the wallet a second time. If DB is down,
+		# leave it unclaimed for manual recovery instead of marking it failed
+		# without a refund (do not touch an already settled order).
+		try:
+			settled = await DatabaseManager.settle_cancel_order(
+				order_id, bot_id=int(data.get('bot_id') or 1), do_refund=True,
+				settlement_calculator=self.compute_order_settlement,
+				final_status='failed',
+			)
+			if settled:
+				logger.warning("Order %s failed; billable used=%s refunded=%s (atomic)",
+				               order_id, settled['used_cost'], settled['refund_amount'])
+		except Exception as exc:
+			logger.error("Order %s failure settlement unavailable (%s); "
+			             "status left for operator review", order_id, type(exc).__name__)
 		self.active_orders.pop(order_id, None)
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
@@ -1552,8 +1612,8 @@ class OrderExecutor:
 		تابع استفاده کنند تا «پیش‌نمایش» و «اجرا» هیچ‌وقت با هم اختلاف نداشته باشند:
 		- scheduled → هنوز مصرفی نشده: عودت کامل.
 		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
-		- مدتی → ثانیه‌ای دقیق؛ اگر started_at خالی است (گیرکرده در فاز build)
-		  مبنا created_at است تا عودت کاملِ اشتباه رخ ندهد.
+		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
+		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
 		"""
 		order = order or {}
 		total_price = float(order.get("price_paid") or 0)
@@ -1570,8 +1630,7 @@ class OrderExecutor:
 			else:
 				used = 0.0
 			return used, max(0.0, total_price - used), 0.0
-		if not started_at:
-			started_at = order.get("created_at")
+		# Never bill the build phase: created_at is NOT a service start.
 		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
 
 	@staticmethod
@@ -1605,6 +1664,7 @@ class OrderExecutor:
 	async def settle_and_refund_order(
 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
 		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+		expected_user_id=None,
 	):
 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
 
@@ -1614,25 +1674,23 @@ class OrderExecutor:
 		خروجی: dict شامل total_cost/used_cost/refund_amount/refund_tx_id/
 		        user_wallet_balance برای نمایش به تماس‌گیرنده.
 		"""
-		order = await DatabaseManager.get_order(order_id) or {}
-		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
-		total_price = float(order.get("price_paid") or 0)
-		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
-		if not do_refund:
-			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
-			used_cost = total_price
-			refund_amount = 0.0
-
-		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-		new_balance = None
-		if do_refund and refund_amount > 0 and user:
-			ok, new_balance = await DatabaseManager.update_user_credit(
-				user["id"], refund_amount, "order_refund",
-				f"عودت لغو سفارش {order_id} | {refund_tx_id}", bot_id=bot_id,
-			)
-		if new_balance is None and user:
-			fresh = await DatabaseManager.get_user_by_id(user["id"])
-			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+		# Row-locked, atomic claim + settlement: a second callback must not
+		# credit the wallet twice or refund a completed/cancelled order. Price
+		# depends on elapsed time and the FULL plan, never the joined-account ratio.
+		settled = await DatabaseManager.settle_cancel_order(
+			order_id, bot_id=bot_id, do_refund=do_refund,
+			settlement_calculator=self.compute_order_settlement,
+			expected_user_id=expected_user_id,
+		)
+		if settled is None:
+			raise ValueError("سفارش قبلاً لغو/تکمیل شده یا متعلق به این ربات نیست.")
+		order = settled['order']
+		user = await DatabaseManager.get_user_by_id(order.get('user_id')) if order.get('user_id') else None
+		total_price = settled['total_cost']
+		used_cost = settled['used_cost']
+		refund_amount = settled['refund_amount']
+		refund_tx_id = settled['refund_tx_id']
+		new_balance = settled['user_wallet_balance']
 
 		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
 		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
@@ -1729,7 +1787,9 @@ class OrderExecutor:
 		plan_minutes = int(data.get("duration_minutes") or order_rec.get("duration_minutes") or 0)
 
 		created_at = order_rec.get("created_at")
-		started_at = order_rec.get("started_at") or created_at or datetime.utcnow()
+		started_at = order_rec.get("started_at")  # never substitute the build date
+		operation_start = started_at or created_at or datetime.utcnow()
+		start_label = format_jalali_datetime(started_at) if started_at else "آغاز نشده"
 		ended_at = order_rec.get("completed_at") or datetime.utcnow()
 
 		# متغیرهای کارنامهٔ عملکرد (swap / stability)
@@ -1754,7 +1814,7 @@ class OrderExecutor:
 				f"├ 🔢 **تعداد اکانت:** `{count}` عدد",
 				f"├ ⏳ **مدت پلن:** `{plan_minutes}` دقیقه",
 				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
-				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(started_at)}`",
+				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(operation_start)}`",
 				sep,
 				"🛡️ *سیستم مانیتورینگ لحظه‌ای و خودکار فعال است.*",
 			]
@@ -1794,7 +1854,7 @@ class OrderExecutor:
 				"│",
 				f"├ 🚫 **لغو شده توسط:** `{canceled_by_role}` ({canceled_by_name})",
 				f"├ 📝 **علت لغو:** `{cancellation_reason}`",
-				f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+				f"├ 🚀 **زمان شروع:** `{start_label}`",
 				f"├ ⏱️ **زمان کارکرد واقعی:** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
 				"│",
 				"├ 💳 **جزئیات مالی و عودت وجه:**",
@@ -1805,7 +1865,8 @@ class OrderExecutor:
 				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
 				f"└ 👛 **موجودی فعلی کیف‌پول:** `{_p(wallet_balance)}` تومان",
 				sep,
-				"⚡ *مبلغ باقی‌مانده بلافاصله و بدون کسر کارمزد به کیف پول حساب شما اضافه شد.*",
+				("⚡ *مبلغ باقی‌مانده به کیف پول اضافه شد.*" if refund_amount
+				 else "ℹ️ *عودت وجهی انجام نشد.*"),
 			]
 			return "\n".join(lines)
 
@@ -1826,7 +1887,7 @@ class OrderExecutor:
 			f"├ 🔗 **لینک مقصد:** `{link}`",
 			"│",
 			f"├ ⏳ **پلن درخواستی:** `{plan_minutes}` دقیقه",
-			f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+			f"├ 🚀 **زمان شروع:** `{start_label}`",
 			f"├ 🏁 **زمان پایان:** `{format_jalali_datetime(ended_at)}`",
 			f"├ ⏱️ **مدت اجرای واقعی:** `{actual_duration_formatted}`",
 			"│",

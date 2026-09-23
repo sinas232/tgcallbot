@@ -300,8 +300,14 @@ async def ap_callback_handler(request):
                 extra={"card_pan": card_pan, "tracking_number": tracking_number},
             )
             if success:
-                await DatabaseManager.update_payment_status(trans_id, 'paid')
-                await DatabaseManager.update_user_credit(transaction['user_id'], int(float(transaction['amount'])), "online_charge", f"شارژ آنلاین (کد: {trans_id})", bot_id=bot_id)
+                credited = await DatabaseManager.credit_verified_payment_once(
+                    trans_id, bot_id=bot_id, gateway_slug='aqayepardakht',
+                    description=f"شارژ آنلاین (کد: {trans_id})",
+                )
+                if not credited:
+                    return web.Response(text=get_html_response(
+                        "پرداخت تکراری", "این تراکنش قبلاً ثبت شده یا نیازمند بررسی پشتیبانی است."),
+                        content_type='text/html')
                 if app: await process_payment_success(transaction, app, bot_id, result_data)
                 return web.Response(text=get_html_response("پرداخت موفق", "حساب شما با موفقیت شارژ شد."), content_type='text/html')
             else:
@@ -343,14 +349,14 @@ async def zp_callback_handler(request):
             success, result_data = await payment_service.verify_payment(authority, amount_toman, "zarinpal", bot_id=bot_id)
             
             if success:
-                await DatabaseManager.update_payment_status(authority, 'paid')
-                await DatabaseManager.update_user_credit(
-                    transaction['user_id'],
-                    int(float(transaction['amount'])),
-                    "online_charge", 
-                    f"شارژ آنلاین زرین‌پال (Ref: {result_data.get('ref_id')})", 
-                    bot_id=bot_id
+                credited = await DatabaseManager.credit_verified_payment_once(
+                    authority, bot_id=bot_id, gateway_slug='zarinpal',
+                    description=f"شارژ آنلاین زرین‌پال (Ref: {result_data.get('ref_id')})",
                 )
+                if not credited:
+                    return web.Response(text=get_html_response(
+                        "پرداخت تکراری", "این تراکنش قبلاً ثبت شده یا نیازمند بررسی پشتیبانی است."),
+                        content_type='text/html')
                 if app: await process_payment_success(transaction, app, bot_id, result_data)
                 return web.Response(text=get_html_response("پرداخت موفق", f"کد پیگیری: {result_data.get('ref_id')}", icon="✅"), content_type='text/html')
             else:
@@ -543,8 +549,15 @@ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
         if not due_orders: return
         for order in due_orders:
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            # submit_order owns the status transition AND task registration.
+            # Marking running first stranded paid scheduled orders if submit
+            # raised before creating a worker (they were no longer 'due').
+            started = await order_executor.submit_order(order['id'], order)
+            if not started:
+                # User/admin may have cancelled and atomically refunded after
+                # get_due_scheduled_orders took its snapshot. Do not announce
+                # a new service or resurrect the settled order.
+                continue
             try:
                 app = bot_manager.active_bots.get(bot_id)
                 if app:
@@ -569,11 +582,10 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
                 order = item['order']
                 duration = order.get('duration_minutes', 0)
                 if duration <= 0: continue
-                # مبنای انقضا: شروع قابل‌محاسبه (started_at) و در صورت نبود آن
-                # (سفارش گیرکرده در فاز ساخت) زمان ثبت سفارش. بدون این fallback،
-                # سفارش‌های بدون started_at هیچ‌وقت منقضی نمی‌شدند و برای همیشه
-                # running می‌ماندند.
-                start_time = order.get('started_at') or order.get('created_at')
+                # زمان ثبت سفارش شروع خدمت نیست. سفارش بدون started_at
+                # هرگز نباید با عنوان «خدمت تکمیل شد» منقضی شود؛ رسیدگی به
+                # سفارش گیرکرده در build یک مسیر جداگانه می‌خواهد.
+                start_time = order.get('started_at')
                 if not start_time: continue
                 end_time = start_time + timedelta(minutes=duration)
                 

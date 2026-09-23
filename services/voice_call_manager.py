@@ -43,6 +43,7 @@ import time
 import json
 import traceback
 import wave
+from weakref import WeakKeyDictionary
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import deque
@@ -729,10 +730,12 @@ class VoiceCallManager:
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
         self._active_call_cache: Dict[int, Tuple[float, object]] = {}
 
-        # Shared chat-info cache (peer + access_hash + InputGroupCall): ONE
-        # account resolves the chat, every other account reuses the cached
-        # objects instead of issuing its own resolve_peer/GetFullChannel flood.
-        self._chat_info_cache: Dict[int, Tuple[float, object, object]] = {}
+        # A channel's InputPeer access_hash is specific to the MTProto account.
+        # Sharing it across accounts produces CHANNEL_INVALID and monitor RPC
+        # storms. Only InputGroupCall (call id/hash) is shared across accounts;
+        # resolved peers are cached separately by actual Client instance.
+        self._chat_info_cache: Dict[int, Tuple[float, object]] = {}
+        self._peer_cache: WeakKeyDictionary = WeakKeyDictionary()
 
         # Group leave reference count: {(account_id, chat_id): active_order_count}
         self._group_refcount: Dict[Tuple[int, int], int] = {}
@@ -999,84 +1002,70 @@ class VoiceCallManager:
             pass
 
     # ─── SHARED CHAT-INFO CACHE (one account resolves, all reuse) ──────
-    def _chat_info_get(self, chat_id: int) -> Optional[Tuple[object, object]]:
-        """Return cached (peer, input_group_call) for a chat, if still fresh."""
+    def _chat_info_get(self, chat_id: int) -> Optional[object]:
+        """Return the shared InputGroupCall only (never another account's peer)."""
         cached = self._chat_info_cache.get(int(chat_id))
-        if not cached:
+        if cached is None:
             return None
-        ts, peer, call = cached
+        ts, call = cached
         if time.time() - ts > CHAT_INFO_CACHE_TTL:
             self._chat_info_cache.pop(int(chat_id), None)
             return None
-        return peer, call
+        return call
 
-    def _chat_info_put(self, chat_id: int, peer: object, call: object) -> None:
-        self._chat_info_cache[int(chat_id)] = (time.time(), peer, call)
+    def _chat_info_put(self, chat_id: int, call: object) -> None:
+        self._chat_info_cache[int(chat_id)] = (time.time(), call)
 
     async def _resolve_cached_peer(self, app: Client, chat_id: int) -> object:
-        """Resolve the raw peer ONCE (cached) and reuse it for all accounts.
+        """Resolve a peer on THIS client; channel access hashes aren't global.
 
-        ONE account does resolve_peer (a single API call); every other account
-        reuses the cached raw peer object.  A peer's channel id + access_hash
-        are GLOBAL (not per-account), so sharing the object is safe and removes
-        the biggest per-IP API-flood source.
+        Weak client keys mean disconnected clients release their cached peers.
+        A chat cache refresh can also clear all per-client entries for that
+        chat. This never tries a peer resolved by another session.
         """
         chat_id = int(chat_id)
-        cached = self._chat_info_get(chat_id)
-        if cached and cached[0] is not None:
-            return cached[0]
+        by_chat = self._peer_cache.setdefault(app, {})
+        cached = by_chat.get(chat_id)
+        if cached and time.time() - cached[0] <= CHAT_INFO_CACHE_TTL:
+            return cached[1]
         peer = await app.resolve_peer(chat_id)
-        cached = self._chat_info_get(chat_id)
-        self._chat_info_put(chat_id, peer, cached[1] if cached else None)
+        by_chat[chat_id] = (time.time(), peer)
         return peer
 
     async def _get_cached_group_call(self, app: Client, chat_id: int, force_refresh: bool = False) -> object:
-        """Get the active group-call object for a chat, cached & shared.
-
-        Returns the raw InputGroupCall, or None when there is no active call.
-        با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
-        گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
-        """
+        """Share only the InputGroupCall across accounts; use own peer for RPC."""
         chat_id = int(chat_id)
         if not force_refresh:
-            cached = self._chat_info_get(chat_id)
-            if cached and cached[1] is not None:
-                return cached[1]
+            call = self._chat_info_get(chat_id)
+            if call is not None:
+                return call
         peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
-        self._chat_info_put(chat_id, peer, call)
+        self._chat_info_put(chat_id, call)
         return call
 
     def _clear_chat_cache(self, chat_id: int) -> None:
+        chat_id = int(chat_id)
         self._chat_refresh_cache.pop(chat_id, None)
         self._input_group_call_cache.pop(chat_id, None)
-        self._active_call_cache.pop(int(chat_id), None)
-        self._chat_info_cache.pop(int(chat_id), None)
+        self._active_call_cache.pop(chat_id, None)
+        self._chat_info_cache.pop(chat_id, None)
+        for per_client in list(self._peer_cache.values()):
+            per_client.pop(chat_id, None)
 
     async def _get_group_call_for_account(self, app: Client, chat_id: int,
                                           force_refresh: bool = False) -> object:
-        """مرجع InputGroupCall را برای «همین اکانت» برمی‌گرداند.
-
-        نکتهٔ کلیدی: access_hash یک کانال، مختصِ هر سشن/اکانت است و سراسری
-        نیست. بنابراین برای فراخوانی channels.GetFullChannel باید peer با سشنِ
-        همین اکانت resolve شود، وگرنه خطای CHANNEL_INVALID رخ می‌دهد. اما خودِ
-        InputGroupCall (call id + access_hash تماس) سراسری است و می‌تواند بین
-        اکانت‌ها به‌اشتراک گذاشته شود؛ پس اگر قبلاً کش شده باشد از آن استفاده
-        می‌کنیم و از GetFullChannel صرف‌نظر می‌کنیم.
-        """
+        """Resolve the channel on this account, but share its group-call id."""
         chat_id = int(chat_id)
         if not force_refresh:
-            cached = self._chat_info_get(chat_id)
-            if cached and cached[1] is not None:
-                return cached[1]
-        # peer را با سشنِ همین اکانت resolve کن (نه از کش مشترک)
-        peer = await app.resolve_peer(chat_id)
+            call = self._chat_info_get(chat_id)
+            if call is not None:
+                return call
+        peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
-        # فقط مرجعِ تماس (سراسری) را کش کن؛ peerِ مختصِ اکانت را کش نمی‌کنیم
-        prev = self._chat_info_get(chat_id)
-        self._chat_info_put(chat_id, prev[0] if prev else peer, call)
+        self._chat_info_put(chat_id, call)
         return call
 
     # ─── IN-CALL MESSAGES & REACTIONS (Telegram Layer 216+) ─────────────
@@ -1302,7 +1291,8 @@ class VoiceCallManager:
         return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
 
     def _account_in_any_order(self, account_id: int) -> bool:
-        return any(aid == account_id for (oid, aid) in self.active_calls.keys())
+        return (any(aid == account_id for (_oid, aid) in self.active_calls)
+                or any(account_id in recs for recs in self.joined_accounts_by_order.values()))
 
     def get_in_use_account_ids(self) -> Set[int]:
         return {aid for (oid, aid) in self.active_calls.keys()}
@@ -1371,6 +1361,28 @@ class VoiceCallManager:
     def get_joined_accounts(self, order_id: int) -> Dict[int, Dict]:
         """Return the persistent joined-account records for an order."""
         return self.joined_accounts_by_order.get(order_id, {})
+
+    def get_binding_status_counts(self, order_id: int) -> Dict[str, int]:
+        """Observed native call bindings, distinct from durable joined slots.
+
+        A native binding is NOT proof of uninterrupted UDP packet delivery.
+        An observation older than two monitor cycles is counted as unknown.
+        Never use this snapshot alone to invalidate a Telegram auth key.
+        """
+        out = {'present': 0, 'missing': 0, 'unknown': 0}
+        freshness = max(15.0, 2.0 * KEEPALIVE_INTERVAL + 10.0)
+        now = time.time()
+        for rec in self.get_joined_accounts(order_id).values():
+            checked_at = float(rec.get('media_binding_checked_at') or 0.0)
+            if checked_at <= 0 or now - checked_at > freshness:
+                out['unknown'] += 1
+            elif rec.get('media_binding_alive') is True:
+                out['present'] += 1
+            elif rec.get('media_binding_alive') is False:
+                out['missing'] += 1
+            else:
+                out['unknown'] += 1
+        return out
 
     # ─── LIVE PRESENCE RECONCILER (additive, deterministic) ───
 
@@ -1976,44 +1988,41 @@ class VoiceCallManager:
                 app = await self._create_pyrogram_client_locked(
                     account_id, session_string, decrypted_session, timeout=20)
 
-            # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
+            # Check existing pytgcalls handle (keyed by account_id, NOT order_id).
             pytg = self.clients.get(account_id)
             if pytg:
-                # PyTgCalls 2.x has NO `is_connected` attribute — reading it
-                # raised AttributeError on EVERY reuse, which forced a
-                # stop()+rebuild of a perfectly healthy engine (and kicked the
-                # account's call). Query the binding's call map instead; the
-                # engine is reusable as long as that coroutine answers.
-                healthy = False
+                # A failed binding query is UNKNOWN, not permission to leave
+                # every chat and construct a second engine. PyTgCalls has no
+                # safe stop() method; the old fallback did exactly that and
+                # dropped healthy orders on transient native/API errors.
                 try:
-                    await pytg.group_calls
-                    healthy = True
-                except Exception as e:
+                    await asyncio.wait_for(pytg.group_calls, timeout=3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
                     logger.warning(
-                        "pytgcalls engine unhealthy acc=%s (%s) — rebuilding",
-                        account_id, e,
+                        "pytgcalls binding check unavailable acc=%s (%s); "
+                        "keeping original engine, no mass leave/rebuild",
+                        account_id, type(exc).__name__,
                     )
-                if not healthy:
-                    # PyTgCalls 2.x has no stop(); leave each held call so the
-                    # engine (and its WebRTC connections) is truly torn down
-                    # before the fresh instance is built below.
-                    try:
-                        for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                            try:
-                                await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    pytg = None
-                    self.clients.pop(account_id, None)
+                    raise SessionInUseError(account_id, "uncertain") from exc
 
             if not pytg:
                 async with CLIENT_CREATE_SEMAPHORE:
                     pytg = PyTgCalls(app)
                     self._attach_engine_handlers(pytg, account_id)
-                    await asyncio.wait_for(pytg.start(), timeout=15)
+                    # start() can time out AFTER native WebRTC initialized.
+                    # Retain the original engine before awaiting it. A retry
+                    # must never construct a second engine on a transport that
+                    # may still be using the same Telegram authorization key.
                     self.clients[account_id] = pytg
+                    try:
+                        await asyncio.wait_for(pytg.start(), timeout=15)
+                    except BaseException:
+                        self._quarantined_accounts.add(account_id)
+                        logger.error("acc=%s engine startup unconfirmed; existing client "
+                                     "quarantined (no second engine)", account_id)
+                        raise
 
             return pytg
 
@@ -2023,9 +2032,9 @@ class VoiceCallManager:
         # disconnecting it. A new wave could connect to that key while the old
         # transport was still open, even within a single bot process.
         async with self._lock(account_id):
-            if not force and any(
-                aid == account_id and oid != order_id for (oid, aid) in self.active_calls
-            ):
+            if not force and self._account_has_other_calls(account_id, order_id):
+                # Monitor bookkeeping can temporarily lose active_calls while
+                # the durable joined slot still exists. Never pop its engine.
                 return
             pytg = self.clients.pop(account_id, None)
             if pytg:
@@ -2166,37 +2175,60 @@ class VoiceCallManager:
             return False
         return True
 
-    async def _rebuild_engine_for_account(self, order_id: int, account_id: int) -> Optional[PyTgCalls]:
-        """Discard the poisoned PyTgCalls engine and build a FRESH one on the
-        SAME pyrogram session.
+    def _account_has_other_calls(self, account_id: int, order_id: int) -> bool:
+        return (any(aid == account_id and oid != order_id
+                    for oid, aid in self.active_calls)
+                or any(oid != order_id and account_id in recs
+                       for oid, recs in self.joined_accounts_by_order.items()))
 
-        'Connection cannot be initialized more than once' is raised by the
-        ntgcalls WebRTC layer when an engine still holds a half-dead peer
-        connection for a chat: no amount of per-chat stop() clears it, and a
-        new play() on the same engine can never initialize a new connection.
-        A brand-new PyTgCalls instance (fresh NTgCalls binding) has a clean
-        connection registry.  IMPORTANT: we do NOT send LeaveGroupCall — the
-        account stays inside the call while the new engine re-issues the
-        standard JoinGroupCall rejoin.
+    def _other_orders_in_chat(self, order_id: int, account_id: int, chat_id: int) -> Set[int]:
+        """Order IDs sharing the exact native binding, including durable-only slots."""
+        result = {oid for (oid, aid), info in self.active_calls.items()
+                  if oid != order_id and aid == account_id
+                  and int((info or {}).get('chat_id') or 0) == chat_id}
+        result.update(oid for oid, recs in self.joined_accounts_by_order.items()
+                      if oid != order_id and account_id in recs
+                      and int((recs[account_id] or {}).get('chat_id') or 0) == chat_id)
+        return result
+
+    async def _rebuild_engine_for_account(self, order_id: int, account_id: int,
+                                          chat_id: int) -> Optional[PyTgCalls]:
+        """Rebuild a broken binding ONLY if doing so cannot drop healthy calls.
+
+        PyTgCalls 2.x has no stop(). The old implementation left EVERY call on
+        this account (and sent LeaveGroupCall to Telegram for each) before a
+        rebuild. A broken chat must never kick an unrelated, healthy order.
+        If a binding query fails or any other call is held, defer the rebuild
+        rather than guessing and disconnecting other participants.
         """
         session_string = self._session_cache.get(account_id)
         if not session_string:
             return None
-        old = self.clients.pop(account_id, None)
+        if self._account_has_other_calls(account_id, order_id):
+            logger.warning("[VoiceEngine] acc=%s chat=%s rebuild deferred: other orders active",
+                           account_id, chat_id)
+            return None
+        old = self.clients.get(account_id)
         if old is not None:
-            # Best-effort: leave any calls the OLD engine still believes it
-            # holds, then drop the engine object (its poisoned WebRTC state
-            # dies with it).
             try:
-                for _cid in list(await asyncio.wait_for(old.group_calls, timeout=3) or {}):
-                    try:
-                        await asyncio.wait_for(old.leave_call(int(_cid)), timeout=5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        # _get_or_create_client re-uses the live pyrogram client and builds a
-        # fresh PyTgCalls(app) because self.clients no longer has one.
+                calls = await asyncio.wait_for(old.group_calls, timeout=3)
+            except Exception as exc:
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: binding status unknown (%s)",
+                               account_id, type(exc).__name__)
+                return None
+            if any(int(cid) != int(chat_id) for cid in (calls or {})):
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: other chat bindings still live",
+                               account_id)
+                return None
+            if any(int(cid) == int(chat_id) for cid in (calls or {})):
+                # L2 leave_call already failed to clear this binding; replacing
+                # the engine would orphan a live media call. Keep it and retry
+                # after verified cleanup instead of creating parallel engines.
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: target binding still live",
+                               account_id)
+                return None
+            self.clients.pop(account_id, None)
+        # Keep the SAME Pyrogram connection and auth-key reservation.
         return await self._get_or_create_client(order_id, account_id, session_string)
 
     # Unrecoverable PyTgCalls/ntgcalls engine states that no per-chat
@@ -2279,10 +2311,14 @@ class VoiceCallManager:
                         account_id, cid, msg1[:120],
                     )
                     # ── L2: explicit WebRTC session cleanup, then rejoin ──
-                    # leave_call() inside try/except as required: it stops the
-                    # engine's connection for this chat and (if the engine
-                    # still lists it) sends LeaveGroupCall, so the NEXT play()
-                    # starts from a fully clean session.
+                    # This sends LeaveGroupCall for the target if bound. Do
+                    # NOT do it while this same MTProto account serves another
+                    # order (including another order in this chat).
+                    if self._account_has_other_calls(account_id, order_id):
+                        self._vc_event_log(order_id, account_id, "media_restore_deferred", {
+                            "chat_id": cid, "reason": "other_active_order",
+                        })
+                        return
                     try:
                         await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
                     except Exception as e_leave:
@@ -2314,7 +2350,7 @@ class VoiceCallManager:
                                 "chat_id": cid, "reason": msg2[:120],
                             })
                             try:
-                                fresh = await self._rebuild_engine_for_account(order_id, account_id)
+                                fresh = await self._rebuild_engine_for_account(order_id, account_id, cid)
                                 if fresh is None:
                                     result = "rebuild_failed:no_client"
                                 else:
@@ -2437,6 +2473,17 @@ class VoiceCallManager:
             await pytg.mute(int(chat_id))
         except Exception:
             pass
+
+    @staticmethod
+    def _media_presence_verdict(participant_presence: Optional[bool],
+                                media_binding: Optional[bool]) -> Optional[bool]:
+        """A missing binding isn't proof of departure if Telegram is unknown.
+
+        A positive local binding proves the client holds a call. A negative
+        binding proves only local media loss; the Telegram participant list
+        must independently confirm absence before the rejoin path may run.
+        """
+        return True if media_binding is True else participant_presence
 
     async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
         """Authoritative per-chat media transport liveness.
@@ -2638,7 +2685,11 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return set()  # no active call → nobody present
+                # A missing call reference on this cycle is not proof that
+                # EACH participant left (a stale/temporarily inaccessible
+                # channel looks identical here). Preserve their slots until
+                # a separate definitive presence/call-ended signal arrives.
+                return None
 
             present_ids: Set[int] = set()
 
@@ -2714,6 +2765,13 @@ class VoiceCallManager:
           False - account confirmed NOT present (full participant list checked).
           None  - presence could not be determined (API error / pagination failure).
         """
+        # One failed SHARED snapshot should never trigger a second, per-account
+        # pagination sweep for every member of a large order. An unknown
+        # response stays unknown; otherwise RPC floods can create the very
+        # timeouts and apparent absences the monitor is trying to fix.
+        snapshot = self._participant_snapshot.get(int(chat_id))
+        if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
+            return None
         my_id = None
         try:
             me = getattr(app, "me", None)
@@ -2745,7 +2803,7 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return False
+                return None  # missing call reference is not proof of leave
 
             # 1) First page via GetGroupCall (cheap)
             try:
@@ -2795,8 +2853,8 @@ class VoiceCallManager:
         """
         # Shared chat-info cache: if another account already confirmed the call
         # is active (cached InputGroupCall), answer instantly — no API call.
-        cached_info = self._chat_info_get(int(chat_id))
-        if cached_info and cached_info[1] is not None:
+        cached_call = self._chat_info_get(int(chat_id))
+        if cached_call is not None:
             return True
         try:
             call = await self._get_cached_group_call(app, int(chat_id))
@@ -2826,7 +2884,8 @@ class VoiceCallManager:
                     }
                     self._order_accounts.setdefault(order_id, set()).add(account_id)
                 try:
-                    await DatabaseManager.update_voice_call_session(account_id, int(chat_id), "joined")
+                    await DatabaseManager.update_voice_call_session(
+                        account_id, int(chat_id), "joined", order_id=order_id)
                 except Exception:
                     pass
                 return True
@@ -3359,9 +3418,10 @@ class VoiceCallManager:
                             media_alive = None  # unknown → rely on the listing
 
                         media_known = media_alive is not None
-                        if media_alive is True:
-                            present = True
-                        elif media_alive is False:
+                        rec['media_binding_alive'] = media_alive
+                        rec['media_binding_checked_at'] = time.time()
+                        present = self._media_presence_verdict(present, media_alive)
+                        if media_alive is False:
                             if present is True:
                                 # ── GHOST-MEDIA-ONLY (presence intact) ──────────
                                 # The participant listing says the account is
@@ -3393,10 +3453,9 @@ class VoiceCallManager:
                                     )
                                 except RuntimeError:
                                     pass
-                            else:
-                                # Media binding gone AND the listing does not
-                                # confirm presence → treat as a real loss
-                                # (existing fail-cycle / recovery logic below).
+                            elif present is False:
+                                # Two independent negatives: no binding AND a
+                                # complete Telegram participant list says absent.
                                 self._vc_event_log(order_id, acc_id, "media_transport_lost", {
                                     "chat_id": cid,
                                     "verdict": "confirmed_media_disconnect",
@@ -3404,7 +3463,15 @@ class VoiceCallManager:
                                 self._record_drop(order_id, acc_id, cid, "media_transport_lost",
                                                   reason="engine media connection missing (ghost)",
                                                   extra={"media_known": media_known})
-                                present = False
+                            else:
+                                # Participant query failed: no rejoin/leave
+                                # based on an ambiguous snapshot. Report it
+                                # so the stable paid count is not mistaken for
+                                # confirmed, continuous media presence.
+                                self._vc_event_log(order_id, acc_id, "media_presence_unknown", {
+                                    "chat_id": cid,
+                                    "reason": "media_binding_lost_and_participant_query_unknown",
+                                })
 
                         # ── DL HOLD-RISK (online deep-learning model) ───
                         # Score every cycle, learn from the resolved outcome, and
@@ -3447,12 +3514,18 @@ class VoiceCallManager:
                             pass
 
                         if present is True:
-                            # JOINED — confirmed present (or media transport alive).
-                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
+                            # Telegram presence and local media binding are
+                            # different signals. A ghost stays durably counted
+                            # but is NOT reported as media-healthy JOINED.
+                            observed_state = (
+                                "JOINED" if media_alive is True else
+                                "MEDIA_LOST" if media_alive is False else "MEDIA_UNKNOWN"
+                            )
+                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = observed_state
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
                             rec.pop("unrecoverable", None)
-                            rec["status"] = "JOINED"
+                            rec["status"] = observed_state
                             rec["last_ok"] = time.time()
                             # Ensure transport bookkeeping still present (idempotent).
                             if (order_id, acc_id) not in self.active_calls:
@@ -3841,26 +3914,46 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, FAILED, f"start call error: {e}")
                 return False, f"Start call error: {str(e)[:80]}", 0
 
-    async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
-        """Stop a single account's voice call. leave_group: also leave the Telegram group (refcount-based)."""
+    async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False,
+                        cleanup_client: bool = False) -> Tuple[bool, str]:
+        """Stop one order without disrupting other orders on the same binding.
+
+        Serialize join/restore/leave for this account+chat. Simultaneous order
+        cancellations must not both decide they are the final holder.
+        """
+        current = self.active_calls.get((order_id, account_id)) or {}
+        saved = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id) or {}
+        chat_id = int(current.get('chat_id') or saved.get('chat_id')
+                      or self.order_chat_ids.get(order_id) or 0)
+        async with self._call_join_locks.setdefault((account_id, chat_id), asyncio.Lock()):
+            return await self._stop_call_locked(
+                order_id, account_id, leave_group=leave_group,
+                cleanup_client=cleanup_client,
+            )
+
+    async def _stop_call_locked(self, order_id: int, account_id: int,
+                                leave_group: bool = False,
+                                cleanup_client: bool = False) -> Tuple[bool, str]:
+        """Remove THIS order's durable record, then leave only if no holders remain."""
         key = (order_id, account_id)
         info = self.active_calls.pop(key, None)
         chat_id = int((info or {}).get("chat_id") or 0)
         if not chat_id:
             chat_id = int(self.order_chat_ids.get(order_id) or 0)
-        if info is None and not chat_id:
-            # Still clean up persistent joined state for this order if present.
-            recorder = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
-            if recorder:
-                chat_id = int(recorder.get("chat_id") or 0)
-        inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
-        if inflight and not inflight.done():
-            inflight.cancel()
-        if chat_id <= 0 and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
+        recorder = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
+        if not chat_id and recorder:
+            chat_id = int(recorder.get('chat_id') or 0)
+        if not chat_id and info is None and recorder is None:
             return True, "Not active"
 
-        # Remove from persistent joined state (order is ending / cancelling).
+        # Remove only THIS order's state. A negative chat id is valid in
+        # Telegram; never mistake it for 'no call' and silently skip cleanup.
         removed = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
+        shared_orders = self._other_orders_in_chat(order_id, account_id, chat_id)
+        if not shared_orders:
+            inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
+            if inflight and not inflight.done():
+                inflight.cancel()
         if removed is not None:
             # Remove ONLY this account's state — never wipe the whole order's
             # state dict (that would drop every other account's machine).
@@ -3879,39 +3972,48 @@ class VoiceCallManager:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
 
-        # Leave the voice call IMMEDIATELY (retry twice, then verify)
+        # One native binding can serve multiple orders in this same chat.
+        # Ending only one order MUST NOT send leave_call/LeaveGroupCall; it
+        # would eject the participant that the other paid order still uses.
         pytg = self.clients.get(account_id)
         app = self.pyrogram_clients.get(account_id)
-        if pytg and chat_id:
-            for _ in range(2):
+        if shared_orders:
+            logger.info("[VoiceLeave] acc=%s chat=%s retained for %s other order(s)",
+                        account_id, chat_id, len(shared_orders))
+        else:
+            if pytg and chat_id:
+                for _ in range(2):
+                    try:
+                        await asyncio.wait_for(pytg.leave_call(int(chat_id)), timeout=10)
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.5)
+            if app and chat_id:
                 try:
-                    await asyncio.wait_for(pytg.leave_call(int(chat_id)), timeout=10)
-                    break
+                    if await self._is_in_voice_call(app, int(chat_id)) is True:
+                        peer = await app.resolve_peer(int(chat_id))
+                        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+                        call = getattr(full.full_chat, "call", None)
+                        if call:
+                            await app.invoke(
+                                functions.phone.LeaveGroupCall(call=call, source=0)
+                            )
                 except Exception:
-                    await asyncio.sleep(0.5)
-        if app and chat_id:
-            try:
-                if await self._is_in_voice_call(app, int(chat_id)) is True:
-                    peer = await app.resolve_peer(int(chat_id))
-                    full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-                    call = getattr(full.full_chat, "call", None)
-                    if call:
-                        await app.invoke(
-                            functions.phone.LeaveGroupCall(call=call, source=0)
-                        )
-            except Exception:
-                pass
+                    pass
 
         try:
-            await DatabaseManager.update_voice_call_session(account_id, chat_id, "left")
+            await DatabaseManager.update_voice_call_session(
+                account_id, chat_id, "left", order_id=order_id)
         except Exception:
             pass
 
-        # Decrement group refcount; leave group only when no orders remain for this account+chat
+        # Derive from remaining actual holders, not an occasionally stale
+        # counter. No group exit may be scheduled while another order holds it.
         if chat_id:
             ref_key = (account_id, int(chat_id))
-            self._group_refcount[ref_key] = self._group_refcount.get(ref_key, 1) - 1
-            if self._group_refcount[ref_key] <= 0:
+            if shared_orders:
+                self._group_refcount[ref_key] = len(shared_orders)
+            else:
                 self._group_refcount.pop(ref_key, None)
                 if leave_group:
                     # 🛡 ضد اسپم: خروج از خودِ گروه «بلافاصله» نیست — در صف
@@ -3958,7 +4060,10 @@ class VoiceCallManager:
                                     await asyncio.sleep(0.5)
                             self._clear_chat_cache(int(chat_id))
 
-        await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+        await self._cleanup_client(
+            account_id, order_id=order_id,
+            force=cleanup_client and not self._account_in_any_order(account_id),
+        )
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
         self._record_drop(order_id, account_id, chat_id, "stopped",
                           deliberate=True, reason="order-managed stop")

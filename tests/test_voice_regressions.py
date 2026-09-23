@@ -33,6 +33,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 import wave
 from types import SimpleNamespace
 
@@ -476,20 +477,38 @@ class EngineLifecycleTests(unittest.TestCase):
             self.assertEqual(len(FakePyTgCalls.instances), 1)
         self.loop.run_until_complete(scenario())
 
-    def test_unhealthy_engine_is_rebuilt_and_handlers_attached(self):
+    def test_unknown_engine_does_not_leave_healthy_calls_or_create_second_engine(self):
         async def scenario():
             app = FakeApp()
             engine = FakeUnhealthyPyTgCalls(app)
             self.mgr.pyrogram_clients[1] = app
             self.mgr.clients[1] = engine
-            got = await self.mgr._get_or_create_client(901, 1, "fake-session")
-            self.assertIsNot(got, engine)
-            # PyTgCalls 2.x has no stop(); unhealthy bindings are left,
-            # then the handle is replaced on the same Pyrogram transport.
+            # A failed native binding query does NOT mean its other calls are
+            # gone. Rebuilding with no stop() would orphan or kick them.
+            with self.assertRaises(SessionInUseError):
+                await self.mgr._get_or_create_client(901, 1, "fake-session")
+            self.assertIs(self.mgr.clients[1], engine)
             self.assertEqual(engine.stopped, 0)
-            self.assertEqual(got.started, 1)
-            # stream-end + chat-update handlers attached on the fresh engine
-            self.assertEqual(len(got.handlers), 2)
+            self.assertEqual(len(FakePyTgCalls.instances), 1)
+        self.loop.run_until_complete(scenario())
+
+    def test_engine_start_timeout_keeps_original_handle_and_quarantines_key(self):
+        class SlowStartPyTgCalls(FakePyTgCalls):
+            async def start(self):
+                raise asyncio.TimeoutError()
+
+        async def scenario():
+            app = FakeApp()
+            self.mgr.pyrogram_clients[1] = app
+            with patch.object(vcm_mod, 'PyTgCalls', SlowStartPyTgCalls):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await self.mgr._get_or_create_client(901, 1, 'fake-session')
+            original = self.mgr.clients[1]
+            self.assertIn(1, self.mgr._quarantined_accounts)
+            with self.assertRaises(SessionInUseError):
+                await self.mgr._get_or_create_client(901, 1, 'fake-session')
+            self.assertIs(self.mgr.clients[1], original)
+            self.assertEqual(len(FakePyTgCalls.instances), 1)
         self.loop.run_until_complete(scenario())
 
     def test_stream_end_event_restarts_silence_once(self):

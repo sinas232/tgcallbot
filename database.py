@@ -9,6 +9,7 @@ database.py
 """
 import logging
 import json
+import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
@@ -681,14 +682,22 @@ class DatabaseManager:
 
     @staticmethod
     async def update_user_credit(internal_user_id: int, amount: float, type: str, desc: str, bot_id=1):
+        # Online top-ups / admin adjustments must serialize with locked order
+        # purchases and refunds. An unlocked ORM read-modify-write could read
+        # the old balance and later overwrite a concurrent debit (lost update).
         async with AsyncSessionLocal() as db_session:
-            user = await db_session.get(User, internal_user_id)
-            if not user: return False, 0
-            user.credit += amount
-            trans = Transaction(bot_id=bot_id, user_id=internal_user_id, amount=amount, type=type, description=desc)
-            db_session.add(trans)
-            await db_session.commit()
-            return True, user.credit
+            async with db_session.begin():
+                user = await db_session.get(
+                    User, internal_user_id, with_for_update=True)
+                if not user:
+                    return False, 0
+                user.credit = float(user.credit or 0) + float(amount)
+                db_session.add(Transaction(
+                    bot_id=bot_id, user_id=internal_user_id, amount=amount,
+                    type=type, description=desc,
+                ))
+                new_balance = user.credit
+            return True, new_balance
 
     @staticmethod
     async def get_user_stats_full(user_id: int) -> Dict[str, Any]:
@@ -751,6 +760,78 @@ class DatabaseManager:
                 await db_session.commit()
                 return True
             return False
+
+    @staticmethod
+    async def create_paid_order(user_id: int, plan_id: int, target_link: str, *,
+                                bot_id: int = 1, scheduled_for=None,
+                                expected_plan: Optional[Dict[str, Any]] = None):
+        """Buy exactly the shown plan or change NOTHING (wallet/order/ledger).
+
+        The user's row is locked through the whole transaction. Two callback
+        deliveries or concurrent purchases cannot both spend the same balance,
+        and an insert failure rolls back the debit. A plan edited after the
+        confirmation screen is rejected rather than silently re-priced.
+        Returns (order dict or None, reason code). Capacity is preflighted by
+        the handler and is NOT guaranteed by this transaction (no MTProto IO).
+        """
+        if expected_plan is None:
+            raise ValueError('the confirmed plan snapshot is required')
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                # Shared row lock keeps admin price/activation edits from
+                # racing the wallet debit. FOR SHARE permits parallel buyers;
+                # the per-user FOR UPDATE below serializes their purchases.
+                plan = await db_session.get(
+                    Plan, int(plan_id), with_for_update={'read': True})
+                if not plan or plan.bot_id != int(bot_id) or not plan.is_active:
+                    return None, 'plan_unavailable'
+                fields = ('service_type', 'accounts_count', 'duration_minutes', 'price')
+                if any(getattr(plan, field) != expected_plan.get(field) for field in fields):
+                    return None, 'plan_changed'
+                price = float(plan.price)
+                if not math.isfinite(price) or price < 0 or int(plan.accounts_count) < 1:
+                    return None, 'plan_unavailable'
+                row = await db_session.execute(
+                    select(User).where(User.id == int(user_id),
+                                       User.bot_id == int(bot_id)).with_for_update()
+                )
+                user = row.scalar_one_or_none()
+                if not user:
+                    return None, 'user_missing'
+                if float(user.credit or 0) < price:
+                    return None, 'insufficient_credit'
+                # Same-user wallet lock serializes simultaneous callbacks.
+                # A duplicate click must not buy/charge the same open plan
+                # twice even if the wallet can afford both. Different links,
+                # plans and completed/failed orders remain independent.
+                duplicate = await db_session.execute(
+                    select(Order.id).where(
+                        Order.bot_id == int(bot_id), Order.user_id == user.id,
+                        Order.plan_id == plan.id,
+                        Order.target_link == target_link,
+                        Order.scheduled_for == scheduled_for,
+                        Order.status.in_(('pending', 'running', 'scheduled')),
+                        Order.created_at >= datetime.utcnow() - timedelta(minutes=2),
+                    ).limit(1)
+                )
+                if duplicate.scalar_one_or_none() is not None:
+                    return None, 'duplicate_purchase'
+                user.credit = float(user.credit or 0) - price
+                order = Order(
+                    bot_id=int(bot_id), user_id=user.id, plan_id=plan.id,
+                    order_type=plan.service_type, target_link=target_link,
+                    accounts_count=plan.accounts_count,
+                    duration_minutes=plan.duration_minutes, price_paid=price,
+                    status='scheduled' if scheduled_for else 'pending',
+                    scheduled_for=scheduled_for,
+                )
+                db_session.add(order)
+                await db_session.flush()  # order id for the immutable ledger
+                db_session.add(Transaction(
+                    bot_id=int(bot_id), user_id=user.id, amount=-price,
+                    type='order', description=f'خرید {plan.name} | سفارش {order.id}',
+                ))
+            return to_dict(order), 'created'
 
     @staticmethod
     async def create_order(user_id, order_type, target_link, accounts_count, duration_minutes, price_paid=0, plan_id=None, scheduled_for=None, bot_id=1):
@@ -838,6 +919,57 @@ class DatabaseManager:
             await db_session.commit()
 
     @staticmethod
+    async def settle_cancel_order(order_id: int, *, bot_id: int, do_refund: bool,
+                                  settlement_calculator, expected_user_id=None,
+                                  final_status: str = 'stopped'):
+        """Claim a paid order and settle its wallet exactly once in one txn.
+
+        Lock ORDER before USER (same ordering for concurrent callbacks). Never
+        credit before the status claim: the old handler credited the wallet
+        first, so repeated callbacks could each refund the full purchase.
+        Return None for already claimed/finished orders; do not mutate them.
+        """
+        if final_status not in ('stopped', 'failed'):
+            raise ValueError('unsupported settlement status')
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                order = await db_session.get(Order, int(order_id), with_for_update=True)
+                if (not order or order.bot_id != int(bot_id)
+                        or (expected_user_id is not None
+                            and order.user_id != int(expected_user_id))
+                        or order.status not in ('running', 'scheduled', 'pending')):
+                    return None
+                user = await db_session.get(User, order.user_id, with_for_update=True)
+                if not user or user.bot_id != int(bot_id):
+                    raise ValueError('order owner is missing or belongs to another bot')
+                original = to_dict(order)
+                total_price = float(order.price_paid or 0)
+                if not math.isfinite(total_price) or total_price < 0:
+                    raise ValueError('invalid order price')
+                used_cost, refund_amount, _elapsed = settlement_calculator(original)
+                if not do_refund:
+                    used_cost, refund_amount = total_price, 0.0
+                if (not math.isfinite(float(refund_amount)) or refund_amount < 0
+                        or refund_amount > total_price):
+                    raise ValueError('invalid settlement amount')
+                refund_tx_id = f'TX-{order.id}' if refund_amount else None
+                order.status = final_status
+                if refund_amount:
+                    user.credit = float(user.credit or 0) + float(refund_amount)
+                    db_session.add(Transaction(
+                        bot_id=int(bot_id), user_id=user.id, amount=float(refund_amount),
+                        type='order_refund',
+                        description=f'عودت لغو سفارش {order.id} | {refund_tx_id}',
+                    ))
+                result = {
+                    'order': original, 'total_cost': total_price,
+                    'used_cost': used_cost, 'refund_amount': float(refund_amount),
+                    'refund_tx_id': refund_tx_id,
+                    'user_wallet_balance': float(user.credit or 0),
+                }
+            return result
+
+    @staticmethod
     async def cancel_order_once(order_id: int) -> bool:
         """Atomically claim a running/scheduled order for cancellation."""
         async with AsyncSessionLocal() as db_session:
@@ -850,32 +982,51 @@ class DatabaseManager:
             return bool(result.rowcount)
 
     @staticmethod
-    async def start_order_duration(order_id: int) -> datetime:
-        """Set billable service start at the end of the build phase."""
-        async with AsyncSessionLocal() as db_session:
-            now = datetime.utcnow()
-            await db_session.execute(
-                update(Order).where(Order.id == order_id).values(started_at=now)
-            )
-            await db_session.commit()
-            return now
-    
-    @staticmethod
-    async def mark_order_as_running(order_id: int):
-        """Move the order to `running` WITHOUT starting the billable clock.
+    async def start_order_duration(order_id: int) -> Optional[datetime]:
+        """Persist the billable start ONCE, only while the order is running.
 
-        `started_at` stays NULL during the whole join/build phase so the
-        time accounts spend joining is never charged to the customer. The
-        executor stamps `started_at` (via start_order_duration) only after
-        the required accounts are present and the paid duration begins.
+        A duplicate worker must reuse the old start (never grant an extra hour
+        or erase elapsed time). A cancelled order must not become billable in
+        the gap between build completion and the DB update. None means it is
+        not running; DB failures raise, so callers never use a local clock as
+        a fake persisted start.
         """
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(
+            async with db_session.begin():
+                now = datetime.utcnow()
+                result = await db_session.execute(
+                    update(Order)
+                    .where(Order.id == order_id, Order.status == 'running',
+                           Order.started_at.is_(None))
+                    .values(started_at=now)
+                    .returning(Order.started_at)
+                )
+                started_at = result.scalar_one_or_none()
+                if started_at is None:
+                    order = await db_session.get(Order, order_id)
+                    if order and order.status == 'running':
+                        started_at = order.started_at
+            return started_at
+    
+    @staticmethod
+    async def mark_order_as_running(order_id: int, *, expected_status: str) -> bool:
+        """Claim an open order without resurrecting a cancelled/failed one.
+
+        A scheduled-order poll can race a customer's refund. Only the expected
+        pending/scheduled state can transition to running; otherwise do not
+        spawn a worker or start a paid timer. The timer remains NULL throughout
+        build and is stamped separately by start_order_duration.
+        """
+        if expected_status not in ('pending', 'scheduled'):
+            raise ValueError('only a paid open order can start')
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
                 update(Order)
-                .where(Order.id == order_id)
+                .where(Order.id == order_id, Order.status == expected_status)
                 .values(status='running')
             )
             await db_session.commit()
+            return bool(result.rowcount)
 
     @staticmethod
     async def complete_order(order_id: int):
@@ -1217,9 +1368,18 @@ class DatabaseManager:
             await db_session.commit()
 
     @staticmethod
-    async def update_voice_call_session(account_id, chat_id, status):
+    async def update_voice_call_session(account_id, chat_id, status, *, order_id=None):
+        """Change only this order's ledger row, not another shared binding."""
+        if order_id is None:
+            raise ValueError('order_id is required to avoid touching other orders')
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.account_id==account_id, VoiceCallSession.chat_id==chat_id).values(status=status))
+            await db_session.execute(
+                update(VoiceCallSession)
+                .where(VoiceCallSession.order_id == order_id,
+                       VoiceCallSession.account_id == account_id,
+                       VoiceCallSession.chat_id == chat_id)
+                .values(status=status)
+            )
             await db_session.commit()
 
     @staticmethod
@@ -1363,9 +1523,54 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
             return to_dict(res.scalar_one_or_none())
 
     @staticmethod
+    async def credit_verified_payment_once(trans_id: str, *, bot_id: int,
+                                           gateway_slug: str, description: str) -> bool:
+        """Credit a verified gateway payment at most once, with its status.
+
+        A preflight `status != paid` outside the transaction is racy under
+        concurrent callbacks; both formerly credited the full amount. The
+        payment row locks first, then the wallet (same wallet lock as orders).
+        The gateway API verification MUST have succeeded before calling this.
+        """
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                row = await db_session.execute(
+                    select(PaymentTransaction)
+                    .where(PaymentTransaction.trans_id == trans_id)
+                    .with_for_update()
+                )
+                payment = row.scalar_one_or_none()
+                if (not payment or payment.status == 'paid'
+                        or payment.status not in ('pending', 'failed')
+                        or payment.bot_id != int(bot_id)
+                        or payment.gateway_slug != gateway_slug):
+                    return False
+                value = float(payment.amount)
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError('invalid verified payment amount')
+                user = await db_session.get(User, payment.user_id, with_for_update=True)
+                if not user or user.bot_id != payment.bot_id:
+                    raise ValueError('payment owner missing or belongs to another bot')
+                amount = int(value)  # same toman conversion as the old callback
+                if amount <= 0:
+                    raise ValueError('payment amount below one toman')
+                user.credit = float(user.credit or 0) + amount
+                payment.status = 'paid'
+                db_session.add(Transaction(
+                    bot_id=payment.bot_id, user_id=user.id, amount=amount,
+                    type='online_charge', description=description,
+                ))
+            return True
+
+    @staticmethod
     async def update_payment_status(trans_id: str, status: str):
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(PaymentTransaction).where(PaymentTransaction.trans_id == trans_id).values(status=status))
+            statement = update(PaymentTransaction).where(
+                PaymentTransaction.trans_id == trans_id)
+            if status == 'failed':
+                # A late failed callback must not erase an earlier paid credit.
+                statement = statement.where(PaymentTransaction.status != 'paid')
+            await db_session.execute(statement.values(status=status))
             await db_session.commit()
 
     @staticmethod

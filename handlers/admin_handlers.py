@@ -805,13 +805,16 @@ async def stop_order_execute(update, context):
         
     if order['status'] == 'scheduled':
         # سفارش زمان‌بندی‌شده هنوز شروع نشده → عودت کامل بدون محاسبهٔ ثانیه‌ای
-        await order_executor.settle_and_refund_order(
-            oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
-            canceled_by_name=update.effective_user.first_name,
-            cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
-            bot_id=context.bot_data.get('bot_id', 1),
-        )
-        msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        try:
+            await order_executor.settle_and_refund_order(
+                oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
+                canceled_by_name=update.effective_user.first_name,
+                cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
+                bot_id=context.bot_data.get('bot_id', 1),
+            )
+            msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        except ValueError:
+            msg = "ℹ️ سفارش پیش‌تر لغو یا تکمیل شده؛ عودت تکراری انجام نشد."
         await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
@@ -936,12 +939,16 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
         return
 
     do_refund = (mode == "refund")
-    result = await order_executor.settle_and_refund_order(
-        oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
-        canceled_by_name=update.effective_user.first_name,
-        cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
-        bot_id=bot_id,
-    )
+    try:
+        result = await order_executor.settle_and_refund_order(
+            oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
+            canceled_by_name=update.effective_user.first_name,
+            cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
+            bot_id=bot_id,
+        )
+    except ValueError:
+        await query.edit_message_text("ℹ️ سفارش پیش‌تر لغو یا تکمیل شده؛ عودتِ تکراری انجام نشد.")
+        return AWAITING_SETTINGS_ACTION
 
     if do_refund:
         txt = (
