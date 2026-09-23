@@ -7,14 +7,28 @@
 ## قبل از دست زدن به فایل یا کانتینر
 
 1. از پنل سوپرادمین، **حالت تعمیرات سراسری** را روشن کنید و در ربات اصلی و نمایندگی‌ها مطمئن شوید خرید جدید بسته است. از SQL برای روشن‌کردن پرچم استفاده نکنید: پرچم در حافظهٔ فرایند هم باید عوض شود. وضعیت سفارش‌های زمان‌بندی‌شده و callbackهای پرداخت در جریان را هم بررسی کنید. هیچ نسخه/ابزار دیگری نباید همان کلیدهای سشن را استفاده کند.
-2. در **مسیر همین نصب فعلی** روی سرور (در مثال `/opt/tgcallbot`؛ ممکن است برای شما `/root/callmanager` باشد) این بلوک فقط‌خواندنی را اجرا کنید. `status=stopped` به معنی تسویهٔ درست نیست؛ اگر سفارش ۸۴۶ هنوز تعیین‌تکلیف نشده است، اینجا متوقف شوید و ledger را بدون تغییر بررسی کنید.
+2. **ابتدا مسیر نصب واقعی را پیدا کنید.** `/opt/tgcallbot` فقط مثال بود و ممکن است
+   ربات شما در `/root/callmanager` یا جای دیگری باشد. دستور `set -euo pipefail`
+   را در **شل تعاملی SSH اجرا نکنید**: شکست `cd`، `test` یا Git می‌تواند کل
+   اتصال را ببندد. این فرمان‌های تشخیصی فقط خواندنی هستند و خطا هم SSH را
+   نمی‌بندد:
 
 ```bash
-cd /opt/tgcallbot   # مسیر فعلیِ نصب را جایگزین کنید؛ پوشهٔ تازه نسازید
-set -euo pipefail
-test -f .env && test -f docker-compose.yml
-test -z "$(git status --porcelain)"   # هیچ تغییر رهگیری‌نشده/محلیِ متعارضی نباشد
-# نه مبلغ سفارش و نه کلید/شماره/لینک در این پرس‌وجو چاپ نمی‌شود:
+printf 'PATH=%s\n' "$PWD"
+ls -ld /opt/tgcallbot /root/callmanager 2>/dev/null || true
+git rev-parse --show-toplevel 2>&1
+git status --short 2>&1
+git branch --show-current 2>&1
+git rev-parse --short HEAD 2>&1
+```
+
+   بعد از تأیید مسیر، **خودتان** وارد پوشهٔ نصبِ در حال اجرا شوید و با `pwd`
+   تأیید کنید. اگر `git status` تغییرات محلی دارد، استقرار نکنید و چیزی را
+   `reset`/`stash` نکنید. اگر سفارش ۸۴۶ هنوز تعیین‌تکلیف نشده، توقف کنید؛
+   `status=stopped` لزوماً به معنی تسویهٔ درست نیست. فقط در پوشهٔ نصبِ تأییدشده
+   و بدون دستکاری DB این پرس‌وجو را اجرا کنید:
+
+```bash
 docker compose exec -T db sh -c 'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
 SELECT id, status, (started_at IS NOT NULL) AS timer_started
   FROM orders WHERE id = 846;
@@ -30,25 +44,40 @@ SQL
 
 کد زیر تغییرات محلی را پاک نمی‌کند و فایل `.env` را نمی‌سازد/تغییر نمی‌دهد. Git در مسیر فعلی، پوشهٔ پروژه را به آخرین commit شاخهٔ کامل می‌برد؛ فایل‌های `data/` و volumeهای Compose متعلق به همین نصب می‌مانند. اگر Git خطا داد، `reset --hard` یا `stash` کورکورانه نزنید.
 
+**این بلوک را تنها بعد از تأیید مسیر، بدون سفارش فعال و با تعمیرات روشن اجرا کنید.**
+مسیرِ نمونهٔ داخل آن را به مسیر واقعیِ تأییدشده تغییر دهید. کل عملیات داخل
+یک **زیرشل** است؛ هر خطا فقط همان بلوک را قطع می‌کند، نه ترمینال SSH را.
+هیچ `set -e` روی شل تعاملی کاربر اجرا نمی‌شود؛ دستورات خطادار با `|| exit 1`
+فقط از زیرشل خارج می‌شوند:
+
 ```bash
-# هنوز حالت تعمیرات روشن و هیچ سفارش فعالی وجود ندارد
-cd /opt/tgcallbot
-set -euo pipefail
-test -z "$(git status --porcelain)"
-git fetch --no-tags origin refs/heads/arena/01a0ccf5-tgcallbot:refs/remotes/origin/arena/01a0ccf5-tgcallbot
-if git show-ref --verify --quiet refs/heads/arena/01a0ccf5-tgcallbot; then
-  git switch arena/01a0ccf5-tgcallbot
-  git merge --ff-only origin/arena/01a0ccf5-tgcallbot
+if (
+  cd '/path/to/current/install' || exit 1  # مسیر نصب واقعی را جایگزین کنید
+  [ -f .env ] && [ -f docker-compose.yml ] || { echo 'پوشهٔ نصب اشتباه است'; exit 1; }
+  changes="$(git status --porcelain)" || exit 1
+  if [ -n "$changes" ]; then
+    echo 'تغییرات محلی دارید؛ بدون reset/stash توقف کنید:'
+    git status --short
+    exit 1
+  fi
+  git fetch --no-tags origin refs/heads/arena/01a0ccf5-tgcallbot:refs/remotes/origin/arena/01a0ccf5-tgcallbot || exit 1
+  if git show-ref --verify --quiet refs/heads/arena/01a0ccf5-tgcallbot; then
+    git switch arena/01a0ccf5-tgcallbot || exit 1
+    git merge --ff-only origin/arena/01a0ccf5-tgcallbot || exit 1
+  else
+    git switch --track -c arena/01a0ccf5-tgcallbot origin/arena/01a0ccf5-tgcallbot || exit 1
+  fi
+  [ "$(git branch --show-current)" = 'arena/01a0ccf5-tgcallbot' ] || exit 1
+  grep -q '^BOT_VERSION = "2.3.14"$' constants.py || exit 1
+  git log -1 --format='%h %s' || exit 1
+  # بکاپِ DB بیرون از پروژه، اعتبارسنجی و کنترل مجدد سفارش را اسکریپت انجام می‌دهد.
+  DEPLOY_CONFIRMED=yes bash './deploy-warp.sh' || exit 1
+  docker compose exec -T bot python './tools/session_audit.py' --bot-id 1 || exit 1
+); then
+  echo 'بلوک اجرا شد؛ صحت سشن/UDP واقعی هنوز باید جداگانه تأیید شود.'
 else
-  git switch --track -c arena/01a0ccf5-tgcallbot origin/arena/01a0ccf5-tgcallbot
+  echo 'بلوک با خطا متوقف شد؛ SSH باز می‌ماند. بدون بررسی خطا، دستور استقرار را تکرار نکنید.' >&2
 fi
-# پیش از استقرار چک کنید شاخهٔ درست و نسخهٔ کامل گرفته شده:
-test "$(git branch --show-current)" = 'arena/01a0ccf5-tgcallbot'
-grep -q '^BOT_VERSION = "2.3.14"$' constants.py
-# backup خودکارِ محدود به دسترسی مالک (حاوی سشن‌ها و بدون رمزنگاری مستقل) بیرونِ پوشهٔ پروژه
-# ساخته/اعتبارسنجی می‌شود. این backup را در چت/گیت/Docker image نریزید.
-DEPLOY_CONFIRMED=yes bash deploy-warp.sh
-docker compose exec -T bot python tools/session_audit.py --bot-id 1
 ```
 
 `deploy-warp.sh` فقط وقتی عمل می‌کند که `.env` موجود باشد، DB همان نصب در حال اجرا باشد، حالت تعمیرات **از پنل** در DB فعال باشد و هیچ سفارش `running`/`pending`/رزرو کمتر از ۳۰ دقیقه وجود نداشته باشد. قبل از هر rebuild از DB در پوشهٔ هم‌سطح پروژه (`../tgcallbot-backups`) با دسترسی ۷۰۰ بکاپ می‌گیرد و با `pg_restore -l` اعتبارسنجی می‌کند؛ **بدون `compose down` و بدون حذف volumeها**، ابتدا bot را build و دوباره وضعیت سفارش را چک می‌کند، سپس سرویس‌ها را با Compose بالا می‌آورد. `bash deploy-warp.sh down` به‌عمد کار نمی‌کند.

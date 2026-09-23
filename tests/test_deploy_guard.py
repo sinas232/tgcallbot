@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -135,3 +136,39 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         ignore = (ROOT / '.dockerignore').read_text()
         for pattern in ('backups/', '*.dump', '*.sql', '.env.*', '.venv/'):
             self.assertIn(pattern, ignore)
+
+    def test_copy_pasted_runbook_error_does_not_close_interactive_shell(self):
+        """A wrong example path must fail the deployment, not kill the SSH shell."""
+        runbook = (ROOT / 'docs/deploy-final.fa.md').read_text()
+        commands = re.findall(r'```bash\n(.*?)\n```', runbook, re.S)
+        self.assertGreaterEqual(len(commands), 3)
+        self.assertFalse(any(re.search(r'^set -[a-z]*e', block, re.M)
+                             for block in commands))
+        deploy = commands[-1]
+        self.assertIn('if (', deploy)
+        self.assertIn("bash './deploy-warp.sh' || exit 1", deploy)
+        self.assertIn("cd '/path/to/current/install' || exit 1", deploy)
+        result = subprocess.run(
+            ['bash', '-c', deploy + '\necho SSH_STILL_OPEN\n'],
+            cwd=self.project, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('SSH_STILL_OPEN', result.stdout)
+        self.assertIn('بلوک با خطا متوقف شد', result.stderr)
+
+        # Even if the actual directory exists but has local changes, do not
+        # fetch, switch, deploy or let a nonzero check terminate the SSH shell.
+        (self.project / 'docker-compose.yml').write_text('services: {}\n')
+        fake_git = self.root / 'bin' / 'git'
+        fake_git.write_text('#!/bin/sh\n[ "$1" = status ] && echo " M local-config"\n')
+        fake_git.chmod(0o755)
+        block = deploy.replace('/path/to/current/install', str(self.project))
+        result = subprocess.run(
+            ['bash', '-c', block + '\necho SSH_STILL_OPEN\n'],
+            cwd=self.project, env=self.env, capture_output=True,
+            text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('SSH_STILL_OPEN', result.stdout)
+        self.assertIn('تغییرات محلی دارید', result.stdout)
+        self.assertEqual(self.commands(), '')

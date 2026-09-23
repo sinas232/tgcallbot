@@ -268,7 +268,12 @@ docker compose logs -f bot
 # ارتقای نصب موجود فقط طبق docs/deploy-final.fa.md، پس از فعال‌کردن
 # تعمیرات، بررسی سفارش‌های زنده و گرفتن بکاپِ بیرون از پروژه است.
 # پس از گرفتن شاخهٔ درست و طی‌کردن پیش‌شرط‌های راهنما:
-DEPLOY_CONFIRMED=yes bash deploy-warp.sh
+# set -e را در SSH تعاملی اجرا نکنید؛ اجرای شرطی خطا را بدون بستن SSH نشان می‌دهد.
+if DEPLOY_CONFIRMED=yes bash './deploy-warp.sh'; then
+  echo 'اسکریپت اجرا شد؛ سلامت واقعی سشن و تماس هنوز نیاز به بررسی دارد.'
+else
+  echo 'استقرار متوقف شد؛ بدون بررسی خطا آن را تکرار نکنید.'
+fi
 
 # بررسی مصرف منابع
 docker stats
