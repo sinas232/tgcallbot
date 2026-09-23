@@ -144,6 +144,15 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertGreaterEqual(len(commands), 3)
         self.assertFalse(any(re.search(r'^set -[a-z]*e', block, re.M)
                              for block in commands))
+        # Read-only diagnostics must also survive a *previously* enabled -e.
+        result = subprocess.run(
+            ['bash', '-c', 'set -eu\n' + commands[0] + '\necho SSH_STILL_OPEN\n'],
+            cwd=self.project, env=self.env, capture_output=True,
+            text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('SSH_STILL_OPEN', result.stdout)
+        self.log.unlink(missing_ok=True)
         deploy = commands[-1]
         self.assertIn('if (', deploy)
         self.assertIn("bash './deploy-warp.sh' || exit 1", deploy)

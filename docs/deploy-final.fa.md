@@ -14,12 +14,14 @@
    نمی‌بندد:
 
 ```bash
+set +e; set +u    # اگر دستور قبلی set -e/-u را فعال کرده، شل SSH باز بماند
 printf 'PATH=%s\n' "$PWD"
 ls -ld /opt/tgcallbot /root/callmanager 2>/dev/null || true
-git rev-parse --show-toplevel 2>&1
-git status --short 2>&1
-git branch --show-current 2>&1
-git rev-parse --short HEAD 2>&1
+git rev-parse --show-toplevel 2>&1 || true
+git status --short 2>&1 || true
+git branch --show-current 2>&1 || true
+git rev-parse --short HEAD 2>&1 || true
+docker ps --format '{{.Names}} {{.Status}}' 2>&1 || true
 ```
 
    بعد از تأیید مسیر، **خودتان** وارد پوشهٔ نصبِ در حال اجرا شوید و با `pwd`
