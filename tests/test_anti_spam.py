@@ -350,11 +350,10 @@ class AuthKeyDuplicatedHardeningTests(unittest.TestCase):
 
 
 class SessionDuplicationDiagnosticsTests(unittest.TestCase):
-    """رگرسیون v2.3.6 — تشخیص «سشن در مکان دیگر فعال است» (406 مداوم):
+    """تشخیص ۴۰۶ بدون ابطال حدسی؛ از نسخهٔ ۲.۳.۱۱ بازیابی فقط تک‌اکانتی است.
 
-    وقتی کلید سشن توسط نمونهٔ دیگری (سرور/پنل/پروسس) آنلاین نگه داشته شود،
-    تکرار اتصال فقط ابطالِ مکرر می‌سازد. باید: (۱) resync دلیل شکست را
-    دسته‌بندی کند، (۲) موج ساخت با ۵ پیاپیِ 406 متوقف شود."""
+    تکرار اتصال با کلیدِ درحال‌استفاده می‌تواند هر دو اتصال را باطل کند؛
+    کد باید خطا را دسته‌بندی کند، نه کلیدها را کورکورانه پروب یا حذف کند."""
 
     def test_fetch_me_status_classifies(self):
         tc = _read_source("telegram_client.py")
@@ -363,11 +362,12 @@ class SessionDuplicationDiagnosticsTests(unittest.TestCase):
         self.assertIn("relogin_required", tc)
         self.assertIn("except SessionInUseError", tc)
 
-    def test_resync_reports_duplication_category(self):
-        ah = _read_source("handlers/admin_handlers.py")
-        self.assertIn("fetch_me_status", ah)
-        self.assertIn("dup_elsewhere", ah)
-        self.assertIn("406 AUTH_KEY_DUPLICATED", ah)
+    def test_single_account_recovery_reports_duplication_category(self):
+        recovery = _read_source("services/account_recovery.py")
+        self.assertIn("fetch_me_status", recovery)
+        self.assertIn("duplicated_in_use", recovery)
+        self.assertIn("AUTH_KEY_DUPLICATED", recovery)
+        self.assertIn("۴۰۶", recovery)
 
     def test_wave_streak_abort_exists(self):
         exc = _read_source("services/order_executor.py")
@@ -463,11 +463,11 @@ class NeverAutoDisableOn406Tests(unittest.TestCase):
         self.assertIn("dup406_streak += 1", dup_branch)
         self.assertIn("no auto-disable", exe)
 
-    def test_resync_protective_abort(self):
+    def test_bulk_resync_and_delete_are_disabled_even_for_stale_buttons(self):
         adm = _read_source("handlers/admin_handlers.py")
-        self.assertIn("dup_streak", adm)
-        self.assertIn("aborted = total - idx", adm)
-        self.assertIn("consecutive 406s", adm)
+        self.assertIn('data in ("acc_resync_all", "dead_del_all", "dead_del_yes")', adm)
+        self.assertNotIn('callback_data="acc_resync_all"', adm)
+        self.assertNotIn('account_resync_dead_sessions', adm)
 
 
 if __name__ == "__main__":

@@ -1360,7 +1360,7 @@ def register_handlers(application: Application) -> None:
 
     # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
     application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
-    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|del|delyes|sync)_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|recover|recoverdo|del|delyes|sync)_\d+$"), group=0)
     # صفحه‌بندی/بستن لیست‌های شیشه‌ای انتخاب اکانت (پروفایل و دریافت کد)
     application.add_handler(CallbackQueryHandler(profile_picker_page_callback, pattern=r"^profpage_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(getcode_picker_page_callback, pattern=r"^codepage_\d+$"), group=0)

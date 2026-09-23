@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
     Column, Integer, String, Boolean, Float, DateTime, Text,
-    BigInteger, func, select, update, delete, desc, text, UniqueConstraint
+    BigInteger, func, select, update, delete, desc, text, case, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -1119,6 +1119,43 @@ class DatabaseManager:
         async with AsyncSessionLocal() as db_session:
             await db_session.execute(update(TelegramAccount).where(TelegramAccount.id == aid).values(spam_status=status, spam_check_result=result_text, last_health_check=datetime.utcnow()))
             await db_session.commit()
+
+    @staticmethod
+    async def recover_account_after_verified_probe(aid: int, bot_id: int, encrypted_session: str) -> bool:
+        """Reactivate ONLY the exact inactive row whose key was just verified.
+
+        A parallel login/import may replace the session while a network probe
+        is in flight. The conditional UPDATE prevents that old probe from
+        blessing a different, untested key. Caller must confirm both get_me()
+        and MTProto disconnect before invoking this method.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                update(TelegramAccount).where(
+                    TelegramAccount.id == int(aid),
+                    TelegramAccount.bot_id == int(bot_id),
+                    TelegramAccount.account_status == 'inactive',
+                    TelegramAccount.session_string == encrypted_session,
+                ).values(
+                    account_status='active',
+                    # A dead marker from an old auth error is no longer valid,
+                    # but get_me() does NOT prove the account is spam-free.
+                    spam_status=case(
+                        (TelegramAccount.spam_status == 'dead', 'unknown'),
+                        else_=TelegramAccount.spam_status,
+                    ),
+                    spam_check_result=case(
+                        (TelegramAccount.spam_status == 'dead', func.concat(
+                            'Session verified and disconnected; SpamBot not checked. Previous flag: ',
+                            func.coalesce(TelegramAccount.spam_check_result, 'unknown'),
+                        )),
+                        else_=TelegramAccount.spam_check_result,
+                    ),
+                    last_health_check=datetime.utcnow(),
+                )
+            )
+            await db_session.commit()
+            return result.rowcount == 1
 
     @staticmethod
     async def create_voice_call_session(order_id, account_id, chat_id, bot_id=1):

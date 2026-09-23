@@ -370,28 +370,32 @@ class TelegramAccountClient:
           مکرر نزنید؛ پس از حذف تداخل، در صورت لزوم دوباره لاگین کنید.
         * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
         * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
+        * ``disconnect_unconfirmed`` — اتصالِ پروب بسته‌نشد؛ بازگردانی ممنوع.
         * ``error`` — سایر خطاها.
 
         SessionInUseError (سشن در اختیار موتور ویس‌کال) بدون بلع به بیرون
         پرتاب می‌شود تا صداکننده «مشغول بودن» را با «مرده بودن» اشتباه نگیرد.
         """
         client = None
+        outcome = (False, "error", None)
         try:
             client = await self.get_client()
             # connect به‌تنهایی برای get_me کافی است؛ start کامل (دیسپچر رخداد)
             # لازم نیست و سربار/ریسک زامبی هم دارد.
             await asyncio.wait_for(client.connect(), timeout=40)
             me = await client.get_me()
-            return True, None, {
+            if not getattr(me, 'id', None):
+                raise ValueError('get_me returned no authenticated user ID')
+            outcome = (True, None, {
                 'first_name': getattr(me, 'first_name', None),
                 'last_name': getattr(me, 'last_name', None),
                 'username': getattr(me, 'username', None),
-            }
+            })
         except SessionInUseError:
             raise
         except asyncio.TimeoutError:
             logger.warning(f"fetch_me timeout for acc {self.account_id}")
-            return False, "timeout", None
+            outcome = (False, "timeout", None)
         except Exception as e:
             up = str(e).upper()
             if is_auth_key_duplicated(e):
@@ -404,7 +408,7 @@ class TelegramAccountClient:
             else:
                 reason = "error"
             logger.warning(f"fetch_me failed for acc {self.account_id}: {e} -> {reason}")
-            return False, reason, None
+            outcome = (False, reason, None)
         finally:
             if client is not None:
                 token = getattr(client, "_ownership_token", None)
@@ -421,6 +425,8 @@ class TelegramAccountClient:
                             self.account_id, token, disconnected=had_transport)
                 if not closed:
                     logger.error("acc=%s probe disconnect unconfirmed; holding reservation", self.account_id)
+                    outcome = (False, "disconnect_unconfirmed", None)
+        return outcome
 
     async def fetch_me(self):
         """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""

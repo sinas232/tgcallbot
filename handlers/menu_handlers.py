@@ -14,6 +14,7 @@ from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
 from telegram_client import TelegramAccountClient
+from services.account_recovery import recover_one_account, recovery_message
 
 try:
     from utils.helpers import format_jalali_datetime
@@ -325,7 +326,7 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"🗓 افزوده شده: {html.escape(str(created))}"
     )
 
-    kb = InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data=f"acc_edit_{acc['id']}")],
         [
             InlineKeyboardButton("📩 دریافت کد ورود", callback_data=f"acc_getcode_{acc['id']}"),
@@ -335,8 +336,12 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("🔄 بروزرسانی اطلاعات", callback_data=f"acc_refresh_{acc['id']}"),
             InlineKeyboardButton("🗑 حذف اکانت", callback_data=f"acc_del_{acc['id']}")
         ],
-        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")]
-    ])
+    ]
+    if raw_status == 'inactive':
+        rows.append([InlineKeyboardButton(
+            "🧪 بررسی و بازیابی فقط همین اکانت", callback_data=f"acc_recover_{acc['id']}")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")])
+    kb = InlineKeyboardMarkup(rows)
 
     try:
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -375,6 +380,40 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
     acc = await DatabaseManager.get_account_by_id(aid)
     if not acc or acc.get('bot_id', 1) != bot_id:
         await query.answer("❌ اکانت یافت نشد.", show_alert=True)
+        return
+
+    if action in ("recover", "recoverdo"):
+        if acc.get('account_status') != 'inactive':
+            await query.answer("این اکانت دیگر غیرفعال نیست.", show_alert=True)
+            return
+        if action == "recover":
+            await query.answer()
+            await query.edit_message_text(
+                "🧪 <b>بررسی زندهٔ فقط همین اکانت</b>\n\n"
+                "برای تأیید اعتبار سشن، ربات یک اتصال کوتاه به تلگرام باز می‌کند. "
+                "فقط اگر هویت تأیید شود، اتصال واقعاً قطع شود و سشنِ ذخیره‌شده "
+                "در این فاصله عوض نشده باشد، اکانت فعال می‌شود.\n\n"
+                "⚠️ اگر کپی همین سشن در برنامه/سرور دیگری وصل است، "
+                "پیش از تأیید آن را قطع کنید؛ تلاش‌های پی‌درپی با کلید تکراری "
+                "ممکن است به ابطال کلید منجر شود.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ فقط همین اکانت را بررسی کن", callback_data=f"acc_recoverdo_{aid}")],
+                    [InlineKeyboardButton("🔙 انصراف", callback_data=f"acc_view_{aid}")],
+                ]), parse_mode=ParseMode.HTML)
+            return
+
+        await query.answer("⏳ بررسی یک سشن؛ لطفاً صبر کنید...")
+        await query.edit_message_text("⏳ اتصال و قطع امن فقط همین اکانت در حال بررسی است...")
+        try:
+            _, reason = await recover_one_account(aid, bot_id)
+        except Exception as exc:
+            logger.warning("Recovery DB error for account %s: %s", aid, type(exc).__name__)
+            reason = 'error'
+        await query.edit_message_text(
+            recovery_message(reason),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 کارت اکانت", callback_data=f"acc_view_{aid}")],
+            ]))
         return
 
     client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
