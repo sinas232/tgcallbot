@@ -1473,25 +1473,83 @@ class DatabaseManager:
             return result.rowcount == 1
 
     @staticmethod
-    async def get_confirmed_deleted_accounts(bot_id: int) -> list[dict]:
+    async def get_confirmed_deleted_accounts(bot_id: int, *,
+                                              account_id: int | None = None) -> list[dict]:
         """Return only fresh, explicit account-deletion evidence for this bot.
 
-        Session ciphertext stays server-side; callers must not send it in
-        Telegram messages or store it in callback data/user_data.
+        Optionally select the exact account that was just reviewed. Session
+        ciphertext stays server-side; callers must not send it to Telegram or
+        store it in callback data/user_data.
         """
         async with AsyncSessionLocal() as db_session:
-            result = await db_session.execute(select(TelegramAccount).where(
+            query = select(TelegramAccount).where(
                 TelegramAccount.bot_id == int(bot_id),
                 TelegramAccount.account_status == 'inactive',
                 TelegramAccount.spam_status == 'dead',
                 TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED,
-            ).order_by(TelegramAccount.id))
+            )
+            if account_id is not None:
+                query = query.where(TelegramAccount.id == int(account_id))
+            result = await db_session.execute(query.order_by(TelegramAccount.id))
             return [{'id': account.id, 'session_string': account.session_string}
                     for account in result.scalars().all()]
 
     @staticmethod
+    async def get_deletion_review_page(bot_id: int, *, page: int = 1,
+                                       page_size: int = 8) -> tuple[list[dict], int]:
+        """Paginate uncertain accounts without loading/decrypting session strings.
+
+        A legacy inactive marker or an active 406 hold is a *candidate for
+        optional single-account review*, never proof of account deletion.
+        Confirmed-deleted rows are shown only in the separate deletion preview.
+        """
+        size = min(8, max(1, int(page_size)))
+        offset = (max(1, int(page)) - 1) * size
+        uncertain = or_(
+            (TelegramAccount.account_status == 'inactive') & or_(
+                TelegramAccount.spam_check_result.is_(None),
+                TelegramAccount.spam_check_result != CONFIRMED_ACCOUNT_DELETED,
+            ),
+            (TelegramAccount.account_status == 'active') &
+            (TelegramAccount.spam_status == 'cooldown') &
+            TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%'),
+        )
+        condition = (TelegramAccount.bot_id == int(bot_id)) & uncertain
+        async with AsyncSessionLocal() as db_session:
+            total = int((await db_session.execute(
+                select(func.count(TelegramAccount.id)).where(condition)
+            )).scalar() or 0)
+            result = await db_session.execute(select(
+                TelegramAccount.id, TelegramAccount.phone_number,
+                TelegramAccount.account_status, TelegramAccount.spam_status,
+            ).where(condition).order_by(TelegramAccount.id)
+             .offset(offset).limit(size))
+            return [dict(row) for row in result.mappings().all()], total
+
+    @staticmethod
+    async def deletion_review_probe_allowed(bot_id: int) -> tuple[bool, str]:
+        """No live probe until global maintenance and a quiet order window.
+
+        This is a preflight only, not permission to bulk probe or to delete.
+        SessionOwnership in the running bot separately rejects shared/busy keys.
+        """
+        async with AsyncSessionLocal() as db_session:
+            if not await _global_maintenance_enabled(db_session):
+                return False, 'maintenance'
+            deadline = datetime.utcnow() + timedelta(minutes=30)
+            busy = (await db_session.execute(select(Order.id).where(
+                Order.bot_id == int(bot_id),
+                or_(Order.status.in_(('running', 'pending')),
+                    (Order.status == 'scheduled') & or_(
+                        Order.scheduled_for.is_(None),
+                        Order.scheduled_for <= deadline)),
+            ).limit(1))).first()
+            return (False, 'busy') if busy else (True, 'ready')
+
+    @staticmethod
     async def delete_confirmed_deleted_accounts(bot_id: int,
-                                                expected_fingerprints: dict[int, str]) -> tuple[int, str]:
+                                                expected_fingerprints: dict[int, str], *,
+                                                single_account_id: int | None = None) -> tuple[int, str]:
         """All-or-nothing cleanup of the exact accounts shown to a superadmin.
 
         This DB operation is deliberately narrower than delete_account(): it
@@ -1501,6 +1559,8 @@ class DatabaseManager:
         """
         if not expected_fingerprints:
             return 0, 'empty'
+        if single_account_id is not None and set(expected_fingerprints) != {int(single_account_id)}:
+            return 0, 'changed'
         async with AsyncSessionLocal() as db_session:
             async with db_session.begin():
                 # Main-bot maintenance is the global switch for every reseller
@@ -1522,14 +1582,17 @@ class DatabaseManager:
                 if busy:
                     return 0, 'busy'
 
-                # Lock all eligible rows, not just the submitted IDs, so any
-                # changed candidate set aborts and requires a new preview.
-                result = await db_session.execute(select(TelegramAccount).where(
+                # Bulk preview must cover ALL eligible rows; after a single
+                # account review, lock/delete ONLY that exact confirmed row.
+                query = select(TelegramAccount).where(
                     TelegramAccount.bot_id == int(bot_id),
                     TelegramAccount.account_status == 'inactive',
                     TelegramAccount.spam_status == 'dead',
                     TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED,
-                ).order_by(TelegramAccount.id).with_for_update())
+                )
+                if single_account_id is not None:
+                    query = query.where(TelegramAccount.id == int(single_account_id))
+                result = await db_session.execute(query.order_by(TelegramAccount.id).with_for_update())
                 rows = result.scalars().all()
                 if len(rows) != len(expected_fingerprints):
                     return 0, 'changed'

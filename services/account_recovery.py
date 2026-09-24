@@ -11,6 +11,8 @@ opens a second process, never bulk-probes keys, and never promotes a row on
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 from datetime import datetime
 from typing import Tuple
@@ -23,11 +25,23 @@ from telegram_client import TelegramAccountClient
 logger = logging.getLogger(__name__)
 
 
-async def recover_one_account(account_id: int, bot_id: int) -> Tuple[bool, str]:
-    """Return (reactivated, diagnostic_code); never expose the session key."""
+async def recover_one_account(account_id: int, bot_id: int, *,
+                              expected_session_fingerprint: str | None = None) -> Tuple[bool, str]:
+    """Return (reactivated, diagnostic_code); never expose the session key.
+
+    The deletion-menu preview may pin the encrypted session fingerprint so a
+    replaced key is not even probed between its confirmation and this fetch.
+    Other existing single-account recovery callers need no preview token.
+    """
     acc = await DatabaseManager.get_account_by_id(int(account_id))
     if not acc or int(acc.get('bot_id') or 0) != int(bot_id):
         return False, 'not_found'
+    if expected_session_fingerprint is not None:
+        saved = acc.get('session_string')
+        if (not isinstance(saved, str) or not hmac.compare_digest(
+                hashlib.sha256(saved.encode('utf-8')).hexdigest(),
+                expected_session_fingerprint)):
+            return False, 'changed_during_probe'
     is_inactive = str(acc.get('account_status') or '').lower() == 'inactive'
     is_conflict = (str(acc.get('account_status') or '').lower() == 'active'
                    and str(acc.get('spam_status') or '').lower() == 'cooldown'

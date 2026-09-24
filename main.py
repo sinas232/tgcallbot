@@ -154,7 +154,9 @@ logger = logging.getLogger(__name__)
 # نکته: 💬 (چت در ویس‌کال) هم جزو دکمه‌های اصلی است و باید از STD_TEXT مستثنا شود
 # تا وقتی کاربر داخل یک مکالمه (کیف پول/پروفایل/...) است، این دکمه بلعیده نشود.
 REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|☠️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
-_DELETED_CLEANUP_CALLBACK_RE = r"^deleted_cleanup_(?:menu|preview|cancel|confirm_[0-9a-f]{16})$"
+_DELETED_CLEANUP_CALLBACK_RE = (r"^deleted_cleanup_(?:menu|preview(?:_[1-9][0-9]{0,9})?"
+                                r"|cancel|list_[1-9][0-9]{0,3}|check_[1-9][0-9]{0,9}"
+                                r"|probe_[0-9a-f]{16}|confirm_[0-9a-f]{16})$")
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
 FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
