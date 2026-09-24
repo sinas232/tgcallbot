@@ -14,7 +14,15 @@ FAKE_DOCKER = r'''#!/usr/bin/env bash
 set -e
 printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
 if [[ "$1" == compose && "$2" == ps && "${3:-}" == --status ]]; then
-  [[ "${FAKE_NO_DB:-0}" == 1 ]] || echo 'existing-db-container'
+  if [[ "${@: -1}" == db ]]; then
+    [[ "${FAKE_NO_DB:-0}" == 1 ]] || echo 'existing-db-container'
+  elif [[ "${@: -1}" == bot && "${FAKE_NO_BOT:-0}" != 1 ]]; then
+    if [[ "${FAKE_UNCHANGED_BOT:-0}" == 1 ]] || ! grep -q 'compose up -d --no-build' "$FAKE_DOCKER_LOG"; then
+      echo 'old-bot-container'
+    else
+      echo 'new-bot-container'
+    fi
+  fi
 elif [[ "$1" == compose && "$2" == exec && "${4:-}" == db ]]; then
   if [[ "$*" == *'pg_dump'* ]]; then
     printf 'FAKE_DUMP_BYTES'  # output is redirected to the private backup
@@ -28,9 +36,17 @@ elif [[ "$1" == compose && "$2" == exec && "${4:-}" == db ]]; then
     printf '%s\n' "$next_state"
   fi
 elif [[ "$1" == inspect ]]; then
-  echo healthy
+  if [[ "$*" == *'State.StartedAt'* ]]; then
+    if [[ "${@: -1}" == new-bot-container ]]; then
+      echo '2026-09-24T12:00:00Z'
+    else
+      echo '2026-09-23T12:00:00Z'
+    fi
+  else
+    echo healthy
+  fi
 elif [[ "$1" == compose && "$2" == exec && "${4:-}" == bot ]]; then
-  echo 'Running bot code: 2.3.15'
+  echo 'Bot checkout version: 2.3.15'
 fi
 '''
 
@@ -149,6 +165,20 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('DB container is not running', result.stderr)
         self.assertNotIn('up -d', self.commands())
+
+    def test_no_existing_bot_is_not_treated_as_a_safe_upgrade(self):
+        result = self.run_script('deploy-warp.sh', FAKE_NO_BOT='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Existing bot is not running', result.stderr)
+        self.assertNotIn('pg_dump', self.commands())
+        self.assertNotIn('up -d', self.commands())
+
+    def test_fresh_import_does_not_hide_an_unchanged_main_process(self):
+        result = self.run_script('deploy-warp.sh', FAKE_UNCHANGED_BOT='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('did not start a new bot process', result.stderr)
+        self.assertIn('up -d --no-build', self.commands())
+        self.assertNotIn('exec -T bot python -c', self.commands())
 
     def test_second_preflight_failure_keeps_running_bot_untouched(self):
         result = self.run_script('deploy-warp.sh', states='1|0\n1|2\n')

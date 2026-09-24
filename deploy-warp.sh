@@ -46,6 +46,15 @@ if [[ -z "$(docker compose ps --status running --quiet db)" ]]; then
   echo "Existing DB container is not running. This updater must not initialize or replace a production DB; follow the new-server guide for a fresh install." >&2
   exit 2
 fi
+# A fresh `docker compose exec bot python ...` loads bind-mounted files even
+# when the *old long-running main process* has not restarted. Record its real
+# container/start time so a no-op `up` cannot be reported as an installed fix.
+old_bot="$(docker compose ps --status running --quiet bot)" || exit 2
+if [[ -z "$old_bot" ]]; then
+  echo "Existing bot is not running. Do not guess which instance owns the sessions; inspect the current installation before deploying." >&2
+  exit 2
+fi
+old_bot_started="$(docker inspect -f '{{.State.StartedAt}}' "$old_bot")" || exit 2
 
 check_idle() {
   # Read-only: the maintenance flag must have been set via the ADMIN UI so
@@ -111,8 +120,18 @@ check_idle
 # Unlike the old script: no 'down', no --remove-orphans, no automatic rollback.
 # Keep maintenance enabled until an operator checks the actual accounts/calls.
 docker compose up -d --no-build
+new_bot="$(docker compose ps --status running --quiet bot)" || exit 1
+if [[ -z "$new_bot" ]]; then
+  echo "The updated bot is not running. Keep maintenance enabled and inspect Compose; do not retry blindly." >&2
+  exit 1
+fi
+new_bot_started="$(docker inspect -f '{{.State.StartedAt}}' "$new_bot")" || exit 1
+if [[ "$new_bot" == "$old_bot" && "$new_bot_started" == "$old_bot_started" ]]; then
+  echo "Compose did not start a new bot process. A fresh Python import is NOT proof that the old bot changed; keep maintenance enabled and inspect deployment." >&2
+  exit 1
+fi
 
-echo "Checking WARP tunnel and the running bot version..."
+echo "Checking WARP tunnel and the updated bot checkout..."
 for _attempt in $(seq 1 20); do
   if [[ "$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null || true)" == healthy ]]; then
     break
@@ -123,7 +142,7 @@ if [[ "$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null
   echo "WARP not healthy. Keep maintenance enabled; inspect networking before accepting orders." >&2
   exit 1
 fi
-# An image/build or version mismatch must not be mistaken for a live fix.
-docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.15", BOT_VERSION; print("Running bot code:", BOT_VERSION)'
+# The checkout version is one additional check, NOT a proof of Telegram health.
+docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.15", BOT_VERSION; print("Bot checkout version:", BOT_VERSION)'
 docker compose ps
-echo "Code is running, but session-key validity and Telegram WebRTC/UDP presence are NOT proved. Keep maintenance enabled until safe single-account checks are complete."
+echo "Bot process was restarted with the updated checkout; session-key validity and Telegram WebRTC/UDP presence are NOT proved. Keep maintenance enabled until safe single-account checks are complete."
