@@ -55,8 +55,8 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 tools/validate_env_compat.p
   echo "Refusing deploy: environment preflight did not pass. See docs/env-compatibility.fa.md." >&2
   exit 2
 fi
-if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.19"$' constants.py; then
-  echo "Wrong source tree: expected the v2.3.19 source tree. Do not deploy an older checkout." >&2
+if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.20"$' constants.py; then
+  echo "Wrong source tree: expected the v2.3.20 source tree. Do not deploy an older checkout." >&2
   exit 2
 fi
 if [[ -z "$(docker compose ps --status running --quiet db)" ]]; then
@@ -166,6 +166,6 @@ if [[ "$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null
   exit 1
 fi
 # The checkout version is one additional check, NOT a proof of Telegram health.
-docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.19", BOT_VERSION; print("Bot checkout version:", BOT_VERSION)'
+docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.20", BOT_VERSION; print("Bot checkout version:", BOT_VERSION)'
 docker compose ps
 echo "Bot process was restarted with the updated checkout; session-key validity and Telegram WebRTC/UDP presence are NOT proved. Keep maintenance enabled until safe single-account checks are complete."

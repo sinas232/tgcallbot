@@ -874,10 +874,10 @@ class OrderExecutor:
 	                    wave_fail += 1
 	                    continue
 
-	                # AUTH_KEY_DUPLICATED (406) says the auth key was used twice;
-	                # it does NOT identify which process did it, and Telegram may
-	                # already have invalidated the key. Never mark it dead on a
-	                # guess; stop attempts for this order and investigate.
+	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
+	                # this auth key, NOT the account. This result is text-only, so
+	                # it cannot prove the RPC type or identify the other TCP
+	                # connection. Preserve the DB row; stop this order's attempts.
 	                if is_auth_key_duplicated(msg):
 	                    dead_count += 1  # order statistics, not a DB auto-disable
 	                    wave_dead += 1
@@ -893,7 +893,7 @@ class OrderExecutor:
 	                        pass
 	                    logger.warning(
 	                        f"Order {order_id}: account {aid} AUTH_KEY_DUPLICATED - "
-	                        "no auto-disable; key may have been invalidated (check local copies/other connections)"
+	                        "row preserved; typed Telegram 406 invalidates the key; re-login with phone"
 	                    )
 	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
 	                    continue

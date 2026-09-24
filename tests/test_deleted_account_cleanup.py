@@ -1187,6 +1187,25 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('فقط همین حساب', buttons[0][0].text)
             self.assertFalse(any('حذف' in button.text for row in buttons for button in row))
 
+    async def test_persisted_cleanup_406_has_login_guide_not_another_probe_button(self):
+        row = dict(id=7, bot_id=1, account_status='inactive', spam_status='dead',
+                   spam_check_result=database.CLEANUP_REVIEW_406_HOLD,
+                   phone_number='0123456', session_string='cipher')
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(admin_handlers, 'recover_one_account',
+                          new_callable=AsyncMock) as probe, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+            query = self.callback('deleted_cleanup_check_7')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertIn('سشن تازه', query.edit_message_text.call_args.args[0])
+            self.assertNotIn('deleted_cleanup_probe', self.context.user_data)
+            markup = query.edit_message_text.call_args.kwargs['reply_markup']
+            self.assertFalse(any(b.callback_data.startswith('deleted_cleanup_probe_')
+                                 for row in markup.inline_keyboard for b in row))
+            probe.assert_not_awaited()
+
     async def test_normal_active_account_cannot_be_probed_from_deletion_menu(self):
         row = dict(id=7, bot_id=1, account_status='active', spam_status='free',
                    spam_check_result=None, phone_number='0123456', session_string='cipher')

@@ -24,14 +24,15 @@ class HealthChecker:
     async def check_single_account_spam(self, account: Dict[str, Any]):
         """بررسی محدودیت اسپم برای یک اکانت.
 
-        اکانت فقط با ابطال صریح کلید غیرفعال می‌شود. خطای
-        AUTH_KEY_DUPLICATED (406) منشأ برخورد یا اعتبار فعلی کلید را ثابت
-        نمی‌کند؛ خودکار غیرفعال نمی‌کنیم، اما دوباره‌پروب مکرر هم نمی‌زنیم.
+        خطای تایپ‌شدهٔ AUTH_KEY_DUPLICATED (406) کلید را باطل می‌کند، نه
+        حساب تلگرام را. این مسیر فقط متن برگشتی را می‌بیند؛ متنِ مبهم به‌تنهایی
+        اثبات تایپ‌شده نیست، پس ردیف را حذف نمی‌کنیم و همان کلید را دوباره
+        پروب هم نمی‌زنیم.
         """
         # get_all_active_accounts() is also used by admin screens, so it
         # deliberately includes quarantined rows. A periodic job must not
-        # independently probe a key already held after a 406; only the
-        # operator-initiated, cooldown-checked in-bot recovery may do that.
+        # independently probe a key already held after a 406. Persisted
+        # cleanup-review holds require a NEW phone login, not another probe.
         if str(account.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
             logger.info("Spam check skipped for quarantined acc=%s", account['id'])
             return
@@ -57,9 +58,9 @@ class HealthChecker:
                 account['id'], account['session_string'], fatal_auth_category(rt))
             return
         if status == 'error' and is_auth_key_duplicated(rt):
-            # 406 can mean Telegram already invalidated this key. Do not
-            # disable it on a guess, but do not call it healthy or keep
-            # probing it; first eliminate simultaneous connections.
+            # A genuine typed 406 invalidates the key; this SpamBot result
+            # only carries error text. Preserve the account, quarantine this
+            # key, and require a fresh phone login if the RPC was typed.
             logger.warning("Acc %s AUTH_KEY_DUPLICATED — no auto-disable; investigate shared keys / instances",
                            account['id'])
             await DatabaseManager.note_session_conflict_if_current(

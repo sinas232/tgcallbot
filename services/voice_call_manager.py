@@ -254,11 +254,11 @@ async def _mark_session_dead(account_id: int, reason: str, encrypted_session: st
     older voice client is failing. Compare-and-swap in the DB prevents that
     OLD client's failure from disabling the NEW valid session.
 
-    AUTH_KEY_DUPLICATED (406) تداخل کلید را نشان می‌دهد؛ با این خطا نه می‌شود
-    محل اتصال دوم را مشخص کرد، نه ثابت کرد کلید هنوز معتبر است. این تداخل
-    حتی با دو ردیف نمایندگی در همان پردازه ممکن است. غیرفعال‌سازی حدسیِ 406
-    استخر اکانت‌ها را خالی می‌کرد؛ در عوض وضعیت cooldown و هشدار ثبت می‌شود.
-    پس از رفع تداخل اگر کلید واقعاً باطل شده باشد، باید دوباره لاگین کرد.
+    AUTH_KEY_DUPLICATED (406) تداخل کلید را نشان می‌دهد؛ منشأ اتصال‌های موازی
+    از خود خطا معلوم نیست. اگر پاسخ تایپ‌شدهٔ تلگرام باشد، **کلید سشن باطل
+    است** و ورود تازه لازم است، ولی حساب تلگرام حذف نشده است. متن خطای مبهم
+    شاهد قطعی نیست. برای جلوگیری از حذف حساب بر اساس متن، ردیف حفظ و برای
+    تخصیص جدید قرنطینه می‌شود؛ کلید باطل را دوباره پروب نکنید.
     """
     try:
         from database import DatabaseManager as _DB
@@ -267,7 +267,8 @@ async def _mark_session_dead(account_id: int, reason: str, encrypted_session: st
                 logger.warning(
                     "Session %s AUTH_KEY_DUPLICATED — not auto-disabled. "
                     "Check same-key reseller rows, old processes and other servers. "
-                    "Telegram may have invalidated the key; re-login if needed.", account_id)
+                    "A typed Telegram 406 invalidates this auth key (not the account). "
+                    "Do not retry the same key; re-login with the phone number.", account_id)
                 await _DB.note_session_conflict_if_current(int(account_id), encrypted_session)
             return
         category = fatal_auth_category(reason)

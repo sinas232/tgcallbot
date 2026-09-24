@@ -66,6 +66,14 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 probe.assert_not_awaited()
                 update.assert_not_awaited()
 
+    async def test_persisted_406_hold_never_reprobes_even_after_cooldown(self):
+        row = dict(self.row, spam_check_result=database.CLEANUP_REVIEW_406_HOLD,
+                   last_health_check=datetime.utcnow() - timedelta(days=2))
+        answer, _, probe, update = await self._probe(row=row)
+        self.assertEqual(answer, (False, 'duplicate_key_relogin_required'))
+        probe.assert_not_awaited()
+        update.assert_not_awaited()
+
     async def test_failed_probes_never_change_db(self):
         for reason in ('duplicated_in_use', 'relogin_required', 'timeout',
                        'disconnect_unconfirmed', 'error'):
@@ -241,27 +249,87 @@ class ProbeCloseTests(unittest.IsolatedAsyncioTestCase):
 
 class FreshLoginPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_verified_new_login_clears_prior_dead_annotation(self):
-        acc = SimpleNamespace(session_string='old', account_status='inactive',
-                              spam_status='dead', spam_check_result='SESSION_REVOKED detected',
-                              last_health_check='old timestamp', api_id=1, api_hash='old')
-        class FakeSession:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *_):
-                pass
-            async def execute(self, _stmt):
-                return SimpleNamespace(scalar_one_or_none=lambda: acc)
-            async def commit(self):
-                pass
+        for marker in ('SESSION_REVOKED detected', database.CLEANUP_REVIEW_406_HOLD):
+            with self.subTest(marker=marker):
+                acc = SimpleNamespace(id=13, session_string='old', account_status='inactive',
+                                      spam_status='dead', spam_check_result=marker,
+                                      last_health_check='old timestamp', api_id=1, api_hash='old')
+                class FakeSession:
+                    async def __aenter__(self):
+                        return self
+                    async def __aexit__(self, *_):
+                        pass
+                    async def execute(self, _stmt):
+                        return SimpleNamespace(scalar_one_or_none=lambda: acc)
+                    async def commit(self):
+                        pass
 
-        with patch.object(database, 'AsyncSessionLocal', return_value=FakeSession()):
-            self.assertEqual(
-                await database.DatabaseManager.add_telegram_account(2, '+100', 'new-key', bot_id=1),
-                (True, 'updated'))
-        self.assertEqual((acc.session_string, acc.account_status, acc.spam_status),
-                         ('new-key', 'active', 'unknown'))
-        self.assertIsNone(acc.spam_check_result)
-        self.assertIsNone(acc.last_health_check)
+                with patch.object(database, 'AsyncSessionLocal', return_value=FakeSession()):
+                    self.assertEqual(
+                        await database.DatabaseManager.add_telegram_account(
+                            2, '+100', 'new-key', bot_id=1), (True, 'updated'))
+                self.assertEqual((acc.id, acc.session_string, acc.account_status,
+                                  acc.spam_status), (13, 'new-key', 'active', 'unknown'))
+                self.assertTrue(acc.is_verified)
+                self.assertIsNone(acc.spam_check_result)
+                self.assertIsNone(acc.last_health_check)
+
+
+class PhoneLoginPathTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_phone_login_uses_configured_voice_proxy(self):
+        from handlers import account_management
+        client = SimpleNamespace(connect=AsyncMock(), send_code=AsyncMock(
+            return_value=SimpleNamespace(phone_code_hash='h')))
+        update = SimpleNamespace(message=SimpleNamespace(text='+100'),
+                                 effective_user=SimpleNamespace(id=5),
+                                 effective_chat=SimpleNamespace(id=5))
+        context = SimpleNamespace(user_data={}, bot_data={'bot_id': 1}, bot=object())
+        proxy = dict(scheme='socks5', hostname='warp', port=1080)
+        with patch.object(account_management, '_account_proxy_config', return_value=proxy), \
+             patch.object(account_management, 'Client', return_value=client) as create, \
+             patch.object(account_management, 'send_safe', new_callable=AsyncMock):
+            self.assertEqual(await account_management.handle_phone_number(update, context),
+                             account_management.AWAITING_CODE)
+        self.assertEqual(create.call_args.kwargs['proxy'], proxy)
+        self.assertEqual(context.user_data['phone_code_hash'], 'h')
+        client.connect.assert_awaited_once()
+
+    async def test_phone_relogin_reports_preserved_row_or_unmatched_new_row(self):
+        from handlers import account_management, menu_handlers
+        me = SimpleNamespace(phone_number='100', first_name='T', last_name=None,
+                             username=None)
+        client = SimpleNamespace(export_session_string=AsyncMock(return_value='fresh-key'),
+                                 get_me=AsyncMock(return_value=me), api_id=1, api_hash='hash')
+        update = SimpleNamespace(effective_user=SimpleNamespace(
+            id=5, username='admin', first_name='A', last_name=None),
+            effective_chat=SimpleNamespace(id=5))
+        context = SimpleNamespace(user_data={'phone': '+100'},
+                                  bot_data={'bot_id': 1}, bot=object())
+        for status, expected in (('updated', 'شناسهٔ ردیف قبلی حفظ'),
+                                 ('created', 'ردیف تازه ثبت شد')):
+            me.phone_number = '100' if status == 'updated' else '+100'
+            with self.subTest(status=status), \
+                 patch.object(account_management, '_cleanup_client',
+                              new_callable=AsyncMock, return_value=True) as close, \
+                 patch.object(account_management.session_ownership,
+                              'note_login_disconnect'), \
+                 patch.object(account_management.SecurityManager, 'encrypt_session',
+                              return_value='cipher'), \
+                 patch.object(account_management.DatabaseManager, 'create_or_update_user',
+                              new_callable=AsyncMock, return_value={'id': 5}), \
+                 patch.object(account_management.DatabaseManager, 'add_telegram_account',
+                              new_callable=AsyncMock, return_value=(True, status)) as save, \
+                 patch.object(account_management, 'send_safe',
+                              new_callable=AsyncMock) as sent, \
+                 patch.object(menu_handlers, 'account_management_handler',
+                              new_callable=AsyncMock, return_value=777):
+                self.assertEqual(await account_management.finalize_session(
+                    update, context, client), 777)
+                self.assertIn(expected, sent.call_args.args[2])
+                save.assert_awaited_once()
+                self.assertEqual(save.call_args.args[:3], (5, '+100', 'cipher'))
+                self.assertEqual(save.call_args.kwargs['bot_id'], 1)
+                self.assertEqual(close.await_count, 2)
 
 
 class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
@@ -500,6 +568,87 @@ class RecoveryActionTests(unittest.IsolatedAsyncioTestCase):
             await menu_handlers.account_action_callback(update, context)
             recover.assert_awaited_once_with(7, 1)
             self.assertIn('فعال برگشت', query.edit_message_text.call_args.args[0])
+
+    async def test_persisted_406_uses_relogin_guide_not_confirmation_or_probe(self):
+        from handlers import menu_handlers
+        row = dict(id=7, bot_id=1, account_status='inactive',
+                   spam_check_result=database.CLEANUP_REVIEW_406_HOLD)
+        query = SimpleNamespace(data='acc_recover_7', answer=AsyncMock(),
+                                edit_message_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123),
+                                 effective_chat=SimpleNamespace(id=123), callback_query=query)
+        context = SimpleNamespace(bot_data={'bot_id': 1})
+        with patch.object(menu_handlers.Config, 'ADMIN_IDS', [123]), \
+             patch.object(menu_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(menu_handlers, 'recover_one_account',
+                          new_callable=AsyncMock) as recover:
+            await menu_handlers.account_action_callback(update, context)
+            self.assertIn('ورود', query.edit_message_text.call_args.args[0])
+            kb = query.edit_message_text.call_args.kwargs['reply_markup']
+            self.assertEqual(kb.inline_keyboard[0][0].callback_data, 'acc_view_7')
+            query.data = 'acc_recoverdo_7'  # stale confirmation from an old card
+            await menu_handlers.account_action_callback(update, context)
+            recover.assert_not_awaited()
+
+    async def test_persisted_406_card_shows_only_relogin_and_back(self):
+        from handlers import menu_handlers
+        row = dict(id=13, bot_id=1, phone_number='+100', account_status='inactive',
+                   spam_check_result=database.CLEANUP_REVIEW_406_HOLD)
+        query = SimpleNamespace(data='acc_view_13', answer=AsyncMock(),
+                                edit_message_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123),
+                                 effective_chat=SimpleNamespace(id=123), callback_query=query)
+        context = SimpleNamespace(bot_data={'bot_id': 1}, user_data={'acc_list_page': 1})
+        with patch.object(menu_handlers.Config, 'ADMIN_IDS', [123]), \
+             patch.object(menu_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row):
+            await menu_handlers.account_view_callback(update, context)
+        markup = query.edit_message_text.call_args.kwargs['reply_markup']
+        actions = [b.callback_data for line in markup.inline_keyboard for b in line]
+        self.assertEqual(actions, ['acc_recover_13', 'acc_page_1'])
+        self.assertIn('شناسه دیتابیس: <code>13</code>',
+                      query.edit_message_text.call_args.args[0])
+
+    async def test_stale_card_buttons_cannot_connect_or_delete_held_406_row(self):
+        from handlers import menu_handlers
+        row = dict(id=7, bot_id=1, phone_number='+100', account_status='inactive',
+                   spam_check_result=database.CLEANUP_REVIEW_406_HOLD,
+                   session_string='cipher')
+        query = SimpleNamespace(data='', answer=AsyncMock(), edit_message_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123),
+                                 effective_chat=SimpleNamespace(id=123), callback_query=query)
+        context = SimpleNamespace(bot_data={'bot_id': 1})
+        with patch.object(menu_handlers.Config, 'ADMIN_IDS', [123]), \
+             patch.object(menu_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(menu_handlers.DatabaseManager, 'delete_account',
+                          new_callable=AsyncMock) as delete, \
+             patch.object(menu_handlers, 'TelegramAccountClient') as client:
+            for action in ('getcode', 'spam', 'refresh', 'del', 'delyes'):
+                with self.subTest(action=action):
+                    query.data = f'acc_{action}_7'
+                    await menu_handlers.account_action_callback(update, context)
+                    self.assertIn('سشن تازه', query.edit_message_text.call_args.args[0])
+            client.assert_not_called()
+            delete.assert_not_awaited()
+
+    async def test_old_edit_profile_button_cannot_use_persisted_406_key(self):
+        from handlers import profile_handlers
+        row = dict(id=7, bot_id=1, account_status='inactive',
+                   spam_check_result=database.CLEANUP_REVIEW_406_HOLD)
+        query = SimpleNamespace(data='acc_edit_7', answer=AsyncMock())
+        update = SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=123))
+        context = SimpleNamespace(bot_data={'bot_id': 1}, user_data={}, bot=object())
+        with patch.object(profile_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(profile_handlers, 'TelegramAccountClient') as client, \
+             patch.object(profile_handlers, 'send_safe', new_callable=AsyncMock) as sent:
+            result = await profile_handlers.edit_account_from_list(update, context)
+        self.assertEqual(result, profile_handlers.AWAITING_SETTINGS_ACTION)
+        self.assertIn('سشن تازه', sent.call_args.args[2])
+        self.assertNotIn('selected_acc_id', context.user_data)
+        client.assert_not_called()
 
     async def test_cross_bot_callback_never_reaches_probe(self):
         from handlers import menu_handlers

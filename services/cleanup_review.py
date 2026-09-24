@@ -31,10 +31,12 @@ MAX_SCAN_CANDIDATES = 100
 UNCERTAIN_CODES = frozenset({
     'changed_before_probe', 'changed_during_probe', 'not_found', 'not_inactive',
     'conflict_cooldown', 'shared', 'busy', 'duplicated_in_use',
-    'relogin_required', 'timeout', 'disconnect_unconfirmed', 'error', 'other',
+    'duplicate_key_relogin_required', 'relogin_required', 'timeout',
+    'disconnect_unconfirmed', 'error', 'other',
 })
-# A first 406 or unconfirmed disconnect may indicate a session is still held:
-# do not immediately connect the *next* key without operator investigation.
+# A genuine typed 406 invalidates the auth key; a free-text match or
+# unconfirmed disconnect might also hide concurrent ownership. In either
+# case, do not connect the *next* key before operator investigation.
 STOP_IMMEDIATELY = frozenset({'duplicated_in_use', 'disconnect_unconfirmed'})
 # Repeated identical failures commonly mean a shared network/credential/
 # ownership problem. Do not turn 25 accounts into 25 pointless attempts.
@@ -84,9 +86,10 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
 
     Missing/malformed ciphertext and key aliases are skipped. Both active
     AND historical inactive 406 rows are NEVER swept: a time delay alone
-    cannot resolve an auth-key collision. They require a separate, explicitly
-    confirmed one-account cooldown/ownership investigation. Expensive/error-
-    prone batches are refused entirely, not silently truncated.
+    cannot make a revoked key usable. Persisted cleanup-review 406 holds
+    require a NEW phone login; old ambiguous labels need an operator ownership
+    check before any single-account probe. Expensive/error-prone batches are
+    refused entirely, not silently truncated.
     """
     rows = await DatabaseManager.get_cleanup_scan_rows(MAX_SCAN_ROWS)
     if len(rows) > MAX_SCAN_ROWS:
@@ -113,9 +116,9 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
             shared += 1
             continue
         # Neither a newly held 406 nor an old collision becomes safe merely
-        # because 60 seconds elapsed. Do not bulk-retry this key, ever; only
-        # the separately confirmed ONE-account route may examine it after its
-        # minimum cooldown and an operator ownership check.
+        # because 60 seconds elapsed. Never bulk-retry either. A persisted
+        # cleanup-review hold must use a new phone login, not another probe;
+        # only ambiguous historical labels may be examined individually.
         marker = str(row['spam_check_result'] or '')
         if 'AUTH_KEY_DUPLICATED' in marker.upper():
             cooldown += 1

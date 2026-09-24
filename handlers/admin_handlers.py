@@ -15,8 +15,8 @@ import re
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from database import (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED,
-                      DatabaseManager)
+from database import (CLEANUP_REVIEW_406_HOLD, CONFIRMED_ACCOUNT_DELETED,
+                      CONFIRMED_SESSION_REVOKED, DatabaseManager)
 from services.account_recovery import recover_one_account, recovery_message
 from services.cleanup_review import (CleanupScanTooLarge, prepare_cleanup_scan,
                                      run_cleanup_scan)
@@ -730,6 +730,10 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         acc = await DatabaseManager.get_account_by_id(aid)
         if not acc or int(acc.get('bot_id') or 0) != bot_id:
             await display('❌ حساب مربوط به این ربات یافت نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (acc.get('account_status') == 'inactive' and
+                acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+            await display(recovery_message('duplicate_key_relogin_required'), back)
             return AWAITING_SETTINGS_ACTION
         if (acc.get('account_status') == 'inactive' and
                 acc.get('spam_check_result') in

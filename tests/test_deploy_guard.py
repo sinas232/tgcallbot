@@ -46,7 +46,7 @@ elif [[ "$1" == inspect ]]; then
     echo healthy
   fi
 elif [[ "$1" == compose && "$2" == exec && "${4:-}" == bot ]]; then
-  echo 'Bot checkout version: 2.3.19'
+  echo 'Bot checkout version: 2.3.20'
 fi
 '''
 FAKE_GIT = r'''#!/usr/bin/env bash
@@ -74,7 +74,7 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.project.mkdir()
         self.backups = self.root / 'safe-backups'
         (self.project / '.env').write_text('# placeholder only, no credentials\n')
-        (self.project / 'constants.py').write_text('BOT_VERSION = "2.3.19"\n')
+        (self.project / 'constants.py').write_text('BOT_VERSION = "2.3.20"\n')
         for filename in ('deploy-warp.sh', 'restart.sh', 'tools/validate_env_compat.py'):
             (self.project / filename).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / filename, self.project / filename)

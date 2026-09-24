@@ -32,9 +32,10 @@ CONFIRMED_ACCOUNT_DELETED = 'Verified Telegram account deleted: USER_DEACTIVATED
 # This does not mean the Telegram user was deleted; re-login can create a new
 # key. Historical free-text labels and generic 401 must never set this marker.
 CONFIRMED_SESSION_REVOKED = 'Verified Telegram session invalid: typed auth-key 401'
-# A 406 during an inactive-row cleanup review is NOT evidence of revocation.
-# Keep it out of all future automatic/batch scans until a deliberate single-
-# account investigation or fresh phone login resolves that specific key.
+# A typed Telegram AUTH_KEY_DUPLICATED (406) invalidates the auth key, but
+# does NOT prove the Telegram account is deleted. A free-text 406 match does
+# not prove even the key is invalid. Preserve the row, avoid probing this
+# specific key again, and allow a fresh phone-authorized login to replace it.
 CLEANUP_REVIEW_406_HOLD = 'AUTH_KEY_DUPLICATED: cleanup review; manual-only until ownership checked'
 Base = declarative_base()
 
@@ -1181,6 +1182,7 @@ class DatabaseManager:
                 if acc:
                     acc.session_string = session_str
                     acc.account_status = 'active'
+                    acc.is_verified = True
                     # A verified phone login/import replaces the prior key.
                     # Never leave an old 'dead' flag on the new active session:
                     # the dead-account menu also looks at spam_status.
@@ -1386,7 +1388,7 @@ class DatabaseManager:
                     TelegramAccount.session_string == encrypted_session,
                 ).values(
                     spam_status='cooldown',
-                    spam_check_result='AUTH_KEY_DUPLICATED: check shared key; validity unknown',
+                    spam_check_result='AUTH_KEY_DUPLICATED: quarantined; typed RPC revokes key, text match ambiguous',
                     last_health_check=datetime.utcnow(),
                 )
             )

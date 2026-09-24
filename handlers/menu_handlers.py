@@ -8,7 +8,7 @@ import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
-from database import DatabaseManager
+from database import CLEANUP_REVIEW_406_HOLD, DatabaseManager
 from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS, AWAITING_SETTINGS_ACTION
 from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
@@ -330,7 +330,10 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"🗓 افزوده شده: {html.escape(str(created))}"
     )
 
-    rows = [
+    held_406 = raw_status == 'inactive' and acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD
+    # A held key cannot fetch codes, refresh its profile or be checked for
+    # spam. Do not offer a generic delete on a merely quarantined account.
+    rows = [] if held_406 else [
         [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data=f"acc_edit_{acc['id']}")],
         [
             InlineKeyboardButton("📩 دریافت کد ورود", callback_data=f"acc_getcode_{acc['id']}"),
@@ -341,7 +344,10 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("🗑 حذف اکانت", callback_data=f"acc_del_{acc['id']}")
         ],
     ]
-    if raw_status == 'inactive' or (raw_status == 'active' and is_conflict):
+    if held_406:
+        rows.append([InlineKeyboardButton(
+            "🔑 راهنمای ورود دوباره (بدون پروب)", callback_data=f"acc_recover_{acc['id']}")])
+    elif raw_status == 'inactive' or (raw_status == 'active' and is_conflict):
         rows.append([InlineKeyboardButton(
             "🧪 بررسی امن فقط همین سشنِ درگیر", callback_data=f"acc_recover_{acc['id']}")])
     rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")])
@@ -393,6 +399,15 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
         if acc.get('account_status') != 'inactive' and not is_conflict:
             await query.answer("این اکانت نه غیرفعال است و نه در قرنطینهٔ ۴۰۶.", show_alert=True)
             return
+        if (acc.get('account_status') == 'inactive' and
+                acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+            await query.answer()
+            await query.edit_message_text(
+                recovery_message('duplicate_key_relogin_required'),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 کارت اکانت", callback_data=f"acc_view_{aid}")],
+                ]))
+            return
         if action == "recover":
             await query.answer()
             await query.edit_message_text(
@@ -423,8 +438,18 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
             ]))
         return
 
+    if (acc.get('account_status') == 'inactive' and
+            acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD and
+            action in ('getcode', 'spam', 'refresh', 'del', 'delyes')):
+        await query.answer()
+        await query.edit_message_text(
+            recovery_message('duplicate_key_relogin_required'),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔙 کارت اکانت', callback_data=f'acc_view_{aid}')],
+            ]))
+        return
     if is_conflict and action in ("getcode", "spam", "refresh"):
-        await query.answer("سشن در قرنطینهٔ ۴۰۶ است؛ فقط از بررسی ایمن تک‌اکانتی یا ورود مجدد استفاده کنید.",
+        await query.answer("سشن در قرنطینهٔ ۴۰۶ است؛ پیش از اتصال دوباره شاهد تایپ‌شده را بررسی یا با شماره وارد شوید.",
                            show_alert=True)
         return
     client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)

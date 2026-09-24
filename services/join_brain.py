@@ -64,7 +64,7 @@ def classify_message(msg: str) -> str:
     """
     text = (msg or "").upper()
     if is_auth_key_duplicated(text):
-        return OUTCOME_DEAD  # skip this order slot; 406 does NOT persistently disable the key
+        return OUTCOME_DEAD  # skip this order slot; text alone cannot authorize DB deletion
     if any(k in text for k in (
         "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
     )):

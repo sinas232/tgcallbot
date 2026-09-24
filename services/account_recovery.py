@@ -1,8 +1,10 @@
 """Guarded, *single-account* recovery of historical inactive/dead flags.
 
-The old executor marked AUTH_KEY_DUPLICATED (406) as dead even though 406
-alone does not prove the key was revoked. A deployment cannot safely turn
-those DB flags back to active without asking Telegram. This helper is called
+The old executor marked all AUTH_KEY_DUPLICATED (406) errors as dead. A
+typed Telegram 406 invalidates the auth key, NOT the user's account; an old
+DB label or a free-text match alone proves neither. A deployment cannot turn
+those DB flags back to active without a fresh phone login or a safe probe
+of an unheld, historically labeled key. This helper is called
 INSIDE the running bot so its session ownership guard applies. It never
 opens a second process, never bulk-probes keys, and never promotes a row on
 406, 401, timeout, or uncertain disconnect.
@@ -18,7 +20,7 @@ from datetime import datetime
 from typing import Tuple
 
 from config import Config
-from database import DatabaseManager
+from database import CLEANUP_REVIEW_406_HOLD, DatabaseManager
 from services.session_ownership import SessionInUseError
 from telegram_client import TelegramAccountClient
 
@@ -48,6 +50,12 @@ async def recover_one_account(account_id: int, bot_id: int, *,
                    and str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
     if not (is_inactive or is_conflict):
         return False, 'not_inactive'
+    # A prior, CAS-persisted cleanup 406 must never be probed again, even
+    # through the single-account menu or after its old one-minute cooldown.
+    # Telegram explicitly invalidates the authorization after a genuine
+    # AUTH_KEY_DUPLICATED. Preserve the DB row for a NEW phone login instead.
+    if is_inactive and acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD:
+        return False, 'duplicate_key_relogin_required'
     conflict_at = acc.get('last_health_check')
     # Historical versions marked 406 collisions *inactive*. Such rows must
     # respect the very same cooldown as currently quarantined active rows.
@@ -101,11 +109,13 @@ async def recover_one_account(account_id: int, bot_id: int, *,
                     int(account_id), int(bot_id), acc['session_string'])
             return (False, 'account_deleted') if changed else (False, 'changed_during_probe')
         if reason == 'duplicated_in_use' and is_inactive:
-            # The Telegram 406 is NOT proof this key is revoked or its user
-            # deleted. Persist a key-specific, CAS-protected hold so a second
-            # batch click (even after a bot restart) cannot probe the same
-            # contested session again. This only happens after disconnect was
-            # confirmed by fetch_me_status; manual review stays possible.
+            # A genuine typed AUTH_KEY_DUPLICATED invalidates the auth key,
+            # not the Telegram account. Persist a key-specific hold rather
+            # than automatically deleting any row; the observed RPC category
+            # may also come from a free-text exception, so it is not itself
+            # sufficient to qualify a row for destructive bulk deletion.
+            # Do not probe this key again after the confirmed disconnect;
+            # preserve the row until a fresh, phone-authorized login.
             held = await DatabaseManager.hold_inactive_cleanup_406_after_probe(
                 int(account_id), int(bot_id), acc['session_string'],
                 expected_marker=acc.get('spam_check_result'),
@@ -134,7 +144,8 @@ _RECOVERY_MESSAGES = {
     'recovered': '✅ اتصال و قطع سشن تأیید شد؛ همین اکانت به وضعیت فعال برگشت.',
     'conflict_cleared': '✅ سشن همین اکانت با بررسی زنده و قطع تأییدشده معتبر بود؛ قرنطینهٔ ۴۰۶ برداشته شد. حضور در تماس هنوز جداگانه باید سنجیده شود.',
     'conflict_cooldown': '⏳ مهلت ایمنی پس از ۴۰۶ تمام نشده یا زمان رخداد نامشخص است؛ هیچ اتصال جدیدی باز نشد.',
-    'duplicated_in_use': '⚠️ خطای ۴۰۶: تداخل کلید سشن. کلید سالم یا باطل بودنش معلوم نیست؛ دوباره‌پروب نکنید. کپی نمایندگی/برنامهٔ دیگر را بررسی کنید.',
+    'duplicated_in_use': '⚠️ تداخل ۴۰۶: پاسخ تایپ‌شدهٔ AuthKeyDuplicated کلید احراز هویت را باطل می‌کند، نه حساب تلگرام را. این ردیف حفظ شده؛ آن را دوباره پروب نکنید، پس از بررسی مالکیت با همان شماره یک سشن تازه بسازید.',
+    'duplicate_key_relogin_required': '🔑 این کلید قبلاً با ۴۰۶ قرنطینه شده است؛ اتصال دوباره به آن باز نشد. از «👥 مدیریت اکانت‌های ربات ← ➕ افزودن اکانت (شماره)» با همان شمارهٔ ردیف، کد ورود و در صورت نیاز رمز دوم، سشن تازه بسازید؛ اگر شمارهٔ ذخیره‌شده دقیقاً یکسان باشد، ردیف قبلی به‌روز می‌شود. سشن قدیمی را دوباره ایمپورت نکنید.',
     'relogin_required': '⚠️ احراز هویت تلگرام ناموفق بود، اما دلیل دقیقِ قابل‌اتکا برای حذف نداریم؛ با شماره دوباره وارد شوید، سشن فعلی خودکار پاک نشد.',
     'session_revoked': '💀 تلگرام ابطال/انقضای همین سشن را صریحاً اعلام کرد؛ حساب تلگرام ممکن است هنوز وجود داشته باشد. پس از پیش‌نمایش و تأیید، فقط این ردیفِ تأییدشده قابل حذف است.',
     'account_deleted': '☠️ تلگرام حذف‌شدن حساب را صریحاً اعلام کرد. فقط این حساب در منوی سوپرادمین برای حذف قابل‌انتخاب است؛ سشن‌های دیگر دست‌نخورده‌اند.',

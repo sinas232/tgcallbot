@@ -16,7 +16,7 @@ from database import DatabaseManager
 from security import SecurityManager
 from constants import *
 from helpers.message_utils import send_safe
-from telegram_client import TelegramAccountClient
+from telegram_client import TelegramAccountClient, _account_proxy_config
 from services.session_client import close_pyrogram_client
 from services.session_ownership import session_ownership, SessionInUseError
 
@@ -99,7 +99,13 @@ async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TY
 
 # --- افزودن اکانت (شماره) ---
 async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await send_safe(context.bot, update.effective_chat.id, "📱 <b>شماره موبایل (مثال: <code>+98...</code>):</b>", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True), parse_mode=ParseMode.HTML)
+    await send_safe(context.bot, update.effective_chat.id,
+                    "📱 <b>شماره موبایل (مثال: <code>+98...</code>):</b>\n"
+                    "برای احیای اکانت ۴۰۶، همان شمارهٔ ثبت‌شده در کارت آن را "
+                    "وارد کنید؛ شمارهٔ متفاوت می‌تواند ردیف جدیدی بسازد. "
+                    "سشن قدیمی را ایمپورت نکنید.",
+                    reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+                    parse_mode=ParseMode.HTML)
     return AWAITING_PHONE_NUMBER
 
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -121,7 +127,11 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         api_id = (reseller and reseller.get('api_id')) or Config.TELEGRAM_API_ID
         api_hash = (reseller and reseller.get('api_hash')) or Config.TELEGRAM_API_HASH
 
-    client = Client(name=f"temp_{update.effective_user.id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    # Use the same MTProto route as recovery/voice; a direct path may fail on
+    # proxy-only hosts even though existing accounts can connect successfully.
+    proxy = _account_proxy_config()
+    client = Client(name=f"temp_{update.effective_user.id}", api_id=api_id,
+                    api_hash=api_hash, in_memory=True, **({'proxy': proxy} if proxy else {}))
     context.user_data['temp_client'] = client
     
     try:
@@ -282,7 +292,8 @@ async def finalize_session(update, context, client):
         enc_sess = SecurityManager.encrypt_session(sess)
         if not enc_sess:
             raise ValueError("رمزنگاری سشن ناموفق بود؛ اکانت ذخیره نشد")
-        phone = f"+{me.phone_number}" if me.phone_number else context.user_data.get('phone', 'Unknown')
+        phone = ('+' + str(me.phone_number).strip().lstrip('+') if me.phone_number
+                 else context.user_data.get('phone', 'Unknown'))
         bot_id = context.bot_data.get('bot_id', 1)
         tg_user = update.effective_user
         db_user = await DatabaseManager.create_or_update_user({
@@ -305,8 +316,16 @@ async def finalize_session(update, context, client):
         )
         safe_name = html.escape(me.first_name or "Unknown")
         if success:
-            msg = f"✅ **اکانت {safe_name} ({phone}) اضافه شد.**"
-            await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
+            if status == 'updated':
+                msg = (f"✅ سشن تازهٔ <b>{safe_name} ({html.escape(phone)})</b> جایگزین شد؛ "
+                       "شناسهٔ ردیف قبلی حفظ و وضعیت آن فعال شد.")
+            else:
+                msg = (f"✅ <b>{safe_name} ({html.escape(phone)})</b> در ردیف تازه ثبت شد. "
+                       "اگر قصد احیای ردیف ۴۰۶ را داشتید، شماره‌ها را بررسی کنید؛ "
+                       "هیچ ردیف قبلی خودکار حذف نشد.")
+            await send_safe(context.bot, update.effective_chat.id, msg,
+                            reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True),
+                            parse_mode=ParseMode.HTML)
         else:
             await send_safe(context.bot, update.effective_chat.id, "❌ خطا در ذخیره.", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True))
     except Exception as e:

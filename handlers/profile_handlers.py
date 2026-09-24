@@ -8,7 +8,7 @@ import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
-from database import DatabaseManager
+from database import CLEANUP_REVIEW_406_HOLD, DatabaseManager
 from telegram_client import TelegramAccountClient
 from constants import *
 from helpers.message_utils import send_safe
@@ -46,6 +46,12 @@ async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_T
     acc = await DatabaseManager.get_account_by_id(aid)
     if not acc or acc.get('bot_id', 1) != bot_id:
         await send_safe(context.bot, update.effective_chat.id, "❌ اکانت یافت نشد یا متعلق به این ربات نیست.")
+        return AWAITING_SETTINGS_ACTION
+    if (acc.get('account_status') == 'inactive' and
+            acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+        from services.account_recovery import recovery_message
+        await send_safe(context.bot, update.effective_chat.id,
+                        recovery_message('duplicate_key_relogin_required'))
         return AWAITING_SETTINGS_ACTION
 
     context.user_data['selected_acc_id'] = aid
