@@ -158,7 +158,8 @@ _DELETED_CLEANUP_CALLBACK_RE = (r"^deleted_cleanup_(?:menu|preview(?:_all|_[1-9]
                                 r"|scan_(?:start|status|stop|confirm_[0-9a-f]{16})"
                                 r"|cancel|list_[1-9][0-9]{0,3}|check_[1-9][0-9]{0,9}"
                                 r"|probe_[0-9a-f]{16}|confirm_[0-9a-f]{16}"
-                                r"|retire406(?:_[1-9][0-9]{0,9}|_confirm_[0-9a-f]{16})?)$")
+                                r"|retire406(?:_[1-9][0-9]{0,9}|_confirm_[0-9a-f]{16})?"
+                                r"|retire22(?:_confirm_[0-9a-f]{16})?)$")
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
 FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)

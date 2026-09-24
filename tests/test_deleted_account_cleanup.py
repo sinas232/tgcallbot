@@ -598,7 +598,8 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
         self.verified = patcher.start()
         self.addCleanup(patcher.stop)
         for name, default, attr in (('get_held_cleanup_406_accounts', [], 'held'),
-                                    ('cleanup_406_incident_blocked', False, 'incident')):
+                                    ('cleanup_406_incident_blocked', False, 'incident'),
+                                    ('count_incident_inactive_accounts', 0, 'unknown_count')):
             p = patch.object(admin_handlers.DatabaseManager, name,
                              new_callable=AsyncMock, return_value=default)
             setattr(self, attr, p.start())
@@ -637,7 +638,9 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(markup)
             callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
             self.assertIn('deleted_cleanup_preview_all', callbacks)
-            self.assertIn('deleted_cleanup_retire406', callbacks)
+            # A zero-count 406 button cannot remove an unknown inactive row.
+            self.assertNotIn('deleted_cleanup_retire406', callbacks)
+            self.assertNotIn('deleted_cleanup_retire22', callbacks)
             self.assertIn('deleted_cleanup_scan_start', callbacks)
             self.assertIn('deleted_cleanup_list_1', callbacks)
             self.assertIn('deleted_cleanup_menu', callbacks)
@@ -1545,6 +1548,8 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             for data in ('deleted_cleanup_preview', 'deleted_cleanup_preview_all',
                          'deleted_cleanup_retire406', 'deleted_cleanup_retire406_13',
                          'deleted_cleanup_retire406_confirm_0123456789abcdef',
+                         'deleted_cleanup_retire22',
+                         'deleted_cleanup_retire22_confirm_0123456789abcdef',
                          'deleted_cleanup_scan_start', 'deleted_cleanup_scan_status',
                          'deleted_cleanup_scan_confirm_0123456789abcdef',
                          'deleted_cleanup_list_1', 'deleted_cleanup_check_7',
@@ -1608,6 +1613,8 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                              'deleted_cleanup_preview_7', 'deleted_cleanup_retire406',
                              'deleted_cleanup_retire406_13',
                              'deleted_cleanup_retire406_confirm_0123456789abcdef',
+                             'deleted_cleanup_retire22',
+                             'deleted_cleanup_retire22_confirm_0123456789abcdef',
                              'deleted_cleanup_scan_start',
                              'deleted_cleanup_scan_status', 'deleted_cleanup_scan_stop',
                              'deleted_cleanup_scan_confirm_0123456789abcdef',

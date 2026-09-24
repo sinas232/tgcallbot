@@ -40,6 +40,9 @@ CLEANUP_REVIEW_406_HOLD = 'AUTH_KEY_DUPLICATED: cleanup review; manual-only unti
 # An independent incident latch must survive deletion or phone re-login of the
 # held rows: neither action establishes why the other auth keys saw 406.
 CLEANUP_REVIEW_406_INCIDENT_SETTING = 'cleanup_review_406_incident'
+# Opt-in incident cleanup, scoped to the 22 *unverified* inactive rows reported
+# after retiring IDs 13/16/17. A changed count needs a fresh owner decision.
+INCIDENT_INACTIVE_RETIRE_COUNT = 22
 Base = declarative_base()
 
 
@@ -66,6 +69,33 @@ async def _global_maintenance_enabled(session: AsyncSession) -> bool:
     res = await session.execute(select(BotSetting.value).where(
         BotSetting.bot_id == 1, BotSetting.key == 'maintenance_mode'))
     return res.scalar_one_or_none() == '1'
+
+
+def _incident_inactive_condition(bot_id: int):
+    """The scan's unknown inactive cohort, excluding verified or held rows.
+
+    `inactive` is NOT proof of an invalid Telegram session or deleted account.
+    The owner explicitly chose to discard exactly this cohort without MTProto.
+    """
+    return (
+        (TelegramAccount.bot_id == int(bot_id)) &
+        (TelegramAccount.account_status == 'inactive') &
+        or_(TelegramAccount.spam_check_result.is_(None),
+            ~TelegramAccount.spam_check_result.in_((
+                CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED,
+                CLEANUP_REVIEW_406_HOLD,
+            )))
+    )
+
+
+def _incident_inactive_fingerprint(account: 'TelegramAccount') -> str:
+    """Hash the FULL stored account snapshot; never expose raw session/phone."""
+    values = []
+    for column in TelegramAccount.__table__.columns:
+        value = getattr(account, column.name)
+        values.append(value.isoformat() if isinstance(value, datetime) else value)
+    packed = json.dumps(values, ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha256(packed.encode('utf-8')).hexdigest()
 
 
 async def _latch_cleanup_406_incident(session: AsyncSession, bot_id: int) -> None:
@@ -1615,6 +1645,28 @@ class DatabaseManager:
                     for acc in result.scalars().all()]
 
     @staticmethod
+    async def count_incident_inactive_accounts(bot_id: int) -> int:
+        """Read-only count of the unknown inactive cohort, no MTProto."""
+        if int(bot_id) != 1:
+            return 0  # Owner approved only the main-bot incident, not resellers.
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(func.count(TelegramAccount.id)).where(
+                _incident_inactive_condition(bot_id)))
+            return int(result.scalar() or 0)
+
+    @staticmethod
+    async def get_incident_inactive_snapshot(bot_id: int) -> list[dict]:
+        """Only IDs and row digests; do not retain sessions in PTB user_data."""
+        if int(bot_id) != 1:
+            return []
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(TelegramAccount).where(
+                _incident_inactive_condition(bot_id)
+            ).order_by(TelegramAccount.id).limit(INCIDENT_INACTIVE_RETIRE_COUNT + 1))
+            return [{'id': row.id, 'fingerprint': _incident_inactive_fingerprint(row)}
+                    for row in result.scalars().all()]
+
+    @staticmethod
     async def get_held_cleanup_406_accounts(bot_id: int, *,
                                             account_id: int | None = None) -> list[dict]:
         """Only exact persisted cleanup-review holds, scoped to one bot.
@@ -1799,6 +1851,111 @@ class DatabaseManager:
                 for account in rows:
                     await db_session.delete(account)
             return len(rows), 'deleted'
+
+    @staticmethod
+    async def retire_incident_inactive_accounts(
+        bot_id: int, expected_fingerprints: dict[int, str],
+    ) -> tuple[int, str]:
+        """Discard EXACTLY the owner's 22 unknown stored keys, no Telegram IO.
+
+        Not a claim of account deletion or authorization validity. All 22
+        complete row snapshots must match a short-lived superadmin preview.
+        On PostgreSQL a short table lock also blocks phantom inserts/edits
+        between snapshot recheck and commit. Historical financial/voice/order
+        rows remain; delayed leaves are cancelled; incident latch stays ON.
+        """
+        if int(bot_id) != 1 or len(expected_fingerprints) != INCIDENT_INACTIVE_RETIRE_COUNT:
+            return 0, 'changed'
+        if (any(type(aid) is not int or aid <= 0 or
+                not isinstance(digest, str) or len(digest) != 64
+                for aid, digest in expected_fingerprints.items())):
+            return 0, 'changed'
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                await _lock_order_admission(db_session)
+                setting = (await db_session.execute(select(BotSetting).where(
+                    BotSetting.bot_id == 1,
+                    BotSetting.key == 'maintenance_mode',
+                ).with_for_update())).scalar_one_or_none()
+                if setting is None or setting.value != '1':
+                    return 0, 'maintenance'
+                # Unlike a missing marker, a missing durable latch must NEVER
+                # be treated as permission to dispose of the unknown cohort.
+                latch = (await db_session.execute(select(BotSetting).where(
+                    BotSetting.bot_id == 1,
+                    BotSetting.key == CLEANUP_REVIEW_406_INCIDENT_SETTING,
+                ).with_for_update())).scalar_one_or_none()
+                if latch is None or latch.value != '1':
+                    return 0, 'incident'
+                held = (await db_session.execute(select(TelegramAccount.id).where(
+                    TelegramAccount.bot_id == 1,
+                    TelegramAccount.spam_check_result == CLEANUP_REVIEW_406_HOLD,
+                ).limit(1))).first()
+                if held:
+                    return 0, 'incident'
+                if db_session.get_bind().dialect.name == 'postgresql':
+                    # Lock writers before the quiet-work preflight: a fresh
+                    # order/payment otherwise could appear right after SELECT.
+                    # These are short transaction-scoped locks, no network IO.
+                    await db_session.execute(text(
+                        'LOCK TABLE orders, payment_transactions '
+                        'IN SHARE ROW EXCLUSIVE MODE'))
+                now = datetime.utcnow()
+                deadline = now + timedelta(minutes=30)
+                busy = (await db_session.execute(select(Order.id).where(or_(
+                    Order.status.in_(('running', 'pending')),
+                    (Order.status == 'scheduled') & or_(
+                        Order.scheduled_for.is_(None),
+                        Order.scheduled_for <= deadline),
+                )).limit(1))).first()
+                if busy:
+                    return 0, 'busy'
+                payments = (await db_session.execute(select(PaymentTransaction.id).where(
+                    PaymentTransaction.status == 'pending',
+                    or_(PaymentTransaction.created_at.is_(None),
+                        PaymentTransaction.created_at >= now - timedelta(minutes=30)),
+                ).limit(1))).first()
+                if payments:
+                    return 0, 'payments'
+
+                if db_session.get_bind().dialect.name == 'postgresql':
+                    # Row locks alone cannot protect against a newly inserted
+                    # qualifying row after a SELECT (phantom). Keep this lock
+                    # ONLY for the short, network-free read/delete transaction.
+                    await db_session.execute(text(
+                        'LOCK TABLE telegram_accounts, pending_group_leaves '
+                        'IN SHARE ROW EXCLUSIVE MODE'))
+                # Include newly written 406 holds in the protected snapshot.
+                held = (await db_session.execute(select(TelegramAccount.id).where(
+                    TelegramAccount.bot_id == 1,
+                    TelegramAccount.spam_check_result == CLEANUP_REVIEW_406_HOLD,
+                ).limit(1))).first()
+                if held:
+                    return 0, 'incident'
+                rows = (await db_session.execute(select(TelegramAccount).where(
+                    _incident_inactive_condition(bot_id)
+                ).order_by(TelegramAccount.id).limit(
+                    INCIDENT_INACTIVE_RETIRE_COUNT + 1
+                ).with_for_update())).scalars().all()
+                if (len(rows) != INCIDENT_INACTIVE_RETIRE_COUNT or
+                        {row.id for row in rows} != set(expected_fingerprints)):
+                    return 0, 'changed'
+                for row in rows:
+                    if not hmac.compare_digest(
+                            _incident_inactive_fingerprint(row),
+                            expected_fingerprints[row.id]):
+                        return 0, 'changed'
+
+                # No MTProto action and no update to Telegram itself.
+                await db_session.execute(update(PendingGroupLeave).where(
+                    PendingGroupLeave.bot_id == 1,
+                    PendingGroupLeave.account_id.in_(list(expected_fingerprints)),
+                    PendingGroupLeave.status.in_(('pending', 'processing')),
+                ).values(status='cancelled', processed_at=now,
+                         last_error='superadmin discarded unknown inactive stored key'))
+                for row in rows:
+                    await db_session.delete(row)
+            return INCIDENT_INACTIVE_RETIRE_COUNT, 'deleted'
 
     @staticmethod
     async def delete_held_cleanup_406_accounts(
@@ -2300,7 +2457,10 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
         """نهایی کردن یک خروج (done / failed / cancelled) با زمان پردازش."""
         async with AsyncSessionLocal() as db_session:
             await db_session.execute(
-                update(PendingGroupLeave).where(PendingGroupLeave.id == row_id).values(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.id == row_id,
+                    PendingGroupLeave.status != 'cancelled',
+                ).values(
                     status=status, processed_at=datetime.utcnow(),
                     last_error=(str(error)[:400] if error else None),
                 )
@@ -2312,10 +2472,13 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
         """برگرداندن رکورد به صف (تلاش مجدد با تأخیر) پس از خطای موقت."""
         async with AsyncSessionLocal() as db_session:
             row = await db_session.get(PendingGroupLeave, row_id)
-            if not row:
+            if not row or row.status == 'cancelled':
                 return
             await db_session.execute(
-                update(PendingGroupLeave).where(PendingGroupLeave.id == row_id).values(
+                update(PendingGroupLeave).where(
+                    PendingGroupLeave.id == row_id,
+                    PendingGroupLeave.status != 'cancelled',
+                ).values(
                     status="pending", attempts=int(row.attempts or 0) + 1,
                     not_before=not_before,
                     last_error=(str(error)[:400] if error else None),

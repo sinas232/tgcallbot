@@ -21,7 +21,7 @@ case "${1:-deploy}" in
 esac
 
 if [[ "${DEPLOY_CONFIRMED:-}" != "yes" ]]; then
-  echo "Deployment is opt-in. Read docs/deploy-final.fa.md, enable global maintenance, check order 846, then use DEPLOY_CONFIRMED=yes bash deploy-warp.sh" >&2
+  echo "Deployment is opt-in. Enable global maintenance from the admin UI; check active/soon-due orders and recent pending payments; then use DEPLOY_CONFIRMED=yes bash deploy-warp.sh" >&2
   exit 2
 fi
 if [[ ! -f .env ]]; then
@@ -55,8 +55,8 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 tools/validate_env_compat.p
   echo "Refusing deploy: environment preflight did not pass. See docs/env-compatibility.fa.md." >&2
   exit 2
 fi
-if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.22"$' constants.py; then
-  echo "Wrong source tree: expected the v2.3.22 source tree. Do not deploy an older checkout." >&2
+if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.23"$' constants.py; then
+  echo "Wrong source tree: expected the v2.3.23 source tree. Do not deploy an older checkout." >&2
   exit 2
 fi
 if [[ -z "$(docker compose ps --status running --quiet db)" ]]; then
@@ -166,6 +166,6 @@ if [[ "$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null
   exit 1
 fi
 # The checkout version is one additional check, NOT a proof of Telegram health.
-docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.22", BOT_VERSION; print("Bot checkout version:", BOT_VERSION)'
+docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.23", BOT_VERSION; print("Bot checkout version:", BOT_VERSION)'
 docker compose ps
 echo "Bot process was restarted with the updated checkout; session-key validity and Telegram WebRTC/UDP presence are NOT proved. Keep maintenance enabled; do NOT probe other old keys during the unresolved 406 incident."
