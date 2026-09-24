@@ -56,6 +56,17 @@ async def recover_one_account(account_id: int, bot_id: int, *,
     # AUTH_KEY_DUPLICATED. Preserve the DB row for a NEW phone login instead.
     if is_inactive and acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD:
         return False, 'duplicate_key_relogin_required'
+    # Removing the held rows must not turn the per-account picker into a way
+    # to probe the 22 unknown keys. Never infer safety from a cleared menu.
+    try:
+        if await DatabaseManager.cleanup_406_incident_blocked(bot_id):
+            return False, 'incident_hold'
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning('Single-account probe paused (incident DB check): %s',
+                       type(exc).__name__)
+        return False, 'error'  # fail closed, not a Telegram verdict
     conflict_at = acc.get('last_health_check')
     # Historical versions marked 406 collisions *inactive*. Such rows must
     # respect the very same cooldown as currently quarantined active rows.
@@ -145,7 +156,8 @@ _RECOVERY_MESSAGES = {
     'conflict_cleared': '✅ سشن همین اکانت با بررسی زنده و قطع تأییدشده معتبر بود؛ قرنطینهٔ ۴۰۶ برداشته شد. حضور در تماس هنوز جداگانه باید سنجیده شود.',
     'conflict_cooldown': '⏳ مهلت ایمنی پس از ۴۰۶ تمام نشده یا زمان رخداد نامشخص است؛ هیچ اتصال جدیدی باز نشد.',
     'duplicated_in_use': '⚠️ تداخل ۴۰۶: پاسخ تایپ‌شدهٔ AuthKeyDuplicated کلید احراز هویت را باطل می‌کند، نه حساب تلگرام را. این ردیف حفظ شده؛ آن را دوباره پروب نکنید، پس از بررسی مالکیت با همان شماره یک سشن تازه بسازید.',
-    'duplicate_key_relogin_required': '🔑 این کلید قبلاً با ۴۰۶ قرنطینه شده است؛ اتصال دوباره به آن باز نشد. از «👥 مدیریت اکانت‌های ربات ← ➕ افزودن اکانت (شماره)» با همان شمارهٔ ردیف، کد ورود و در صورت نیاز رمز دوم، سشن تازه بسازید؛ اگر شمارهٔ ذخیره‌شده دقیقاً یکسان باشد، ردیف قبلی به‌روز می‌شود. سشن قدیمی را دوباره ایمپورت نکنید.',
+    'duplicate_key_relogin_required': '🔑 این کلید قبلاً با ۴۰۶ قرنطینه شده است؛ اتصال دوباره به آن باز نشد. اگر نمی‌خواهید نگهش دارید، از منوی سوپرادمین «حذف سشن‌های ۴۰۶ِ قرنطینه‌شده» را با پیش‌نمایش انتخاب کنید؛ این حذف خود حساب تلگرام نیست. راه حفظ حساب، ساخت سشن تازه با ورود همان شماره/OTP در ربات است. سشن قدیمی را دوباره ایمپورت نکنید.',
+    'incident_hold': '⛔️ پس از ۴۰۶، بررسی کلیدهای قدیمی این ربات موقتاً قفل است، حتی اگر ردیف‌های ۴۰۶ را از DB حذف کرده باشید. بدون تعیین منشأ تداخل، این کلید را آزمایش نکنید؛ هیچ اتصال یا تغییری انجام نشد.',
     'relogin_required': '⚠️ احراز هویت تلگرام ناموفق بود، اما دلیل دقیقِ قابل‌اتکا برای حذف نداریم؛ با شماره دوباره وارد شوید، سشن فعلی خودکار پاک نشد.',
     'session_revoked': '💀 تلگرام ابطال/انقضای همین سشن را صریحاً اعلام کرد؛ حساب تلگرام ممکن است هنوز وجود داشته باشد. پس از پیش‌نمایش و تأیید، فقط این ردیفِ تأییدشده قابل حذف است.',
     'account_deleted': '☠️ تلگرام حذف‌شدن حساب را صریحاً اعلام کرد. فقط این حساب در منوی سوپرادمین برای حذف قابل‌انتخاب است؛ سشن‌های دیگر دست‌نخورده‌اند.',

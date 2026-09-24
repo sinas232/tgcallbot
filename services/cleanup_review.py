@@ -33,12 +33,12 @@ UNCERTAIN_CODES = frozenset({
     'changed_before_probe', 'changed_during_probe', 'not_found', 'not_inactive',
     'conflict_cooldown', 'shared', 'busy', 'duplicated_in_use',
     'duplicate_key_relogin_required', 'relogin_required', 'timeout',
-    'disconnect_unconfirmed', 'error', 'other',
+    'disconnect_unconfirmed', 'incident_hold', 'error', 'other',
 })
 # A genuine typed 406 invalidates the auth key; a free-text match or
 # unconfirmed disconnect might also hide concurrent ownership. In either
 # case, do not connect the *next* key before operator investigation.
-STOP_IMMEDIATELY = frozenset({'duplicated_in_use', 'disconnect_unconfirmed'})
+STOP_IMMEDIATELY = frozenset({'duplicated_in_use', 'disconnect_unconfirmed', 'incident_hold'})
 # Repeated identical failures commonly mean a shared network/credential/
 # ownership problem. Do not turn 25 accounts into 25 pointless attempts.
 STOP_AFTER_THREE = frozenset({'error', 'timeout', 'relogin_required', 'busy', 'shared'})
@@ -55,6 +55,7 @@ class CleanupScanPlan:
     # Do not keep marching through the next 22 keys by clicking "start" again.
     # Only scoped IDs are exposed to the superadmin; never session/phone data.
     pending_406_ids: tuple[int, ...] = ()
+    incident_blocked: bool = False  # durable BotSetting survives deletion/re-login
 
 
 class CleanupScanTooLarge(RuntimeError):
@@ -135,8 +136,11 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
             continue
         candidates.append((int(row['id']), hashlib.sha256(
             row['session_string'].encode('utf-8')).hexdigest()))
+    # A deleted/phone-replaced held row must not quietly unlock the other old
+    # keys. Strict DB read; a failed setting query aborts planning, not fail-open.
+    incident_blocked = await DatabaseManager.cleanup_406_incident_blocked(bot_id)
     return CleanupScanPlan(tuple(candidates), len(target), shared, unreadable,
-                           cooldown, pending_406_ids)
+                           cooldown, pending_406_ids, incident_blocked)
 
 
 @dataclass(frozen=True)
@@ -176,9 +180,9 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
                 stop_reason = reason
                 break
             latest = await prepare_cleanup_scan(bot_id)
-            if latest.pending_406_ids:
-                # A different review may have recorded a typed 406 since
-                # confirmation. Do not open any *other* old auth key now.
+            if latest.pending_406_ids or latest.incident_blocked:
+                # This circuit breaker persists even after the superadmin
+                # removes all three old 406 rows; do not probe the other 22.
                 stop_reason = 'held_406'
                 break
             if (aid, fingerprint) not in latest.candidates:

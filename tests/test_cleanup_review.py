@@ -73,9 +73,12 @@ class ScanPlanningTests(unittest.IsolatedAsyncioTestCase):
             ('old-406', b'h'), ('new-review-hold', b'i'))}
         with patch.object(cleanup_review.DatabaseManager, 'get_cleanup_scan_rows',
                           new_callable=AsyncMock, return_value=rows) as select, \
+             patch.object(cleanup_review.DatabaseManager, 'cleanup_406_incident_blocked',
+                          new_callable=AsyncMock, return_value=False) as incident, \
              patch.object(cleanup_review.SecurityManager, 'decrypt_session',
                           side_effect=lambda c: keys.get(c)):
             plan = await cleanup_review.prepare_cleanup_scan(1)
+        incident.assert_awaited_once_with(1)
         select.assert_awaited_once_with(cleanup_review.MAX_SCAN_ROWS)
         self.assertEqual(plan.uncertain_total, 7)
         self.assertEqual(plan.skipped_shared, 1)
@@ -86,6 +89,20 @@ class ScanPlanningTests(unittest.IsolatedAsyncioTestCase):
                                            (9, hashlib.sha256(b'historic-revoked').hexdigest())))
         self.assertNotIn(_export(b'a'), repr(plan))
         self.assertNotIn('unique', repr(plan))
+
+    async def test_planner_reads_durable_incident_even_with_no_remaining_held_row(self):
+        rows = [_row(18, 1, 'cipher18')]
+        with patch.object(cleanup_review.DatabaseManager, 'get_cleanup_scan_rows',
+                          new_callable=AsyncMock, return_value=rows), \
+             patch.object(cleanup_review.DatabaseManager, 'cleanup_406_incident_blocked',
+                          new_callable=AsyncMock, return_value=True) as gate, \
+             patch.object(cleanup_review.SecurityManager, 'decrypt_session',
+                          return_value=_export(b'j')):
+            plan = await cleanup_review.prepare_cleanup_scan(1)
+        self.assertEqual(plan.pending_406_ids, ())
+        self.assertTrue(plan.incident_blocked)
+        self.assertEqual([aid for aid, _ in plan.candidates], [18])
+        gate.assert_awaited_once_with(1)
 
     async def test_plan_fails_closed_instead_of_truncating_large_database(self):
         for rows in ([dict(id=i, bot_id=1, account_status='inactive',
@@ -106,6 +123,21 @@ class ScanPlanningTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SerialScanTests(unittest.IsolatedAsyncioTestCase):
+    async def test_durable_incident_blocks_batch_after_all_406_rows_deleted(self):
+        approved = ((18, 'hash18'), (19, 'hash19'))
+        blocked = cleanup_review.CleanupScanPlan(
+            approved, 22, 0, 0, 0, pending_406_ids=(), incident_blocked=True)
+        with patch.object(cleanup_review.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')), \
+             patch.object(cleanup_review, 'prepare_cleanup_scan',
+                          new_callable=AsyncMock, return_value=blocked), \
+             patch.object(cleanup_review, 'recover_one_account',
+                          new_callable=AsyncMock) as probe:
+            result = await cleanup_review.run_cleanup_scan(1, approved, AsyncMock())
+        self.assertEqual(result.checked, 0)
+        self.assertEqual(result.stop_reason, 'held_406')
+        probe.assert_not_awaited()
+
     async def test_prior_cleanup_406_blocks_every_new_batch_without_probing_next_key(self):
         approved = ((16, 'hash16'), (17, 'hash17'))
         blocked = cleanup_review.CleanupScanPlan(

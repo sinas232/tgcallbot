@@ -399,8 +399,8 @@ _CLEANUP_SCAN_STOP_LABELS = {
     'busy': 'سفارش فعال/نزدیک آغاز شد.',
     'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
     'unavailable': 'خطای غیرمنتظره در پیش‌شرط یا پروب؛ جزئیات نوع خطا در لاگ خصوصی است.',
-    'unsafe_probe': '۴۰۶ یا قطع نامطمئن رخ داد؛ بررسی را از اول تکرار نکنید. اگر ۴۰۶ تایپ‌شده باشد، کلید همان سشن باطل است. تا ورود تازهٔ ردیف‌های نشان‌دار و بررسی علت تداخل، کل بررسی گروهی باید متوقف بماند؛ حساب‌ها خودکار حذف نمی‌شوند.',
-    'held_406': 'کلیدهای ۴۰۶ِ ذخیره‌شده هنوز با ورود تازه جایگزین نشده‌اند؛ برای حفظ بقیهٔ سشن‌ها هیچ کلید دیگری پروب نشد.',
+    'unsafe_probe': '۴۰۶ یا قطع نامطمئن رخ داد؛ بررسی را از اول تکرار نکنید. اگر ۴۰۶ تایپ‌شده باشد، کلید همان سشن باطل است. برای ردیف نشان‌دار می‌توانید ورود تازه کنید یا با تأیید جداگانه کلید ذخیره‌شده را حذف کنید؛ تا بررسی علت، بقیه را پروب نکنید.',
+    'held_406': 'حادثهٔ ۴۰۶ هنوز قفل است؛ حتی پس از حذف ردیف‌های نشان‌دار، برای حفظ کلیدهای نامعلوم هیچ کلید دیگری پروب نشد.',
     'repeated_uncertain': 'سه نتیجهٔ نامطمئنِ یکسان پیاپی؛ ابتدا علت مشترک را بررسی کنید.',
 }
 
@@ -416,6 +416,7 @@ _CLEANUP_SCAN_REASON_LABELS = {
     'relogin_required': 'احراز هویت مبهم/بن (نیاز به بررسی ورود)',
     'timeout': 'مهلت اتصال تمام شد',
     'disconnect_unconfirmed': 'قطع اتصال نامطمئن',
+    'incident_hold': 'توقف به‌علت قفل ذخیره‌شدهٔ حادثهٔ ۴۰۶',
     'error': 'خطای دیگر (نوع در لاگ خصوصی)',
     'other': 'علت دیگر',
 }
@@ -527,6 +528,9 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
     # The actual running job is process-local and is not affected by menus.
     if data != 'deleted_cleanup_scan_start' and not data.startswith('deleted_cleanup_scan_confirm_'):
         context.user_data.pop('deleted_cleanup_scan', None)
+    if not (data == 'deleted_cleanup_retire406' or
+            data.startswith('deleted_cleanup_retire406_')):
+        context.user_data.pop('deleted_cleanup_retire406', None)
 
     if data in ('deleted_cleanup_scan_status', 'deleted_cleanup_scan_stop'):
         job = _cleanup_scan_jobs.get(bot_id)
@@ -588,19 +592,21 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
                    f'سشن ناخوانا: {plan.skipped_unreadable} • '
                    f'نشانگرهای ۴۰۶: {plan.skipped_cooldown} • '
                    f'قرنطینهٔ ثبت‌شدهٔ بررسی زنده: {len(plan.pending_406_ids)}')
-        if plan.pending_406_ids:
+        if plan.pending_406_ids or plan.incident_blocked:
             held = '، '.join(str(aid) for aid in plan.pending_406_ids[:8])
             extra = ' و موارد دیگر' if len(plan.pending_406_ids) > 8 else ''
             await display(
                 '⛔️ بررسی گروهی قفل است؛ هیچ اتصال یا حذفی انجام نشد. '
                 'بررسی‌های قبلی به ۴۰۶ رسیدند. تکرار گروهی ممکن است کلیدِ '
-                'بعدی را هم باطل کند. ابتدا ردیف‌های نشان‌دار را با شمارهٔ '
-                'دقیق همان ردیف و کد ورود/رمز دوم، به سشن تازه تبدیل کنید؛ '
-                'کلید قدیمی را دوباره پروب یا ایمپورت نکنید. علت اتصال هم‌زمان '
-                'هنوز معلوم نیست و بعد از ورود تازه هم باید پیش از آزمونِ '
-                'دیگر بررسی شود.\n\n'
-                + summary + '\nشناسه‌های نشان‌دار: ' + held + extra,
-                [[InlineKeyboardButton('🗑 پیش‌نمایش فقط موارد تأییدشده',
+                'بعدی را هم باطل کند. اگر این سشن‌های ۴۰۶ را دیگر نمی‌خواهید، '
+                'از گزینهٔ حذف جداگانهٔ سشن‌های قرنطینه‌شده با پیش‌نمایش و تأیید '
+                'استفاده کنید؛ برای نگه‌داشتنشان ورود تازه با شماره/OTP لازم است. '
+                'حذف ردیف، حساب تلگرام را حذف نمی‌کند و قفلِ بررسیِ بقیه را '
+                'برنمی‌دارد؛ علت تداخل هنوز معلوم نیست.\n\n'
+                + summary + '\nشناسه‌های نشان‌دار: ' + (held + extra if held else 'ندارد؛ قفل حادثه باقی است'),
+                [[InlineKeyboardButton('🗑 پیش‌نمایش حذف سشن‌های ۴۰۶ِ قرنطینه‌شده',
+                                       callback_data='deleted_cleanup_retire406')],
+                 [InlineKeyboardButton('🗑 پیش‌نمایش فقط موارد تأییدشده',
                                        callback_data='deleted_cleanup_preview_all')], *back])
             return AWAITING_SETTINGS_ACTION
         if not plan.candidates:
@@ -655,11 +661,11 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             except Exception as exc:
                 logger.warning('Cleanup scan preflight failed: %s', type(exc).__name__)
                 allowed, reason, current = False, 'unavailable', None
-            if current and current.pending_406_ids:
-                await display('⛔️ ۴۰۶ِ قرنطینه‌شده ثبت شده است؛ تأیید قدیمی '
-                              'اجازهٔ پروب بقیهٔ کلیدها را نمی‌دهد. با شمارهٔ '
-                              'همان ردیف‌ها ورود تازه کنید؛ بررسی گروهی را '
-                              'تکرار نکنید.', back)
+            if current and (current.pending_406_ids or current.incident_blocked):
+                await display('⛔️ ۴۰۶ِ قرنطینه‌شده یا قفل حادثه ثبت شده است؛ '
+                              'تأیید قدیمی اجازهٔ پروب بقیهٔ کلیدها را نمی‌دهد. '
+                              'اگر سشن قدیمی را نمی‌خواهید از منوی حذف ۴۰۶ِ '
+                              'قرنطینه‌شده استفاده کنید، نه بررسی گروهی.', back)
                 return AWAITING_SETTINGS_ACTION
             if not allowed or not current or current.candidates != pending['candidates']:
                 await display('⛔️ تعمیرات/سفارش/فهرست سشن‌ها تغییر کرده است؛ '
@@ -726,6 +732,14 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
                     pending['fingerprint'])):
             await display('⚠️ حساب یا سشن آن از زمان انتخاب تغییر کرده؛ هیچ بررسی‌ای انجام نشد.', back)
             return AWAITING_SETTINGS_ACTION
+        try:
+            if await DatabaseManager.cleanup_406_incident_blocked(bot_id):
+                await display(recovery_message('incident_hold'), back)
+                return AWAITING_SETTINGS_ACTION
+        except Exception as exc:
+            logger.warning('Single review incident guard unavailable: %s', type(exc).__name__)
+            await display('⛔️ وضعیت حادثه قابل تأیید نیست؛ سشن باز نشد.', back)
+            return AWAITING_SETTINGS_ACTION
         await display(f'⏳ بررسی و قطع اتصال امن فقط حساب #{aid} در جریان است...')
         try:
             _, verdict = await recover_one_account(
@@ -756,7 +770,9 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             return AWAITING_SETTINGS_ACTION
         if (acc.get('account_status') == 'inactive' and
                 acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
-            await display(recovery_message('duplicate_key_relogin_required'), back)
+            await display(recovery_message('duplicate_key_relogin_required'), [
+                [InlineKeyboardButton(f'🗑 پیش‌نمایش حذف سشن #{aid} بدون اتصال',
+                                      callback_data=f'deleted_cleanup_retire406_{aid}')], *back])
             return AWAITING_SETTINGS_ACTION
         if (acc.get('account_status') == 'inactive' and
                 acc.get('spam_check_result') in
@@ -767,6 +783,15 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             return AWAITING_SETTINGS_ACTION
         if not _deletion_review_candidate(acc) or not isinstance(acc.get('session_string'), str):
             await display('ℹ️ این حساب دیگر نامزد بررسی نیست؛ سشن دست‌نخورده ماند.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            if await DatabaseManager.cleanup_406_incident_blocked(bot_id):
+                await display(recovery_message('incident_hold'), back)
+                return AWAITING_SETTINGS_ACTION
+        except Exception as exc:
+            logger.warning('Single review incident guard unavailable: %s', type(exc).__name__)
+            await display('⛔️ وضعیت حادثه از دیتابیس قابل تأیید نیست؛ '
+                          'هیچ اتصال یا حذفی انجام نشد.', back)
             return AWAITING_SETTINGS_ACTION
         nonce = secrets.token_hex(8)
         context.user_data['deleted_cleanup_probe'] = {
@@ -819,6 +844,100 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             f'کل: {total} • صفحهٔ {page}/{(total + 7) // 8}\n\n'
             'هر دکمه فقط کارت انتخاب همان حساب را باز می‌کند؛ '
             'اتصال به تلگرام یا حذف، خودکار و انبوه انجام نمی‌شود.', rows)
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_retire406_confirm_'):
+        # Pop before the first await: no replay, including across admins/chats.
+        pending = context.user_data.pop('deleted_cleanup_retire406', None)
+        if (not pending or
+                pending.get('nonce') != data.removeprefix('deleted_cleanup_retire406_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید حذف سشن‌های ۴۰۶ نامعتبر یا منقضی است؛ '
+                          'دوباره پیش‌نمایش بگیرید. هیچ ردیفی حذف نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            kwargs = ({'single_account_id': pending['account_id']}
+                      if pending['account_id'] is not None else {})
+            deleted, result = await DatabaseManager.delete_held_cleanup_406_accounts(
+                bot_id, pending['fingerprints'], **kwargs)
+        except Exception as exc:
+            logger.warning('406 session retirement failed (bot=%s): %s',
+                           bot_id, type(exc).__name__)
+            await display('❌ خطای دیتابیس؛ حذف تأیید نشد. وضعیت را بررسی کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        if result == 'deleted':
+            logger.warning('Superadmin %s retired %s stored 406 keys from bot %s',
+                           update.effective_user.id, deleted, bot_id)
+            await display(f'✅ {deleted} سشن ۴۰۶ِ قرنطینه‌شده و ردیف مرتبط '
+                          'از فهرست/DB حذف شد. خود حساب تلگرام حذف نشده است؛ '
+                          'سشن‌های بررسی‌نشده دست‌نخورده‌اند. قفل بررسیِ '
+                          'گروهی/تک‌اکانتیِ کلیدهای قدیمی باقی می‌ماند تا '
+                          'علت تداخل مشخص شود.', back)
+        else:
+            reason = {
+                'maintenance': 'تعمیرات سراسری باید روشن باشد.',
+                'busy': 'سفارش فعال، در صف یا نزدیک وجود دارد.',
+                'changed': 'فهرست، نشانگر، وضعیت یا سشن پس از پیش‌نمایش تغییر کرده است.',
+                'empty': 'سشن نشان‌دار قابل‌حذفی وجود ندارد.',
+            }.get(result, 'پیش‌شرط حذف برقرار نیست.')
+            await display('⛔️ هیچ ردیفی حذف نشد. ' + reason, back)
+        return AWAITING_SETTINGS_ACTION
+
+    if (data == 'deleted_cleanup_retire406' or
+            re.fullmatch(r'deleted_cleanup_retire406_[1-9][0-9]{0,9}', data)):
+        context.user_data.pop('deleted_cleanup_preview', None)
+        context.user_data.pop('deleted_cleanup_probe', None)
+        target = (None if data == 'deleted_cleanup_retire406'
+                  else int(data.removeprefix('deleted_cleanup_retire406_')))
+        accounts = await DatabaseManager.get_held_cleanup_406_accounts(
+            bot_id, **({'account_id': target} if target is not None else {}))
+        if not accounts:
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('📭 هیچ ردیف inactive با نشانگر دقیق بررسی ۴۰۶ برای '
+                          'حذف بدون اتصال وجود ندارد؛ هیچ حذفی انجام نشد. '
+                          'قفل حادثه حتی با شمار صفر ممکن است باقی بماند.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (len(accounts) > 100 or
+                (target is not None and
+                 (len(accounts) != 1 or int(accounts[0]['id']) != target))):
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('⛔️ فهرست از سقف ایمن بزرگ‌تر یا تغییر کرده است؛ '
+                          'حذف گروهی متوقف شد. یک ردیف انتخاب کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        ids = '، '.join(str(acc['id']) for acc in accounts)
+        if len(ids) > 2400:
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('⛔️ فهرست شناسه‌ها برای یک پیش‌نمایش کامل بیش از حد '
+                          'بزرگ است؛ حذف انجام نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_retire406'] = {
+            'nonce': nonce, 'expires': time.time() + 300,
+            'bot_id': bot_id, 'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id, 'account_id': target,
+            'fingerprints': {
+                int(acc['id']): hashlib.sha256(
+                    acc['session_string'].encode('utf-8')).hexdigest()
+                for acc in accounts
+            },
+        }
+        await display(
+            f'⚠️ حذف آگاهانهٔ {len(accounts)} سشن ۴۰۶ِ قرنطینه‌شده '
+            f'از ربات {bot_id}\nشناسه‌های دقیق: {ids}\n\n'
+            'این عملیات بدون اتصال به تلگرام ردیف و کلید ذخیره‌شده را '
+            'از DB/لیست حذف می‌کند؛ به معنی حذف خود حساب تلگرام نیست. '
+            'کلیدهای بررسی‌نشده و سوابق مالی/سفارش حذف نمی‌شوند. بعد از حذف '
+            'هم قفل بررسی قدیمی‌ها باقی می‌ماند تا علت تداخل مشخص شود.\n'
+            'حذف غیرقابل‌بازگشت است؛ بکاپ خصوصی معتبر و تعمیرات روشن لازم است. '
+            'در زمان سفارش فعال/در صف/نزدیک، حذف رد می‌شود. '
+            'این تأیید تا ۵ دقیقه اعتبار دارد.', [
+                [InlineKeyboardButton(f'✅ حذف فقط همین {len(accounts)} سشن ۴۰۶',
+                                      callback_data=f'deleted_cleanup_retire406_confirm_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
         return AWAITING_SETTINGS_ACTION
 
     if data.startswith('deleted_cleanup_confirm_'):
@@ -935,9 +1054,12 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         return AWAITING_SETTINGS_ACTION
 
     context.user_data.pop('deleted_cleanup_preview', None)
+    context.user_data.pop('deleted_cleanup_retire406', None)
     context.user_data.pop('deleted_cleanup_probe', None)
     context.user_data.pop('deleted_cleanup_scan', None)
     accounts = await DatabaseManager.get_verified_unusable_accounts(bot_id)
+    held_406 = await DatabaseManager.get_held_cleanup_406_accounts(bot_id)
+    incident_blocked = await DatabaseManager.cleanup_406_incident_blocked(bot_id)
     deleted_count = sum(acc['marker'] == CONFIRMED_ACCOUNT_DELETED for acc in accounts)
     revoked_count = len(accounts) - deleted_count
     job = _cleanup_scan_jobs.get(bot_id)
@@ -945,7 +1067,10 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
     buttons = [
         [InlineKeyboardButton(f'🗑 حذف همهٔ تأییدشده‌ها ({len(accounts)})',
                               callback_data='deleted_cleanup_preview_all')],
-        [InlineKeyboardButton('🧪 بررسی مرحله‌ای همهٔ سوخته‌های غیرفعال',
+        [InlineKeyboardButton(f'🗑 حذف سشن‌های ۴۰۶ِ قرنطینه‌شده ({len(held_406)})',
+                              callback_data='deleted_cleanup_retire406')],
+        [InlineKeyboardButton('🧪 بررسی مرحله‌ای همهٔ سوخته‌های غیرفعال'
+                              + (' (قفل حادثه)' if held_406 or incident_blocked else ''),
                               callback_data='deleted_cleanup_scan_start')],
         [InlineKeyboardButton('📋 انتخاب حساب مشکوک (تک‌اکانتی)',
                               callback_data='deleted_cleanup_list_1')],
@@ -968,13 +1093,16 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         [InlineKeyboardButton('🔙 گزارش سلامت اکانت‌ها', callback_data='health_back')],
     ])
     await display(
-        f'☠️ حذف حساب/سشن سوختهٔ تأییدشده | ربات {bot_id}\n\n'
+        f'☠️ مدیریت حذف حساب/سشن | ربات {bot_id}\n\n'
         f'حساب دلیت‌شدهٔ تأییدشده: {deleted_count}\n'
         f'سشن خارج‌شده/باطلِ تأییدشده: {revoked_count}\n'
-        'حذف همه همیشه در دسترس است، ولی با شمار صفر چیزی را پاک نمی‌کند. '
-        'ابتدا بررسی مرحله‌ایِ سشن‌های غیرفعال را جداگانه تأیید کنید؛ '
-        'سشن‌های سالم حفظ می‌شوند، موارد نامطمئن حذف نمی‌شوند. '
-        'بعد فهرست دقیقِ تأییدشده‌ها را پیش‌نمایش و حذف نهایی را تأیید کنید.'
+        f'سشن ۴۰۶ِ قرنطینه‌شده (حذف آگاهانه بدون پروب): {len(held_406)}\n'
+        'حذفِ تأییدشده با حذف آگاهانهٔ کلید ۴۰۶ متفاوت است؛ هیچ‌کدام '
+        'حساب تلگرام را حذف نمی‌کند. با شمار صفر چیزی پاک نمی‌شود. '
+        'تا روشن‌شدن علت تداخل، کلیدهای نامعلوم را پروب نکنید؛ '
+        'حذف ۴۰۶ها قفل بررسی را خودکار برنمی‌دارد.'
+        + ('\n⛔️ قفل حادثهٔ ۴۰۶ در دیتابیس فعال است؛ بررسی گروهی/تک‌اکانتی '
+           'کلیدهای قدیمی متوقف می‌ماند.' if incident_blocked else '')
         + last_review,
         buttons)
     return AWAITING_SETTINGS_ACTION

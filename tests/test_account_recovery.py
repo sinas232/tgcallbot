@@ -26,6 +26,10 @@ _UNSET = object()
 
 class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        gate = patch.object(account_recovery.DatabaseManager, 'cleanup_406_incident_blocked',
+                            new_callable=AsyncMock, return_value=False)
+        gate.start()
+        self.addCleanup(gate.stop)
         self.row = dict(id=7, bot_id=1, phone_number='test-phone',
                         account_status='inactive', spam_status='dead',
                         session_string='encrypted-key')
@@ -73,6 +77,28 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, (False, 'duplicate_key_relogin_required'))
         probe.assert_not_awaited()
         update.assert_not_awaited()
+
+    async def test_incident_latch_after_row_deletion_blocks_old_single_key(self):
+        with patch.object(account_recovery.DatabaseManager, 'cleanup_406_incident_blocked',
+                          new_callable=AsyncMock, return_value=True), \
+             patch.object(account_recovery.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock) as probe:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'incident_hold'))
+        probe.assert_not_awaited()
+
+    async def test_incident_latch_read_error_fails_closed_without_probe(self):
+        with patch.object(account_recovery.DatabaseManager, 'cleanup_406_incident_blocked',
+                          new_callable=AsyncMock, side_effect=RuntimeError('offline')), \
+             patch.object(account_recovery.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock) as probe:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'error'))
+        probe.assert_not_awaited()
 
     async def test_failed_probes_never_change_db(self):
         for reason in ('duplicated_in_use', 'relogin_required', 'timeout',
@@ -128,6 +154,10 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 class QuarantinedConflictTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        gate = patch.object(account_recovery.DatabaseManager, 'cleanup_406_incident_blocked',
+                            new_callable=AsyncMock, return_value=False)
+        gate.start()
+        self.addCleanup(gate.stop)
         self.row = dict(id=7, bot_id=1, phone_number='test-phone',
                         account_status='active', spam_status='cooldown',
                         spam_check_result='AUTH_KEY_DUPLICATED: validity unknown',
@@ -338,6 +368,7 @@ class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
         from sqlalchemy.orm import Session
         engine = create_engine('sqlite:///:memory:')
         database.TelegramAccount.__table__.create(engine)
+        database.BotSetting.__table__.create(engine)
         stamp = datetime.utcnow() - timedelta(days=3)
         with engine.begin() as connection:
             connection.execute(database.TelegramAccount.__table__.insert(), [
@@ -357,6 +388,7 @@ class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *unused): self.session.close()
             async def execute(self, stmt): return self.session.execute(stmt)
             async def commit(self): self.session.commit()
+            def add(self, row): self.session.add(row)
 
         try:
             with patch.object(database, 'AsyncSessionLocal', side_effect=AsyncSession):
@@ -402,6 +434,10 @@ class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
                                  'inactive')
                 self.assertEqual(session.scalars(select(database.TelegramAccount.id)).all(),
                                  [7, 8])
+                self.assertEqual(session.scalar(select(database.BotSetting.value).where(
+                    database.BotSetting.bot_id == 1,
+                    database.BotSetting.key == database.CLEANUP_REVIEW_406_INCIDENT_SETTING,
+                )), '1')
             # Even if an operator saves a fresh login with the same ID, a
             # delayed old probe cannot stamp 406 on the replacement key.
             with Session(engine) as session, session.begin():

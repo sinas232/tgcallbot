@@ -107,6 +107,9 @@ class HealthChecker:
                 if await DatabaseManager.global_maintenance_enabled_strict():
                     logger.info('Automatic spam check paused by maintenance')
                     return
+                if await DatabaseManager.cleanup_406_incident_blocked(1):
+                    logger.info('Automatic spam check paused by 406 incident')
+                    return
             except Exception as exc:
                 logger.warning('Automatic spam check paused (DB unavailable): %s',
                                type(exc).__name__)

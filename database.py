@@ -37,6 +37,9 @@ CONFIRMED_SESSION_REVOKED = 'Verified Telegram session invalid: typed auth-key 4
 # not prove even the key is invalid. Preserve the row, avoid probing this
 # specific key again, and allow a fresh phone-authorized login to replace it.
 CLEANUP_REVIEW_406_HOLD = 'AUTH_KEY_DUPLICATED: cleanup review; manual-only until ownership checked'
+# An independent incident latch must survive deletion or phone re-login of the
+# held rows: neither action establishes why the other auth keys saw 406.
+CLEANUP_REVIEW_406_INCIDENT_SETTING = 'cleanup_review_406_incident'
 Base = declarative_base()
 
 
@@ -63,6 +66,26 @@ async def _global_maintenance_enabled(session: AsyncSession) -> bool:
     res = await session.execute(select(BotSetting.value).where(
         BotSetting.bot_id == 1, BotSetting.key == 'maintenance_mode'))
     return res.scalar_one_or_none() == '1'
+
+
+async def _latch_cleanup_406_incident(session: AsyncSession, bot_id: int) -> None:
+    """Persist a per-bot circuit breaker in the SAME transaction as a hold/delete.
+
+    A race on the unique setting key fails the transaction closed. An operator
+    must not be able to delete the last held account and thereby implicitly
+    reopen the bulk probe for the still-unexamined accounts.
+    """
+    result = await session.execute(select(BotSetting).where(
+        BotSetting.bot_id == int(bot_id),
+        BotSetting.key == CLEANUP_REVIEW_406_INCIDENT_SETTING,
+    ).with_for_update())
+    row = result.scalar_one_or_none()
+    if row is None:
+        session.add(BotSetting(bot_id=int(bot_id),
+                               key=CLEANUP_REVIEW_406_INCIDENT_SETTING,
+                               value='1'))
+    else:
+        row.value = '1'
 
 
 DB_URL_ASYNC = Config.get_normalized_database_url()
@@ -1426,6 +1449,10 @@ class DatabaseManager:
             ).values(spam_status='cooldown',
                      spam_check_result=CLEANUP_REVIEW_406_HOLD,
                      last_health_check=datetime.utcnow()))
+            # Even when the row changed during an in-flight probe, a real
+            # collision just occurred. Latch the incident for this bot rather
+            # than allowing a second batch to continue with the next key.
+            await _latch_cleanup_406_incident(db_session, bot_id)
             await db_session.commit()
             return result.rowcount == 1
 
@@ -1588,6 +1615,28 @@ class DatabaseManager:
                     for acc in result.scalars().all()]
 
     @staticmethod
+    async def get_held_cleanup_406_accounts(bot_id: int, *,
+                                            account_id: int | None = None) -> list[dict]:
+        """Only exact persisted cleanup-review holds, scoped to one bot.
+
+        This is NOT evidence that the Telegram account was deleted. Return
+        ciphertext only to the server-side preview to fingerprint the key;
+        never send it to Telegram or save it in PTB user_data/callback data.
+        """
+        async with AsyncSessionLocal() as db_session:
+            query = select(TelegramAccount).where(
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.spam_status == 'cooldown',
+                TelegramAccount.spam_check_result == CLEANUP_REVIEW_406_HOLD,
+            )
+            if account_id is not None:
+                query = query.where(TelegramAccount.id == int(account_id))
+            result = await db_session.execute(query.order_by(TelegramAccount.id).limit(101))
+            return [{'id': acc.id, 'session_string': acc.session_string}
+                    for acc in result.scalars().all()]
+
+    @staticmethod
     async def get_deletion_review_page(bot_id: int, *, page: int = 1,
                                        page_size: int = 8) -> tuple[list[dict], int]:
         """Paginate uncertain accounts without loading/decrypting session strings.
@@ -1635,6 +1684,28 @@ class DatabaseManager:
                 TelegramAccount.last_health_check, TelegramAccount.session_string,
             ).order_by(TelegramAccount.id).limit(max_rows + 1))
             return [dict(row) for row in result.mappings().all()]
+
+    @staticmethod
+    async def cleanup_406_incident_blocked(bot_id: int) -> bool:
+        """Strict read: current held rows OR durable latch block old-key probes.
+
+        A 2.3.21 server already has 406 holds without a BotSetting latch; the
+        same protection must apply immediately after this version deploys.
+        A DB error propagates and callers must fail closed.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(BotSetting.value).where(
+                BotSetting.bot_id == int(bot_id),
+                BotSetting.key == CLEANUP_REVIEW_406_INCIDENT_SETTING,
+            ))
+            if result.scalar_one_or_none() == '1':
+                return True
+            held = await db_session.execute(select(TelegramAccount.id).where(
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.spam_check_result == CLEANUP_REVIEW_406_HOLD,
+            ).limit(1))
+            return held.first() is not None
 
     @staticmethod
     async def deletion_review_probe_allowed(bot_id: int) -> tuple[bool, str]:
@@ -1727,6 +1798,80 @@ class DatabaseManager:
                         return 0, 'changed'
                 for account in rows:
                     await db_session.delete(account)
+            return len(rows), 'deleted'
+
+    @staticmethod
+    async def delete_held_cleanup_406_accounts(
+        bot_id: int, expected_fingerprints: dict[int, str], *,
+        single_account_id: int | None = None,
+    ) -> tuple[int, str]:
+        """Retire ONLY explicitly selected stored 406 keys, with NO MTProto probe.
+
+        This is a superadmin's destructive choice to remove unusable stored
+        authorizations, NOT a finding that Telegram deleted the user. It is
+        separate from the typed-401/USER_DEACTIVATED verified-delete path.
+        The per-bot incident latch remains set after the last row is deleted,
+        so the 22 unexamined keys cannot be scanned just because the markers
+        disappeared. The caller requires a nonce-bound 5-minute preview.
+        """
+        if not expected_fingerprints:
+            return 0, 'empty'
+        if (len(expected_fingerprints) > 100 or
+                (single_account_id is not None and
+                 set(expected_fingerprints) != {int(single_account_id)})):
+            return 0, 'changed'
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                # Serialize with checkout/maintenance transitions before
+                # deciding that no paid or soon-due order needs this key.
+                await _lock_order_admission(db_session)
+                setting = (await db_session.execute(select(BotSetting).where(
+                    BotSetting.bot_id == 1,
+                    BotSetting.key == 'maintenance_mode',
+                ).with_for_update())).scalar_one_or_none()
+                if setting is None or setting.value != '1':
+                    return 0, 'maintenance'
+                deadline = datetime.utcnow() + timedelta(minutes=30)
+                busy = (await db_session.execute(select(Order.id).where(
+                    or_(Order.status.in_(('running', 'pending')),
+                        (Order.status == 'scheduled') & or_(
+                            Order.scheduled_for.is_(None),
+                            Order.scheduled_for <= deadline)),
+                ).limit(1))).first()
+                if busy:
+                    return 0, 'busy'
+
+                query = select(TelegramAccount).where(
+                    TelegramAccount.bot_id == int(bot_id),
+                    TelegramAccount.account_status == 'inactive',
+                    TelegramAccount.spam_status == 'cooldown',
+                    TelegramAccount.spam_check_result == CLEANUP_REVIEW_406_HOLD,
+                )
+                if single_account_id is not None:
+                    query = query.where(TelegramAccount.id == int(single_account_id))
+                rows = (await db_session.execute(
+                    query.order_by(TelegramAccount.id).limit(101).with_for_update()
+                )).scalars().all()
+                if (len(rows) != len(expected_fingerprints) or
+                        {row.id for row in rows} != set(expected_fingerprints)):
+                    return 0, 'changed'
+                for row in rows:
+                    digest = hashlib.sha256(row.session_string.encode('utf-8')).hexdigest()
+                    if not hmac.compare_digest(digest, expected_fingerprints[row.id]):
+                        return 0, 'changed'
+
+                # Commit the durable pause and removal atomically. Never clear
+                # this pause automatically on deletion/re-login/restart.
+                await _latch_cleanup_406_incident(db_session, bot_id)
+                await db_session.execute(update(PendingGroupLeave).where(
+                    PendingGroupLeave.bot_id == int(bot_id),
+                    PendingGroupLeave.account_id.in_(list(expected_fingerprints)),
+                    PendingGroupLeave.status.in_(('pending', 'processing')),
+                ).values(status='cancelled', processed_at=datetime.utcnow(),
+                         last_error='superadmin retired quarantined 406 key'))
+                # Historical voice/order/financial audit records are retained.
+                for row in rows:
+                    await db_session.delete(row)
             return len(rows), 'deleted'
 
     @staticmethod
