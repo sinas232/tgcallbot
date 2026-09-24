@@ -121,7 +121,9 @@ if [[ "$(stat -c %a "$backup_dir")" != 700 ]]; then
   echo "Backup directory must already be private (chmod 700): $backup_dir" >&2
   exit 2
 fi
-backup="$backup_dir/predeploy-$(date -u +%Y%m%dT%H%M%SZ).dump"
+# Never truncate an existing (possibly valid) private backup when a deploy is
+# retried in the same second or after the host clock moves backwards.
+backup="$(mktemp "$backup_dir/predeploy-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX.dump")"
 if ! docker compose exec -T db sh -c 'exec pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > "$backup"; then
   echo "Database backup failed; no service was restarted. Check private file: $backup" >&2
   exit 1

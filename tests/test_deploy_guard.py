@@ -237,6 +237,18 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertEqual(dumps[0].stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.backups.stat().st_mode & 0o777, 0o700)
 
+    def test_existing_private_backup_is_never_overwritten_on_retry(self):
+        self.backups.mkdir(mode=0o700)
+        old = self.backups / 'predeploy-20260924T000000Z.dump'
+        old.write_bytes(b'PRESERVE_PREVIOUS_BACKUP')
+        date = self.root / 'bin' / 'date'
+        date.write_text('#!/bin/sh\necho 20260924T000000Z\n')
+        date.chmod(0o755)
+        result = self.run_script('deploy-warp.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(old.read_bytes(), b'PRESERVE_PREVIOUS_BACKUP')
+        self.assertEqual(len(list(self.backups.glob('predeploy-*.dump'))), 2)
+
     def test_backup_in_project_is_rejected_and_restart_wrapper_is_safe(self):
         result = self.run_script('deploy-warp.sh',
                                  TGCB_BACKUP_DIR=str(self.project / 'backups'))

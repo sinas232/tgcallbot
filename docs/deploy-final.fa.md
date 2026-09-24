@@ -2,7 +2,7 @@
 
 **شاخهٔ انتشار این جلسه:** `arena/01a0ccf5-tgcallbot`؛ `main` هنوز نسخهٔ قدیمی است. روی نصب موجود از `git pull origin main`، `docker compose down`، پاک‌سازی volume، `git clean`، `reset --hard` یا ساخت `.env`/کلید جدید استفاده نکنید. دستورها برای نصب تأییدشدهٔ شما در **`/opt/tgcallbot`** نوشته شده‌اند. اگر این مسیر یا شاخه تغییر کرده، توقف کنید؛ آن‌ها را حدس نزنید. تمام دستورهای خطاپذیر داخل `if`/زیرشل هستند تا حتی در نشست SSH با `set -e`، **خطای دستور نشست را نبندد**.
 
-**وضعیت مشاهده‌شده، نه نتیجهٔ نصب:** پرچم تعمیرات `1|1`، سفارش ۸۴۶ `completed` و تایمرش شروع شده، سفارش مشغول/نزدیک `0`؛ با این حال **۷۷ پرداخت pending** وجود دارد که **۵۲ مورد URL خالی یا خارج از دو میزبان شناخته‌شده** دارند. گارد قبلی به‌درستی به‌خاطر فایل‌های untracked (از جمله `backup_2026-09-20.dump`) متوقف شد؛ fetch/build/restart هنوز روی سرور اجرا نشده است. وضعیت تسویه، سشن‌های تاریخی، تماس، callback و اینکه کدام پرداخت واقعاً در جریان است، **مجهول** است. این مراحل جایگزین بررسی دستی درگاه/دفتر مالی نیستند؛ pending قدیمی را خودکار paid/failed نکنید و برای گذشتن از گارد، محدودیت URL را بر ندارید.
+**وضعیت مشاهده‌شده، نه نتیجهٔ نصب:** HEAD سرور `0a627e1` (نیای انتشار فعلی) است؛ تعمیرات `1|1` و سفارش مشغول/نزدیک `0`. سفارش ۸۴۶ `completed` با مبلغ ۲۰۰٬۰۰۰ و تایمر شروع/پایان دارد، اما پرس‌وجوی ledger با قالب جدید **هیچ ردیف متناظری** پیدا نکرد؛ این نه اثبات تسویه است و نه اثبات کسر نشدن پول. **۷۷ پرداخت pending** همگی بیش از ۲۴ ساعت قدمت دارند؛ **۵۲ مورد زرین‌پال بدون URL** و ۲۵ مورد با میزبان زرین‌پال‌اند، شمار تازه/زمان‌نامعلوم `0` است. ۱۴ فایل untracked سطح اول (از جمله `backup_2026-09-20.dump`) همگی **صفر بایت** و عادی هستند؛ dump صفر بایتی بکاپ معتبر نیست. گارد قبلی به‌درستی متوقف شد؛ fetch/build/restart هنوز روی سرور اجرا نشده است. وضعیت تسویه، سشن‌های تاریخی، تماس، callback و اینکه کدام پرداخت واقعاً در جریان است، **مجهول** است. pending قدیمی را خودکار paid/failed نکنید و برای گذشتن از گارد، محدودیت URL را بر ندارید.
 
 ## ۱. بررسی فقط‌خواندنیِ فایل‌های نصب
 
@@ -32,54 +32,45 @@ fi
 
 اگر فایل ناشناسِ فعال، پوشه، symlink، اصلاحِ فایل tracked یا نامی غیرمنتظره می‌بینید، **متوقف شوید و بدون افشای محتوا علت را پیدا کنید**. خروجی شبیه `[bot` یا `CACHED` احتمالاً بازماندهٔ خروجی build است اما این فقط حدس است. بکاپ تاریخ‌دار را حتی اگر قدیمی است نگه دارید؛ ممکن است کلیدها و session string داشته باشد.
 
-## ۲. قرنطینهٔ غیرمخربِ untracked، فقط بعد از تأیید فهرست بالا
+## ۲. انتقال بدون سؤال تعاملیِ **همین ۱۴ فایل صفر‌بایتی** به بیرون پروژه
 
-این بلوک **همهٔ فایل‌های untracked سادهٔ سطح اول** را به پوشهٔ خصوصیِ بیرون پروژه انتقال می‌دهد؛ آن‌ها را حذف، بازنویسی یا در Git ثبت نمی‌کند. اگر فهرست مرحلهٔ ۱ را تأیید نکرده‌اید، **آن را اجرا نکنید**. برای پوشه/symlink/hardlink، تغییر tracked، فایل سشن/`.env`/DB، بیش از ۳۰ فایل، مسیر روی filesystem دیگر، یا نبود ترمینال برای تأیید صریح، بدون انتقال متوقف می‌شود. پیش از انتقال در ترمینال باید عبارت نمایش‌داده‌شده را **خودتان تایپ کنید** (چسباندن دستور کافی نیست). یک خطای نادر هنگام انتقال ممکن است فقط بخشی از فایل‌ها را در قرنطینه بگذارد؛ در آن حالت محل چاپ‌شده را حفظ و قبل از تکرار بررسی کنید.
+خروجی واقعی مرحلهٔ قبل نشان داد ۱۴ فایل عادی سطح اول وجود دارد و **هر ۱۴ فایل صفر بایت** هستند. متن فرمان قبلی به ترمینال paste شد و خط بعدی را به‌جای پاسخ تعاملی خواند؛ `تأیید نشد` و **چیزی منتقل نشد**. این نسخه هیچ prompt/ورودی تعاملی ندارد. فقط وقتی مجموعهٔ نام‌ها، نوع، تعداد و اندازه‌ها **دقیقاً با گزارش شما** برابر باشند فایل‌ها را بدون حذف به `/opt/tgcallbot-backups/untracked-zero-*` با دسترسی خصوصی منتقل می‌کند؛ در هر اختلافی قبل از انتقال می‌ایستد. نام `backup_2026-09-20.dump` صرفاً حفظ می‌شود؛ چون صفر بایت است، بکاپ قابل‌بازیابی نیست. گارد استقرار در مرحلهٔ ۴ باید *بکاپ تازهٔ غیرخالی* بسازد و با `pg_restore -l` اعتبارسنجی کند.
 
 ```bash
 if (
   cd /opt/tgcallbot || exit 1
-  python3 - <<'PY'
+  python3 - <<'PYCODE'
 import os, pathlib, stat, subprocess, sys, tempfile
 
 def stop(message):
-    print('توقفِ امن: ' + message, file=sys.stderr)
+    print('توقف امن: ' + message, file=sys.stderr)
     sys.exit(1)
 
 repo = pathlib.Path.cwd().resolve()
+expected = {
+    '=', 'CACHED', '[bot', '[bot]', '[internal]', '[payproxy', '[payproxy]',
+    'backup_2026-09-20.dump', 'exporting', 'naming', 'reading', 'resolve',
+    'transferring', 'unpacking',
+}
 if str(repo) != '/opt/tgcallbot' or not (repo / '.git').is_dir():
-    stop('مسیر نصب Git مورد انتظار نیست')
+    stop('این ریشهٔ نصب مورد انتظار نیست')
+if subprocess.check_output(['git', 'branch', '--show-current']).strip() != b'arena/01a0ccf5-tgcallbot':
+    stop('شاخهٔ نصب تغییر کرده است')
 for args in (['git', 'diff', '--quiet'], ['git', 'diff', '--cached', '--quiet']):
-    if subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+    if subprocess.run(args, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode:
         stop('تغییر tracked وجود دارد؛ چیزی منتقل نشد')
 raw = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '-z'])
 names = [os.fsdecode(x) for x in raw.split(b'\0') if x]
-if not 0 < len(names) <= 30:
-    stop('تعداد فایل‌های untracked غیرمنتظره است؛ چیزی منتقل نشد')
+if len(names) != 14 or set(names) != expected:
+    stop('فهرست ۱۴ نام دقیقاً با گزارش شما برابر نیست؛ چیزی منتقل نشد')
 entries = []
-for name in names:
-    if ('/' in name or name in ('.', '..') or name.startswith(('.env', 'data'))
-            or name.endswith(('.session', '.session-journal', '.db', '.sqlite', '.sqlite3'))):
-        stop('فایل حساس/پوشه یا مسیر تو در تو دیده شد؛ چیزی منتقل نشد')
+for name in sorted(expected):
     source = repo / name
     info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        stop('فایل غیربینظیر یا غیرعادی دیده شد؛ چیزی منتقل نشد')
-    entries.append((source, info.st_dev, info.st_ino, info.st_size))
-print('برای انتقال فقط همین نام‌ها، کاربردشان را با مرحلهٔ ۱ تطبیق دهید:')
-for source, _, _, size in entries:
-    print(repr(source.name), 'bytes:', size)
-try:
-    phrase = 'QUARANTINE ' + str(len(entries))
-    with open('/dev/tty', 'w', encoding='utf-8') as tty_out:
-        tty_out.write('برای انتقال غیرحذفی به پوشهٔ خصوصی تایپ کنید: ' + phrase + '\n> ')
-        tty_out.flush()
-    with open('/dev/tty', 'r', encoding='utf-8') as tty_in:
-        answer = tty_in.readline().strip()
-except OSError:
-    stop('ترمینال تعاملی وجود ندارد؛ چیزی منتقل نشد')
-if answer != phrase:
-    stop('تأیید نشد؛ چیزی منتقل نشد')
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+        stop('نوع/اندازه/لینک یکی از فایل‌ها تغییر کرده؛ چیزی منتقل نشد')
+    entries.append((source, info.st_dev, info.st_ino))
 backup_root = repo.parent / 'tgcallbot-backups'
 if backup_root.is_symlink():
     stop('مسیر بکاپ symlink است؛ چیزی منتقل نشد')
@@ -89,30 +80,30 @@ if (not backup_root.is_dir()
         or stat.S_IMODE(backup_root.stat().st_mode) != 0o700
         or backup_root.stat().st_dev != repo.stat().st_dev):
     stop('پوشهٔ خصوصی بیرون پروژه روی همان filesystem لازم است؛ چیزی منتقل نشد')
-place = pathlib.Path(tempfile.mkdtemp(prefix='untracked-', dir=backup_root))
-print('قرنطینهٔ خصوصی:', place)
-for source, dev, ino, size in entries:
-    info = source.lstat()  # changed while approving? refuse, preserve prior moves
-    if (info.st_dev, info.st_ino, info.st_size) != (dev, ino, size):
-        stop('فایل همزمان تغییر کرد؛ باقی فایل‌ها را منتقل نکنید')
+place = pathlib.Path(tempfile.mkdtemp(prefix='untracked-zero-', dir=backup_root))
+print('محل خصوصی حفظ فایل‌ها:', place)
+for source, dev, ino in entries:
+    info = source.lstat()
+    if (info.st_dev, info.st_ino, info.st_size) != (dev, ino, 0):
+        stop('فایل همزمان تغییر کرد؛ محل قرنطینه را قبل از تکرار بررسی کنید')
     target = place / source.name
-    os.rename(source, target)  # same filesystem; no copy or deletion
+    os.rename(source, target)
     os.chmod(target, 0o600)
-    copied = target.lstat()
-    if (copied.st_dev, copied.st_ino, copied.st_size) != (dev, ino, size):
+    info = target.lstat()
+    if (info.st_dev, info.st_ino, info.st_size) != (dev, ino, 0):
         stop('صحت انتقال نیاز به بررسی دستی دارد')
 if subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all']).strip():
-    stop('هنوز تغییرات Git وجود دارد؛ قبل از fetch بررسی کنید')
-print('فایل‌ها بدون حذف در قرنطینه‌اند؛ بکاپ قدیمی را نگه دارید.')
-PY
+    stop('هنوز تغییر Git وجود دارد؛ قبل از fetch بررسی کنید')
+print('همهٔ ۱۴ فایل صفر‌بایتی بیرون پروژه حفظ شدند؛ بکاپ قدیمی معتبر نیست.')
+PYCODE
 ); then
-  echo 'در صورت نیاز، از نسخهٔ قدیمی بکاپ نیز در مسیر خصوصی pg_restore -l بگیرید؛ این مرحله هیچ DB/کانتینری را تغییر نداد.'
+  echo 'Git تمیز شد؛ این مرحله Docker یا DB را تغییر نداد.'
 else
-  echo 'انتقال متوقف شد؛ SSH باز است. قبل از تکرار git status و مسیر قرنطینه را بررسی کنید.' >&2
+  echo 'انتقال متوقف شد؛ SSH باز است. git status و مسیر خصوصی چاپ‌شده را بررسی کنید.' >&2
 fi
 ```
 
-**نکته:** `pg_restore -l` برای dump با فرمت `pg_dump -Fc` مناسب است؛ اگر بکاپ قدیمی فایل SQL متن باشد، خطای آن دلیل حذف فایل نیست. اسکریپت استقرار در مرحلهٔ ۴ *بکاپ جدید* `-Fc` می‌گیرد و خودش پیش از build اعتبار آن را بررسی می‌کند. قرنطینه و بکاپ را نه در repo و نه در Docker context نگه دارید.
+اگر یک نام/حجم تغییر کرده است، **به‌جای تکرار یا git clean، خروجی جدیدِ فقط نام/نوع/حجم را بفرستید.** فایل‌های `data/`، `.env` و volumeهای Docker در این مرحله لمس نمی‌شوند.
 
 ## ۳. ممیزی **تجمعی و فقط‌خواندنی** پرداخت و سفارش ۸۴۶
 
@@ -232,7 +223,7 @@ else
 fi
 ```
 
-`deploy-warp.sh` پیش از هر Docker، repo تمیز، کد/`.env` سازگار، DB و bot **در حال اجرا**، تعمیرات، سفارش‌ها و پرداخت‌های تازه را کنترل می‌کند. پیش از build در `../tgcallbot-backups` (یا `TGCB_BACKUP_DIR` خصوصی بیرون پروژه) با `pg_dump -Fc` بکاپ تازهٔ DB می‌گیرد و با `pg_restore -l` می‌سنجد. سپس `docker compose config --quiet` و **`docker compose build bot`** را انجام می‌دهد، تمیزی Git و شمارهای DB را دوباره می‌سنجد، و **`docker compose up -d --no-build`** را اجرا می‌کند. Compose ممکن است بسته به تغییر پیکربندی سرویس‌های دیگری را هم بازآفرینی کند؛ این فرمان `down` یا پاکسازی volume نمی‌کند. image جداگانهٔ `payproxy` در این تغییرات کد عوض نشده و بازبیلد آن برای به‌روزرسانی ربات لازم نیست. گارد زمان شروع/شناسهٔ پردازهٔ اصلی bot و WARP را بررسی می‌کند؛ import تازهٔ Python داخل کانتینر، یا صرفِ سبزبودن WARP، **اثبات سلامت اکانت/مدیای تماس نیست**. اگر `up` شروع شده و سپس خطایی رخ داد، ممکن است بعضی کانتینرها تغییر کرده باشند: تعمیرات را روشن نگه دارید و وضعیت را بررسی کنید، نه restart/rollback کورکورانه.
+`deploy-warp.sh` پیش از هر Docker، repo تمیز، کد/`.env` سازگار، DB و bot **در حال اجرا**، تعمیرات، سفارش‌ها و پرداخت‌های تازه را کنترل می‌کند. پیش از build در `../tgcallbot-backups` (یا `TGCB_BACKUP_DIR` خصوصی بیرون پروژه) با `pg_dump -Fc` بکاپ تازهٔ DB با نام یکتا (بدون بازنویسی بکاپ قبلی) می‌گیرد و با `pg_restore -l` می‌سنجد. سپس `docker compose config --quiet` و **`docker compose build bot`** را انجام می‌دهد، تمیزی Git و شمارهای DB را دوباره می‌سنجد، و **`docker compose up -d --no-build`** را اجرا می‌کند. Compose ممکن است بسته به تغییر پیکربندی سرویس‌های دیگری را هم بازآفرینی کند؛ این فرمان `down` یا پاکسازی volume نمی‌کند. image جداگانهٔ `payproxy` در این تغییرات کد عوض نشده و بازبیلد آن برای به‌روزرسانی ربات لازم نیست. گارد زمان شروع/شناسهٔ پردازهٔ اصلی bot و WARP را بررسی می‌کند؛ import تازهٔ Python داخل کانتینر، یا صرفِ سبزبودن WARP، **اثبات سلامت اکانت/مدیای تماس نیست**. اگر `up` شروع شده و سپس خطایی رخ داد، ممکن است بعضی کانتینرها تغییر کرده باشند: تعمیرات را روشن نگه دارید و وضعیت را بررسی کنید، نه restart/rollback کورکورانه.
 
 ## ۵. پذیرش عملی و بازگشت از تعمیرات
 
