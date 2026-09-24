@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_DOCKER = r'''#!/usr/bin/env bash
@@ -49,6 +49,20 @@ elif [[ "$1" == compose && "$2" == exec && "${4:-}" == bot ]]; then
   echo 'Bot checkout version: 2.3.15'
 fi
 '''
+FAKE_GIT = r'''#!/usr/bin/env bash
+set -e
+case "$1" in
+  rev-parse) echo "$FAKE_PROJECT_ROOT" ;;
+  branch) echo "${FAKE_BRANCH-arena/01a0ccf5-tgcallbot}" ;;
+  status)
+    if [[ "${FAKE_GIT_DIRTY:-0}" == 1 ]] || {
+      [[ "${FAKE_GIT_DIRTY_AFTER_BUILD:-0}" == 1 ]] &&
+      grep -q 'compose build bot' "$FAKE_DOCKER_LOG" 2>/dev/null
+    }; then
+      echo '?? private-backup.dump'
+    fi ;;
+esac
+'''
 
 
 class ExistingServerDeployGuardTests(unittest.TestCase):
@@ -68,19 +82,21 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         fakebin.mkdir()
         (fakebin / 'docker').write_text(FAKE_DOCKER)
         (fakebin / 'docker').chmod(0o755)
+        (fakebin / 'git').write_text(FAKE_GIT)
+        (fakebin / 'git').chmod(0o755)
         self.log = self.root / 'docker-invocations'
         self.states = self.root / 'preflight-states'
         self.sql = self.root / 'sql-seen'
         self.env = dict(os.environ, PATH=f'{fakebin}:{os.environ.get("PATH", "")}',
                         FAKE_DOCKER_LOG=str(self.log), FAKE_STATES=str(self.states),
-                        FAKE_SQL_LAST=str(self.sql), TGCB_BACKUP_DIR=str(self.backups),
-                        DEPLOY_CONFIRMED='yes')
+                        FAKE_SQL_LAST=str(self.sql), FAKE_PROJECT_ROOT=str(self.project),
+                        TGCB_BACKUP_DIR=str(self.backups), DEPLOY_CONFIRMED='yes')
 
-    def run_script(self, *args, states='1|0\n1|0\n', **extra_env):
+    def run_script(self, *args, states='1|0|0\n1|0|0\n', **extra_env):
         self.states.write_text(states)
         return subprocess.run(['bash', *args], cwd=self.project,
                               env={**self.env, **extra_env},
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=20, check=False)
 
     def commands(self):
         return self.log.read_text() if self.log.exists() else ''
@@ -92,8 +108,8 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.commands(), '')
 
-    def test_busy_or_maintenance_off_aborts_before_backup_and_build(self):
-        for state in ('0|0\n', '1|1\n'):
+    def test_busy_maintenance_off_or_recent_payment_aborts_before_backup_and_build(self):
+        for state in ('0|0|0\n', '1|1|0\n', '1|0|1\n'):
             with self.subTest(preflight=state):
                 self.log.unlink(missing_ok=True)
                 result = self.run_script('deploy-warp.sh', states=state)
@@ -103,6 +119,22 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
                 self.assertNotIn('pg_dump', self.commands())
                 self.assertNotIn('build bot', self.commands())
                 self.assertNotIn('up -d', self.commands())
+
+    def test_dirty_or_detached_checkout_aborts_without_docker_or_backup(self):
+        for env in ({'FAKE_GIT_DIRTY': '1'}, {'FAKE_BRANCH': ''}):
+            with self.subTest(env=env):
+                self.log.unlink(missing_ok=True)
+                result = self.run_script('deploy-warp.sh', **env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('local changes detected', result.stderr)
+                self.assertEqual(self.commands(), '')
+                self.assertFalse(self.backups.exists())
+
+    def test_second_checkout_check_aborts_if_build_creates_unknown_files(self):
+        result = self.run_script('deploy-warp.sh', FAKE_GIT_DIRTY_AFTER_BUILD='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('build bot', self.commands())
+        self.assertNotIn('up -d', self.commands())
 
     def test_supported_voice_knobs_pass_preflight_without_printing_env(self):
         secret = 'PRIVATE_PLACEHOLDER_NOT_A_REAL_CREDENTIAL'
@@ -181,7 +213,7 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertNotIn('exec -T bot python -c', self.commands())
 
     def test_second_preflight_failure_keeps_running_bot_untouched(self):
-        result = self.run_script('deploy-warp.sh', states='1|0\n1|2\n')
+        result = self.run_script('deploy-warp.sh', states='1|0|0\n1|2|0\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('pg_dump', self.commands())
         self.assertIn('build bot', self.commands())
@@ -197,6 +229,8 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertNotIn('remove-orphans', calls)
         self.assertIn('maintenance_mode', self.sql.read_text())
         self.assertIn('scheduled', self.sql.read_text())
+        self.assertIn('payment_transactions', self.sql.read_text())
+        self.assertIn("created_at IS NULL", self.sql.read_text())
         dumps = list(self.backups.glob('predeploy-*.dump'))
         self.assertEqual(len(dumps), 1)
         self.assertNotEqual(dumps[0].parent, self.project)
@@ -227,15 +261,16 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
     def test_copy_pasted_runbook_error_does_not_close_interactive_shell(self):
         """A wrong example path must fail the deployment, not kill the SSH shell."""
         runbook = (ROOT / 'docs/deploy-final.fa.md').read_text()
-        commands = re.findall(r'```bash\n(.*?)\n```', runbook, re.S)
+        commands = re.findall(r'```bash\n(.*?)\n```', runbook, re.DOTALL)
         self.assertGreaterEqual(len(commands), 3)
-        self.assertFalse(any(re.search(r'^set -[a-z]*e', block, re.M)
+        self.assertFalse(any(re.search(r'^set -[a-z]*e', block, re.MULTILINE)
                              for block in commands))
         # Read-only diagnostics must also survive a *previously* enabled -e.
+        diagnostic = commands[0].replace('/opt/tgcallbot', str(self.project))
         result = subprocess.run(
-            ['bash', '-c', 'set -eu\n' + commands[0] + '\necho SSH_STILL_OPEN\n'],
+            ['bash', '-c', 'set -eu\n' + diagnostic + '\necho SSH_STILL_OPEN\n'],
             cwd=self.project, env=self.env, capture_output=True,
-            text=True, timeout=10,
+            text=True, timeout=10, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SSH_STILL_OPEN', result.stdout)
@@ -245,9 +280,10 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.assertIn('DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh || exit 1', deploy)
         self.assertIn('root="$(git rev-parse --show-toplevel', deploy)
         self.assertNotIn('/path/to/current/install', deploy)
+        deploy = deploy.replace('/opt/tgcallbot', str(self.project))
         result = subprocess.run(
             ['bash', '-c', deploy + '\necho SSH_STILL_OPEN\n'],
-            cwd=self.project, capture_output=True, text=True, timeout=10,
+            cwd=self.project, capture_output=True, text=True, timeout=10, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SSH_STILL_OPEN', result.stdout)
@@ -259,14 +295,16 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         fake_git = self.root / 'bin' / 'git'
         fake_git.write_text('#!/bin/sh\n'
                             'if [ "$1" = rev-parse ]; then echo "' + str(self.project) + '"; '
+                            'elif [ "$1" = branch ]; then echo "arena/01a0ccf5-tgcallbot"; '
                             'elif [ "$1" = status ]; then echo " M local-config"; fi\n')
         fake_git.chmod(0o755)
         result = subprocess.run(
             ['bash', '-c', deploy + '\necho SSH_STILL_OPEN\n'],
             cwd=self.project, env=self.env, capture_output=True,
-            text=True, timeout=10,
+            text=True, timeout=10, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SSH_STILL_OPEN', result.stdout)
-        self.assertIn('تغییرات محلی دارید', result.stderr)
+        self.assertIn('فایل محلی هنوز هست', result.stderr)
+        self.assertIn('استقرار یا ممیزی متوقف شد', result.stderr)
         self.assertEqual(self.commands(), '')

@@ -22,7 +22,7 @@
 | [`docs/session-safety.fa.md`](docs/session-safety.fa.md) | جلوگیری از تداخل سشن، استقرار امن و بازیابی اکانت‌های ۴۰۶ |
 | [`docs/full-version.fa.md`](docs/full-version.fa.md) | موجودی قابلیت‌های کد ۲.۳.۱۵ و محدودیت‌های بررسی آفلاین |
 | [`docs/env-compatibility.fa.md`](docs/env-compatibility.fa.md) | **گارد نام/مقدار تنظیمات تاریخی `.env`؛ پیش از استقرار بخوانید** |
-| [`docs/deploy-final.fa.md`](docs/deploy-final.fa.md) | **دستورهای استقرار مشروط نسخهٔ ۲.۳.۱۵ روی نصب موجود**؛ فقط پس از بررسی زندهٔ پیش‌شرط‌ها |
+| [`docs/deploy-final.fa.md`](docs/deploy-final.fa.md) | **دستورهای استقرار مشروط نسخهٔ ۲.۳.۱۵ روی نصب موجود**؛ قرنطینهٔ خصوصی فایل‌های ناشناس و ممیزی پرداخت‌های pending پیش از Docker |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
 | [`docs/premium-emoji.fa.md`](docs/premium-emoji.fa.md) | **💎 ایموجی پریمیوم (Custom Emoji)** در همهٔ منوها، دکمه‌ها، تیکت و بازنشر پیام کاربر |
 

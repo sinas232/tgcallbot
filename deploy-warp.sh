@@ -32,6 +32,23 @@ if [[ ! -r .env ]]; then
   echo "Cannot read .env; refusing deploy without checking compatibility." >&2
   exit 2
 fi
+# Do not package unidentified local files or a dump in the build context.
+# Recheck after build too: a source checkout changing while Docker builds is
+# not a trustworthy release, even if the initial runbook checked Git.
+verify_checkout() {
+  local root branch changes
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "Not inside a Git checkout; refusing existing-install deploy." >&2
+    return 1
+  }
+  branch="$(git branch --show-current)" || return 1
+  changes="$(git status --porcelain --untracked-files=all)" || return 1
+  if [[ "$root" != "$project_dir" || -z "$branch" || -n "$changes" ]]; then
+    echo "Detached branch, checkout root mismatch or local changes detected. Preserve untracked files outside this project and inspect git status; no reset/clean/stash was run." >&2
+    return 1
+  fi
+}
+verify_checkout || exit 2
 # Validate supported operational policies without echoing .env values. The
 # stdlib-only checker runs before ANY Docker command or private DB backup.
 if ! command -v python3 >/dev/null 2>&1 || ! python3 tools/validate_env_compat.py .env; then
@@ -70,15 +87,18 @@ SELECT
   ) THEN '1' ELSE '0' END,
   (SELECT count(*) FROM orders WHERE status IN ('running', 'pending')
       OR (status = 'scheduled' AND scheduled_for <=
-          (now() AT TIME ZONE 'UTC') + interval '30 minutes'));
+          (now() AT TIME ZONE 'UTC') + interval '30 minutes')),
+  (SELECT count(*) FROM payment_transactions WHERE status = 'pending'
+      AND (created_at IS NULL OR created_at >=
+          (now() AT TIME ZONE 'UTC') - interval '30 minutes'));
 SQL
 )" || {
-    echo "Order preflight query failed; refusing deploy." >&2
+    echo "Order/payment preflight query failed; refusing deploy." >&2
     return 1
   }
-  if [[ "$state" != '1|0' ]]; then
-    echo "Refusing deploy: require maintenance enabled and zero running/pending/soon-due orders (maintenance|busy=$state)." >&2
-    echo "Inspect paid orders, especially #846, before touching services. No refunds or DB updates were performed." >&2
+  if [[ "$state" != '1|0|0' ]]; then
+    echo "Refusing deploy: require maintenance, zero active/soon-due orders AND zero pending payments opened in the last 30 minutes or with unknown time (maintenance|orders|recent_payments=$state)." >&2
+    echo "Older pending payments may STILL be in flight: reconcile them with the gateway manually; do not mark them paid/failed by guess. No refunds or DB updates were performed." >&2
     return 1
   fi
 }
@@ -116,6 +136,7 @@ echo "Private DB backup verified outside the project: $backup"
 # interruption. The last check immediately precedes container recreation.
 docker compose config --quiet
 docker compose build bot
+verify_checkout || exit 2
 check_idle
 # Unlike the old script: no 'down', no --remove-orphans, no automatic rollback.
 # Keep maintenance enabled until an operator checks the actual accounts/calls.
