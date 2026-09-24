@@ -30,6 +30,26 @@ from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
 
+
+def _account_proxy_config():
+    """Use the same configured MTProto path as voice clients for ad-hoc checks.
+
+    Previously voice went through the WARP SOCKS5 endpoint when USE_PROXY was
+    enabled, but health/recovery probes ignored it. A failed direct route can
+    look like 25 unusable sessions; a network error is never deletion proof.
+    Do not expose proxy credentials in logs or admin messages.
+    """
+    if not Config.USE_PROXY:
+        return None
+    proxy = {"scheme": "socks5", "hostname": str(Config.SOCKS5_HOST),
+             "port": int(Config.SOCKS5_PORT)}
+    if Config.SOCKS5_USERNAME:
+        proxy['username'] = Config.SOCKS5_USERNAME
+    if Config.SOCKS5_PASSWORD:
+        proxy['password'] = Config.SOCKS5_PASSWORD
+    return proxy
+
+
 class TelegramAccountClient:
     """کلاس مدیریت اکانت‌های تلگرام"""
 
@@ -98,6 +118,7 @@ class TelegramAccountClient:
                 session_string=decrypted_session,
                 no_updates=no_updates,
                 in_memory=True,
+                proxy=_account_proxy_config(),
             )
             self._bind_ownership_release(client, token)
             return client

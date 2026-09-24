@@ -1,7 +1,8 @@
-"""Bounded offline plan for an explicitly approved, serial cleanup review.
+"""Offline plan and in-process worker for a bounded, approved cleanup review.
 
-No Telegram connection or database mutation occurs here. The whole-table
-snapshot is necessary to skip aliases of the same decrypted auth key across
+Planning opens no Telegram connection or database write. The confirmed worker
+may update a row's status/evidence after a guarded probe but NEVER deletes it.
+The whole-table snapshot detects aliases of the decrypted auth key across
 main/reseller bots; only IDs and hashes of encrypted rows leave this module.
 """
 from __future__ import annotations
@@ -27,6 +28,20 @@ from services.account_recovery import recover_one_account
 
 MAX_SCAN_ROWS = 5000
 MAX_SCAN_CANDIDATES = 100
+
+# The UI must distinguish a refused probe from a Telegram verdict. These are
+# fixed internal codes, never raw RPC text or session/phone material.
+UNCERTAIN_CODES = frozenset({
+    'changed_before_probe', 'changed_during_probe', 'not_found', 'not_inactive',
+    'conflict_cooldown', 'shared', 'busy', 'duplicated_in_use',
+    'relogin_required', 'timeout', 'disconnect_unconfirmed', 'error', 'other',
+})
+# A first 406 or unconfirmed disconnect may indicate a session is still held:
+# do not immediately connect the *next* key without operator investigation.
+STOP_IMMEDIATELY = frozenset({'duplicated_in_use', 'disconnect_unconfirmed'})
+# Repeated identical failures commonly mean a shared network/credential/
+# ownership problem. Do not turn 25 accounts into 25 pointless attempts.
+STOP_AFTER_THREE = frozenset({'error', 'timeout', 'relogin_required', 'busy', 'shared'})
 
 
 @dataclass(frozen=True)
@@ -121,6 +136,7 @@ class CleanupScanResult:
     reactivated: int
     uncertain: int
     stop_reason: str | None = None
+    reasons: tuple[tuple[str, int], ...] = ()
 
 
 async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
@@ -131,11 +147,16 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
     superadmin preview. Before EVERY connection, recheck maintenance, orders,
     alias uniqueness and the exact unchanged candidate. Restart/cancellation
     stops the loop; already verified DB markers remain for a later preview.
+    The progress callback receives aggregate fixed reason codes, never raw
+    RPC text, phone numbers, fingerprints or the session itself.
     """
     logger = logging.getLogger(__name__)
     checked = deleted = revoked = reactivated = uncertain = 0
     total = len(approved)
     stop_reason = None
+    reasons: Counter[str] = Counter()
+    last_failure = None
+    same_failure = 0
     for aid, fingerprint in approved:
         try:
             allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
@@ -144,17 +165,18 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
                 break
             latest = await prepare_cleanup_scan(bot_id)
             if (aid, fingerprint) not in latest.candidates:
-                uncertain += 1  # changed key, alias, status or new 406 cooldown
-                checked += 1
-                continue
-            # The alias scan can take time on a large installation. Recheck
-            # maintenance and orders immediately before opening a transport.
-            allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
-            if not allowed:
-                stop_reason = reason
-                break
-            _, verdict = await recover_one_account(
-                aid, bot_id, expected_session_fingerprint=fingerprint)
+                # The snapshot changed after confirmation: NO connection was
+                # made, and it must not be reported as an auth failure.
+                verdict = 'changed_before_probe'
+            else:
+                # The alias scan can take time on a large installation. Recheck
+                # maintenance and orders immediately before opening a transport.
+                allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
+                if not allowed:
+                    stop_reason = reason
+                    break
+                _, verdict = await recover_one_account(
+                    aid, bot_id, expected_session_fingerprint=fingerprint)
         except asyncio.CancelledError:
             raise
         except CleanupScanTooLarge:
@@ -173,10 +195,30 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
             reactivated += 1
         else:
             uncertain += 1
+            # recover_one_account never includes arbitrary Telegram text in a
+            # verdict, but still enforce an allowlist before displaying it.
+            code = verdict if verdict in UNCERTAIN_CODES else 'other'
+            reasons[code] += 1
+
+        if verdict in STOP_IMMEDIATELY:
+            if checked < total:
+                stop_reason = 'unsafe_probe'
+        elif verdict in STOP_AFTER_THREE:
+            same_failure = same_failure + 1 if verdict == last_failure else 1
+            last_failure = verdict
+            if same_failure >= 3 and checked < total:
+                stop_reason = 'repeated_uncertain'
+        else:
+            last_failure = None
+            same_failure = 0
+
         if checked % 10 == 0:
-            await progress(checked, total, deleted, revoked, reactivated, uncertain)
+            await progress(checked, total, deleted, revoked, reactivated,
+                           uncertain, tuple(sorted(reasons.items())))
+        if stop_reason:
+            break
         # Avoid rapid reconnects/Telegram abuse even for distinct auth keys.
         if checked < total:
             await asyncio.sleep(1)
     return CleanupScanResult(checked, total, deleted, revoked, reactivated,
-                             uncertain, stop_reason)
+                             uncertain, stop_reason, tuple(sorted(reasons.items())))

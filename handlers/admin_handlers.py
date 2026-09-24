@@ -389,18 +389,50 @@ def _cleanup_scan_running(job: dict | None) -> bool:
                 (job.get('task') is None or not job['task'].done()))
 
 
+_CLEANUP_SCAN_STOP_LABELS = {
+    'cancelled': 'بررسی با درخواست توقف/خاموشی لغو شد؛ ممکن است همهٔ سشن‌ها بررسی نشده باشند.',
+    'maintenance': 'حالت تعمیرات خاموش شد.',
+    'busy': 'سفارش فعال/نزدیک آغاز شد.',
+    'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
+    'unavailable': 'خطای غیرمنتظره در پیش‌شرط یا پروب؛ جزئیات نوع خطا در لاگ خصوصی است.',
+    'unsafe_probe': 'تداخل ۴۰۶ یا قطع اتصال نامطمئن ثبت شد؛ تا بررسی علت، سشن بعدی پروب نشد.',
+    'repeated_uncertain': 'سه نتیجهٔ نامطمئنِ یکسان پیاپی؛ ابتدا علت مشترک را بررسی کنید.',
+}
+
+_CLEANUP_SCAN_REASON_LABELS = {
+    'changed_before_probe': 'ردشده پیش از اتصال (تغییر ردیف/کلید)',
+    'changed_during_probe': 'تغییر ردیف حین بررسی',
+    'not_found': 'ردیف یافت نشد',
+    'not_inactive': 'دیگر غیرفعال نیست',
+    'conflict_cooldown': 'مهلت ایمنی ۴۰۶',
+    'shared': 'کلید مشترک/قفل‌شده',
+    'busy': 'سشن مشغول/قفل‌شده',
+    'duplicated_in_use': 'تداخل ۴۰۶',
+    'relogin_required': 'احراز هویت مبهم/بن (نیاز به بررسی ورود)',
+    'timeout': 'مهلت اتصال تمام شد',
+    'disconnect_unconfirmed': 'قطع اتصال نامطمئن',
+    'error': 'خطای دیگر (نوع در لاگ خصوصی)',
+    'other': 'علت دیگر',
+}
+
+
 def _cleanup_scan_progress(job: dict) -> str:
     done, total, deleted, revoked, active, uncertain = job['progress']
+    reason_counts = job.get('reasons') or ()
+    summary = ('\nعلت نامطمئن‌ها: ' + ' • '.join(
+        f'{_CLEANUP_SCAN_REASON_LABELS.get(code, "علت دیگر")}: {count}'
+        for code, count in reason_counts) if reason_counts else '')
     return (f'🧪 بررسی مرحله‌ای: {done}/{total}\n'
             f'حساب واقعاً دلیت‌شده: {deleted} • سشن باطل/منقضی‌شده: {revoked}\n'
-            f'سشن سالم و دوباره فعال‌شده: {active} • نامطمئن/عوض‌شده: {uncertain}\n'
-            'هیچ ردیفی در مرحلهٔ بررسی حذف نمی‌شود.')
+            f'سشن سالم و دوباره فعال‌شده: {active} • نامطمئن/عوض‌شده: {uncertain}'
+            + summary + '\nهیچ ردیفی در مرحلهٔ بررسی حذف نمی‌شود.')
 
 
 async def _run_cleanup_review_job(bot, chat_id: int, bot_id: int, job: dict,
                                   approved: tuple[tuple[int, str], ...]) -> None:
-    async def notify(checked, total, deleted, revoked, active, uncertain):
+    async def notify(checked, total, deleted, revoked, active, uncertain, reasons):
         job['progress'] = (checked, total, deleted, revoked, active, uncertain)
+        job['reasons'] = reasons
         try:
             await send_safe(bot, chat_id, _cleanup_scan_progress(job), parse_mode=None)
         except Exception as exc:
@@ -410,19 +442,24 @@ async def _run_cleanup_review_job(bot, chat_id: int, bot_id: int, job: dict,
         result = await run_cleanup_scan(bot_id, approved, notify)
         job['progress'] = (result.checked, result.total, result.deleted_accounts,
                            result.revoked_sessions, result.reactivated, result.uncertain)
+        job['reasons'] = result.reasons
+        job['stop_reason'] = result.stop_reason
         if result.stop_reason:
-            why = {'maintenance': 'حالت تعمیرات خاموش شد.',
-                   'busy': 'سفارش فعال/نزدیک آغاز شد.',
-                   'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
-                   'unavailable': 'بررسی امن وضعیت دیتابیس ممکن نبود.'}.get(
-                       result.stop_reason, 'پیش‌شرط ایمنی برقرار نبود.')
+            why = _CLEANUP_SCAN_STOP_LABELS.get(result.stop_reason,
+                                                'پیش‌شرط ایمنی برقرار نبود.')
             text = '⛔️ بررسی نیمه‌تمام متوقف شد: ' + why + '\n' + _cleanup_scan_progress(job)
+        elif not (result.deleted_accounts or result.revoked_sessions or result.reactivated):
+            text = ('⚠️ بررسی پایان یافت، اما شاهد قابل حذف یا احیا به‌دست نیامد. '
+                    '«نامطمئن» به معنی دلیت‌شدن حساب نیست؛ با گزارش دلیل‌ها و '
+                    'لاگ خصوصی علت را بررسی کنید، ۲۵ پروب را کورکورانه تکرار نکنید.\n'
+                    + _cleanup_scan_progress(job))
         else:
             text = ('✅ بررسی مرحله‌ای پایان یافت.\n' + _cleanup_scan_progress(job) +
                     '\nحالا فهرست دقیق موارد تأییدشده را ببینید و جداگانه حذف را تأیید کنید.')
     except asyncio.CancelledError:
         text = ('🛑 بررسی مرحله‌ای لغو شد؛ حساب‌های بررسی‌شده خودکار حذف نشدند. '
                 'نشانگرهای تأییدشدهٔ قبلی برای پیش‌نمایش باقی‌اند.')
+        job['stop_reason'] = 'cancelled'
         job['finished'] = True
         try:
             await send_safe(bot, chat_id, text, parse_mode=None)
@@ -431,6 +468,7 @@ async def _run_cleanup_review_job(bot, chat_id: int, bot_id: int, job: dict,
         raise
     except Exception as exc:
         logger.warning('Cleanup review stopped: %s', type(exc).__name__)
+        job['stop_reason'] = 'unavailable'
         text = ('⛔️ بررسی مرحله‌ای به‌علت خطا متوقف شد؛ هیچ حذف خودکاری رخ نداد. '
                 'وضعیت را بررسی کنید.')
     job['finished'] = True
@@ -506,7 +544,15 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             [InlineKeyboardButton('🗑 پیش‌نمایش حذف همهٔ تأییدشده‌ها',
                                   callback_data='deleted_cleanup_preview_all')],
         ]) + back
-        await display(_cleanup_scan_progress(job), buttons)
+        status = _cleanup_scan_progress(job)
+        if not running and job.get('stop_reason'):
+            status = ('⛔️ بررسی نیمه‌تمام متوقف شد: '
+                      + _CLEANUP_SCAN_STOP_LABELS.get(job['stop_reason'],
+                                                      'علت توقف را در لاگ بررسی کنید.')
+                      + '\n' + status)
+        elif not running:
+            status = '✅ بررسی پایان یافته است.\n' + status
+        await display(status, buttons)
         return AWAITING_SETTINGS_ACTION
 
     if data == 'deleted_cleanup_scan_start':
@@ -592,7 +638,7 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             return AWAITING_SETTINGS_ACTION
         job = {'user_id': update.effective_user.id, 'chat_id': update.effective_chat.id,
                'finished': False, 'progress': (0, len(current.candidates), 0, 0, 0, 0),
-               'task': None}
+               'reasons': (), 'task': None}
         _cleanup_scan_jobs[bot_id] = job
         worker = _run_cleanup_review_job(context.bot, update.effective_chat.id,
                                          bot_id, job, current.candidates)
@@ -858,7 +904,8 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
     accounts = await DatabaseManager.get_verified_unusable_accounts(bot_id)
     deleted_count = sum(acc['marker'] == CONFIRMED_ACCOUNT_DELETED for acc in accounts)
     revoked_count = len(accounts) - deleted_count
-    running = any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values())
+    job = _cleanup_scan_jobs.get(bot_id)
+    running = _cleanup_scan_running(job)
     buttons = [
         [InlineKeyboardButton(f'🗑 حذف همهٔ تأییدشده‌ها ({len(accounts)})',
                               callback_data='deleted_cleanup_preview_all')],
@@ -867,9 +914,19 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         [InlineKeyboardButton('📋 انتخاب حساب مشکوک (تک‌اکانتی)',
                               callback_data='deleted_cleanup_list_1')],
     ]
-    if running:
-        buttons.append([InlineKeyboardButton('♻️ وضعیت بررسی جاری',
+    if running or (job and job.get('finished')):
+        buttons.append([InlineKeyboardButton('♻️ نتیجه/وضعیت آخرین بررسی',
                                              callback_data='deleted_cleanup_scan_status')])
+    if running:
+        last_review = (f'\n\n⏳ بررسی هنوز در جریان است: '
+                       f'{job["progress"][0]}/{job["progress"][1]}. '
+                       'شمار صفر در منو نتیجهٔ نهایی نیست.')
+    elif job and job.get('finished') and job['progress'][5]:
+        last_review = ('\n\n⚠️ آخرین بررسی موارد نامطمئن داشت؛ علت‌ها را از '
+                       '«نتیجه/وضعیت آخرین بررسی» ببینید. با شمار صفر، '
+                       'دکمهٔ حذف چیزی پاک نمی‌کند.')
+    else:
+        last_review = ''
     buttons.extend([
         [InlineKeyboardButton('♻️ بروزرسانی منو', callback_data='deleted_cleanup_menu')],
         [InlineKeyboardButton('🔙 گزارش سلامت اکانت‌ها', callback_data='health_back')],
@@ -881,7 +938,8 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         'حذف همه همیشه در دسترس است، ولی با شمار صفر چیزی را پاک نمی‌کند. '
         'ابتدا بررسی مرحله‌ایِ سشن‌های غیرفعال را جداگانه تأیید کنید؛ '
         'سشن‌های سالم حفظ می‌شوند، موارد نامطمئن حذف نمی‌شوند. '
-        'بعد فهرست دقیقِ تأییدشده‌ها را پیش‌نمایش و حذف نهایی را تأیید کنید.',
+        'بعد فهرست دقیقِ تأییدشده‌ها را پیش‌نمایش و حذف نهایی را تأیید کنید.'
+        + last_review,
         buttons)
     return AWAITING_SETTINGS_ACTION
 

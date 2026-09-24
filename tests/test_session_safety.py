@@ -189,6 +189,44 @@ class ClientCloseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdHocClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_client_uses_configured_voice_proxy_only_when_enabled(self):
+        import telegram_client as module
+        from services import voice_call_manager as voice
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                guard = SessionOwnership()
+                transport = SimpleNamespace(is_connected=False, is_initialized=False,
+                                            session=None, connect=AsyncMock(),
+                                            disconnect=AsyncMock(), start=AsyncMock())
+                with patch.object(module.Config, 'USE_PROXY', enabled), \
+                     patch.object(module.Config, 'SOCKS5_HOST', '127.0.0.1'), \
+                     patch.object(module.Config, 'SOCKS5_PORT', 1080), \
+                     patch.object(module.Config, 'SOCKS5_USERNAME', 'user'), \
+                     patch.object(module.Config, 'SOCKS5_PASSWORD', 'private-secret'), \
+                     patch.object(module.DatabaseManager, 'get_account_by_id',
+                                  new_callable=AsyncMock, return_value={
+                                      'session_string': 'cipher', 'account_status': 'inactive'}), \
+                     patch.object(module.SecurityManager, 'decrypt_session',
+                                  return_value=_export(b'a' * 256)), \
+                     patch.object(module.TelegramAccountClient, '_get_api_credentials',
+                                  new_callable=AsyncMock, return_value=(123, 'hash')), \
+                     patch.object(module, 'session_ownership', guard), \
+                     patch.object(module, 'Client', return_value=transport) as construct:
+                    client = await module.TelegramAccountClient(
+                        'phone', 'cipher', 77, allow_recovery_probe=True).get_client()
+                    self.assertIs(client, transport)
+                    self.assertEqual(construct.call_args.kwargs['proxy'],
+                                     voice._voice_proxy_config())
+                    if enabled:
+                        self.assertEqual(construct.call_args.kwargs['proxy'], {
+                            'scheme': 'socks5', 'hostname': '127.0.0.1',
+                            'port': 1080, 'username': 'user', 'password': 'private-secret'})
+                    else:
+                        self.assertIsNone(construct.call_args.kwargs['proxy'])
+                    self.assertTrue(guard.is_busy(77))
+                    guard.end_ad_hoc(77, client._ownership_token)
+                    self.assertFalse(guard.is_busy(77))
+
     async def test_cancel_during_credentials_lookup_clears_reservation(self):
         import telegram_client as module
         so = SessionOwnership()

@@ -115,7 +115,9 @@ class SerialScanTests(unittest.IsolatedAsyncioTestCase):
                                 (False, 'disconnect_unconfirmed')]) as probe, \
              patch.object(cleanup_review.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
             outcome = await cleanup_review.run_cleanup_scan(1, approved, progress)
-        self.assertEqual(outcome, cleanup_review.CleanupScanResult(5, 5, 1, 1, 1, 2))
+        self.assertEqual(outcome, cleanup_review.CleanupScanResult(
+            5, 5, 1, 1, 1, 2, reasons=(('disconnect_unconfirmed', 1),
+                                      ('relogin_required', 1))))
         self.assertEqual([call.args[0] for call in probe.await_args_list], [7, 8, 9, 10, 11])
         self.assertTrue(all(call.kwargs['expected_session_fingerprint'] == f'hash{call.args[0]}'
                             for call in probe.await_args_list))
@@ -150,8 +152,55 @@ class SerialScanTests(unittest.IsolatedAsyncioTestCase):
              patch.object(cleanup_review, 'recover_one_account', new_callable=AsyncMock,
                    return_value=(False, 'account_deleted')) as probe:
             result = await cleanup_review.run_cleanup_scan(1, approved, AsyncMock())
-        self.assertEqual(result, cleanup_review.CleanupScanResult(2, 2, 1, 0, 0, 1))
+        self.assertEqual(result, cleanup_review.CleanupScanResult(
+            2, 2, 1, 0, 0, 1, reasons=(('changed_before_probe', 1),)))
         probe.assert_awaited_once_with(8, 1, expected_session_fingerprint='hash8')
+
+    async def test_three_same_failures_stop_before_probing_remaining_accounts(self):
+        approved = tuple((aid, f'hash{aid}') for aid in range(7, 12))
+        with patch.object(cleanup_review.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')), \
+             patch.object(cleanup_review, 'prepare_cleanup_scan', new_callable=AsyncMock,
+                          return_value=cleanup_review.CleanupScanPlan(approved, 5, 0, 0, 0)), \
+             patch.object(cleanup_review, 'recover_one_account', new_callable=AsyncMock,
+                          side_effect=[(False, 'error')] * 3 +
+                                      [(False, 'account_deleted')] * 2) as probe, \
+             patch.object(cleanup_review.asyncio, 'sleep', new_callable=AsyncMock):
+            result = await cleanup_review.run_cleanup_scan(1, approved, AsyncMock())
+        self.assertEqual(result, cleanup_review.CleanupScanResult(
+            3, 5, 0, 0, 0, 3, 'repeated_uncertain', (('error', 3),)))
+        self.assertEqual(probe.await_count, 3)
+
+    async def test_406_or_unconfirmed_disconnect_halts_before_next_key(self):
+        approved = ((7, 'hash7'), (8, 'hash8'))
+        for reason in ('duplicated_in_use', 'disconnect_unconfirmed'):
+            with self.subTest(reason=reason), \
+                 patch.object(cleanup_review.DatabaseManager, 'deletion_review_probe_allowed',
+                              new_callable=AsyncMock, return_value=(True, 'ready')), \
+                 patch.object(cleanup_review, 'prepare_cleanup_scan', new_callable=AsyncMock,
+                              return_value=cleanup_review.CleanupScanPlan(approved, 2, 0, 0, 0)), \
+                 patch.object(cleanup_review, 'recover_one_account', new_callable=AsyncMock,
+                              side_effect=[(False, reason), (False, 'session_revoked')]) as probe:
+                result = await cleanup_review.run_cleanup_scan(1, approved, AsyncMock())
+            self.assertEqual(result, cleanup_review.CleanupScanResult(
+                1, 2, 0, 0, 0, 1, 'unsafe_probe', ((reason, 1),)))
+            probe.assert_awaited_once()
+
+    async def test_progress_reports_fixed_aggregate_codes_without_session_ids(self):
+        approved = tuple((aid, f'cipher-hash{aid}') for aid in range(7, 17))
+        progress = AsyncMock()
+        with patch.object(cleanup_review.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')), \
+             patch.object(cleanup_review, 'prepare_cleanup_scan', new_callable=AsyncMock,
+                          return_value=cleanup_review.CleanupScanPlan(approved, 10, 0, 0, 0)), \
+             patch.object(cleanup_review, 'recover_one_account', new_callable=AsyncMock,
+                          side_effect=[(False, 'timeout'), (True, 'recovered')] * 5), \
+             patch.object(cleanup_review.asyncio, 'sleep', new_callable=AsyncMock):
+            result = await cleanup_review.run_cleanup_scan(1, approved, progress)
+        self.assertEqual(result.checked, 10)
+        self.assertEqual(result.reasons, (('timeout', 5),))
+        progress.assert_awaited_once_with(10, 10, 0, 0, 5, 5, (('timeout', 5),))
+        self.assertNotIn('cipher-hash', repr(progress.await_args))
 
     async def test_database_error_stops_whole_scan_without_connecting(self):
         with patch.object(cleanup_review.DatabaseManager, 'deletion_review_probe_allowed',

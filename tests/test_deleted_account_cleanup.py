@@ -629,6 +629,45 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('deleted_cleanup_menu', callbacks)
             self.assertNotIn('deleted_cleanup_confirm_', repr(callbacks))
 
+    async def test_menu_explains_incomplete_review_and_breaks_down_uncertain_codes(self):
+        job = {'user_id': 5, 'chat_id': 55, 'finished': False,
+               'progress': (20, 25, 0, 0, 0, 20),
+               'reasons': (('error', 20),),
+               'task': SimpleNamespace(done=lambda: False)}
+        admin_handlers._cleanup_scan_jobs[1] = job
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+             patch.object(admin_handlers, 'recover_one_account',
+                          new_callable=AsyncMock) as probe, \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock) as delete:
+            query = self.callback('deleted_cleanup_menu')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertIn('شمار صفر در منو نتیجهٔ نهایی نیست',
+                          query.edit_message_text.call_args.args[0])
+            query.data = 'deleted_cleanup_scan_status'
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            text = query.edit_message_text.call_args.args[0]
+            self.assertIn('20/25', text)
+            self.assertIn('خطای دیگر (نوع در لاگ خصوصی): 20', text)
+            self.assertNotIn('cipher', text)
+
+            job['finished'] = True
+            job['task'] = SimpleNamespace(done=lambda: True)
+            job['stop_reason'] = 'repeated_uncertain'
+            job['progress'] = (3, 25, 0, 0, 0, 3)
+            job['reasons'] = (('relogin_required', 3),)
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertIn('سه نتیجهٔ نامطمئنِ یکسان پیاپی',
+                          query.edit_message_text.call_args.args[0])
+            self.assertIn('احراز هویت مبهم/بن', query.edit_message_text.call_args.args[0])
+            query.data = 'deleted_cleanup_menu'
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertIn('آخرین بررسی موارد نامطمئن داشت',
+                          query.edit_message_text.call_args.args[0])
+            probe.assert_not_awaited()
+            delete.assert_not_awaited()
+
     async def test_bulk_delete_button_at_zero_never_deletes_legacy_dead_rows(self):
         with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
              patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
@@ -737,6 +776,25 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             query.data = 'deleted_cleanup_list_2'
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             select.assert_awaited_with(1, page=2)
+
+    async def test_result_with_no_evidence_explains_failure_instead_of_promising_cleanup(self):
+        result = cleanup_review.CleanupScanResult(
+            3, 25, 0, 0, 0, 3, 'repeated_uncertain', (('timeout', 3),))
+        job = {'progress': (0, 25, 0, 0, 0, 0), 'reasons': (), 'finished': False}
+        with patch.object(admin_handlers, 'run_cleanup_scan', new_callable=AsyncMock,
+                          return_value=result), \
+             patch.object(admin_handlers, 'send_safe', new_callable=AsyncMock) as send, \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock) as delete:
+            await admin_handlers._run_cleanup_review_job(
+                self.context.bot, 55, 1, job, ((7, 'hash7'),))
+            self.assertTrue(job['finished'])
+            self.assertEqual(job['reasons'], (('timeout', 3),))
+            text = send.call_args.args[2]
+            self.assertIn('بررسی نیمه‌تمام متوقف شد', text)
+            self.assertIn('مهلت اتصال تمام شد: 3', text)
+            self.assertNotIn('حذف شد', text)
+            delete.assert_not_awaited()
 
     async def test_leaving_scan_preview_invalidates_old_confirm_button(self):
         plan = cleanup_review.CleanupScanPlan(((7, 'hash7'),), 1, 0, 0, 0)

@@ -33,18 +33,22 @@ class QuarantineRunbookTests(unittest.TestCase):
             (self.project / name).touch()
         source = (ROOT / 'docs/deploy-final.fa.md').read_text()
         blocks = re.findall(r'```bash\n(.*?)\n```', source, re.DOTALL)
-        self.assertEqual(len(blocks), 5)
-        # Exercise the literal documented command; replace only the fixture's
-        # path, preserving all whitelist and Git-branch conditions.
-        self.block = blocks[1].replace('/opt/tgcallbot', str(self.project))
-        self.report_block = (blocks[3]
+        # Find each literal command by its distinctive action, not by index:
+        # diagnostic blocks may be added without silently changing which
+        # potentially destructive command these tests execute.
+        quarantine = next(b for b in blocks if 'untracked-zero-' in b)
+        provider_report = next(b for b in blocks if 'pending-review-XXXXXXXX.csv' in b)
+        aggregate = next(b for b in blocks if 'BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY' in b)
+        safe_logs = next(b for b in blocks if 'fetch_me failed for acc' in b)
+        self.block = quarantine.replace('/opt/tgcallbot', str(self.project))
+        self.report_block = (provider_report
                              .replace('/opt/tgcallbot-backups',
                                       str(self.project.parent / 'tgcallbot-backups'))
                              .replace('/opt/tgcallbot', str(self.project)))
+        self.log_block = safe_logs.replace('/opt/tgcallbot', str(self.project))
         # The public report is aggregate-only. Provider IDs belong only in a
         # private file, not terminal output or a chat paste.
-        self.assertNotIn('trans_id', blocks[2])
-        self.assertIn('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY', blocks[2])
+        self.assertNotIn('trans_id', aggregate)
 
     def git(self, *args):
         return subprocess.run(['git', *args], cwd=self.project,
@@ -110,6 +114,32 @@ class QuarantineRunbookTests(unittest.TestCase):
         self.assertIn('پوشهٔ خصوصی', result.stderr)
         self.assertTrue((self.project / 'backup_2026-09-20.dump').exists())
         self.assertFalse(list(private.iterdir()))
+
+    def test_prior_scan_logs_report_counts_without_ids_or_session_material(self):
+        fakebin = self.project.parent / 'bin'
+        fakebin.mkdir()
+        fake_docker = fakebin / 'docker'
+        fake_docker.write_text(
+            '#!/bin/sh\ncat <<\'LOG\'\n'
+            'fetch_me failed for acc 7: TimeoutError -> error\n'
+            'Account 8 single recovery failed: ConnectionError\n'
+            'acc=9 probe disconnect unconfirmed; holding reservation\n'
+            'Cleanup review halted at account 10: RuntimeError\n'
+            'other line with PHONE_PRIVATE_SESSION_KEY_SHOULD_NOT_APPEAR\n'
+            'LOG\n')
+        fake_docker.chmod(0o755)
+        env = dict(os.environ, PATH=f'{fakebin}:{os.environ["PATH"]}')
+        result = subprocess.run(['bash', '-c', self.log_block], cwd=self.project,
+                                env=env, capture_output=True, text=True,
+                                timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Telegram/TimeoutError/error: 1', result.stdout)
+        self.assertIn('recovery_error/ConnectionError: 1', result.stdout)
+        self.assertIn('disconnect_unconfirmed: 1', result.stdout)
+        self.assertIn('scan_halted/RuntimeError: 1', result.stdout)
+        self.assertNotIn('acc 7', result.stdout)
+        self.assertNotIn('PHONE_PRIVATE_SESSION', result.stdout + result.stderr)
+        self.assertEqual(len(list(self.project.parent.glob('tgcallbot-backups*'))), 0)
 
     def test_provider_ids_export_only_to_private_file(self):
         private = self.project.parent / 'tgcallbot-backups'
