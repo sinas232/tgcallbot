@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -357,6 +358,243 @@ class DurableDurationStartTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await database.DatabaseManager.start_order_duration(846))
 
 
+class PaymentRedirectSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_trusted_https_payment_hosts_are_redirectable(self):
+        from main import pay_redirect_handler
+        from database import DatabaseManager
+        req = SimpleNamespace(match_info={'trans_id': '<script>foo</script>'})
+        base = {'status': 'pending', 'amount': 1000, 'pay_url':
+                'https://payment.zarinpal.com/pg/StartPay/authority?x="evil"'}
+        with patch.object(DatabaseManager, 'get_payment_transaction',
+                          new=AsyncMock(return_value=base)):
+            response = await pay_redirect_handler(req)
+            self.assertEqual(response.status, 200)
+            self.assertIn('&lt;script&gt;', response.text)
+            self.assertIn('&quot;evil&quot;', response.text)
+            self.assertNotIn('window.location.href', response.text)
+        # Both gateway implementations (including old Aghaye sandbox links)
+        # produce these same hosts; a stored pending link stays usable.
+        from services.payment_service import AghayePardakhtGateway, ZarinPalGateway
+        for url in (ZarinPalGateway.START_PAY_URL + 'old-authority',
+                    AghayePardakhtGateway.START_PAY_URL + 'old-transid',
+                    AghayePardakhtGateway.START_PAY_SANDBOX_URL + 'old-transid'):
+            with self.subTest(url=url), \
+                 patch.object(DatabaseManager, 'get_payment_transaction',
+                              new=AsyncMock(return_value={**base, 'pay_url': url})):
+                self.assertEqual((await pay_redirect_handler(req)).status, 200)
+        for url in ('javascript:alert(1)', 'https://evil.example/pay',
+                    'https://payment.zarinpal.com@evil.example/pay'):
+            with self.subTest(url=url), \
+                 patch.object(DatabaseManager, 'get_payment_transaction',
+                              new=AsyncMock(return_value={**base, 'pay_url': url})):
+                response = await pay_redirect_handler(req)
+                self.assertEqual(response.status, 500)
+                self.assertNotIn(url, response.text)
+
+
+class PaymentHtmlSafetyTests(unittest.TestCase):
+    def test_gateway_error_and_reference_cannot_inject_html(self):
+        from main import get_html_response
+        markup = get_html_response('<svg onload=alert(1)>',
+                                   '<script>alert(2)</script>',
+                                   color='red; background:url(javascript:foo)')
+        self.assertNotIn('<svg', markup)
+        self.assertNotIn('<script', markup)
+        self.assertNotIn('javascript:', markup)
+        self.assertIn('&lt;script&gt;', markup)
+        self.assertIn('#333333', markup)
+
+
+class GlobalMaintenanceToggleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reseller_toggle_commits_global_row_before_flipping_any_cache(self):
+        import handlers.admin_handlers as admin
+        import services.bot_manager as reseller_module
+        query = SimpleNamespace(data='maint_on', answer=AsyncMock(),
+                                edit_message_text=AsyncMock())
+        update = SimpleNamespace(callback_query=query,
+                                 effective_user=SimpleNamespace(id=5))
+        context = SimpleNamespace(bot_data={'bot_id': 2, 'maintenance_mode': False})
+        reseller = SimpleNamespace(bot_data={'maintenance_mode': False})
+        with patch.object(admin.Config, 'ADMIN_IDS', [5]), \
+             patch.object(reseller_module.bot_manager, 'active_bots', {2: reseller}), \
+             patch.object(admin.DatabaseManager, 'set_setting',
+                          new=AsyncMock()) as save:
+            await admin.maintenance_toggle_callback(update, context)
+            save.assert_awaited_once_with('maintenance_mode', '1', bot_id=1)
+        self.assertTrue(context.bot_data['maintenance_mode'])
+        self.assertTrue(reseller.bot_data['maintenance_mode'])
+
+        context.bot_data['maintenance_mode'] = False
+        reseller.bot_data['maintenance_mode'] = False
+        with patch.object(admin.Config, 'ADMIN_IDS', [5]), \
+             patch.object(reseller_module.bot_manager, 'active_bots', {2: reseller}), \
+             patch.object(admin.DatabaseManager, 'set_setting',
+                          new=AsyncMock(side_effect=ConnectionError('db down'))):
+            await admin.maintenance_toggle_callback(update, context)
+        self.assertFalse(context.bot_data['maintenance_mode'])
+        self.assertFalse(reseller.bot_data['maintenance_mode'])
+
+
+class MaintenanceStartupTests(unittest.IsolatedAsyncioTestCase):
+    def test_maintenance_menu_shows_real_line_breaks(self):
+        from handlers.admin_handlers import _maintenance_text
+        self.assertIn('Maintenance)**\n\nوضعیت فعلی:', _maintenance_text(True))
+        self.assertNotIn('\\n', _maintenance_text(False))
+
+    async def test_reseller_start_and_superadmin_toggle_do_not_lost_update(self):
+        import services.bot_manager as module
+        import handlers.admin_handlers as admin
+        manager = module.BotManager()
+        app = SimpleNamespace(bot_data={'maintenance_mode': True})
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+        query = SimpleNamespace(data='maint_on', answer=AsyncMock(),
+                                edit_message_text=AsyncMock())
+        update = SimpleNamespace(callback_query=query,
+                                 effective_user=SimpleNamespace(id=5))
+        context = SimpleNamespace(bot_data={'bot_id': 1, 'maintenance_mode': False})
+
+        async def slow_read():
+            read_started.set()
+            await release_read.wait()
+            return False  # snapshot from BEFORE the toggle
+
+        with patch.object(module, 'bot_manager', manager), \
+             patch.object(module.DatabaseManager, 'global_maintenance_enabled_strict',
+                          side_effect=slow_read), \
+             patch.object(admin.DatabaseManager, 'set_setting', new_callable=AsyncMock) as save, \
+             patch.object(admin.Config, 'ADMIN_IDS', [5]):
+            starting = asyncio.create_task(manager._publish_initialized_bot(2, app))
+            await asyncio.wait_for(read_started.wait(), timeout=1)
+            toggling = asyncio.create_task(admin.maintenance_toggle_callback(update, context))
+            await asyncio.sleep(0)
+            self.assertFalse(toggling.done())
+            release_read.set()
+            await asyncio.wait_for(asyncio.gather(starting, toggling), timeout=1)
+            save.assert_awaited_once_with('maintenance_mode', '1', bot_id=1)
+        self.assertIs(manager.active_bots[2], app)
+        self.assertTrue(app.bot_data['maintenance_mode'])
+        self.assertTrue(context.bot_data['maintenance_mode'])
+
+    async def test_failed_reseller_start_removes_published_app_and_closes_session(self):
+        import services.bot_manager as module
+        manager = module.BotManager()
+        updater = SimpleNamespace(running=True, stop=AsyncMock())
+        app = SimpleNamespace(bot_data={'maintenance_mode': True}, updater=updater,
+                              running=True, stop=AsyncMock(), shutdown=AsyncMock())
+        manager.active_bots[2] = app
+        await manager._discard_partial_bot(2, app)
+        self.assertNotIn(2, manager.active_bots)
+        updater.stop.assert_awaited_once()
+        app.stop.assert_awaited_once()
+        app.shutdown.assert_awaited_once()
+
+    async def test_stopping_during_reseller_start_cancels_untracked_login(self):
+        import services.bot_manager as module
+        manager = module.BotManager()
+        manager.set_handler_registrar(lambda _app: None)
+        starting = asyncio.Event()
+        hold = asyncio.Event()
+
+        async def stalled_start():
+            starting.set()
+            await hold.wait()
+
+        app = SimpleNamespace(bot_data={}, initialize=AsyncMock(),
+                              start=AsyncMock(side_effect=stalled_start),
+                              updater=SimpleNamespace(running=False,
+                                                      start_polling=AsyncMock()),
+                              running=False, stop=AsyncMock(), shutdown=AsyncMock())
+
+        class Builder:
+            def bot(self, *_args): return self
+            def application_class(self, *_args): return self
+            def persistence(self, *_args): return self
+            def build(self): return app
+
+        info = {'id': 2, 'owner_id': 5, 'token': 'fake-token',
+                'api_id': 1, 'api_hash': 'fake'}
+        with patch.object(module.Application, 'builder', return_value=Builder()), \
+             patch.object(module, 'PremiumEmojiBot', return_value=object()), \
+             patch.object(module, 'HTTPXRequest', return_value=object()), \
+             patch.object(module, 'PicklePersistence', return_value=object()), \
+             patch.object(module.DatabaseManager, 'global_maintenance_enabled_strict',
+                          new=AsyncMock(return_value=False)):
+            task = asyncio.create_task(manager.start_bot(info))
+            await asyncio.wait_for(starting.wait(), timeout=1)
+            self.assertIs(manager.active_bots[2], app)
+            self.assertFalse(await manager.start_bot(info))  # never double-start this token
+            await asyncio.wait_for(manager.stop_bot(2), timeout=1)
+            self.assertTrue(task.cancelled())
+        self.assertEqual(manager.active_bots, {})
+        self.assertEqual(manager._starting_tasks, {})
+        app.shutdown.assert_awaited_once()
+
+    async def test_reseller_initialization_read_failure_fails_closed(self):
+        import services.bot_manager as module
+        manager = module.BotManager()
+        app = SimpleNamespace(bot_data={'maintenance_mode': False})
+        with patch.object(module.DatabaseManager, 'global_maintenance_enabled_strict',
+                          new=AsyncMock(side_effect=ConnectionError('db down'))):
+            await manager._publish_initialized_bot(2, app)
+        self.assertTrue(app.bot_data['maintenance_mode'])
+        self.assertIs(manager.active_bots[2], app)
+
+    def test_main_bot_reads_global_flag_after_persistence_is_loaded(self):
+        source = (Path(__file__).resolve().parents[1] / 'main.py').read_text()
+        start = source.index('await main_app.initialize()')
+        flag = source.index("main_app.bot_data['maintenance_mode'] = await")
+        running = source.index('await main_app.start()', start)
+        self.assertLess(start, flag)
+        self.assertLess(flag, running)
+
+
+class MaintenanceAdmissionLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_flag_write_and_paid_admissions_share_serial_lock(self):
+        class FakeSession:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            async def execute(self, _stmt):
+                return SimpleNamespace(scalar_one_or_none=lambda: None)
+            def add(self, row): self.inserted = row
+            async def commit(self): self.committed = True
+        db = FakeSession()
+        with patch.object(database, 'AsyncSessionLocal', return_value=db), \
+             patch.object(database, '_lock_order_admission', new=AsyncMock()) as lock:
+            await database.DatabaseManager.set_setting('maintenance_mode', '1', bot_id=1)
+            lock.assert_awaited_once_with(db)
+            self.assertEqual(db.inserted.value, '1')
+            self.assertTrue(db.committed)
+            lock.reset_mock()
+            await database.DatabaseManager.set_setting('maintenance_mode', '1', bot_id=2)
+            lock.assert_not_awaited()
+
+    async def test_strict_global_flag_read_never_converts_db_outage_to_off(self):
+        class FakeSession:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            async def execute(self, _stmt): raise ConnectionError('db unavailable')
+        with patch.object(database, 'AsyncSessionLocal', return_value=FakeSession()):
+            with self.assertRaises(ConnectionError):
+                await database.DatabaseManager.global_maintenance_enabled_strict()
+
+    async def test_due_scheduled_order_does_not_claim_during_maintenance(self):
+        class FakeSession:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            def begin(self): return self
+            async def execute(self, _stmt):
+                raise AssertionError('must not update order while in maintenance')
+        db = FakeSession()
+        with patch.object(database, 'AsyncSessionLocal', return_value=db), \
+             patch.object(database, '_lock_order_admission', new=AsyncMock()) as lock, \
+             patch.object(database, '_global_maintenance_enabled',
+                          new=AsyncMock(return_value=True)):
+            self.assertFalse(await database.DatabaseManager.mark_order_as_running(
+                946, expected_status='scheduled'))
+            lock.assert_awaited_once_with(db)
+
+
 class ScheduledSubmissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_order_is_not_marked_running_ahead_of_task_registration(self):
         import main as bot_main
@@ -387,13 +625,24 @@ class OrderStartRaceTests(unittest.IsolatedAsyncioTestCase):
                 self.statement = statement.compile(
                     compile_kwargs={'literal_binds': True}).string
                 return SimpleNamespace(rowcount=self.rows)
-            async def commit(self):
-                self.commits += 1
+            def begin(self):
+                db = self
+                class Transaction:
+                    async def __aenter__(self):
+                        return self
+                    async def __aexit__(self, *_):
+                        db.commits += 1
+                return Transaction()
 
         for state, rows in [('pending', 1), ('scheduled', 0)]:
             with self.subTest(state=state):
                 db = FakeSession(rows)
-                with patch.object(database, 'AsyncSessionLocal', return_value=db):
+                with patch.object(database, 'AsyncSessionLocal', return_value=db), \
+                     patch.object(database, '_global_maintenance_enabled',
+                                  new_callable=AsyncMock, return_value=False), \
+                     patch.object(database, '_lock_order_admission', new_callable=AsyncMock), \
+                     patch.object(database, '_occupied_order_slots',
+                                  new_callable=AsyncMock, return_value=0):
                     claimed = await database.DatabaseManager.mark_order_as_running(
                         946, expected_status=state)
                 self.assertEqual(claimed, bool(rows))
@@ -707,7 +956,8 @@ class AtomicPurchaseTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.duplicate_statement = str(stmt)
                     value = self.duplicate_id
-                return SimpleNamespace(scalar_one_or_none=lambda: value)
+                return SimpleNamespace(scalar_one_or_none=lambda: value,
+                                       scalars=lambda: ['t.me/example'] if self.duplicate_id else [])
             duplicate_id = None
             def add(self, obj):
                 outer.created.append(obj)
@@ -723,9 +973,43 @@ class AtomicPurchaseTests(unittest.IsolatedAsyncioTestCase):
                          'duration_minutes': 60, 'price': 500_000}
 
     async def _run(self):
-        with patch.object(database, 'AsyncSessionLocal', return_value=self.session):
+        with patch.object(database, 'AsyncSessionLocal', return_value=self.session), \
+             patch.object(database, '_global_maintenance_enabled',
+                          new_callable=AsyncMock, return_value=False), \
+             patch.object(database, '_lock_order_admission', new_callable=AsyncMock), \
+             patch.object(database, '_occupied_order_slots',
+                          new_callable=AsyncMock, return_value=0):
             return await database.DatabaseManager.create_paid_order(
                 12, 5, 't.me/example', bot_id=1, expected_plan=self.expected)
+
+    async def test_global_maintenance_refuses_before_wallet_debit(self):
+        with patch.object(database, 'AsyncSessionLocal', return_value=self.session), \
+             patch.object(database, '_global_maintenance_enabled',
+                          new_callable=AsyncMock, return_value=True), \
+             patch.object(database, '_lock_order_admission',
+                          new_callable=AsyncMock) as lock:
+            order, reason = await database.DatabaseManager.create_paid_order(
+                12, 5, 't.me/example', bot_id=1, expected_plan=self.expected)
+        self.assertIsNone(order)
+        self.assertEqual(reason, 'maintenance')
+        self.assertEqual(self.user.credit, 1_000_000)
+        self.assertEqual(self.created, [])
+        lock.assert_awaited_once()
+
+    async def test_capacity_busy_refuses_before_wallet_debit(self):
+        with patch.object(database, 'AsyncSessionLocal', return_value=self.session), \
+             patch.object(database, '_global_maintenance_enabled',
+                          new_callable=AsyncMock, return_value=False), \
+             patch.object(database, '_lock_order_admission', new_callable=AsyncMock) as lock, \
+             patch.object(database, '_occupied_order_slots',
+                          new_callable=AsyncMock, return_value=10):
+            order, reason = await database.DatabaseManager.create_paid_order(
+                12, 5, 't.me/example', bot_id=1, expected_plan=self.expected)
+        self.assertIsNone(order)
+        self.assertEqual(reason, 'order_capacity')
+        self.assertEqual(self.user.credit, 1_000_000)
+        self.assertEqual(self.created, [])
+        lock.assert_awaited_once()
 
     async def test_order_and_debit_are_in_one_transaction_with_locked_wallet(self):
         order, reason = await self._run()

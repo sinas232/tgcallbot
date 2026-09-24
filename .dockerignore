@@ -22,8 +22,9 @@ restart.sh
 
 silence.raw
 sessions/
-# Do not bake private backups or local environments into the bot image.
+# Do not bake private backups, test logs or local environments into the bot image.
 backups/
+.test-*.log
 *.dump
 *.sql
 .env.*

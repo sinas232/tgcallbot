@@ -30,7 +30,7 @@ elif [[ "$1" == compose && "$2" == exec && "${4:-}" == db ]]; then
 elif [[ "$1" == inspect ]]; then
   echo healthy
 elif [[ "$1" == compose && "$2" == exec && "${4:-}" == bot ]]; then
-  echo 'Running bot code: 2.3.14'
+  echo 'Running bot code: 2.3.15'
 fi
 '''
 
@@ -44,8 +44,9 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.project.mkdir()
         self.backups = self.root / 'safe-backups'
         (self.project / '.env').write_text('# placeholder only, no credentials\n')
-        (self.project / 'constants.py').write_text('BOT_VERSION = "2.3.14"\n')
-        for filename in ('deploy-warp.sh', 'restart.sh'):
+        (self.project / 'constants.py').write_text('BOT_VERSION = "2.3.15"\n')
+        for filename in ('deploy-warp.sh', 'restart.sh', 'tools/validate_env_compat.py'):
+            (self.project / filename).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / filename, self.project / filename)
         fakebin = self.root / 'bin'
         fakebin.mkdir()
@@ -87,7 +88,7 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
                 self.assertNotIn('build bot', self.commands())
                 self.assertNotIn('up -d', self.commands())
 
-    def test_ignored_voice_knobs_refuse_before_docker_without_printing_env(self):
+    def test_supported_voice_knobs_pass_preflight_without_printing_env(self):
         secret = 'PRIVATE_PLACEHOLDER_NOT_A_REAL_CREDENTIAL'
         env_file = self.project / '.env'
         original = ('BOT_TOKEN=' + secret + '\n'
@@ -97,27 +98,41 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
                     'VOICE_SILENCE_MODE=auto\n')
         env_file.write_text(original)
         result = self.run_script('deploy-warp.sh')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Refusing deploy', result.stderr)
-        self.assertIn('docs/env-compatibility.fa.md', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('up -d --no-build', self.commands())
         self.assertNotIn(secret, result.stdout + result.stderr)
         self.assertEqual(env_file.read_text(), original)
-        self.assertEqual(self.commands(), '')
-        self.assertFalse(list(self.backups.glob('*.dump')))
 
-    def test_guard_covers_the_different_unsupported_feature_families(self):
+    def test_guard_covers_invalid_values_and_unknown_feature_names(self):
         for name in ('VOICE_JOIN_SEQUENTIAL_GAP_MIN',
                      'VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX',
                      'VOICE_SECOND_CHANCE_COOLDOWN_SECONDS',
                      'VOICE_LISTENER_MAX_DROPS',
                      'VOICE_IDLE_REAPER',
-                     'ORDER_LINK_MODE', 'BOT_MEM_LIMIT', 'BOT_CPU_LIMIT'):
+                     'ORDER_LINK_MODE', 'BOT_MEM_LIMIT', 'BOT_CPU_LIMIT',
+                     'VOICE_SECOND_CHANCE_UNIMPLEMENTED'):
             with self.subTest(key=name):
                 self.log.unlink(missing_ok=True)
                 (self.project / '.env').write_text(name + '=example_not_secret\n')
                 result = self.run_script('deploy-warp.sh')
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('Refusing deploy', result.stderr)
+                self.assertEqual(self.commands(), '')
+
+    def test_preflight_rejects_unsafe_ranges_and_bad_regex_without_leaking_values(self):
+        private = 'EXAMPLE_SECRET_NOT_FOR_LOGS'
+        for text in ('VOICE_SESSION_CONFLICT_RETRY_SECONDS=1',
+                     'VOICE_LISTENER_PROBE_SECONDS=0',
+                     'VOICE_IDLE_CLIENT_TTL=1',
+                     'VOICE_SECOND_CHANCE_ROUNDS=10000',
+                     'VOICE_JOIN_ACCOUNT_GAP_MIN=-3',
+                     'ORDER_LINK_REGEX="([' + private + '"'):
+            with self.subTest(setting=text.split('=', 1)[0]):
+                self.log.unlink(missing_ok=True)
+                (self.project / '.env').write_text('BOT_TOKEN=' + private + '\n' + text + '\n')
+                result = self.run_script('deploy-warp.sh')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(private, result.stdout + result.stderr)
                 self.assertEqual(self.commands(), '')
 
     def test_legacy_flags_in_comments_do_not_block(self):
@@ -197,29 +212,31 @@ class ExistingServerDeployGuardTests(unittest.TestCase):
         self.log.unlink(missing_ok=True)
         deploy = commands[-1]
         self.assertIn('if (', deploy)
-        self.assertIn("bash './deploy-warp.sh' || exit 1", deploy)
-        self.assertIn("cd '/path/to/current/install' || exit 1", deploy)
+        self.assertIn('DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh || exit 1', deploy)
+        self.assertIn('root="$(git rev-parse --show-toplevel', deploy)
+        self.assertNotIn('/path/to/current/install', deploy)
         result = subprocess.run(
             ['bash', '-c', deploy + '\necho SSH_STILL_OPEN\n'],
             cwd=self.project, capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SSH_STILL_OPEN', result.stdout)
-        self.assertIn('بلوک با خطا متوقف شد', result.stderr)
+        self.assertIn('استقرار یا ممیزی متوقف شد', result.stderr)
 
         # Even if the actual directory exists but has local changes, do not
         # fetch, switch, deploy or let a nonzero check terminate the SSH shell.
         (self.project / 'docker-compose.yml').write_text('services: {}\n')
         fake_git = self.root / 'bin' / 'git'
-        fake_git.write_text('#!/bin/sh\n[ "$1" = status ] && echo " M local-config"\n')
+        fake_git.write_text('#!/bin/sh\n'
+                            'if [ "$1" = rev-parse ]; then echo "' + str(self.project) + '"; '
+                            'elif [ "$1" = status ]; then echo " M local-config"; fi\n')
         fake_git.chmod(0o755)
-        block = deploy.replace('/path/to/current/install', str(self.project))
         result = subprocess.run(
-            ['bash', '-c', block + '\necho SSH_STILL_OPEN\n'],
+            ['bash', '-c', deploy + '\necho SSH_STILL_OPEN\n'],
             cwd=self.project, env=self.env, capture_output=True,
             text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('SSH_STILL_OPEN', result.stdout)
-        self.assertIn('تغییرات محلی دارید', result.stdout)
+        self.assertIn('تغییرات محلی دارید', result.stderr)
         self.assertEqual(self.commands(), '')

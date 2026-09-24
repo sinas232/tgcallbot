@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Tuple
 
+from config import Config
 from database import DatabaseManager
 from services.session_ownership import SessionInUseError
 from telegram_client import TelegramAccountClient
@@ -26,15 +28,26 @@ async def recover_one_account(account_id: int, bot_id: int) -> Tuple[bool, str]:
     acc = await DatabaseManager.get_account_by_id(int(account_id))
     if not acc or int(acc.get('bot_id') or 0) != int(bot_id):
         return False, 'not_found'
-    if str(acc.get('account_status') or '').lower() != 'inactive':
+    is_inactive = str(acc.get('account_status') or '').lower() == 'inactive'
+    is_conflict = (str(acc.get('account_status') or '').lower() == 'active'
+                   and str(acc.get('spam_status') or '').lower() == 'cooldown'
+                   and str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
+    if not (is_inactive or is_conflict):
         return False, 'not_inactive'
+    conflict_at = acc.get('last_health_check')
+    if is_conflict:
+        # Also protect direct starts that bypass deploy-warp.sh's .env guard.
+        delay = max(60, int(getattr(Config, 'VOICE_SESSION_CONFLICT_RETRY_SECONDS', 60)))
+        if conflict_at is None or (datetime.utcnow() - conflict_at).total_seconds() < delay:
+            return False, 'conflict_cooldown'
 
     try:
         # fetch_me_status now returns True ONLY after get_me() AND a confirmed
         # disconnect. Running in the main bot process matters: a separate
         # `docker compose exec bot python ...` would bypass the live key guard.
         ok, reason, _ = await TelegramAccountClient(
-            acc['phone_number'], acc['session_string'], int(account_id)
+            acc['phone_number'], acc['session_string'], int(account_id),
+            allow_recovery_probe=True,
         ).fetch_me_status()
     except SessionInUseError as exc:
         return False, 'shared' if exc.reason == 'shared' else 'busy'
@@ -46,25 +59,37 @@ async def recover_one_account(account_id: int, bot_id: int) -> Tuple[bool, str]:
 
     if not ok:
         if reason == 'account_deleted':
-            # Only a typed USER_DEACTIVATED RPC in the guarded in-bot probe,
-            # followed by confirmed disconnect, can make a row eligible for
-            # the superadmin deletion menu. Never tag a replaced session.
-            changed = await DatabaseManager.mark_account_deleted_after_verified_probe(
-                int(account_id), int(bot_id), acc['session_string']
-            )
+            # Only typed USER_DEACTIVATED after a confirmed disconnect may
+            # mark this exact key as deleted. A conflict row is atomically
+            # moved to inactive so the deletion menu can see it.
+            if is_conflict:
+                changed = await DatabaseManager.resolve_session_conflict_after_verified_probe(
+                    int(account_id), int(bot_id), acc['session_string'], conflict_at,
+                    account_deleted=True)
+            else:
+                changed = await DatabaseManager.mark_account_deleted_after_verified_probe(
+                    int(account_id), int(bot_id), acc['session_string'])
             return (False, 'account_deleted') if changed else (False, 'changed_during_probe')
+        # Even a 401 does not authorize probing again or reactivating this key.
+        # It remains quarantined for operator re-login (no session deletion).
         return False, reason or 'error'
 
     # Avoid racing an administrator who imported/logged in with a NEW session
-    # while get_me() was in flight. Reactivate only the EXACT key just tested.
+    # while get_me() was in flight. The old 406 marker may have been refreshed
+    # concurrently on the SAME key; compare its timestamp as well.
+    if is_conflict:
+        changed = await DatabaseManager.resolve_session_conflict_after_verified_probe(
+            int(account_id), int(bot_id), acc['session_string'], conflict_at)
+        return (True, 'conflict_cleared') if changed else (False, 'changed_during_probe')
     changed = await DatabaseManager.recover_account_after_verified_probe(
-        int(account_id), int(bot_id), acc['session_string']
-    )
+        int(account_id), int(bot_id), acc['session_string'])
     return (True, 'recovered') if changed else (False, 'changed_during_probe')
 
 
 _RECOVERY_MESSAGES = {
     'recovered': '✅ اتصال و قطع سشن تأیید شد؛ همین اکانت به وضعیت فعال برگشت.',
+    'conflict_cleared': '✅ سشن همین اکانت با بررسی زنده و قطع تأییدشده معتبر بود؛ قرنطینهٔ ۴۰۶ برداشته شد. حضور در تماس هنوز جداگانه باید سنجیده شود.',
+    'conflict_cooldown': '⏳ مهلت ایمنی پس از ۴۰۶ تمام نشده یا زمان رخداد نامشخص است؛ هیچ اتصال جدیدی باز نشد.',
     'duplicated_in_use': '⚠️ خطای ۴۰۶: تداخل کلید سشن. کلید سالم یا باطل بودنش معلوم نیست؛ دوباره‌پروب نکنید. کپی نمایندگی/برنامهٔ دیگر را بررسی کنید.',
     'relogin_required': '💀 تلگرام ابطال کلید را اعلام کرد؛ این اکانت فقط با ورود مجدد و سشن تازه بازیابی می‌شود.',
     'account_deleted': '☠️ تلگرام حذف‌شدن حساب را صریحاً اعلام کرد. فقط این حساب در منوی سوپرادمین برای حذف قابل‌انتخاب است؛ سشن‌های دیگر دست‌نخورده‌اند.',

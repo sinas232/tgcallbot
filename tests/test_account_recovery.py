@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import unittest
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -91,6 +92,72 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await account_recovery.recover_one_account(7, 1)
             update.assert_not_awaited()
+
+
+class QuarantinedConflictTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.row = dict(id=7, bot_id=1, phone_number='test-phone',
+                        account_status='active', spam_status='cooldown',
+                        spam_check_result='AUTH_KEY_DUPLICATED: validity unknown',
+                        last_health_check=datetime.utcnow() - timedelta(minutes=2),
+                        session_string='encrypted-key')
+
+    async def test_cooldown_prevents_connections_and_no_automatic_retry(self):
+        self.row['last_health_check'] = datetime.utcnow()
+        with patch.object(database.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock) as probe:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'conflict_cooldown'))
+            probe.assert_not_awaited()
+
+    async def test_direct_start_cannot_reduce_406_cooldown_below_one_minute(self):
+        self.row['last_health_check'] = datetime.utcnow() - timedelta(seconds=15)
+        with patch.object(database.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.Config,
+                          'VOICE_SESSION_CONFLICT_RETRY_SECONDS', 0), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock) as probe:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'conflict_cooldown'))
+            probe.assert_not_awaited()
+
+    async def test_operator_probe_only_clears_matching_key_and_timestamp(self):
+        with patch.object(database.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock, return_value=(True, None, {})) as probe, \
+             patch.object(database.DatabaseManager, 'resolve_session_conflict_after_verified_probe',
+                          new_callable=AsyncMock, return_value=True) as clear:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (True, 'conflict_cleared'))
+            clear.assert_awaited_once_with(7, 1, 'encrypted-key', self.row['last_health_check'])
+            probe.assert_awaited_once()
+
+    async def test_repeat_406_does_not_clear_quarantine(self):
+        with patch.object(database.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock, return_value=(False, 'duplicated_in_use', None)), \
+             patch.object(database.DatabaseManager, 'resolve_session_conflict_after_verified_probe',
+                          new_callable=AsyncMock) as clear:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'duplicated_in_use'))
+            clear.assert_not_awaited()
+
+    async def test_typed_deleted_account_changes_only_exact_quarantined_row(self):
+        with patch.object(database.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock, return_value=(False, 'account_deleted', None)), \
+             patch.object(database.DatabaseManager, 'resolve_session_conflict_after_verified_probe',
+                          new_callable=AsyncMock, return_value=True) as clear:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'account_deleted'))
+            clear.assert_awaited_once_with(7, 1, 'encrypted-key',
+                                           self.row['last_health_check'], account_deleted=True)
 
 
 class ProbeCloseTests(unittest.IsolatedAsyncioTestCase):
@@ -228,6 +295,31 @@ class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('cooldown', compiled.params.values())
         self.assertNotIn('inactive', compiled.params.values())
 
+    async def test_conflict_release_is_cas_on_status_key_and_event_time(self):
+        stamp = datetime.utcnow() - timedelta(minutes=2)
+        class FakeSession:
+            statement = None
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def execute(self, stmt):
+                self.statement = stmt
+                return SimpleNamespace(rowcount=1)
+            async def commit(self): pass
+        fake = FakeSession()
+        with patch.object(database, 'AsyncSessionLocal', return_value=fake):
+            self.assertTrue(await database.DatabaseManager.resolve_session_conflict_after_verified_probe(
+                7, 1, 'ciphertext', stamp))
+        stmt = fake.statement.compile()
+        sql = str(stmt)
+        for col in ('telegram_accounts.account_status', 'telegram_accounts.spam_status',
+                    'telegram_accounts.spam_check_result', 'telegram_accounts.session_string',
+                    'telegram_accounts.last_health_check'):
+            self.assertIn(col, sql)
+        for expected in ('active', 'cooldown', 'ciphertext', stamp):
+            self.assertIn(expected, stmt.params.values())
+        self.assertFalse(await database.DatabaseManager.resolve_session_conflict_after_verified_probe(
+            7, 1, 'ciphertext', None))
+
     async def test_fatal_auth_update_requires_exact_old_key_and_records_category(self):
         class FakeSession:
             statement = None
@@ -315,13 +407,13 @@ class RecoveryActionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RecoveryWiringTests(unittest.TestCase):
-    def test_live_probe_needs_confirmation_and_only_inactive_card_shows_button(self):
+    def test_live_probe_needs_confirmation_for_inactive_or_quarantined_card(self):
         from pathlib import Path
         root = Path(__file__).resolve().parent.parent
         menu = (root / 'handlers/menu_handlers.py').read_text()
         main = (root / 'main.py').read_text()
         admin = (root / 'handlers/admin_handlers.py').read_text()
-        self.assertIn("if raw_status == 'inactive':", menu)
+        self.assertIn("if raw_status == 'inactive' or (raw_status == 'active' and is_conflict):", menu)
         self.assertIn('callback_data=f"acc_recover_{acc[', menu)
         self.assertIn('callback_data=f"acc_recoverdo_{aid}"', menu)
         self.assertLess(menu.index('if action == "recover":'), menu.index('recover_one_account(aid, bot_id)'))

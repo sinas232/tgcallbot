@@ -29,6 +29,32 @@ logger = logging.getLogger(__name__)
 CONFIRMED_ACCOUNT_DELETED = 'Verified Telegram account deleted: USER_DEACTIVATED'
 Base = declarative_base()
 
+
+async def _lock_order_admission(session: AsyncSession) -> None:
+    """Serialize capacity checks across bot/reseller processes in PostgreSQL.
+
+    Not an auth-key lock. This lock is transaction-scoped and acquired BEFORE
+    plan/wallet/order row locks so checkout and scheduled claims cannot race.
+    SQLite test fixtures serialize writers themselves; production uses PG.
+    """
+    if session.get_bind().dialect.name == 'postgresql':
+        await session.execute(text('SELECT pg_advisory_xact_lock(213669, 42)'))
+
+
+async def _occupied_order_slots(session: AsyncSession, *, exclude_id: Optional[int] = None) -> int:
+    stmt = select(func.count(Order.id)).where(Order.status.in_(('pending', 'running')))
+    if exclude_id is not None:
+        stmt = stmt.where(Order.id != int(exclude_id))
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
+async def _global_maintenance_enabled(session: AsyncSession) -> bool:
+    """Unlike get_setting(), a DB error must propagate (fail closed)."""
+    res = await session.execute(select(BotSetting.value).where(
+        BotSetting.bot_id == 1, BotSetting.key == 'maintenance_mode'))
+    return res.scalar_one_or_none() == '1'
+
+
 DB_URL_ASYNC = Config.get_normalized_database_url()
 if not DB_URL_ASYNC:
     raise RuntimeError("DATABASE_URL not provided")
@@ -611,10 +637,19 @@ class DatabaseManager:
                 setting = res.scalar_one_or_none()
                 return setting.value if setting else default
             except: return default
-            
+
+    @staticmethod
+    async def global_maintenance_enabled_strict() -> bool:
+        async with AsyncSessionLocal() as db_session:
+            return await _global_maintenance_enabled(db_session)
+
     @staticmethod
     async def set_setting(key: str, value: str, bot_id=1):
         async with AsyncSessionLocal() as db_session:
+            # Serialize the global maintenance transition with every paid
+            # purchase / due reservation, even when the setting row is absent.
+            if key == 'maintenance_mode' and int(bot_id) == 1:
+                await _lock_order_admission(db_session)
             res = await db_session.execute(select(BotSetting).filter(BotSetting.bot_id == bot_id, BotSetting.key == key))
             setting = res.scalar_one_or_none()
             if not setting:
@@ -782,8 +817,24 @@ class DatabaseManager:
         """
         if expected_plan is None:
             raise ValueError('the confirmed plan snapshot is required')
+        from services.link_validator import invite_hash, normalize_invite_link, target_key
+        target_link = (normalize_invite_link(target_link) if invite_hash(target_link)
+                       else str(target_link or '').strip())
+        if not target_link:
+            return None, 'invalid_link'
         async with AsyncSessionLocal() as db_session:
             async with db_session.begin():
+                # Share ONE transaction lock with the global maintenance
+                # toggle, including scheduled/unlimited-capacity purchases.
+                # A purchase that read OFF must finish before the toggle can
+                # commit ON; the deploy preflight will then see its order.
+                await _lock_order_admission(db_session)
+                if await _global_maintenance_enabled(db_session):
+                    return None, 'maintenance'
+                limit = max(0, int(getattr(Config, 'MAX_CONCURRENT_ORDERS', 10)))
+                if limit and scheduled_for is None:
+                    if await _occupied_order_slots(db_session) >= limit:
+                        return None, 'order_capacity'
                 # Shared row lock keeps admin price/activation edits from
                 # racing the wallet debit. FOR SHARE permits parallel buyers;
                 # the per-user FOR UPDATE below serializes their purchases.
@@ -811,16 +862,15 @@ class DatabaseManager:
                 # twice even if the wallet can afford both. Different links,
                 # plans and completed/failed orders remain independent.
                 duplicate = await db_session.execute(
-                    select(Order.id).where(
+                    select(Order.target_link).where(
                         Order.bot_id == int(bot_id), Order.user_id == user.id,
                         Order.plan_id == plan.id,
-                        Order.target_link == target_link,
                         Order.scheduled_for == scheduled_for,
                         Order.status.in_(('pending', 'running', 'scheduled')),
                         Order.created_at >= datetime.utcnow() - timedelta(minutes=2),
-                    ).limit(1)
+                    )
                 )
-                if duplicate.scalar_one_or_none() is not None:
+                if any(target_key(old) == target_key(target_link) for old in duplicate.scalars()):
                     return None, 'duplicate_purchase'
                 user.credit = float(user.credit or 0) - price
                 order = Order(
@@ -1026,13 +1076,26 @@ class DatabaseManager:
         if expected_status not in ('pending', 'scheduled'):
             raise ValueError('only a paid open order can start')
         async with AsyncSessionLocal() as db_session:
-            result = await db_session.execute(
-                update(Order)
-                .where(Order.id == order_id, Order.status == expected_status)
-                .values(status='running')
-            )
-            await db_session.commit()
-            return bool(result.rowcount)
+            async with db_session.begin():
+                if expected_status == 'scheduled':
+                    await _lock_order_admission(db_session)
+                    if await _global_maintenance_enabled(db_session):
+                        return False
+                # A due reservation is paid but does not occupy a worker slot
+                # until this transition. Leave it scheduled when busy; the
+                # scheduler will retry without changing its paid duration.
+                limit = max(0, int(getattr(Config, 'MAX_CONCURRENT_ORDERS', 10)))
+                if expected_status == 'scheduled' and limit:
+                    if await _occupied_order_slots(db_session) >= limit:
+                        return False
+                # Pending orders already reserved a slot at checkout and
+                # MUST NOT be stranded by a later config change.
+                result = await db_session.execute(
+                    update(Order)
+                    .where(Order.id == order_id, Order.status == expected_status)
+                    .values(status='running')
+                )
+                return bool(result.rowcount)
 
     @staticmethod
     async def complete_order(order_id: int):
@@ -1054,13 +1117,14 @@ class DatabaseManager:
         """بررسی وجود سفارش فعال برای یک لینک خاص (جهت خروج هوشمند)"""
         async with AsyncSessionLocal() as db_session:
             # بررسی سفارشات با وضعیت running یا scheduled برای این لینک
-            q = select(Order).filter(
-                Order.target_link == link,
+            from services.link_validator import target_key
+            q = select(Order.target_link).filter(
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled'])
-            ).limit(1)
+            )
             res = await db_session.execute(q)
-            return res.scalar_one_or_none() is not None
+            key = target_key(link)
+            return any(target_key(other) == key for other in res.scalars())
 
     @staticmethod
     async def has_time_overlap_order(link: str, new_start_time: datetime, new_duration_minutes: int, bot_id: int = 1) -> bool:
@@ -1069,9 +1133,10 @@ class DatabaseManager:
             # محاسبه زمان پایان سفارش جدید
             new_end_time = new_start_time + timedelta(minutes=new_duration_minutes)
             
-            # دریافت تمام سفارشات فعال/رزروی برای این لینک
+            # Include legacy spellings of the SAME invitation in overlap checks.
+            from services.link_validator import target_key
+            key = target_key(link)
             q = select(Order).filter(
-                Order.target_link == link,
                 Order.bot_id == bot_id,
                 Order.status.in_(['running', 'scheduled'])
             )
@@ -1079,6 +1144,8 @@ class DatabaseManager:
             existing_orders = res.scalars().all()
             
             for order in existing_orders:
+                if target_key(order.target_link) != key:
+                    continue
                 # تعیین زمان شروع سفارش موجود
                 existing_start = order.started_at if order.started_at else (order.scheduled_for if order.scheduled_for else order.created_at)
                 if not existing_start:
@@ -1200,6 +1267,8 @@ class DatabaseManager:
                 q = select(func.count(TelegramAccount.id)).filter(
                     func.lower(func.trim(TelegramAccount.account_status)) == 'active',
                     TelegramAccount.bot_id == bot_id,
+                    or_(TelegramAccount.spam_check_result.is_(None),
+                        ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
                 )
                 cnt = (await db_session.execute(q)).scalar() or 0
                 if cnt > 0:
@@ -1211,6 +1280,8 @@ class DatabaseManager:
                 q2 = select(func.count(TelegramAccount.id)).filter(
                     TelegramAccount.account_status.ilike('active'),
                     TelegramAccount.bot_id == bot_id,
+                    or_(TelegramAccount.spam_check_result.is_(None),
+                        ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
                 )
                 return int((await db_session.execute(q2)).scalar() or 0)
             except Exception:
@@ -1228,6 +1299,8 @@ class DatabaseManager:
                 query = select(TelegramAccount).where(
                     func.lower(func.trim(TelegramAccount.account_status)) == 'active',
                     TelegramAccount.bot_id == bot_id,
+                    or_(TelegramAccount.spam_check_result.is_(None),
+                        ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
                 ).order_by(TelegramAccount.id).offset(max(0, offset)).limit(max(1, limit))
                 res = await db_session.execute(query)
                 accs = [to_dict(a) for a in res.scalars().all()]
@@ -1240,6 +1313,8 @@ class DatabaseManager:
                 query2 = select(TelegramAccount).where(
                     TelegramAccount.account_status.ilike('active'),
                     TelegramAccount.bot_id == bot_id,
+                    or_(TelegramAccount.spam_check_result.is_(None),
+                        ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
                 ).order_by(TelegramAccount.id).offset(max(0, offset)).limit(max(1, limit))
                 res2 = await db_session.execute(query2)
                 return [to_dict(a) for a in res2.scalars().all()]
@@ -1252,6 +1327,8 @@ class DatabaseManager:
             query = select(TelegramAccount).where(
                 func.lower(func.trim(TelegramAccount.account_status)) == 'active',
                 TelegramAccount.bot_id == bot_id,
+                or_(TelegramAccount.spam_check_result.is_(None),
+                    ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
             ).limit(limit)
             res = await db_session.execute(query)
             return [to_dict(a) for a in res.scalars().all()]
@@ -1280,7 +1357,13 @@ class DatabaseManager:
     @staticmethod
     async def update_account_spam_status(aid, status, result_text):
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(TelegramAccount).where(TelegramAccount.id == aid).values(spam_status=status, spam_check_result=result_text, last_health_check=datetime.utcnow()))
+            # A SpamBot check cannot silently clear an unresolved 406 hold.
+            await db_session.execute(update(TelegramAccount).where(
+                TelegramAccount.id == aid,
+                or_(TelegramAccount.spam_check_result.is_(None),
+                    ~TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%')),
+            ).values(spam_status=status, spam_check_result=result_text,
+                     last_health_check=datetime.utcnow()))
             await db_session.commit()
 
     @staticmethod
@@ -1298,6 +1381,41 @@ class DatabaseManager:
                     last_health_check=datetime.utcnow(),
                 )
             )
+            await db_session.commit()
+            return result.rowcount == 1
+
+    @staticmethod
+    async def resolve_session_conflict_after_verified_probe(
+        aid: int, bot_id: int, encrypted_session: str, conflict_at: datetime,
+        *, account_deleted: bool = False,
+    ) -> bool:
+        """Resolve only a matching 406 marker after typed Telegram evidence.
+
+        The in-bot, ownership-guarded probe must have finished get_me() and
+        confirmed disconnect. The timestamp also prevents a newer 406 on the
+        SAME key from being silently cleared by an older in-flight probe.
+        An explicit USER_DEACTIVATED may mark the exact account as deleted.
+        """
+        if conflict_at is None:
+            return False
+        values = {
+            'last_health_check': datetime.utcnow(),
+            'spam_status': 'dead' if account_deleted else 'unknown',
+            'spam_check_result': (CONFIRMED_ACCOUNT_DELETED if account_deleted else
+                                  'Session verified and disconnected; 406 hold cleared'),
+        }
+        if account_deleted:
+            values['account_status'] = 'inactive'
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(update(TelegramAccount).where(
+                TelegramAccount.id == int(aid),
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'active',
+                TelegramAccount.spam_status == 'cooldown',
+                TelegramAccount.spam_check_result.like('AUTH_KEY_DUPLICATED:%'),
+                TelegramAccount.session_string == encrypted_session,
+                TelegramAccount.last_health_check == conflict_at,
+            ).values(**values))
             await db_session.commit()
             return result.rowcount == 1
 

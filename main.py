@@ -50,6 +50,7 @@ if os.name != "nt":
 
 import html
 import json
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -237,7 +238,11 @@ async def process_payment_success(transaction, app, bot_id, extra_data=None):
         logger.error(f"Payment success processing error: {e}")
 
 def get_html_response(title, message, color="#4CAF50", icon="✅"):
-    """تولید صفحه HTML برای نمایش نتیجه پرداخت در مرورگر"""
+    """HTML for gateway results: never render raw remote error/ref strings."""
+    title = html.escape(str(title), quote=True)
+    message = html.escape(str(message), quote=True)
+    icon = html.escape(str(icon), quote=True)
+    color = color if color in ("#4CAF50", "#F44336") else "#333333"
     return f"""
     <html>
     <head>
@@ -399,23 +404,34 @@ async def pay_redirect_handler(request):
         )
 
     pay_url = transaction.get('pay_url')
-    if not pay_url:
+    parsed_url = None
+    try:
+        parsed_url = urlsplit(str(pay_url or ''))
+        host = parsed_url.hostname
+    except ValueError:
+        host = None
+    if (not pay_url or parsed_url is None or parsed_url.scheme != 'https'
+            or parsed_url.username or parsed_url.password
+            or host not in {'payment.zarinpal.com', 'panel.aqayepardakht.ir'}):
+        # Never emit an arbitrary DB/API URL into a meta refresh/HTML link.
         return web.Response(
-            text=get_html_response("خطا", "آدرس درگاه برای این تراکنش ثبت نشده است.",
+            text=get_html_response("خطا", "آدرس درگاه معتبر نیست؛ با پشتیبانی تماس بگیرید.",
                                    color="#F44336", icon="❌"),
             content_type='text/html', status=500,
         )
 
+    safe_url = html.escape(str(pay_url), quote=True)
+    safe_id = html.escape(str(trans_id), quote=True)
     amount = int(float(transaction.get('amount', 0)))
     # صفحهٔ فاکتور با هدایت خودکار (meta refresh + JS) به درگاه. چون این صفحه
     # روی دامنهٔ اصلی ما بارگذاری می‌شود، مرورگر هنگام رفتن به درگاه، همین دامنه
     # را به‌عنوان Referrer ارسال می‌کند و الزام تطابق دامنه رعایت می‌شود.
-    html = f"""<!DOCTYPE html>
+    html_body = f"""<!DOCTYPE html>
 <html lang="fa">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="1;url={pay_url}">
+    <meta http-equiv="refresh" content="1;url={safe_url}">
     <title>در حال انتقال به درگاه پرداخت</title>
     <style>
         body {{ font-family: Tahoma, Arial, sans-serif; text-align: center; padding: 50px; direction: rtl; background:#f4f4f9; }}
@@ -425,19 +441,18 @@ async def pay_redirect_handler(request):
         .btn {{ display:inline-block; margin-top:24px; padding:12px 26px; background:#0088cc; color:#fff; text-decoration:none; border-radius:8px; font-weight:bold; }}
         .muted {{ color:#888; font-size:13px; margin-top:16px; }}
     </style>
-    <script>setTimeout(function(){{ window.location.href = "{pay_url}"; }}, 900);</script>
 </head>
 <body>
     <div class="card">
         <h1>در حال انتقال به درگاه پرداخت…</h1>
         <div class="amount">مبلغ: {amount:,} تومان</div>
         <p>لطفاً چند لحظه صبر کنید. اگر به‌صورت خودکار منتقل نشدید، روی دکمهٔ زیر بزنید:</p>
-        <a class="btn" href="{pay_url}">ورود به درگاه پرداخت</a>
-        <div class="muted">شناسهٔ تراکنش: {trans_id}</div>
+        <a class="btn" href="{safe_url}">ورود به درگاه پرداخت</a>
+        <div class="muted">شناسهٔ تراکنش: {safe_id}</div>
     </div>
 </body>
 </html>"""
-    return web.Response(text=html, content_type='text/html')
+    return web.Response(text=html_body, content_type='text/html')
 
 async def health_handler(request):
     """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
@@ -755,10 +770,9 @@ def register_handlers(application: Application) -> None:
         if not update.effective_user:
             return
         try:
-            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
-            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
-            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
-            flag = context.bot_data.get('maintenance_mode', False)
+            # Read only the cached flag on the hot path; a missing cache is
+            # unsafe after a DB outage on startup, so fail CLOSED instead.
+            flag = context.bot_data.get('maintenance_mode', True)
             if not flag:
                 return
             if await _is_super_admin_user(update, context):
@@ -801,9 +815,10 @@ def register_handlers(application: Application) -> None:
             raise ApplicationHandlerStop
         except ApplicationHandlerStop:
             raise
-        except Exception:
-            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
-            return
+        except Exception as exc:
+            # An unhandled guard error is UNKNOWN, never permission to buy.
+            logger.error("maintenance guard failed closed (%s)", type(exc).__name__)
+            raise ApplicationHandlerStop
 
     # نگهبان تعمیرات در گروهٔ مستقل 2- (هندلرهایش await می‌شوند تا
     # raise ApplicationHandlerStop واقعاً در همین نقطه جلوی گروه‌های بعدی
@@ -1513,20 +1528,20 @@ async def main_loop():
         .build()
     )
     
-    main_app.bot_data['bot_id'] = 1
-    main_app.bot_data['owner_id'] = 0
-    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
-    try:
-        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
-    except Exception as e:
-        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
-        main_app.bot_data['maintenance_mode'] = False
-    
     register_handlers(main_app)
     instance_lock.ensure_held()
     await main_app.initialize()
     instance_lock.ensure_held()
+    # initialize() restores PTB persistence and may overwrite bot_data. Set
+    # authoritative runtime identity/maintenance only AFTER it has completed.
+    main_app.bot_data['bot_id'] = 1
+    main_app.bot_data['owner_id'] = 0
+    try:
+        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
+            DatabaseManager.global_maintenance_enabled_strict(), timeout=10)
+    except Exception as e:
+        logger.error("maintenance flag load failed (%s) — failing CLOSED (ON)", type(e).__name__)
+        main_app.bot_data['maintenance_mode'] = True
     await main_app.start()
 
     # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها

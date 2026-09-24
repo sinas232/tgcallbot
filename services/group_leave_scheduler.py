@@ -234,9 +234,14 @@ class GroupLeaveScheduler:
             await _db().finish_group_leave(row_id, "cancelled", "account deleted")
             return "account deleted"
         if str(account.get("account_status") or "").lower() != "active":
-            # اکانت سوخته/غیرفعال است یا هست — خروج لازم نیست/ممکن نیست.
+            # An inactive account is not probed just to leave a group.
             await _db().finish_group_leave(row_id, "done", "account not active (nothing to do)")
             return "account inactive"
+        if str(account.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
+            # A delayed leave must neither reopen a conflicted key nor spend
+            # its bounded retry budget. Revisit after manual in-bot recovery.
+            await self._reschedule(row, seconds=3600, reason='406 quarantine')
+            return 'deferred (quarantined)'
 
         # اگر اکانت همین حالا با یک سفارش در حال اجرا داخل همان چت است، خروج
         # غلط است؛ رکورد لغو می‌شود (سفارش جدید خودش مسئول پایان‌اش است).

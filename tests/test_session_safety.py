@@ -200,6 +200,8 @@ class AdHocClientTests(unittest.IsolatedAsyncioTestCase):
 
         client = module.TelegramAccountClient("phone", "encrypted", 77)
         with patch.object(module, "session_ownership", so), \
+                patch.object(module.DatabaseManager, "get_account_by_id", new_callable=AsyncMock,
+                             return_value={'session_string': 'encrypted', 'account_status': 'active'}), \
                 patch.object(module.SecurityManager, "decrypt_session", return_value="same-key"), \
                 patch.object(module.TelegramAccountClient, "_get_api_credentials", slow_credentials):
             task = asyncio.create_task(client.get_client())
@@ -232,7 +234,13 @@ class AdHocClientTests(unittest.IsolatedAsyncioTestCase):
 
         first = module.TelegramAccountClient("phone", "encrypted-A", 101)
         copy = module.TelegramAccountClient("phone", "encrypted-B", 202)
+        async def matching_row(aid):
+            return {'session_string': 'encrypted-A' if aid == 101 else 'encrypted-B',
+                    'account_status': 'active'}
+
         with patch.object(module, "session_ownership", so), \
+                patch.object(module.DatabaseManager, "get_account_by_id",
+                             side_effect=matching_row), \
                 patch.object(ownership_module, "RECONNECT_QUIET_SEC", 0), \
                 patch.object(module.SecurityManager, "decrypt_session", return_value="same-key"), \
                 patch.object(module.TelegramAccountClient, "_get_api_credentials", new_callable=AsyncMock,
@@ -248,6 +256,62 @@ class AdHocClientTests(unittest.IsolatedAsyncioTestCase):
             await app2.disconnect()
         self.assertFalse(so.is_busy(101))
         self.assertFalse(so.is_busy(202))
+
+
+class AdHocQuarantineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_paths_never_open_inactive_conflicted_or_stale_session(self):
+        import telegram_client as module
+        for row in (
+            {'session_string': 'enc', 'account_status': 'inactive'},
+            {'session_string': 'enc', 'account_status': 'active',
+             'spam_check_result': 'AUTH_KEY_DUPLICATED: check ownership'},
+            {'session_string': 'new-enc', 'account_status': 'active'},
+            None,
+        ):
+            with self.subTest(row=row), \
+                 patch.object(module.DatabaseManager, 'get_account_by_id',
+                              new_callable=AsyncMock, return_value=row), \
+                 patch.object(module.SecurityManager, 'decrypt_session') as decrypt:
+                with self.assertRaises(SessionInUseError):
+                    await module.TelegramAccountClient('phone', 'enc', 7).get_client()
+                decrypt.assert_not_called()
+
+    async def test_delayed_group_leave_defers_406_without_spending_retry_budget(self):
+        import services.group_leave_scheduler as module
+        import telegram_client
+        scheduler = module.GroupLeaveScheduler()
+        row = {'id': 11, 'account_id': 7, 'chat_id': -1001, 'bot_id': 1}
+        account = {'account_status': 'active', 'session_string': 'enc',
+                   'spam_check_result': 'AUTH_KEY_DUPLICATED: held'}
+        fake_db = SimpleNamespace(get_account_by_id=AsyncMock(return_value=account))
+        with patch.object(module, '_db', return_value=fake_db), \
+             patch.object(scheduler, '_reschedule', new=AsyncMock()) as defer, \
+             patch.object(telegram_client, 'TelegramAccountClient') as client:
+            self.assertEqual(await scheduler._process_one(row), 'deferred (quarantined)')
+            defer.assert_awaited_once_with(row, seconds=3600, reason='406 quarantine')
+            client.assert_not_called()
+
+    async def test_manual_probe_only_bypasses_status_not_ciphertext_or_db_error(self):
+        import telegram_client as module
+        with patch.object(module.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value={
+                              'session_string': 'enc', 'account_status': 'inactive'}), \
+             patch.object(module.SecurityManager, 'decrypt_session', return_value=None) as decrypt:
+            with self.assertRaisesRegex(ValueError, 'Invalid Session'):
+                await module.TelegramAccountClient(
+                    'phone', 'enc', 7, allow_recovery_probe=True).get_client()
+            decrypt.assert_called_once_with('enc')
+        with patch.object(module.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value={
+                              'session_string': 'old', 'account_status': 'inactive'}):
+            with self.assertRaises(SessionInUseError):
+                await module.TelegramAccountClient(
+                    'phone', 'enc', 7, allow_recovery_probe=True).get_client()
+        with patch.object(module.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, side_effect=OSError('db down')):
+            with self.assertRaises(OSError):
+                await module.TelegramAccountClient(
+                    'phone', 'enc', 7, allow_recovery_probe=True).get_client()
 
 
 class SessionImportTests(unittest.IsolatedAsyncioTestCase):
@@ -367,6 +431,9 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
         mgr = vcm.VoiceCallManager()
         from services import session_ownership as ownership_module
         with patch.object(vcm, "session_ownership", so), \
+                patch.object(vcm.DatabaseManager, "get_account_by_id",
+                             new=AsyncMock(return_value={'session_string': 'encrypted',
+                                                         'account_status': 'active'})), \
                 patch.object(ownership_module, "RECONNECT_QUIET_SEC", 0), \
                 patch.object(vcm.SecurityManager, "decrypt_session", return_value="shared-auth-key"), \
                 patch.object(vcm.TelegramAccountClient, "_get_api_credentials",
@@ -409,6 +476,9 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         mgr = vcm.VoiceCallManager()
         with patch.object(vcm, "session_ownership", so), \
+                patch.object(vcm.DatabaseManager, "get_account_by_id",
+                             new=AsyncMock(return_value={'session_string': 'encrypted',
+                                                         'account_status': 'active'})), \
                 patch.object(vcm.SecurityManager, "decrypt_session", return_value="risky-key"), \
                 patch.object(vcm.TelegramAccountClient, "_get_api_credentials",
                              new=AsyncMock(return_value=(123, "hash"))), \
@@ -423,6 +493,22 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 await so.acquire_voice(922, "risky-key")
             self.assertEqual(cm.exception.reason, "shared")
 
+    async def test_voice_prewarmer_and_reconnector_refuse_new_db_406_hold(self):
+        import services.voice_call_manager as vcm
+        mgr = vcm.VoiceCallManager()
+        with patch.object(vcm.DatabaseManager, 'get_account_by_id',
+                          new=AsyncMock(return_value={
+                              'session_string': 'encrypted', 'account_status': 'active',
+                              'spam_check_result': 'AUTH_KEY_DUPLICATED: held'})), \
+             patch.object(vcm, 'Client') as client:
+            with self.assertRaises(SessionInUseError) as cm:
+                await mgr._assert_session_assignable(7, 'encrypted')
+            self.assertEqual(cm.exception.reason, 'quarantined')
+            # Same check runs under the per-account lock on prewarm and reuse.
+            with self.assertRaises(SessionInUseError):
+                await mgr._create_pyrogram_client_locked(7, 'encrypted', 'key', 1)
+            client.assert_not_called()
+
     async def test_executor_does_not_disable_406_even_with_unrelated_401_in_text(self):
         import services.order_executor as module
         ex = module.OrderExecutor()
@@ -430,14 +516,20 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
         acc = {"id": 880, "phone_number": "x", "session_string": "encrypted"}
         duplicate = "AUTH_KEY_DUPLICATED [406] trace=401"
         mark_dead = AsyncMock()
+        note_conflict = AsyncMock(return_value=True)
         fake_mgr = SimpleNamespace(start_call=AsyncMock(return_value=(False, duplicate, 0)))
         fake_tac = SimpleNamespace(join_chat=AsyncMock(return_value=(False, duplicate)))
         with patch.object(module, "_get_voice_call_manager", return_value=fake_mgr), \
                 patch.object(module, "TelegramAccountClient", return_value=fake_tac), \
+                patch.object(module.DatabaseManager, 'note_session_conflict_if_current',
+                             note_conflict), \
                 patch.object(ex, "_mark_account_dead", mark_dead):
             for kind in ("voice_chat", "group_join"):
                 res = await ex._join_single_account(771, acc, kind, "t.me/a")
                 self.assertEqual(res["status"], "failed")
+                if kind == 'group_join':
+                    self.assertTrue(res['retry_managed'])
+            note_conflict.assert_awaited_once_with(880, 'encrypted')
             mark_dead.assert_not_awaited()
             fake_mgr.start_call.return_value = (False, "SESSION_REVOKED [401]", 0)
             res = await ex._join_single_account(771, acc, "voice_chat", "t.me/a")
@@ -503,6 +595,15 @@ class AuthResultPersistenceTests(unittest.IsolatedAsyncioTestCase):
             conflict.assert_awaited_once_with(7, 'old-ciphertext')
             await _mark_session_dead(7, 'AuthKeyInvalid', 'old-ciphertext')
             fatal.assert_awaited_once_with(7, 'old-ciphertext', 'AUTH_KEY_INVALID')
+
+    async def test_auto_spam_check_skips_quarantined_account_without_connection(self):
+        import services.health_checker as module
+        acc = {'id': 7, 'phone_number': 'p', 'session_string': 'encrypted',
+               'account_status': 'active',
+               'spam_check_result': 'AUTH_KEY_DUPLICATED: conflict'}
+        with patch.object(module, 'TelegramAccountClient') as client:
+            await module.HealthChecker().check_single_account_spam(acc)
+            client.assert_not_called()
 
     async def test_spambot_message_is_not_a_session_revocation(self):
         import services.health_checker as module

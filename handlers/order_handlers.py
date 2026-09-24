@@ -12,7 +12,7 @@ import math
 import re
 from datetime import datetime, timedelta
 import jdatetime
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
 from config import Config
@@ -21,6 +21,7 @@ from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
 from services.anti_spam import anti_spam
+from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
 
 logger = logging.getLogger(__name__)
 
@@ -175,16 +176,25 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['selected_plan'] = plan
     
     await query.delete_message()
-    await send_safe(context.bot, update.effective_chat.id, "🔗 **لطفاً لینک (گروه/کانال/ویس) مقصد را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+    await send_safe(context.bot, update.effective_chat.id, link_help_text() if Config.ORDER_LINK_MODE == "private" else "🔗 **لطفاً لینک (گروه/کانال/ویس) مقصد را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_ORDER_LINK
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = update.message.text
+    link = update.message.text or update.message.caption or ""
     if BTN_CANCEL in link:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
         
-    context.user_data['target_link'] = link
+    hidden_urls = []
+    for entity in (update.message.entities or update.message.caption_entities or ()):
+        if entity.type == MessageEntity.TEXT_LINK and entity.url:
+            hidden_urls.append(entity.url)
+    ok, normalized, error = validate_order_link(link, hidden_urls)
+    if not ok:
+        await send_safe(context.bot, update.effective_chat.id, rejection_message(error),
+                        reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+        return AWAITING_ORDER_LINK
+    context.user_data['target_link'] = normalized
     
     # انتخاب نوع زمان اجرا
     kb = ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True)
@@ -345,7 +355,14 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         bot_id = context.bot_data.get('bot_id', 1)
         plan = context.user_data['selected_plan']
         link = context.user_data['target_link']
-        
+        # Revalidate immediately before the wallet transaction.
+        ok, link, error = validate_order_link(link)
+        if not ok:
+            context.user_data.pop('target_link', None)
+            await query.edit_message_text(rejection_message(error))
+            return AWAITING_ORDER_LINK
+        context.user_data['target_link'] = link
+
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         # 🛡 گارد دوبارهٔ ممنوعیت پس از لغو — اگر کاربر وسط فلو یک سفارشِ دیگر
         # را لغو کرده باشد، پرداخت نهایی این سفارش هم نباید انجام شود.
@@ -419,6 +436,9 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
                 'plan_unavailable': 'پلن دیگر در دسترس نیست.',
                 'user_missing': 'حساب کاربر یافت نشد.',
                 'duplicate_purchase': 'سفارش مشابه هنوز در حال پردازش است؛ خرید تکراری انجام نشد.',
+                'order_capacity': 'سقف سفارش‌های هم‌زمان پر است؛ بدون برداشت وجه بعداً دوباره تلاش کنید.',
+                'maintenance': 'حالت تعمیرات سراسری فعال است؛ بدون برداشت وجه سفارش تازه پذیرفته نمی‌شود.',
+                'invalid_link': 'لینک مقصد خالی یا نامعتبر است.',
             }
             await query.edit_message_text(
                 '⛔️ سفارش ثبت نشد و اعتباری کسر نشد. ' +

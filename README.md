@@ -20,9 +20,9 @@
 | [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md) | **راه‌اندازی درگاه پرداخت زرین‌پال** (دامنه، Referrer، callback، عیب‌یابی) |
 | [`docs/voice-reliability-deploy.fa.md`](docs/voice-reliability-deploy.fa.md) | پایداری تماس صوتی و استقرار |
 | [`docs/session-safety.fa.md`](docs/session-safety.fa.md) | جلوگیری از تداخل سشن، استقرار امن و بازیابی اکانت‌های ۴۰۶ |
-| [`docs/full-version.fa.md`](docs/full-version.fa.md) | موجودی قابلیت‌های پیش‌نویس ۲.۳.۱۴ و محدودیت‌های آن |
-| [`docs/env-compatibility.fa.md`](docs/env-compatibility.fa.md) | **ناسازگاری برخی گزینه‌های `.env` تاریخی؛ پیش از هر استقرار بخوانید** |
-| [`docs/deploy-final.fa.md`](docs/deploy-final.fa.md) | پیش‌نویس دستورهای استقرار محافظت‌شده؛ فعلاً برای سرور دارای تنظیمات تاریخی قابل اجرا نیست |
+| [`docs/full-version.fa.md`](docs/full-version.fa.md) | موجودی قابلیت‌های کد ۲.۳.۱۵ و محدودیت‌های بررسی آفلاین |
+| [`docs/env-compatibility.fa.md`](docs/env-compatibility.fa.md) | **گارد نام/مقدار تنظیمات تاریخی `.env`؛ پیش از استقرار بخوانید** |
+| [`docs/deploy-final.fa.md`](docs/deploy-final.fa.md) | **دستورهای استقرار مشروط نسخهٔ ۲.۳.۱۵ روی نصب موجود**؛ فقط پس از بررسی زندهٔ پیش‌شرط‌ها |
 | [`docs/adaptive_join_brain.md`](docs/adaptive_join_brain.md) | مغز تطبیقیِ ورود به تماس (Adaptive Join) |
 | [`docs/premium-emoji.fa.md`](docs/premium-emoji.fa.md) | **💎 ایموجی پریمیوم (Custom Emoji)** در همهٔ منوها، دکمه‌ها، تیکت و بازنشر پیام کاربر |
 
@@ -266,10 +266,10 @@ docker compose logs -f bot
 
 # ⚠️ روی سرور دارای سفارش پولی، این دستورات را مستقیماً اجرا نکنید:
 # docker compose restart bot / docker compose down / git pull origin main
-# استقرار پیش‌نویس ۲.۳.۱۴ برای سرور دارای گزینه‌های تاریخیِ ورود ترتیبی/
-# listener/second-chance موقتاً متوقف است؛ docs/env-compatibility.fa.md را بخوانید.
-# حذف گزینه‌ها از .env برای دور زدن گارد راه‌حل نیست. راهنمای استقرار فقط
-# بعد از رفع ناسازگاری و تأیید فعال‌نبودن سفارش‌ها کاربرد دارد.
+# نسخهٔ ۲.۳.۱۵ تنظیمات تاریخی شناخته‌شده را با گارد نام/مقدار بررسی می‌کند.
+# گزینه‌ها یا کلید سشن را برای عبور از گارد پاک نکنید؛ docs/env-compatibility.fa.md
+# و دستورهای مشروط نصب موجود در docs/deploy-final.fa.md را فقط پس از
+# بررسیِ واقعی تماس‌ها، پرداخت‌ها و سفارش‌های سرور اجرا کنید.
 
 # بررسی مصرف منابع
 docker stats
@@ -323,8 +323,8 @@ MTProto). راهنمای کامل: [`docs/premium-emoji.fa.md`](docs/premium-emo
 
 ## 📄 نسخه و توسعه
 
-- `main` هنوز روی ۲.۲.۳ است. شاخهٔ `arena/01a0ccf5-tgcallbot` پیش‌نویس ۲.۳.۱۴ است؛ برخی تنظیمات قبلی هنوز در آن اجرا نمی‌شوند. تغییر شاخه یا ادغام GitHub، **سرور را خودکار به‌روز نمی‌کند**.
-- پیش از ارتقای سرور موجود [هشدار سازگاری `.env`](docs/env-compatibility.fa.md) را بخوانید. [راهنمای استقرار](docs/deploy-final.fa.md) تا رفع ناسازگاری و تأیید سفارش‌های زنده دستور آمادهٔ اجرا نیست.
+- `main` هنوز روی ۲.۲.۳ است. کد شاخهٔ `arena/01a0ccf5-tgcallbot` نسخهٔ ۲.۳.۱۵ است؛ تغییر شاخه یا ادغام GitHub، **سرور را خودکار به‌روز نمی‌کند** و تست آفلاین سلامت سشن/تماس زنده را ثابت نمی‌کند.
+- پیش از ارتقای سرور موجود [سازگاری `.env`](docs/env-compatibility.fa.md) را بخوانید. [راهنمای استقرار مشروط](docs/deploy-final.fa.md) فقط پس از تأیید سفارش‌ها/تعمیرات/بکاپ و اطمینان از مسیر نصب واقعی قابل اجراست.
 - تاریخچهٔ کامل تغییرات در [`CHANGELOG.md`](CHANGELOG.md) آمده است.
 
 </div>

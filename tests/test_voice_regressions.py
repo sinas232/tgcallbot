@@ -33,7 +33,7 @@ import sys
 import tempfile
 import unittest
 import warnings
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import wave
 from types import SimpleNamespace
 
@@ -435,6 +435,10 @@ class EngineLifecycleTests(unittest.TestCase):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.mgr = VoiceCallManager()
+        self._db_row_patch = patch.object(
+            vcm_mod.DatabaseManager, 'get_account_by_id', new_callable=AsyncMock,
+            return_value={'session_string': 'fake-session', 'account_status': 'active'})
+        self._db_row_patch.start()
         self._orig_cls = vcm_mod.PyTgCalls
         vcm_mod.PyTgCalls = FakePyTgCalls
         FakePyTgCalls.instances = []
@@ -453,6 +457,7 @@ class EngineLifecycleTests(unittest.TestCase):
         vcm_mod.TelegramAccountClient._get_api_credentials = fake_creds
 
     def tearDown(self) -> None:
+        self._db_row_patch.stop()
         vcm_mod.PyTgCalls = self._orig_cls
         vcm_mod.SecurityManager.decrypt_session = self._orig_decrypt
         vcm_mod.TelegramAccountClient._get_api_credentials = self._orig_cred
@@ -752,6 +757,9 @@ class TelegramClientGuardTests(unittest.TestCase):
                 from unittest.mock import patch
                 tc = TelegramAccountClient("+98x", "fake-session", 9001)
                 with patch("telegram_client.SecurityManager.decrypt_session", return_value="key"), \
+                        patch('telegram_client.DatabaseManager.get_account_by_id',
+                              new=AsyncMock(return_value={'session_string': 'fake-session',
+                                                          'account_status': 'active'})), \
                         self.assertRaises(SessionInUseError):
                     await tc.get_client()
             finally:

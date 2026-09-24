@@ -389,6 +389,10 @@ async def leave_all_chats_callback(update: Update, context: ContextTypes.DEFAULT
 async def process_leave_all_chats(context, chat_id):
     bot_id = context.bot_data.get('bot_id', 1)
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
+    # Never bulk-connect a 406 key just because it is still marked active.
+    # Manual single-account recovery is the only safe probing path.
+    accounts = [acc for acc in accounts if not
+                str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:')]
     total_accs = len(accounts)
     total_left = 0
     msg_id = None

@@ -33,10 +33,13 @@ logger = logging.getLogger(__name__)
 class TelegramAccountClient:
     """کلاس مدیریت اکانت‌های تلگرام"""
 
-    def __init__(self, phone_number, session_string, account_id):
+    def __init__(self, phone_number, session_string, account_id, *, allow_recovery_probe=False):
         self.phone_number = phone_number
         self.session_string = session_string
         self.account_id = account_id
+        # Only the explicit, in-bot, single-account confirmation path may
+        # inspect an inactive/quarantined key. Never bypass the ownership lock.
+        self._allow_recovery_probe = bool(allow_recovery_probe)
         self.client = None
         # 🛡 آی‌دی چتی که در آخرین join موفق وارد شدیم (برای خروج به‌تأخیرافتادهٔ
         # دقیق — ضد اسپم — تا خروج بعداً با آی‌دی عددی انجام شود، نه حدس لینک).
@@ -65,6 +68,20 @@ class TelegramAccountClient:
         دومی باز نمی‌شود. رزروِ انجام‌شده با stop() کلاینت (پایان
         context manager) آزاد می‌شود.
         """
+        # Fetch the current row strictly: a stale ciphertext, a DB outage,
+        # an inactive historical row or a persisted 406 must NEVER silently
+        # launch an automatic ad-hoc probe (health check, profile sync,
+        # scheduled group leave, code retrieval, etc.). The dedicated manual
+        # recovery path opts in after its own cooldown/confirmation checks.
+        row = await DatabaseManager.get_account_by_id(self.account_id)
+        if not row or row.get('session_string') != self.session_string:
+            raise SessionInUseError(self.account_id, 'stale')
+        if not self._allow_recovery_probe:
+            if str(row.get('account_status') or '').lower() != 'active':
+                raise SessionInUseError(self.account_id, 'inactive')
+            if str(row.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
+                raise SessionInUseError(self.account_id, 'quarantined')
+
         decrypted_session = SecurityManager.decrypt_session(self.session_string)
         if not decrypted_session:
             raise ValueError(f"Invalid Session for account {self.account_id}")

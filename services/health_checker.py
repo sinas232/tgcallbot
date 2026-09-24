@@ -28,6 +28,13 @@ class HealthChecker:
         AUTH_KEY_DUPLICATED (406) منشأ برخورد یا اعتبار فعلی کلید را ثابت
         نمی‌کند؛ خودکار غیرفعال نمی‌کنیم، اما دوباره‌پروب مکرر هم نمی‌زنیم.
         """
+        # get_all_active_accounts() is also used by admin screens, so it
+        # deliberately includes quarantined rows. A periodic job must not
+        # independently probe a key already held after a 406; only the
+        # operator-initiated, cooldown-checked in-bot recovery may do that.
+        if str(account.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
+            logger.info("Spam check skipped for quarantined acc=%s", account['id'])
+            return
         try:
             client = TelegramAccountClient(account['phone_number'], account['session_string'], account['id'])
             status, result_text = await client.check_spambot()

@@ -32,24 +32,14 @@ if [[ ! -r .env ]]; then
   echo "Cannot read .env; refusing deploy without checking compatibility." >&2
   exit 2
 fi
-# These settings existed in a separate voice branch or were supplied by
-# operators, but this release does not implement them. Silently ignoring a
-# requested sequential/listener/second-chance policy is unsafe. This check
-# reads *names only*, never prints the credential-bearing .env or its values.
-# Do not bypass it by stripping the keys unless the operator has explicitly
-# approved losing those behaviours.
-if grep -Eq '^[[:space:]]*(VOICE_JOIN_SEQUENTIAL(_[A-Z0-9_]+)?|VOICE_JOIN_ACCOUNT_GAP_[A-Z0-9_]+|VOICE_SECOND_CHANCE_[A-Z0-9_]+|VOICE_SILENCE_MODE|VOICE_LISTENER_[A-Z0-9_]+|VOICE_SESSION_CONFLICT_RETRY_SECONDS|VOICE_IDLE_[A-Z0-9_]+|ORDER_LINK_MODE|BOT_(MEM|CPU)_LIMIT|VOICE_RAM_SOFT_LIMIT_MB)[[:space:]]*=' .env; then
-  echo "Refusing deploy: .env requests unsupported voice/order/resource settings in this draft. No values were printed. See docs/env-compatibility.fa.md; do not strip settings just to bypass this guard." >&2
+# Validate supported operational policies without echoing .env values. The
+# stdlib-only checker runs before ANY Docker command or private DB backup.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 tools/validate_env_compat.py .env; then
+  echo "Refusing deploy: environment preflight did not pass. See docs/env-compatibility.fa.md." >&2
   exit 2
-else
-  env_check_status=$?
-  if (( env_check_status != 1 )); then
-    echo "Could not check .env safely; refusing deploy without reading secrets aloud." >&2
-    exit 2
-  fi
 fi
-if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.14"$' constants.py; then
-  echo "Wrong source tree: expected the v2.3.14 draft. Do not deploy an older checkout." >&2
+if [[ ! -f constants.py ]] || ! grep -q '^BOT_VERSION = "2.3.15"$' constants.py; then
+  echo "Wrong source tree: expected the v2.3.15 source tree. Do not deploy an older checkout." >&2
   exit 2
 fi
 if [[ -z "$(docker compose ps --status running --quiet db)" ]]; then
@@ -134,6 +124,6 @@ if [[ "$(docker inspect -f '{{.State.Health.Status}}' warp_container 2>/dev/null
   exit 1
 fi
 # An image/build or version mismatch must not be mistaken for a live fix.
-docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.14", BOT_VERSION; print("Running bot code:", BOT_VERSION)'
+docker compose exec -T bot python -c 'from constants import BOT_VERSION; assert BOT_VERSION == "2.3.15", BOT_VERSION; print("Running bot code:", BOT_VERSION)'
 docker compose ps
 echo "Code is running, but session-key validity and Telegram WebRTC/UDP presence are NOT proved. Keep maintenance enabled until safe single-account checks are complete."

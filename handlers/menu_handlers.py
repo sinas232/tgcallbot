@@ -301,7 +301,11 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         status_line = f"❌ غیرفعال ({html.escape(raw_status)})"
 
     spam_status = str(acc.get('spam_status') or "unknown").lower()
-    if spam_status == 'limited':
+    is_conflict = (spam_status == 'cooldown' and
+                   str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
+    if is_conflict:
+        spam_line = "🔒 تداخل سشن ۴۰۶؛ تا بررسی ایمن از سفارش کنار گذاشته شده"
+    elif spam_status == 'limited':
         spam_line = "⛔️ محدود شده (اسپم‌بلاک)"
     elif spam_status in ('free', 'ok', 'clean'):
         spam_line = "🟢 بدون محدودیت"
@@ -337,9 +341,9 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("🗑 حذف اکانت", callback_data=f"acc_del_{acc['id']}")
         ],
     ]
-    if raw_status == 'inactive':
+    if raw_status == 'inactive' or (raw_status == 'active' and is_conflict):
         rows.append([InlineKeyboardButton(
-            "🧪 بررسی و بازیابی فقط همین اکانت", callback_data=f"acc_recover_{acc['id']}")])
+            "🧪 بررسی امن فقط همین سشنِ درگیر", callback_data=f"acc_recover_{acc['id']}")])
     rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")])
     kb = InlineKeyboardMarkup(rows)
 
@@ -382,9 +386,12 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("❌ اکانت یافت نشد.", show_alert=True)
         return
 
+    is_conflict = (acc.get('account_status') == 'active' and
+                   acc.get('spam_status') == 'cooldown' and
+                   str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
     if action in ("recover", "recoverdo"):
-        if acc.get('account_status') != 'inactive':
-            await query.answer("این اکانت دیگر غیرفعال نیست.", show_alert=True)
+        if acc.get('account_status') != 'inactive' and not is_conflict:
+            await query.answer("این اکانت نه غیرفعال است و نه در قرنطینهٔ ۴۰۶.", show_alert=True)
             return
         if action == "recover":
             await query.answer()
@@ -392,7 +399,7 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
                 "🧪 <b>بررسی زندهٔ فقط همین اکانت</b>\n\n"
                 "برای تأیید اعتبار سشن، ربات یک اتصال کوتاه به تلگرام باز می‌کند. "
                 "فقط اگر هویت تأیید شود، اتصال واقعاً قطع شود و سشنِ ذخیره‌شده "
-                "در این فاصله عوض نشده باشد، اکانت فعال می‌شود.\n\n"
+                "در این فاصله عوض نشده باشد، غیرفعال به فعال/قرنطینهٔ ۴۰۶ به آزاد تبدیل می‌شود.\n\n"
                 "⚠️ اگر کپی همین سشن در برنامه/سرور دیگری وصل است، "
                 "پیش از تأیید آن را قطع کنید؛ تلاش‌های پی‌درپی با کلید تکراری "
                 "ممکن است به ابطال کلید منجر شود.",
@@ -416,6 +423,10 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
             ]))
         return
 
+    if is_conflict and action in ("getcode", "spam", "refresh"):
+        await query.answer("سشن در قرنطینهٔ ۴۰۶ است؛ فقط از بررسی ایمن تک‌اکانتی یا ورود مجدد استفاده کنید.",
+                           show_alert=True)
+        return
     client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
 
     if action == "getcode":
@@ -492,6 +503,11 @@ async def _sync_account_names(bot_id, page=1, limit=8):
     accounts, _ = await DatabaseManager.get_accounts_paginated(limit=limit, offset=offset, active_only=False, bot_id=bot_id)
     updated = 0
     for acc in accounts:
+        # Never mass-probe historical inactive rows or a 406 quarantine just
+        # because the admin refreshed the list of cached account names.
+        if (str(acc.get('account_status') or '').lower() != 'active' or
+                str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:')):
+            continue
         # فقط اکانت‌هایی که نام کش‌شده ندارند
         if acc.get('first_name') or acc.get('last_name') or acc.get('username'):
             continue

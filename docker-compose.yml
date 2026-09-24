@@ -128,14 +128,16 @@ services:
     # سقف ۲ هستهٔ ملایم انتخاب شده تا اسپایک لحظه‌ای ورودِ ۳۷ اکانت خفه نشود،
     # ولی مصرف در حالت پایدار (با uvloop + تک‌ریسمانی ffmpeg + لاگ خفه‌شده)
     # به‌راحتی زیر این سقف می‌ماند. برای سخت‌گیری بیشتر cpus را روی '1.0' بگذارید.
+    # Compose applies these to both non-Swarm and Swarm resource settings.
+    # Verify the EFFECTIVE limits after deploy with docker inspect; a value
+    # in .env alone is not proof that a container was recreated with it.
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 1536M
-    # سازگاری با اجرای غیر-swarm قدیمی‌تر (docker-compose v1) در صورت وجود:
-    mem_limit: 1536m
-    cpus: 2.0
+          cpus: "${BOT_CPU_LIMIT:-2.0}"
+          memory: ${BOT_MEM_LIMIT:-1536M}
+    mem_limit: ${BOT_MEM_LIMIT:-1536M}
+    cpus: ${BOT_CPU_LIMIT:-2.0}
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}

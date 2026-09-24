@@ -273,10 +273,10 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def _maintenance_text(on):
     status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
     return (
-        "🛠 **حالت تعمیرات (Maintenance)**\\n\\n"
-        f"وضعیت فعلی: {status}\\n\\n"
+        "🛠 **حالت تعمیرات (Maintenance)**\n\n"
+        f"وضعیت فعلی: {status}\n\n"
         "وقتی فعال باشد، هیچ کاربری (حتی ادمین عادی) نمی‌تواند با ربات "
-        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\\n"
+        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\n"
         "برای آپدیت امن: اول فعال کنید، آپدیت کنید، بعد خاموش کنید."
     )
 
@@ -290,15 +290,18 @@ def _maintenance_kb(on):
 @require_super_admin
 async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """منوی حالت تعمیرات — فقط سوپرادمین."""
-    bot_id = context.bot_data.get('bot_id', 1)
     try:
         on = context.bot_data.get('maintenance_mode')
         if on is None:
-            on = (await asyncio.wait_for(DatabaseManager.get_setting(
-                "maintenance_mode", "0", bot_id=bot_id), timeout=10)) == "1"
+            # All bot apps use bot_id=1 as the canonical, global flag.
+            # get_setting() swallows DB errors and returns the OFF default;
+            # the strict read is required whenever the cache is absent.
+            on = await asyncio.wait_for(
+                DatabaseManager.global_maintenance_enabled_strict(), timeout=10)
             context.bot_data['maintenance_mode'] = on
     except Exception:
-        on = False
+        on = True  # unknown DB/cache state must never look safely OFF
+        context.bot_data['maintenance_mode'] = True
     await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     return AWAITING_SETTINGS_ACTION
 
@@ -322,36 +325,27 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
             pass
         return AWAITING_SETTINGS_ACTION
     on = (query.data == "maint_on")
+    from services.bot_manager import bot_manager as _bm
     try:
-        await asyncio.wait_for(DatabaseManager.set_setting(
-            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
+        # Coordinate with publication of a newly initialized reseller app.
+        # Both the canonical DB write and the in-process cache update belong
+        # to the same critical section. The DB admission lock separately
+        # serializes paid orders, even across processes.
+        async with _bm.maintenance_lock:
+            await asyncio.wait_for(DatabaseManager.set_setting(
+                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
+            for _bid, _app in list(_bm.active_bots.items()):
+                try:
+                    _app.bot_data['maintenance_mode'] = on
+                except Exception:
+                    logger.exception('Bot %s: maintenance cache update failed', _bid)
+            context.bot_data['maintenance_mode'] = on
     except Exception:
         try:
             await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
         except Exception:
             pass
         return AWAITING_SETTINGS_ACTION
-    # 🌍 حالت تعمیرات «سراسری» است: اگر فقط bot_data همین اپ به‌روز شود،
-    # ربات‌های نمایندگی (اپ‌های جدا با bot_data جدا) همچنان باز می‌مانند و
-    # کاربرانشان می‌توانند سفارش بزنند (باگ گزارش‌شده). راه‌حل:
-    # ۱) تنظیم اصلی در bot_id=1 ذخیره می‌شود (مرجع لودِ استارت‌آپ همهٔ اپ‌ها)
-    # ۲) پرچم همهٔ اپ‌های فعال همین حالا فلیپ می‌شود
-    if bot_id != 1:
-        try:
-            await asyncio.wait_for(DatabaseManager.set_setting(
-                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
-        except Exception:
-            pass
-    try:
-        from services.bot_manager import bot_manager as _bm
-        for _bid, _app in list(_bm.active_bots.items()):
-            try:
-                _app.bot_data['maintenance_mode'] = on
-            except Exception:
-                pass
-    except Exception:
-        pass
-    context.bot_data['maintenance_mode'] = on
     try:
         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
     except Exception:
