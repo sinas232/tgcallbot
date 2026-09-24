@@ -16,6 +16,7 @@ import struct
 from collections import Counter
 from dataclasses import dataclass
 from database import (
+    CLEANUP_REVIEW_406_HOLD,
     CONFIRMED_ACCOUNT_DELETED,
     CONFIRMED_SESSION_REVOKED,
     DatabaseManager,
@@ -50,6 +51,10 @@ class CleanupScanPlan:
     skipped_shared: int
     skipped_unreadable: int
     skipped_cooldown: int
+    # A live typed 406 may have invalidated a key *during the review itself*.
+    # Do not keep marching through the next 22 keys by clicking "start" again.
+    # Only scoped IDs are exposed to the superadmin; never session/phone data.
+    pending_406_ids: tuple[int, ...] = ()
 
 
 class CleanupScanTooLarge(RuntimeError):
@@ -100,6 +105,11 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
                   (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED)]
     if len(target) > MAX_SCAN_CANDIDATES:
         raise CleanupScanTooLarge('too_many_candidates')
+    # Unlike a historical/free-text 406 marker, these holds were written by
+    # the guarded cleanup probe. A single persisted hold pauses the WHOLE
+    # batch, not merely that row, because the cause might affect other keys.
+    pending_406_ids = tuple(int(row['id']) for row in target
+                            if row['spam_check_result'] == CLEANUP_REVIEW_406_HOLD)
 
     # Count aliases in ALL bots. Different Fernet ciphertexts can encrypt the
     # same auth key, so a DB equality check on session_string is insufficient.
@@ -125,7 +135,8 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
             continue
         candidates.append((int(row['id']), hashlib.sha256(
             row['session_string'].encode('utf-8')).hexdigest()))
-    return CleanupScanPlan(tuple(candidates), len(target), shared, unreadable, cooldown)
+    return CleanupScanPlan(tuple(candidates), len(target), shared, unreadable,
+                           cooldown, pending_406_ids)
 
 
 @dataclass(frozen=True)
@@ -165,6 +176,11 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
                 stop_reason = reason
                 break
             latest = await prepare_cleanup_scan(bot_id)
+            if latest.pending_406_ids:
+                # A different review may have recorded a typed 406 since
+                # confirmation. Do not open any *other* old auth key now.
+                stop_reason = 'held_406'
+                break
             if (aid, fingerprint) not in latest.candidates:
                 # The snapshot changed after confirmation: NO connection was
                 # made, and it must not be reported as an auth failure.
@@ -202,8 +218,9 @@ async def run_cleanup_scan(bot_id: int, approved: tuple[tuple[int, str], ...],
             reasons[code] += 1
 
         if verdict in STOP_IMMEDIATELY:
-            if checked < total:
-                stop_reason = 'unsafe_probe'
+            # Even if this was the last candidate, a typed 406 invalidated
+            # its key and should be reported as an incident, not "completed".
+            stop_reason = 'unsafe_probe'
         elif verdict in STOP_AFTER_THREE:
             same_failure = same_failure + 1 if verdict == last_failure else 1
             last_failure = verdict

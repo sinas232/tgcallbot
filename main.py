@@ -495,8 +495,17 @@ async def start_web_server():
 # ---------------------------------------------------------
 
 async def auto_spam_check_job(context: ContextTypes.DEFAULT_TYPE):
-    try: await health_checker_service.run_auto_check()
-    except Exception as e: logger.error(f"Auto check job error: {e}")
+    # A Telegram-account health job must not open sessions while operators
+    # deliberately keep the bot in global maintenance for a 406 incident.
+    # Check the canonical DB flag too: stale bot_data must not open a key.
+    if context.bot_data.get('maintenance_mode', True):
+        return
+    try:
+        if await DatabaseManager.global_maintenance_enabled_strict():
+            return
+        await health_checker_service.run_auto_check()
+    except Exception as e:
+        logger.warning('Automatic spam check skipped/failed: %s', type(e).__name__)
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """پشتیبان‌گیری خودکار زمان‌بندی شده و ارسال به کانال پشتیبان."""

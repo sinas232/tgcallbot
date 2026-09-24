@@ -399,7 +399,8 @@ _CLEANUP_SCAN_STOP_LABELS = {
     'busy': 'سفارش فعال/نزدیک آغاز شد.',
     'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
     'unavailable': 'خطای غیرمنتظره در پیش‌شرط یا پروب؛ جزئیات نوع خطا در لاگ خصوصی است.',
-    'unsafe_probe': 'تداخل ۴۰۶ یا قطع اتصال نامطمئن ثبت شد؛ تا بررسی علت، سشن بعدی پروب نشد. ۴۰۶ مجوز حذف نیست و آن کلید در نسخهٔ جدید از بررسی گروهی بعدی کنار می‌رود.',
+    'unsafe_probe': '۴۰۶ یا قطع نامطمئن رخ داد؛ بررسی را از اول تکرار نکنید. اگر ۴۰۶ تایپ‌شده باشد، کلید همان سشن باطل است. تا ورود تازهٔ ردیف‌های نشان‌دار و بررسی علت تداخل، کل بررسی گروهی باید متوقف بماند؛ حساب‌ها خودکار حذف نمی‌شوند.',
+    'held_406': 'کلیدهای ۴۰۶ِ ذخیره‌شده هنوز با ورود تازه جایگزین نشده‌اند؛ برای حفظ بقیهٔ سشن‌ها هیچ کلید دیگری پروب نشد.',
     'repeated_uncertain': 'سه نتیجهٔ نامطمئنِ یکسان پیاپی؛ ابتدا علت مشترک را بررسی کنید.',
 }
 
@@ -411,7 +412,7 @@ _CLEANUP_SCAN_REASON_LABELS = {
     'conflict_cooldown': 'مهلت ایمنی ۴۰۶',
     'shared': 'کلید مشترک/قفل‌شده',
     'busy': 'سشن مشغول/قفل‌شده',
-    'duplicated_in_use': 'تداخل ۴۰۶',
+    'duplicated_in_use': 'تداخل ۴۰۶ (پاسخ تایپ‌شده: کلید باطل)',
     'relogin_required': 'احراز هویت مبهم/بن (نیاز به بررسی ورود)',
     'timeout': 'مهلت اتصال تمام شد',
     'disconnect_unconfirmed': 'قطع اتصال نامطمئن',
@@ -582,10 +583,26 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             await display('⛔️ فهرست امن اکانت‌ها قابل تهیه نیست؛ هیچ اتصال یا حذفی انجام نشد.',
                           back)
             return AWAITING_SETTINGS_ACTION
-        summary = (f'نامزدهای inactive: {plan.uncertain_total} • قابل بررسی: '
+        summary = (f'نامزدهای inactive: {plan.uncertain_total} • قابل بررسی پس از رفع خطر: '
                    f'{len(plan.candidates)}\nکلید مشترک: {plan.skipped_shared} • '
                    f'سشن ناخوانا: {plan.skipped_unreadable} • '
-                   f'قرنطینهٔ ۴۰۶ (فقط تک‌اکانتی): {plan.skipped_cooldown}')
+                   f'نشانگرهای ۴۰۶: {plan.skipped_cooldown} • '
+                   f'قرنطینهٔ ثبت‌شدهٔ بررسی زنده: {len(plan.pending_406_ids)}')
+        if plan.pending_406_ids:
+            held = '، '.join(str(aid) for aid in plan.pending_406_ids[:8])
+            extra = ' و موارد دیگر' if len(plan.pending_406_ids) > 8 else ''
+            await display(
+                '⛔️ بررسی گروهی قفل است؛ هیچ اتصال یا حذفی انجام نشد. '
+                'بررسی‌های قبلی به ۴۰۶ رسیدند. تکرار گروهی ممکن است کلیدِ '
+                'بعدی را هم باطل کند. ابتدا ردیف‌های نشان‌دار را با شمارهٔ '
+                'دقیق همان ردیف و کد ورود/رمز دوم، به سشن تازه تبدیل کنید؛ '
+                'کلید قدیمی را دوباره پروب یا ایمپورت نکنید. علت اتصال هم‌زمان '
+                'هنوز معلوم نیست و بعد از ورود تازه هم باید پیش از آزمونِ '
+                'دیگر بررسی شود.\n\n'
+                + summary + '\nشناسه‌های نشان‌دار: ' + held + extra,
+                [[InlineKeyboardButton('🗑 پیش‌نمایش فقط موارد تأییدشده',
+                                       callback_data='deleted_cleanup_preview_all')], *back])
+            return AWAITING_SETTINGS_ACTION
         if not plan.candidates:
             await display('📭 هیچ سشن غیرفعالِ یکتای قابل بررسی وجود ندارد.\n'
                           + summary + '\nحساب‌های تأییدشده را جداگانه پیش‌نمایش کنید.', [
@@ -638,6 +655,12 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             except Exception as exc:
                 logger.warning('Cleanup scan preflight failed: %s', type(exc).__name__)
                 allowed, reason, current = False, 'unavailable', None
+            if current and current.pending_406_ids:
+                await display('⛔️ ۴۰۶ِ قرنطینه‌شده ثبت شده است؛ تأیید قدیمی '
+                              'اجازهٔ پروب بقیهٔ کلیدها را نمی‌دهد. با شمارهٔ '
+                              'همان ردیف‌ها ورود تازه کنید؛ بررسی گروهی را '
+                              'تکرار نکنید.', back)
+                return AWAITING_SETTINGS_ACTION
             if not allowed or not current or current.candidates != pending['candidates']:
                 await display('⛔️ تعمیرات/سفارش/فهرست سشن‌ها تغییر کرده است؛ '
                               'هیچ اتصالی باز نشد. دوباره پیش‌نمایش بگیرید. '

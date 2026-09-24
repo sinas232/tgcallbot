@@ -100,9 +100,20 @@ class HealthChecker:
         accounts = await DatabaseManager.get_all_active_accounts()
         
         for acc in accounts:
+            # Maintenance can be switched ON while a long-running spam job
+            # is iterating. Fail closed on DB errors; never keep connecting
+            # the remaining old auth keys during a 406 investigation.
+            try:
+                if await DatabaseManager.global_maintenance_enabled_strict():
+                    logger.info('Automatic spam check paused by maintenance')
+                    return
+            except Exception as exc:
+                logger.warning('Automatic spam check paused (DB unavailable): %s',
+                               type(exc).__name__)
+                return
             await self.check_single_account_spam(acc)
-            await asyncio.sleep(5) 
-            
+            await asyncio.sleep(5)
+
         self.total_checks += 1
         logger.info("✅ Automatic Spam Check Completed.")
 

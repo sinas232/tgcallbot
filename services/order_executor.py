@@ -893,7 +893,8 @@ class OrderExecutor:
 	                        pass
 	                    logger.warning(
 	                        f"Order {order_id}: account {aid} AUTH_KEY_DUPLICATED - "
-	                        "row preserved; typed Telegram 406 invalidates the key; re-login with phone"
+	                        "no auto-disable; row preserved; typed Telegram 406 invalidates the key; "
+	                        "re-login with phone"
 	                    )
 	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
 	                    continue

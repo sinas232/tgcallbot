@@ -742,6 +742,54 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                           first.edit_message_text.call_args.args[0])
             self.assertFalse(admin_handlers._cleanup_scan_starting)
 
+    async def test_saved_406_from_first_scan_blocks_next_batch_before_any_connection(self):
+        plan = cleanup_review.CleanupScanPlan(
+            ((18, 'hash18'),), 25, 0, 0, 3, pending_406_ids=(13, 16, 17))
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers, 'prepare_cleanup_scan',
+                          new_callable=AsyncMock, return_value=plan), \
+             patch.object(admin_handlers, 'run_cleanup_scan',
+                          new_callable=AsyncMock) as scan, \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock) as allowed, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+            query = self.callback('deleted_cleanup_scan_start')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            text = query.edit_message_text.call_args.args[0]
+            self.assertIn('بررسی گروهی قفل است', text)
+            self.assertIn('13، 16، 17', text)
+            self.assertNotIn('hash18', text)
+            self.assertNotIn('deleted_cleanup_scan', self.context.user_data)
+            markup = query.edit_message_text.call_args.kwargs['reply_markup']
+            self.assertFalse(any(b.callback_data.startswith('deleted_cleanup_scan_confirm_')
+                                 for line in markup.inline_keyboard for b in line))
+            allowed.assert_not_awaited()
+            scan.assert_not_awaited()
+
+    async def test_old_confirm_refuses_new_406_hold_even_if_candidates_unchanged(self):
+        approved = ((18, 'hash18'),)
+        clear = cleanup_review.CleanupScanPlan(approved, 1, 0, 0, 0)
+        held = cleanup_review.CleanupScanPlan(
+            approved, 2, 0, 0, 1, pending_406_ids=(17,))
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers, 'prepare_cleanup_scan', new_callable=AsyncMock,
+                          side_effect=(clear, held)), \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')), \
+             patch.object(admin_handlers, 'run_cleanup_scan',
+                          new_callable=AsyncMock) as scan, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+             patch.object(admin_handlers, 'time', SimpleNamespace(time=lambda: 1000)):
+            query = self.callback('deleted_cleanup_scan_start')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            button = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0]
+            self.assertTrue(button.callback_data.startswith('deleted_cleanup_scan_confirm_'))
+            query.data = button.callback_data
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertIn('۴۰۶ِ قرنطینه‌شده', query.edit_message_text.call_args.args[0])
+            self.assertNotIn('deleted_cleanup_scan', self.context.user_data)
+            scan.assert_not_awaited()
+
     async def test_superadmin_can_batch_review_then_preview_delete_verified_revoked_at_zero(self):
         plan = cleanup_review.CleanupScanPlan(
             ((7, hashlib.sha256(b'cipher7').hexdigest()),), 25, 2, 1, 0)
