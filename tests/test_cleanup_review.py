@@ -6,7 +6,7 @@ import hashlib
 import os
 import struct
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
@@ -61,21 +61,26 @@ class ScanPlanningTests(unittest.IsolatedAsyncioTestCase):
             _row(8, 1, 'recent-406', marker='AUTH_KEY_DUPLICATED: not proof',
                  checked=datetime.utcnow()),
             _row(9, 1, 'historic-revoked', marker='SESSION_REVOKED detected'),
+            _row(10, 1, 'old-406', marker='AUTH_KEY_DUPLICATED: older collision',
+                 checked=datetime.utcnow() - timedelta(days=3)),
+            _row(11, 1, 'new-review-hold', marker=database.CLEANUP_REVIEW_406_HOLD,
+                 checked=datetime.utcnow() - timedelta(days=3)),
         ]
         keys = {cipher: _export(char) for cipher, char in (
             ('unique', b'a'), ('shared-1', b'b'), ('shared-2', b'b'),
             ('active', b'c'), ('hold', b'd'), ('previously-verified', b'e'),
-            ('recent-406', b'f'), ('historic-revoked', b'g'))}
+            ('recent-406', b'f'), ('historic-revoked', b'g'),
+            ('old-406', b'h'), ('new-review-hold', b'i'))}
         with patch.object(cleanup_review.DatabaseManager, 'get_cleanup_scan_rows',
                           new_callable=AsyncMock, return_value=rows) as select, \
              patch.object(cleanup_review.SecurityManager, 'decrypt_session',
                           side_effect=lambda c: keys.get(c)):
             plan = await cleanup_review.prepare_cleanup_scan(1)
         select.assert_awaited_once_with(cleanup_review.MAX_SCAN_ROWS)
-        self.assertEqual(plan.uncertain_total, 5)
+        self.assertEqual(plan.uncertain_total, 7)
         self.assertEqual(plan.skipped_shared, 1)
         self.assertEqual(plan.skipped_unreadable, 1)
-        self.assertEqual(plan.skipped_cooldown, 1)
+        self.assertEqual(plan.skipped_cooldown, 3)
         self.assertEqual(plan.candidates, ((1, hashlib.sha256(b'unique').hexdigest()),
                                            (9, hashlib.sha256(b'historic-revoked').hexdigest())))
         self.assertNotIn(_export(b'a'), repr(plan))

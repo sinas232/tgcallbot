@@ -592,6 +592,7 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
         self.verified = patcher.start()
         self.addCleanup(patcher.stop)
         admin_handlers._cleanup_scan_jobs.clear()
+        admin_handlers._cleanup_scan_starting.clear()
         self.context = SimpleNamespace(bot=object(), bot_data={'bot_id': 1}, user_data={})
         self.message = SimpleNamespace(text='☠️ حذف اکانت‌های دلیت‌شده',
                                        reply_text=AsyncMock())
@@ -687,6 +688,59 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             delete.assert_not_awaited()
             legacy.assert_not_awaited()
             probe.assert_not_awaited()
+
+    async def test_concurrent_confirmations_cannot_both_start_while_preflight_awaits(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        plan = cleanup_review.CleanupScanPlan(((7, 'hash7'),), 1, 0, 0, 0)
+        self.context.application = SimpleNamespace(create_task=asyncio.create_task)
+        self.context.user_data['deleted_cleanup_scan'] = dict(
+            nonce='n1', expires=1300, bot_id=1, user_id=5,
+            chat_id=55, candidates=plan.candidates)
+        first = self.callback('deleted_cleanup_scan_confirm_n1')
+        other_context = SimpleNamespace(bot=object(), bot_data={'bot_id': 1},
+                                        user_data={'deleted_cleanup_scan': dict(
+                                            nonce='n2', expires=1300, bot_id=1,
+                                            user_id=6, chat_id=66,
+                                            candidates=plan.candidates)},
+                                        application=self.context.application)
+        other_query = SimpleNamespace(data='deleted_cleanup_scan_confirm_n2',
+                                      answer=AsyncMock(), edit_message_text=AsyncMock())
+        other = SimpleNamespace(effective_user=SimpleNamespace(id=6),
+                                effective_chat=SimpleNamespace(id=66),
+                                message=None, callback_query=other_query)
+
+        async def paused_preflight(_bot_id):
+            entered.set()
+            await release.wait()
+            return True, 'ready'
+
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5, 6]), \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+             patch.object(admin_handlers, 'time', SimpleNamespace(time=lambda: 1000)), \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          side_effect=paused_preflight) as allowed, \
+             patch.object(admin_handlers, 'prepare_cleanup_scan', new_callable=AsyncMock,
+                          return_value=plan), \
+             patch.object(admin_handlers, 'run_cleanup_scan', new_callable=AsyncMock,
+                          return_value=cleanup_review.CleanupScanResult(1, 1, 0, 0, 0, 1)) as scan:
+            task = asyncio.create_task(admin_handlers.deleted_account_cleanup_handler(
+                self.update, self.context))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                await admin_handlers.deleted_account_cleanup_handler(other, other_context)
+                self.assertIn('بررسی مرحله‌ای دیگری',
+                              other_query.edit_message_text.call_args.args[0])
+                self.assertEqual(allowed.await_count, 1)
+                self.assertEqual(scan.await_count, 0)
+            finally:
+                release.set()
+                await task
+            job = admin_handlers._cleanup_scan_jobs[1]
+            await job['task']
+            scan.assert_awaited_once()
+            self.assertIn('بررسی مرحله‌ای آغاز شد',
+                          first.edit_message_text.call_args.args[0])
+            self.assertFalse(admin_handlers._cleanup_scan_starting)
 
     async def test_superadmin_can_batch_review_then_preview_delete_verified_revoked_at_zero(self):
         plan = cleanup_review.CleanupScanPlan(

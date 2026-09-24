@@ -382,6 +382,10 @@ def _masked_account_phone(phone: object) -> str:
 # A restart stops the scan; completed proof markers stay in the DB, but no
 # task resumes itself and no row is ever deleted by the worker.
 _cleanup_scan_jobs: dict[int, dict] = {}
+# Claim the start BEFORE the first preflight await. Two admins (even across
+# reseller bots in this process) must not each pass the running-job check
+# while the other's DB/alias snapshot is pending and launch two workers.
+_cleanup_scan_starting: set[int] = set()
 
 
 def _cleanup_scan_running(job: dict | None) -> bool:
@@ -395,7 +399,7 @@ _CLEANUP_SCAN_STOP_LABELS = {
     'busy': 'سفارش فعال/نزدیک آغاز شد.',
     'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
     'unavailable': 'خطای غیرمنتظره در پیش‌شرط یا پروب؛ جزئیات نوع خطا در لاگ خصوصی است.',
-    'unsafe_probe': 'تداخل ۴۰۶ یا قطع اتصال نامطمئن ثبت شد؛ تا بررسی علت، سشن بعدی پروب نشد.',
+    'unsafe_probe': 'تداخل ۴۰۶ یا قطع اتصال نامطمئن ثبت شد؛ تا بررسی علت، سشن بعدی پروب نشد. ۴۰۶ مجوز حذف نیست و آن کلید در نسخهٔ جدید از بررسی گروهی بعدی کنار می‌رود.',
     'repeated_uncertain': 'سه نتیجهٔ نامطمئنِ یکسان پیاپی؛ ابتدا علت مشترک را بررسی کنید.',
 }
 
@@ -581,7 +585,7 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
         summary = (f'نامزدهای inactive: {plan.uncertain_total} • قابل بررسی: '
                    f'{len(plan.candidates)}\nکلید مشترک: {plan.skipped_shared} • '
                    f'سشن ناخوانا: {plan.skipped_unreadable} • '
-                   f'مهلت ایمنی ۴۰۶: {plan.skipped_cooldown}')
+                   f'قرنطینهٔ ۴۰۶ (فقط تک‌اکانتی): {plan.skipped_cooldown}')
         if not plan.candidates:
             await display('📭 هیچ سشن غیرفعالِ یکتای قابل بررسی وجود ندارد.\n'
                           + summary + '\nحساب‌های تأییدشده را جداگانه پیش‌نمایش کنید.', [
@@ -621,35 +625,40 @@ async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.
             await display('⛔️ تأیید بررسی گروهی منقضی/نامعتبر است؛ دوباره پیش‌نمایش بگیرید.',
                           back)
             return AWAITING_SETTINGS_ACTION
-        if any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values()):
+        if (_cleanup_scan_starting or
+                any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values())):
             await display('⛔️ بررسی مرحله‌ای دیگری در همین پردازه فعال است؛ '
                           'اتصال موازی به سشن‌ها باز نشد.', back)
             return AWAITING_SETTINGS_ACTION
+        _cleanup_scan_starting.add(bot_id)
         try:
-            allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
-            current = await prepare_cleanup_scan(bot_id) if allowed else None
-        except Exception as exc:
-            logger.warning('Cleanup scan preflight failed: %s', type(exc).__name__)
-            allowed, reason, current = False, 'unavailable', None
-        if not allowed or not current or current.candidates != pending['candidates']:
-            await display('⛔️ تعمیرات/سفارش/فهرست سشن‌ها تغییر کرده است؛ '
-                          'هیچ اتصالی باز نشد. دوباره پیش‌نمایش بگیرید. '
-                          f'({reason if not allowed else "changed"})', back)
-            return AWAITING_SETTINGS_ACTION
-        job = {'user_id': update.effective_user.id, 'chat_id': update.effective_chat.id,
-               'finished': False, 'progress': (0, len(current.candidates), 0, 0, 0, 0),
-               'reasons': (), 'task': None}
-        _cleanup_scan_jobs[bot_id] = job
-        worker = _run_cleanup_review_job(context.bot, update.effective_chat.id,
-                                         bot_id, job, current.candidates)
-        try:
-            job['task'] = context.application.create_task(worker)
-        except Exception as exc:
-            worker.close()
-            job['finished'] = True
-            logger.warning('Cleanup scan could not start: %s', type(exc).__name__)
-            await display('⛔️ اجرای بررسی گروهی ممکن نشد؛ هیچ اتصالی باز نشد.', back)
-            return AWAITING_SETTINGS_ACTION
+            try:
+                allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
+                current = await prepare_cleanup_scan(bot_id) if allowed else None
+            except Exception as exc:
+                logger.warning('Cleanup scan preflight failed: %s', type(exc).__name__)
+                allowed, reason, current = False, 'unavailable', None
+            if not allowed or not current or current.candidates != pending['candidates']:
+                await display('⛔️ تعمیرات/سفارش/فهرست سشن‌ها تغییر کرده است؛ '
+                              'هیچ اتصالی باز نشد. دوباره پیش‌نمایش بگیرید. '
+                              f'({reason if not allowed else "changed"})', back)
+                return AWAITING_SETTINGS_ACTION
+            job = {'user_id': update.effective_user.id, 'chat_id': update.effective_chat.id,
+                   'finished': False, 'progress': (0, len(current.candidates), 0, 0, 0, 0),
+                   'reasons': (), 'task': None}
+            _cleanup_scan_jobs[bot_id] = job
+            worker = _run_cleanup_review_job(context.bot, update.effective_chat.id,
+                                             bot_id, job, current.candidates)
+            try:
+                job['task'] = context.application.create_task(worker)
+            except Exception as exc:
+                worker.close()
+                job['finished'] = True
+                logger.warning('Cleanup scan could not start: %s', type(exc).__name__)
+                await display('⛔️ اجرای بررسی گروهی ممکن نشد؛ هیچ اتصالی باز نشد.', back)
+                return AWAITING_SETTINGS_ACTION
+        finally:
+            _cleanup_scan_starting.discard(bot_id)
         await display('🧪 بررسی مرحله‌ای آغاز شد. هیچ حسابی خودکار حذف نمی‌شود.\n'
                       + _cleanup_scan_progress(job), [
                           [InlineKeyboardButton('♻️ وضعیت بررسی',

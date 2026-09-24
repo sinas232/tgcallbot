@@ -37,8 +37,17 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
                           new_callable=AsyncMock, return_value=result) as probe, \
              patch.object(account_recovery.DatabaseManager, 'recover_account_after_verified_probe',
-                          new_callable=AsyncMock, return_value=updated) as update:
+                          new_callable=AsyncMock, return_value=updated) as update, \
+             patch.object(account_recovery.DatabaseManager, 'hold_inactive_cleanup_406_after_probe',
+                          new_callable=AsyncMock, return_value=True) as hold:
             answer = await account_recovery.recover_one_account(7, 1)
+            if result[1] == 'duplicated_in_use' and row is not None:
+                hold.assert_awaited_once_with(
+                    7, 1, row['session_string'], expected_marker=row.get('spam_check_result'),
+                    expected_health=row.get('last_health_check'),
+                    expected_spam_status=row.get('spam_status'))
+            else:
+                hold.assert_not_awaited()
             return answer, get_row, probe, update
 
     async def test_success_reactivates_only_exact_verified_session(self):
@@ -65,6 +74,21 @@ class SingleAccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(answer, (False, reason))
                 probe.assert_awaited_once()
                 update.assert_not_awaited()
+
+    async def test_406_cas_rejects_changed_row_but_batch_still_stops(self):
+        with patch.object(account_recovery.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=self.row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock,
+                          return_value=(False, 'duplicated_in_use', None)), \
+             patch.object(account_recovery.DatabaseManager, 'hold_inactive_cleanup_406_after_probe',
+                          new_callable=AsyncMock, return_value=False) as hold, \
+             patch.object(account_recovery.DatabaseManager, 'mark_session_revoked_after_verified_probe',
+                          new_callable=AsyncMock) as revoke:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'duplicated_in_use'))
+            hold.assert_awaited_once()
+            revoke.assert_not_awaited()
 
     async def test_other_session_owner_never_connects_or_promotes(self):
         with patch.object(account_recovery.DatabaseManager, 'get_account_by_id',
@@ -241,6 +265,91 @@ class FreshLoginPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConditionalUpdateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cleanup_406_hold_is_cas_and_never_deletes_or_verifies_session(self):
+        from sqlalchemy import create_engine, select, update
+        from sqlalchemy.orm import Session
+        engine = create_engine('sqlite:///:memory:')
+        database.TelegramAccount.__table__.create(engine)
+        stamp = datetime.utcnow() - timedelta(days=3)
+        with engine.begin() as connection:
+            connection.execute(database.TelegramAccount.__table__.insert(), [
+                dict(id=7, bot_id=1, user_id=9, phone_number='+123',
+                     account_status='inactive', session_string='old-cipher',
+                     spam_status='dead', spam_check_result='SESSION_REVOKED detected',
+                     last_health_check=stamp),
+                dict(id=8, bot_id=1, user_id=10, phone_number='+124',
+                     account_status='inactive', session_string='no-old-marker',
+                     spam_status=None, spam_check_result=None, last_health_check=None),
+            ])
+
+        class AsyncSession:
+            async def __aenter__(self):
+                self.session = Session(engine)
+                return self
+            async def __aexit__(self, *unused): self.session.close()
+            async def execute(self, stmt): return self.session.execute(stmt)
+            async def commit(self): self.session.commit()
+
+        try:
+            with patch.object(database, 'AsyncSessionLocal', side_effect=AsyncSession):
+                # Wrong bot, key, marker, timestamp or spam state cannot take
+                # a hold on someone else's or a replaced session.
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 2, 'old-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp, expected_spam_status='dead'))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'different-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp, expected_spam_status='dead'))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker='changed',
+                    expected_health=stamp, expected_spam_status='dead'))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp - timedelta(hours=1), expected_spam_status='dead'))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp, expected_spam_status='unknown'))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker=database.CONFIRMED_ACCOUNT_DELETED,
+                    expected_health=stamp, expected_spam_status='dead'))
+                self.assertTrue(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp, expected_spam_status='dead'))
+                self.assertTrue(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    8, 1, 'no-old-marker', expected_marker=None,
+                    expected_health=None, expected_spam_status=None))
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker='SESSION_REVOKED detected',
+                    expected_health=stamp, expected_spam_status='dead'))
+            with Session(engine) as session:
+                row = session.get(database.TelegramAccount, 7)
+                self.assertEqual(row.session_string, 'old-cipher')
+                self.assertEqual(row.account_status, 'inactive')
+                self.assertEqual(row.spam_status, 'cooldown')
+                self.assertEqual(row.spam_check_result, database.CLEANUP_REVIEW_406_HOLD)
+                self.assertGreater(row.last_health_check, stamp)
+                self.assertEqual(session.get(database.TelegramAccount, 8).spam_check_result,
+                                 database.CLEANUP_REVIEW_406_HOLD)
+                self.assertEqual(session.get(database.TelegramAccount, 8).account_status,
+                                 'inactive')
+                self.assertEqual(session.scalars(select(database.TelegramAccount.id)).all(),
+                                 [7, 8])
+            # Even if an operator saves a fresh login with the same ID, a
+            # delayed old probe cannot stamp 406 on the replacement key.
+            with Session(engine) as session, session.begin():
+                session.execute(update(database.TelegramAccount).where(
+                    database.TelegramAccount.id == 7).values(
+                        session_string='fresh-key', account_status='active',
+                        spam_status='unknown', spam_check_result=None))
+            with patch.object(database, 'AsyncSessionLocal', side_effect=AsyncSession):
+                self.assertFalse(await database.DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                    7, 1, 'old-cipher', expected_marker=database.CLEANUP_REVIEW_406_HOLD,
+                    expected_health=stamp, expected_spam_status='cooldown'))
+            with Session(engine) as session:
+                self.assertEqual(session.get(database.TelegramAccount, 7).session_string, 'fresh-key')
+        finally:
+            engine.dispose()
+
     async def test_update_scoped_to_bot_inactive_and_exact_encrypted_key(self):
         class FakeSession:
             statement = None

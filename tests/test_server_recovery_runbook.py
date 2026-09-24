@@ -46,6 +46,9 @@ class QuarantineRunbookTests(unittest.TestCase):
                                       str(self.project.parent / 'tgcallbot-backups'))
                              .replace('/opt/tgcallbot', str(self.project)))
         self.log_block = safe_logs.replace('/opt/tgcallbot', str(self.project))
+        self.assertIn('2026-09-24T09:23:00Z', self.log_block)
+        self.assertIn('2026-09-24T09:35:00Z', self.log_block)
+        self.assertNotIn('2026-09-24T09:00:00Z', self.log_block)
         # The public report is aggregate-only. Provider IDs belong only in a
         # private file, not terminal output or a chat paste.
         self.assertNotIn('trans_id', aggregate)
@@ -125,6 +128,9 @@ class QuarantineRunbookTests(unittest.TestCase):
             'Account 8 single recovery failed: ConnectionError\n'
             'acc=9 probe disconnect unconfirmed; holding reservation\n'
             'Cleanup review halted at account 10: RuntimeError\n'
+            'fetch_me failed for acc 12: AuthKeyDuplicated -> duplicated_in_use\n'
+            '🚀 Main Bot Started. (version 2.3.18)\n'
+            'Instance database lock acquired (shared across checkouts/servers)\n'
             'other line with PHONE_PRIVATE_SESSION_KEY_SHOULD_NOT_APPEAR\n'
             'LOG\n')
         fake_docker.chmod(0o755)
@@ -137,6 +143,9 @@ class QuarantineRunbookTests(unittest.TestCase):
         self.assertIn('recovery_error/ConnectionError: 1', result.stdout)
         self.assertIn('disconnect_unconfirmed: 1', result.stdout)
         self.assertIn('scan_halted/RuntimeError: 1', result.stdout)
+        self.assertIn('Telegram/AuthKeyDuplicated/duplicated_in_use: 1', result.stdout)
+        self.assertIn('process_start: 1', result.stdout)
+        self.assertIn('db_singleton_lock_acquired: 1', result.stdout)
         self.assertNotIn('acc 7', result.stdout)
         self.assertNotIn('PHONE_PRIVATE_SESSION', result.stdout + result.stderr)
         self.assertEqual(len(list(self.project.parent.glob('tgcallbot-backups*'))), 0)

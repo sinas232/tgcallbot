@@ -15,9 +15,6 @@ import logging
 import struct
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
-
-from config import Config
 from database import (
     CONFIRMED_ACCOUNT_DELETED,
     CONFIRMED_SESSION_REVOKED,
@@ -85,9 +82,11 @@ def _auth_key_digest(encrypted: str) -> bytes | None:
 async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
     """Only historical inactive rows with a unique, readable stored auth key.
 
-    Missing/malformed ciphertext and key aliases are skipped. Active 406 rows
-    are NEVER swept; they require the separate one-account cooldown workflow.
-    Expensive/error-prone batches are refused entirely, not silently truncated.
+    Missing/malformed ciphertext and key aliases are skipped. Both active
+    AND historical inactive 406 rows are NEVER swept: a time delay alone
+    cannot resolve an auth-key collision. They require a separate, explicitly
+    confirmed one-account cooldown/ownership investigation. Expensive/error-
+    prone batches are refused entirely, not silently truncated.
     """
     rows = await DatabaseManager.get_cleanup_scan_rows(MAX_SCAN_ROWS)
     if len(rows) > MAX_SCAN_ROWS:
@@ -113,15 +112,14 @@ async def prepare_cleanup_scan(bot_id: int) -> CleanupScanPlan:
         if counts[key] != 1:
             shared += 1
             continue
-        # A stale 406 marker is *not* evidence of revocation. Reconnecting
-        # immediately after a recorded collision can itself revoke a key.
+        # Neither a newly held 406 nor an old collision becomes safe merely
+        # because 60 seconds elapsed. Do not bulk-retry this key, ever; only
+        # the separately confirmed ONE-account route may examine it after its
+        # minimum cooldown and an operator ownership check.
         marker = str(row['spam_check_result'] or '')
         if 'AUTH_KEY_DUPLICATED' in marker.upper():
-            when = row['last_health_check']
-            delay = max(60, int(getattr(Config, 'VOICE_SESSION_CONFLICT_RETRY_SECONDS', 60)))
-            if (when is None or (datetime.utcnow() - when).total_seconds() < delay):
-                cooldown += 1
-                continue
+            cooldown += 1
+            continue
         candidates.append((int(row['id']), hashlib.sha256(
             row['session_string'].encode('utf-8')).hexdigest()))
     return CleanupScanPlan(tuple(candidates), len(target), shared, unreadable, cooldown)

@@ -32,6 +32,10 @@ CONFIRMED_ACCOUNT_DELETED = 'Verified Telegram account deleted: USER_DEACTIVATED
 # This does not mean the Telegram user was deleted; re-login can create a new
 # key. Historical free-text labels and generic 401 must never set this marker.
 CONFIRMED_SESSION_REVOKED = 'Verified Telegram session invalid: typed auth-key 401'
+# A 406 during an inactive-row cleanup review is NOT evidence of revocation.
+# Keep it out of all future automatic/batch scans until a deliberate single-
+# account investigation or fresh phone login resolves that specific key.
+CLEANUP_REVIEW_406_HOLD = 'AUTH_KEY_DUPLICATED: cleanup review; manual-only until ownership checked'
 Base = declarative_base()
 
 
@@ -1386,6 +1390,40 @@ class DatabaseManager:
                     last_health_check=datetime.utcnow(),
                 )
             )
+            await db_session.commit()
+            return result.rowcount == 1
+
+    @staticmethod
+    async def hold_inactive_cleanup_406_after_probe(
+        aid: int, bot_id: int, encrypted_session: str, *,
+        expected_marker: str | None, expected_health: datetime | None,
+        expected_spam_status: str | None,
+    ) -> bool:
+        """Persist a 406 on the exact inactive row; NEVER claim deletion.
+
+        The in-process probe has received AUTH_KEY_DUPLICATED and confirmed
+        teardown. Compare all state observed before the connection so a new
+        login, verified deletion, other admin or later error cannot inherit
+        this hold. Unlike a timer, the *batch* scan must not lift it again;
+        the admin must inspect ownership and use one-account review/re-login.
+        """
+        if expected_marker in (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED):
+            return False
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(update(TelegramAccount).where(
+                TelegramAccount.id == int(aid),
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.session_string == encrypted_session,
+                (TelegramAccount.spam_check_result.is_(None) if expected_marker is None
+                 else TelegramAccount.spam_check_result == expected_marker),
+                (TelegramAccount.last_health_check.is_(None) if expected_health is None
+                 else TelegramAccount.last_health_check == expected_health),
+                (TelegramAccount.spam_status.is_(None) if expected_spam_status is None
+                 else TelegramAccount.spam_status == expected_spam_status),
+            ).values(spam_status='cooldown',
+                     spam_check_result=CLEANUP_REVIEW_406_HOLD,
+                     last_health_check=datetime.utcnow()))
             await db_session.commit()
             return result.rowcount == 1
 

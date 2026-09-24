@@ -100,6 +100,20 @@ async def recover_one_account(account_id: int, bot_id: int, *,
                 changed = await DatabaseManager.mark_account_deleted_after_verified_probe(
                     int(account_id), int(bot_id), acc['session_string'])
             return (False, 'account_deleted') if changed else (False, 'changed_during_probe')
+        if reason == 'duplicated_in_use' and is_inactive:
+            # The Telegram 406 is NOT proof this key is revoked or its user
+            # deleted. Persist a key-specific, CAS-protected hold so a second
+            # batch click (even after a bot restart) cannot probe the same
+            # contested session again. This only happens after disconnect was
+            # confirmed by fetch_me_status; manual review stays possible.
+            held = await DatabaseManager.hold_inactive_cleanup_406_after_probe(
+                int(account_id), int(bot_id), acc['session_string'],
+                expected_marker=acc.get('spam_check_result'),
+                expected_health=acc.get('last_health_check'),
+                expected_spam_status=acc.get('spam_status'))
+            if not held:
+                logger.warning('Account %s 406 hold not saved: row changed during probe', account_id)
+            return False, 'duplicated_in_use'  # always stop the running batch
         # Even a 401 does not authorize probing again or reactivating this key.
         # It remains quarantined for operator re-login (no session deletion).
         return False, reason or 'error'
