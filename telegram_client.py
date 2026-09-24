@@ -25,7 +25,7 @@ from security import SecurityManager
 from database import DatabaseManager
 from services.session_ownership import (session_ownership, SessionInUseError,
                                         is_auth_key_duplicated, is_fatal_auth_error,
-                                        is_account_deleted_rpc)
+                                        is_account_deleted_rpc, is_invalid_session_rpc)
 from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
@@ -388,7 +388,9 @@ class TelegramAccountClient:
           یا جای دیگر رخ دهد؛ تلگرام ممکن است کلید را باطل کرده باشد. پروبِ
           مکرر نزنید؛ پس از حذف تداخل، در صورت لزوم دوباره لاگین کنید.
         * ``account_deleted`` — خطای تایپ‌شدهٔ USER_DEACTIVATED (نه BAN).
-        * ``relogin_required`` — کلید باطل/حذف‌شده (401/revoked): فقط لاگین مجدد.
+        * ``session_revoked`` — خطای تایپ‌شدهٔ ابطال/انقضای همین کلید (401)
+          پس از قطع اتصال تأییدشده؛ حساب تلگرام ممکن است هنوز وجود داشته باشد.
+        * ``relogin_required`` — 401/خطای احراز هویتِ مبهم: لاگین مجدد، نه حذف.
         * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
         * ``disconnect_unconfirmed`` — اتصالِ پروب بسته‌نشد؛ بازگردانی ممنوع.
         * ``error`` — سایر خطاها.
@@ -421,6 +423,8 @@ class TelegramAccountClient:
                 reason = "duplicated_in_use"
             elif is_account_deleted_rpc(e):
                 reason = "account_deleted"
+            elif is_invalid_session_rpc(e):
+                reason = "session_revoked"
             elif is_fatal_auth_error(e):
                 reason = "relogin_required"
             else:

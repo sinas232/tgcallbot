@@ -49,7 +49,11 @@ async def recover_one_account(account_id: int, bot_id: int, *,
     if not (is_inactive or is_conflict):
         return False, 'not_inactive'
     conflict_at = acc.get('last_health_check')
-    if is_conflict:
+    # Historical versions marked 406 collisions *inactive*. Such rows must
+    # respect the very same cooldown as currently quarantined active rows.
+    old_406 = is_inactive and 'AUTH_KEY_DUPLICATED' in str(
+        acc.get('spam_check_result') or '').upper()
+    if is_conflict or old_406:
         # Also protect direct starts that bypass deploy-warp.sh's .env guard.
         delay = max(60, int(getattr(Config, 'VOICE_SESSION_CONFLICT_RETRY_SECONDS', 60)))
         if conflict_at is None or (datetime.utcnow() - conflict_at).total_seconds() < delay:
@@ -72,6 +76,18 @@ async def recover_one_account(account_id: int, bot_id: int, *,
         return False, 'error'
 
     if not ok:
+        if reason == 'session_revoked':
+            # Typed SESSION_REVOKED/EXPIRED/AUTH_KEY_* (not a bare 401) and a
+            # confirmed disconnect: this *key* cannot be reused. The Telegram
+            # account might still exist, and a fresh phone login remains valid.
+            if is_conflict:
+                changed = await DatabaseManager.resolve_session_conflict_after_verified_probe(
+                    int(account_id), int(bot_id), acc['session_string'], conflict_at,
+                    session_revoked=True)
+            else:
+                changed = await DatabaseManager.mark_session_revoked_after_verified_probe(
+                    int(account_id), int(bot_id), acc['session_string'])
+            return (False, 'session_revoked') if changed else (False, 'changed_during_probe')
         if reason == 'account_deleted':
             # Only typed USER_DEACTIVATED after a confirmed disconnect may
             # mark this exact key as deleted. A conflict row is atomically
@@ -105,7 +121,8 @@ _RECOVERY_MESSAGES = {
     'conflict_cleared': '✅ سشن همین اکانت با بررسی زنده و قطع تأییدشده معتبر بود؛ قرنطینهٔ ۴۰۶ برداشته شد. حضور در تماس هنوز جداگانه باید سنجیده شود.',
     'conflict_cooldown': '⏳ مهلت ایمنی پس از ۴۰۶ تمام نشده یا زمان رخداد نامشخص است؛ هیچ اتصال جدیدی باز نشد.',
     'duplicated_in_use': '⚠️ خطای ۴۰۶: تداخل کلید سشن. کلید سالم یا باطل بودنش معلوم نیست؛ دوباره‌پروب نکنید. کپی نمایندگی/برنامهٔ دیگر را بررسی کنید.',
-    'relogin_required': '💀 تلگرام ابطال کلید را اعلام کرد؛ این اکانت فقط با ورود مجدد و سشن تازه بازیابی می‌شود.',
+    'relogin_required': '⚠️ احراز هویت تلگرام ناموفق بود، اما دلیل دقیقِ قابل‌اتکا برای حذف نداریم؛ با شماره دوباره وارد شوید، سشن فعلی خودکار پاک نشد.',
+    'session_revoked': '💀 تلگرام ابطال/انقضای همین سشن را صریحاً اعلام کرد؛ حساب تلگرام ممکن است هنوز وجود داشته باشد. پس از پیش‌نمایش و تأیید، فقط این ردیفِ تأییدشده قابل حذف است.',
     'account_deleted': '☠️ تلگرام حذف‌شدن حساب را صریحاً اعلام کرد. فقط این حساب در منوی سوپرادمین برای حذف قابل‌انتخاب است؛ سشن‌های دیگر دست‌نخورده‌اند.',
     'timeout': '⏱ اتصال تلگرام تایم‌اوت شد؛ هیچ تغییری در وضعیت اکانت ندادیم.',
     'disconnect_unconfirmed': '🔒 قطع اتصالِ پروب تأیید نشد؛ برای جلوگیری از تداخل، اکانت فعال نشد.',

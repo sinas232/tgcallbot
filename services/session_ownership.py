@@ -110,6 +110,28 @@ def is_account_deleted_rpc(error: object) -> bool:
             and getattr(error, 'ID', None) == 'USER_DEACTIVATED')
 
 
+def is_invalid_session_rpc(error: object) -> bool:
+    """Typed 401 proving this authorization key is unusable, not account deletion.
+
+    Generic Unauthorized/401, a text label, 406 and USER_DEACTIVATED_BAN
+    cannot authorize destructive cleanup. Include expired sessions: a new
+    login is necessary even though the Telegram user itself may still exist.
+    """
+    if isinstance(error, str):
+        return False
+    code = getattr(error, 'CODE', None)
+    if code is None:
+        code = getattr(error, 'code', None)
+    name = type(error).__name__.replace('_', '').upper()
+    rpc_id = getattr(error, 'ID', None)
+    return code == 401 and (name, rpc_id) in {
+        ('SESSIONREVOKED', 'SESSION_REVOKED'),
+        ('SESSIONEXPIRED', 'SESSION_EXPIRED'),
+        ('AUTHKEYUNREGISTERED', 'AUTH_KEY_UNREGISTERED'),
+        ('AUTHKEYINVALID', 'AUTH_KEY_INVALID'),
+    }
+
+
 def fatal_auth_category(error: object) -> Optional[str]:
     """Safe, fixed diagnostic label for persistence; never record raw RPC text."""
     if not is_fatal_auth_error(error):

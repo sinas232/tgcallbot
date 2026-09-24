@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # Only a typed USER_DEACTIVATED response from a guarded single-account probe
 # may set this new marker. Historic 'dead', revoked and 406 labels are ineligible.
 CONFIRMED_ACCOUNT_DELETED = 'Verified Telegram account deleted: USER_DEACTIVATED'
+# Only a typed 401 (SESSION_REVOKED/SESSION_EXPIRED/AUTH_KEY_*) returned by a
+# guarded probe whose transport was closed may mark the *session* unusable.
+# This does not mean the Telegram user was deleted; re-login can create a new
+# key. Historical free-text labels and generic 401 must never set this marker.
+CONFIRMED_SESSION_REVOKED = 'Verified Telegram session invalid: typed auth-key 401'
 Base = declarative_base()
 
 
@@ -1387,24 +1392,27 @@ class DatabaseManager:
     @staticmethod
     async def resolve_session_conflict_after_verified_probe(
         aid: int, bot_id: int, encrypted_session: str, conflict_at: datetime,
-        *, account_deleted: bool = False,
+        *, account_deleted: bool = False, session_revoked: bool = False,
     ) -> bool:
         """Resolve only a matching 406 marker after typed Telegram evidence.
 
         The in-bot, ownership-guarded probe must have finished get_me() and
         confirmed disconnect. The timestamp also prevents a newer 406 on the
         SAME key from being silently cleared by an older in-flight probe.
-        An explicit USER_DEACTIVATED may mark the exact account as deleted.
+        An explicit USER_DEACTIVATED may mark the account deleted; a typed
+        revoked/expired-key error may mark only this authorization unusable.
         """
-        if conflict_at is None:
+        if conflict_at is None or (account_deleted and session_revoked):
             return False
+        confirmed = account_deleted or session_revoked
         values = {
             'last_health_check': datetime.utcnow(),
-            'spam_status': 'dead' if account_deleted else 'unknown',
+            'spam_status': 'dead' if confirmed else 'unknown',
             'spam_check_result': (CONFIRMED_ACCOUNT_DELETED if account_deleted else
+                                  CONFIRMED_SESSION_REVOKED if session_revoked else
                                   'Session verified and disconnected; 406 hold cleared'),
         }
-        if account_deleted:
+        if confirmed:
             values['account_status'] = 'inactive'
         async with AsyncSessionLocal() as db_session:
             result = await db_session.execute(update(TelegramAccount).where(
@@ -1473,6 +1481,27 @@ class DatabaseManager:
             return result.rowcount == 1
 
     @staticmethod
+    async def mark_session_revoked_after_verified_probe(aid: int, bot_id: int,
+                                                        encrypted_session: str) -> bool:
+        """Mark ONLY an inactive key with fresh, typed revocation evidence.
+
+        A historical label, generic 401, failed disconnect, or replacement
+        session must never qualify for removal from the database.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(update(TelegramAccount).where(
+                TelegramAccount.id == int(aid),
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.session_string == encrypted_session,
+                or_(TelegramAccount.spam_check_result.is_(None),
+                    TelegramAccount.spam_check_result != CONFIRMED_ACCOUNT_DELETED),
+            ).values(spam_status='dead', spam_check_result=CONFIRMED_SESSION_REVOKED,
+                     last_health_check=datetime.utcnow()))
+            await db_session.commit()
+            return result.rowcount == 1
+
+    @staticmethod
     async def get_confirmed_deleted_accounts(bot_id: int, *,
                                               account_id: int | None = None) -> list[dict]:
         """Return only fresh, explicit account-deletion evidence for this bot.
@@ -1495,6 +1524,30 @@ class DatabaseManager:
                     for account in result.scalars().all()]
 
     @staticmethod
+    async def get_verified_unusable_accounts(bot_id: int, *,
+                                              account_id: int | None = None) -> list[dict]:
+        """Only fresh, typed Telegram proof for the exact stored session.
+
+        Account deletion and authorization revocation are distinct; expose the
+        marker with the ID/ciphertext only to server-side preview code. Never
+        infer either proof from inactive/dead or an old free-text annotation.
+        """
+        async with AsyncSessionLocal() as db_session:
+            query = select(TelegramAccount).where(
+                TelegramAccount.bot_id == int(bot_id),
+                TelegramAccount.account_status == 'inactive',
+                TelegramAccount.spam_status == 'dead',
+                TelegramAccount.spam_check_result.in_(
+                    (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED)),
+            )
+            if account_id is not None:
+                query = query.where(TelegramAccount.id == int(account_id))
+            result = await db_session.execute(query.order_by(TelegramAccount.id))
+            return [{'id': acc.id, 'session_string': acc.session_string,
+                     'marker': acc.spam_check_result}
+                    for acc in result.scalars().all()]
+
+    @staticmethod
     async def get_deletion_review_page(bot_id: int, *, page: int = 1,
                                        page_size: int = 8) -> tuple[list[dict], int]:
         """Paginate uncertain accounts without loading/decrypting session strings.
@@ -1508,7 +1561,8 @@ class DatabaseManager:
         uncertain = or_(
             (TelegramAccount.account_status == 'inactive') & or_(
                 TelegramAccount.spam_check_result.is_(None),
-                TelegramAccount.spam_check_result != CONFIRMED_ACCOUNT_DELETED,
+                ~TelegramAccount.spam_check_result.in_(
+                    (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED)),
             ),
             (TelegramAccount.account_status == 'active') &
             (TelegramAccount.spam_status == 'cooldown') &
@@ -1525,6 +1579,22 @@ class DatabaseManager:
             ).where(condition).order_by(TelegramAccount.id)
              .offset(offset).limit(size))
             return [dict(row) for row in result.mappings().all()], total
+
+    @staticmethod
+    async def get_cleanup_scan_rows(max_rows: int = 5000) -> list[dict]:
+        """Bounded, server-side snapshot for alias-aware supervised scans.
+
+        Ciphertexts are needed *only* to detect copies of the same auth key
+        across bots. Never return this data to an admin chat or persist it in
+        PTB user_data; the caller returns IDs and hashes only.
+        """
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(select(
+                TelegramAccount.id, TelegramAccount.bot_id,
+                TelegramAccount.account_status, TelegramAccount.spam_check_result,
+                TelegramAccount.last_health_check, TelegramAccount.session_string,
+            ).order_by(TelegramAccount.id).limit(max_rows + 1))
+            return [dict(row) for row in result.mappings().all()]
 
     @staticmethod
     async def deletion_review_probe_allowed(bot_id: int) -> tuple[bool, str]:
@@ -1549,7 +1619,10 @@ class DatabaseManager:
     @staticmethod
     async def delete_confirmed_deleted_accounts(bot_id: int,
                                                 expected_fingerprints: dict[int, str], *,
-                                                single_account_id: int | None = None) -> tuple[int, str]:
+                                                single_account_id: int | None = None,
+                                                include_revoked: bool = False,
+                                                expected_markers: dict[int, str] | None = None
+                                                ) -> tuple[int, str]:
         """All-or-nothing cleanup of the exact accounts shown to a superadmin.
 
         This DB operation is deliberately narrower than delete_account(): it
@@ -1560,6 +1633,12 @@ class DatabaseManager:
         if not expected_fingerprints:
             return 0, 'empty'
         if single_account_id is not None and set(expected_fingerprints) != {int(single_account_id)}:
+            return 0, 'changed'
+        if include_revoked and (not expected_markers or
+                                set(expected_markers) != set(expected_fingerprints) or
+                                any(marker not in (CONFIRMED_ACCOUNT_DELETED,
+                                                   CONFIRMED_SESSION_REVOKED)
+                                    for marker in expected_markers.values())):
             return 0, 'changed'
         async with AsyncSessionLocal() as db_session:
             async with db_session.begin():
@@ -1588,7 +1667,10 @@ class DatabaseManager:
                     TelegramAccount.bot_id == int(bot_id),
                     TelegramAccount.account_status == 'inactive',
                     TelegramAccount.spam_status == 'dead',
-                    TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED,
+                    (TelegramAccount.spam_check_result.in_(
+                        (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED))
+                     if include_revoked else
+                     TelegramAccount.spam_check_result == CONFIRMED_ACCOUNT_DELETED),
                 )
                 if single_account_id is not None:
                     query = query.where(TelegramAccount.id == int(single_account_id))
@@ -1600,6 +1682,8 @@ class DatabaseManager:
                     fingerprint = hashlib.sha256(account.session_string.encode('utf-8')).hexdigest()
                     expected = expected_fingerprints.get(account.id, '')
                     if not hmac.compare_digest(fingerprint, expected):
+                        return 0, 'changed'
+                    if include_revoked and account.spam_check_result != expected_markers.get(account.id):
                         return 0, 'changed'
                 for account in rows:
                     await db_session.delete(account)

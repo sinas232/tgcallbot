@@ -5,12 +5,13 @@ never proof that a Telegram account itself was deleted.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
 os.environ.setdefault('BOT_TOKEN', 'test-token')
@@ -18,9 +19,10 @@ os.environ.setdefault('BOT_TOKEN', 'test-token')
 import database  # noqa: E402
 import telegram_client  # noqa: E402
 from handlers import admin_handlers  # noqa: E402
-from services import account_recovery  # noqa: E402
+from services import account_recovery, cleanup_review  # noqa: E402
 from services.session_ownership import (  # noqa: E402
     SessionOwnership, fatal_auth_category, is_account_deleted_rpc,
+    is_invalid_session_rpc,
 )
 
 
@@ -39,6 +41,59 @@ class Rpc401(Exception):
 
 
 class DeletedRpcTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_typed_revoked_or_expired_key_proves_session_logged_out(self):
+        from pyrogram.errors import (AuthKeyInvalid, AuthKeyUnregistered,
+                                     SessionExpired, SessionRevoked, Unauthorized)
+        for cls in (AuthKeyInvalid, AuthKeyUnregistered, SessionExpired, SessionRevoked):
+            self.assertTrue(is_invalid_session_rpc(cls()), cls.__name__)
+        for value in (Unauthorized(), UserDeactivated(), UserDeactivatedBan(),
+                      Rpc401(), RuntimeError('SESSION_REVOKED'), 'SESSION_REVOKED',
+                      RuntimeError('406 AUTH_KEY_DUPLICATED')):
+            self.assertFalse(is_invalid_session_rpc(value), type(value).__name__)
+
+    async def test_typed_revocation_requires_confirmed_disconnect(self):
+        from pyrogram.errors import SessionRevoked
+
+        for closes in (True, False):
+            with self.subTest(closes=closes):
+                transport = SimpleNamespace(
+                    is_connected=True, is_initialized=False, session=object(),
+                    connect=AsyncMock(), get_me=AsyncMock(side_effect=SessionRevoked()),
+                )
+                async def disconnect():
+                    if closes:
+                        transport.is_connected = False
+                        transport.session = None
+                    else:
+                        raise TimeoutError('not closed')
+                transport.disconnect = disconnect
+                client = telegram_client.TelegramAccountClient('test-phone', 'cipher', 7)
+                with patch.object(client, 'get_client', new_callable=AsyncMock,
+                                  return_value=transport):
+                    result = await client.fetch_me_status()
+                self.assertEqual(result, (False, 'session_revoked' if closes else
+                                          'disconnect_unconfirmed', None))
+
+    async def test_recovery_marks_typed_revocation_only_on_matching_inactive_key(self):
+        row = dict(id=7, bot_id=1, account_status='inactive', phone_number='test-phone',
+                   session_string='cipher', spam_check_result=None)
+        with patch.object(account_recovery.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(account_recovery.TelegramAccountClient, 'fetch_me_status',
+                          new_callable=AsyncMock, return_value=(False, 'session_revoked', None)), \
+             patch.object(account_recovery.DatabaseManager,
+                          'mark_session_revoked_after_verified_probe',
+                          new_callable=AsyncMock, return_value=True) as mark, \
+             patch.object(account_recovery.DatabaseManager, 'mark_account_deleted_after_verified_probe',
+                          new_callable=AsyncMock) as mark_deleted:
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'session_revoked'))
+            mark.assert_awaited_once_with(7, 1, 'cipher')
+            mark_deleted.assert_not_awaited()
+            mark.return_value = False
+            self.assertEqual(await account_recovery.recover_one_account(7, 1),
+                             (False, 'changed_during_probe'))
+
     def test_typed_deactivation_is_not_ban_revoke_or_string(self):
         from pyrogram.errors import UserDeactivated as RealUserDeactivated
         from pyrogram.errors import UserDeactivatedBan as RealUserDeactivatedBan
@@ -232,7 +287,9 @@ class CleanupDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('telegram_accounts.bot_id', str(stmt))
             self.assertIn('inactive', compiled.params.values())
             self.assertIn('AUTH_KEY_DUPLICATED:%', compiled.params.values())
-            self.assertIn(database.CONFIRMED_ACCOUNT_DELETED, compiled.params.values())
+            self.assertTrue(any(database.CONFIRMED_ACCOUNT_DELETED in value and
+                                database.CONFIRMED_SESSION_REVOKED in value
+                                for value in compiled.params.values() if isinstance(value, list)))
         self.assertNotIn('telegram_accounts.session_string', str(items))
         self.assertEqual(items.compile().params['param_1'], 8)
         self.assertEqual(items.compile().params['param_2'], 8)
@@ -275,6 +332,47 @@ class CleanupDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([acc['id'] for acc in first + second], [1, 2, 4])
         self.assertNotIn('session_string', repr(first + second))
         self.assertNotIn(database.CONFIRMED_ACCOUNT_DELETED, repr(first + second))
+
+    async def test_sql_confirmed_revocation_requires_inactive_bot_key_and_allows_null_marker(self):
+        from sqlalchemy import create_engine
+
+        engine = create_engine('sqlite:///:memory:')
+        database.TelegramAccount.__table__.create(engine)
+        rows = [
+            dict(id=7, bot_id=1, user_id=1, phone_number='p7', session_string='cipher7',
+                 account_status='inactive', spam_status='dead', spam_check_result=None),
+            dict(id=8, bot_id=1, user_id=1, phone_number='p8', session_string='cipher8',
+                 account_status='active', spam_status='free', spam_check_result=None),
+            dict(id=9, bot_id=2, user_id=2, phone_number='p9', session_string='cipher9',
+                 account_status='inactive', spam_status='dead', spam_check_result=None),
+            dict(id=10, bot_id=1, user_id=1, phone_number='p10', session_string='cipher10',
+                 account_status='inactive', spam_status='dead',
+                 spam_check_result=database.CONFIRMED_ACCOUNT_DELETED),
+        ]
+        with engine.begin() as connection:
+            connection.execute(database.TelegramAccount.__table__.insert(), rows)
+
+        class SyncBackedSession:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def execute(self, stmt): return connection.execute(stmt)
+            async def commit(self): connection.commit()
+
+        with engine.connect() as connection, \
+             patch.object(database, 'AsyncSessionLocal', side_effect=SyncBackedSession):
+            self.assertTrue(await database.DatabaseManager.mark_session_revoked_after_verified_probe(
+                7, 1, 'cipher7'))
+            for aid, bot, key in ((7, 1, 'old'), (8, 1, 'cipher8'),
+                                  (9, 1, 'cipher9'), (10, 1, 'cipher10')):
+                self.assertFalse(await database.DatabaseManager.mark_session_revoked_after_verified_probe(
+                    aid, bot, key))
+            marked = connection.execute(database.TelegramAccount.__table__.select()).mappings().all()
+        engine.dispose()
+        labels = {row['id']: row['spam_check_result'] for row in marked}
+        self.assertEqual(labels[7], database.CONFIRMED_SESSION_REVOKED)
+        self.assertEqual(labels[10], database.CONFIRMED_ACCOUNT_DELETED)
+        self.assertIsNone(labels[8])
+        self.assertIsNone(labels[9])
 
     async def test_targeted_cleanup_sql_keeps_other_confirmed_and_legacy_sessions(self):
         from sqlalchemy import create_engine
@@ -322,6 +420,69 @@ class CleanupDatabaseTests(unittest.IsolatedAsyncioTestCase):
         with Session(engine) as session:
             self.assertEqual(sorted(row.id for row in session.query(database.TelegramAccount).all()),
                              [8, 9])
+        engine.dispose()
+
+    async def test_sql_bulk_delete_only_fresh_typed_deleted_or_revoked_proofs(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        engine = create_engine('sqlite:///:memory:')
+        for table in (database.TelegramAccount.__table__, database.BotSetting.__table__,
+                      database.Order.__table__):
+            table.create(engine)
+        with Session(engine) as session, session.begin():
+            session.add(database.BotSetting(bot_id=1, key='maintenance_mode', value='1'))
+            for aid, bot, status, marker in (
+                    (7, 1, 'inactive', database.CONFIRMED_ACCOUNT_DELETED),
+                    (8, 1, 'inactive', database.CONFIRMED_SESSION_REVOKED),
+                    (9, 1, 'inactive', 'SESSION_REVOKED detected'),
+                    (10, 1, 'active', 'AUTH_KEY_DUPLICATED: not proof'),
+                    (11, 2, 'inactive', database.CONFIRMED_SESSION_REVOKED)):
+                session.add(database.TelegramAccount(
+                    id=aid, bot_id=bot, user_id=bot, phone_number=f'p{aid}',
+                    session_string=f'cipher{aid}', account_status=status,
+                    spam_status='dead' if status == 'inactive' else 'cooldown',
+                    spam_check_result=marker))
+
+        class SyncSession:
+            def __init__(self): self.session = Session(engine)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): self.session.close()
+            def begin(self):
+                cm = self.session.begin()
+                class Tx:
+                    async def __aenter__(self): cm.__enter__()
+                    async def __aexit__(self, typ, val, tb): cm.__exit__(typ, val, tb)
+                return Tx()
+            async def execute(self, stmt): return self.session.execute(stmt)
+            async def delete(self, row): self.session.delete(row)
+
+        snapshots = {aid: self._digest(f'cipher{aid}') for aid in (7, 8)}
+        markers = {7: database.CONFIRMED_ACCOUNT_DELETED,
+                   8: database.CONFIRMED_SESSION_REVOKED}
+        with patch.object(database, 'AsyncSessionLocal', side_effect=SyncSession):
+            self.assertEqual([row['id'] for row in
+                              await database.DatabaseManager.get_verified_unusable_accounts(1)],
+                             [7, 8])
+            self.assertEqual([row['id'] for row in
+                              await database.DatabaseManager.get_confirmed_deleted_accounts(1)],
+                             [7])
+            self.assertEqual(await database.DatabaseManager.delete_confirmed_deleted_accounts(
+                1, snapshots, include_revoked=True,
+                expected_markers={7: markers[7], 8: 'historical revoked'}), (0, 'changed'))
+            # Same ciphertext but newly changed, still-eligible evidence must
+            # invalidate a stale preview, not silently delete the other rows.
+            with Session(engine) as session, session.begin():
+                session.get(database.TelegramAccount, 8).spam_check_result = markers[7]
+            self.assertEqual(await database.DatabaseManager.delete_confirmed_deleted_accounts(
+                1, snapshots, include_revoked=True, expected_markers=markers), (0, 'changed'))
+            with Session(engine) as session, session.begin():
+                session.get(database.TelegramAccount, 8).spam_check_result = markers[8]
+            self.assertEqual(await database.DatabaseManager.delete_confirmed_deleted_accounts(
+                1, snapshots, include_revoked=True, expected_markers=markers), (2, 'deleted'))
+        with Session(engine) as session:
+            self.assertEqual(sorted(acc.id for acc in session.query(database.TelegramAccount).all()),
+                             [9, 10, 11])
         engine.dispose()
 
     async def test_probe_preflight_requires_maintenance_and_no_soon_due_order(self):
@@ -423,6 +584,14 @@ class CleanupDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
 class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        # Menu callbacks must remain offline even if a test forgets to stub a
+        # newly added verified-selector query.
+        patcher = patch.object(admin_handlers.DatabaseManager,
+                               'get_verified_unusable_accounts',
+                               new_callable=AsyncMock, return_value=[])
+        self.verified = patcher.start()
+        self.addCleanup(patcher.stop)
+        admin_handlers._cleanup_scan_jobs.clear()
         self.context = SimpleNamespace(bot=object(), bot_data={'bot_id': 1}, user_data={})
         self.message = SimpleNamespace(text='☠️ حذف اکانت‌های دلیت‌شده',
                                        reply_text=AsyncMock())
@@ -436,7 +605,7 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
         self.update.message = None
         return query
 
-    async def test_menu_has_no_bulk_delete_for_unverified_legacy_rows(self):
+    async def test_menu_always_has_bulk_verified_delete_even_at_zero_not_legacy_delete(self):
         with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
              patch.object(admin_handlers.DatabaseManager, 'get_confirmed_deleted_accounts',
                           new_callable=AsyncMock, return_value=[]) as select, \
@@ -446,16 +615,97 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                           new_callable=AsyncMock) as delete, \
              patch.object(admin_handlers, 'send_safe', new_callable=AsyncMock) as send:
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
-            select.assert_awaited_once_with(1)
+            self.verified.assert_awaited_once_with(1)
+            select.assert_not_awaited()
             old_dead.assert_not_awaited()
             delete.assert_not_awaited()
-            self.assertIn('تعداد با پاسخ تأییدشدهٔ حذف حساب: 0', send.call_args.args[2])
+            self.assertIn('حساب دلیت‌شدهٔ تأییدشده: 0', send.call_args.args[2])
             markup = send.call_args.kwargs['reply_markup']
             self.assertIsNotNone(markup)
             callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+            self.assertIn('deleted_cleanup_preview_all', callbacks)
+            self.assertIn('deleted_cleanup_scan_start', callbacks)
             self.assertIn('deleted_cleanup_list_1', callbacks)
             self.assertIn('deleted_cleanup_menu', callbacks)
-            self.assertNotIn('deleted_cleanup_preview', callbacks)
+            self.assertNotIn('deleted_cleanup_confirm_', repr(callbacks))
+
+    async def test_bulk_delete_button_at_zero_never_deletes_legacy_dead_rows(self):
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock) as delete, \
+             patch.object(admin_handlers.DatabaseManager, 'get_dead_accounts',
+                          new_callable=AsyncMock) as legacy, \
+             patch.object(admin_handlers, 'recover_one_account',
+                          new_callable=AsyncMock) as probe, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+            query = self.callback('deleted_cleanup_preview_all')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.verified.assert_awaited_once_with(1)
+            self.assertIn('هیچ حساب/سشنِ باطل یا دلیت‌شدهٔ تأییدشده‌ای',
+                          query.edit_message_text.call_args.args[0])
+            keyboard = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard
+            self.assertEqual(keyboard[0][0].callback_data, 'deleted_cleanup_scan_start')
+            delete.assert_not_awaited()
+            legacy.assert_not_awaited()
+            probe.assert_not_awaited()
+
+    async def test_superadmin_can_batch_review_then_preview_delete_verified_revoked_at_zero(self):
+        plan = cleanup_review.CleanupScanPlan(
+            ((7, hashlib.sha256(b'cipher7').hexdigest()),), 25, 2, 1, 0)
+        self.context.application = SimpleNamespace(create_task=lambda coro: asyncio.create_task(coro))
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers, 'prepare_cleanup_scan',
+                          new_callable=AsyncMock, return_value=plan) as prepare, \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')) as allowed, \
+             patch.object(admin_handlers, 'run_cleanup_scan', new_callable=AsyncMock,
+                          return_value=cleanup_review.CleanupScanResult(1, 1, 0, 1, 0, 0)) as scan, \
+             patch.object(admin_handlers.DatabaseManager, 'get_verified_unusable_accounts',
+                          new_callable=AsyncMock, return_value=[
+                              {'id': 7, 'session_string': 'cipher7',
+                               'marker': database.CONFIRMED_SESSION_REVOKED}]) as verified, \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock, return_value=(1, 'deleted')) as delete, \
+             patch.object(admin_handlers, 'send_safe', new_callable=AsyncMock) as send, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+             patch.object(admin_handlers, 'time', SimpleNamespace(time=lambda: 1000)):
+            query = self.callback('deleted_cleanup_scan_start')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertNotIn('cipher7', repr(self.context.user_data))
+            self.assertEqual(self.context.user_data['deleted_cleanup_scan']['candidates'],
+                             plan.candidates)
+            prepare.assert_awaited_once_with(1)
+            allowed.assert_not_awaited()
+            scan.assert_not_awaited()
+            delete.assert_not_awaited()
+            start = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+            self.assertRegex(start, r'^deleted_cleanup_scan_confirm_[0-9a-f]{16}$')
+
+            query.data = start
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            allowed.assert_awaited_once_with(1)
+            self.assertNotIn('deleted_cleanup_scan', self.context.user_data)
+            job = admin_handlers._cleanup_scan_jobs[1]
+            await job['task']
+            scan.assert_awaited_once_with(1, plan.candidates, ANY)
+            self.assertTrue(job['finished'])
+            self.assertEqual(send.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data,
+                             'deleted_cleanup_preview_all')
+            delete.assert_not_awaited()  # review NEVER removes a row
+
+            query.data = 'deleted_cleanup_preview_all'
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            verified.assert_awaited_once_with(1)
+            preview_text = query.edit_message_text.call_args.args[0]
+            self.assertIn('سشنِ واقعاً باطل/منقضی‌شده: 1', preview_text)
+            self.assertEqual(self.context.user_data['deleted_cleanup_preview']['markers'],
+                             {7: database.CONFIRMED_SESSION_REVOKED})
+            code = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+            query.data = code
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            delete.assert_awaited_once_with(
+                1, {7: hashlib.sha256(b'cipher7').hexdigest()}, include_revoked=True,
+                expected_markers={7: database.CONFIRMED_SESSION_REVOKED})
 
     async def test_paged_inline_candidate_picker_does_not_probe_or_delete(self):
         page = [{'id': i, 'phone_number': f'+9890000000{i:02d}',
@@ -488,6 +738,90 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             select.assert_awaited_with(1, page=2)
 
+    async def test_leaving_scan_preview_invalidates_old_confirm_button(self):
+        plan = cleanup_review.CleanupScanPlan(((7, 'hash7'),), 1, 0, 0, 0)
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers, 'prepare_cleanup_scan',
+                          new_callable=AsyncMock, return_value=plan), \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock) as allowed, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+            query = self.callback('deleted_cleanup_scan_start')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            code = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+            query.data = 'deleted_cleanup_menu'
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertNotIn('deleted_cleanup_scan', self.context.user_data)
+            query.data = code
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            allowed.assert_not_awaited()
+            self.assertIn('منقضی/نامعتبر', query.edit_message_text.call_args.args[0])
+
+    async def test_running_scan_can_be_stopped_only_by_its_owner(self):
+        running = asyncio.create_task(asyncio.Event().wait())
+        job = {'user_id': 5, 'chat_id': 55, 'finished': False,
+               'progress': (1, 3, 0, 1, 0, 0), 'task': running}
+        admin_handlers._cleanup_scan_jobs[1] = job
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5, 6]), \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock) as delete:
+            self.update.effective_user.id = 6
+            query = self.callback('deleted_cleanup_scan_stop')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            self.assertFalse(running.cancelled())
+            self.assertIn('فقط آغازکننده', query.edit_message_text.call_args.args[0])
+            self.update.effective_user.id = 5
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            delete.assert_not_awaited()
+        job['finished'] = True
+
+    async def test_batch_wrong_chat_expiry_busy_or_changed_plan_never_starts(self):
+        good = cleanup_review.CleanupScanPlan(((7, 'hash7'),), 1, 0, 0, 0)
+        for scenario in ('wrong_chat', 'wrong_bot', 'expired', 'busy', 'changed', 'replay'):
+            with self.subTest(scenario=scenario), \
+                 patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+                 patch.object(admin_handlers, 'prepare_cleanup_scan',
+                              new_callable=AsyncMock, return_value=good) as prepare, \
+                 patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                              new_callable=AsyncMock, return_value=(scenario != 'busy',
+                                                                   'busy' if scenario == 'busy'
+                                                                   else 'ready')), \
+                 patch.object(admin_handlers, 'run_cleanup_scan',
+                              new_callable=AsyncMock) as scan, \
+                 patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock), \
+                 patch.object(admin_handlers, 'time', SimpleNamespace(time=lambda: 1000)):
+                self.context.user_data.clear()
+                create_task = Mock()
+                self.context.application = SimpleNamespace(create_task=create_task)
+                query = self.callback('deleted_cleanup_scan_start')
+                await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+                code = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+                if scenario == 'wrong_chat':
+                    self.update.effective_chat.id = 99
+                elif scenario == 'wrong_bot':
+                    self.context.bot_data['bot_id'] = 2
+                elif scenario == 'expired':
+                    with patch.object(admin_handlers, 'time', SimpleNamespace(time=lambda: 1301)):
+                        query.data = code
+                        await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+                elif scenario == 'changed':
+                    prepare.return_value = cleanup_review.CleanupScanPlan(((8, 'hash8'),), 1, 0, 0, 0)
+                elif scenario == 'replay':
+                    self.context.user_data.pop('deleted_cleanup_scan')
+                if scenario != 'expired':
+                    query.data = code
+                    await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+                self.update.effective_chat.id = 55
+                self.context.bot_data['bot_id'] = 1
+                scan.assert_not_awaited()
+                create_task.assert_not_called()
+                self.assertFalse(any(not job.get('finished')
+                                     for job in admin_handlers._cleanup_scan_jobs.values()))
+                self.assertNotIn('deleted_cleanup_scan', self.context.user_data)
+
     async def test_exact_account_picker_probe_and_legacy_safe_delete_end_to_end(self):
         row = dict(id=7, bot_id=1, account_status='inactive', spam_status='dead',
                    spam_check_result='SESSION_REVOKED detected',
@@ -498,9 +832,10 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                           new_callable=AsyncMock, return_value=row) as get_one, \
              patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
                           new_callable=AsyncMock, return_value=(True, 'ready')) as allowed, \
-             patch.object(admin_handlers.DatabaseManager, 'get_confirmed_deleted_accounts',
+             patch.object(admin_handlers.DatabaseManager, 'get_verified_unusable_accounts',
                           new_callable=AsyncMock, return_value=[
-                              {'id': 7, 'session_string': 'private ciphertext'}]) as confirmed, \
+                              {'id': 7, 'session_string': 'private ciphertext',
+                               'marker': database.CONFIRMED_ACCOUNT_DELETED}]) as confirmed, \
              patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
                           new_callable=AsyncMock, return_value=(1, 'deleted')) as delete, \
              patch.object(admin_handlers, 'recover_one_account',
@@ -538,18 +873,47 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertRegex(confirm, r'^deleted_cleanup_confirm_[0-9a-f]{16}$')
             query.data = confirm
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
-            delete.assert_awaited_once_with(1, {7: digest}, single_account_id=7)
-            self.assertIn('✅ 1 اکانت', query.edit_message_text.call_args.args[0])
+            delete.assert_awaited_once_with(
+                1, {7: digest}, single_account_id=7, include_revoked=True,
+                expected_markers={7: database.CONFIRMED_ACCOUNT_DELETED})
+            self.assertIn('✅ 1 ردیف', query.edit_message_text.call_args.args[0])
+
+    async def test_single_probe_typed_revocation_offers_exact_safe_preview(self):
+        row = dict(id=7, bot_id=1, account_status='inactive', spam_status='dead',
+                   spam_check_result='SESSION_REVOKED detected',
+                   phone_number='+989123456789', session_string='cipher')
+        with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+             patch.object(admin_handlers.DatabaseManager, 'get_account_by_id',
+                          new_callable=AsyncMock, return_value=row), \
+             patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                          new_callable=AsyncMock, return_value=(True, 'ready')), \
+             patch.object(admin_handlers, 'recover_one_account', new_callable=AsyncMock,
+                          return_value=(False, 'session_revoked')) as probe, \
+             patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                          new_callable=AsyncMock) as delete, \
+             patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+            query = self.callback('deleted_cleanup_check_7')
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            query.data = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+            await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+            probe.assert_awaited_once_with(
+                7, 1, expected_session_fingerprint=hashlib.sha256(b'cipher').hexdigest())
+            markup = query.edit_message_text.call_args.kwargs['reply_markup']
+            self.assertEqual(markup.inline_keyboard[0][0].callback_data,
+                             'deleted_cleanup_preview_7')
+            delete.assert_not_awaited()
 
     async def test_targeted_preview_never_includes_other_confirmed_accounts(self):
         async def get_confirmed(bot_id, *, account_id=None):
             self.assertEqual(bot_id, 1)
-            all_rows = [{'id': 7, 'session_string': 'cipher7'},
-                        {'id': 8, 'session_string': 'cipher8'}]
+            all_rows = [{'id': 7, 'session_string': 'cipher7',
+                         'marker': database.CONFIRMED_ACCOUNT_DELETED},
+                        {'id': 8, 'session_string': 'cipher8',
+                         'marker': database.CONFIRMED_SESSION_REVOKED}]
             return [row for row in all_rows if account_id is None or row['id'] == account_id]
 
         with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
-             patch.object(admin_handlers.DatabaseManager, 'get_confirmed_deleted_accounts',
+             patch.object(admin_handlers.DatabaseManager, 'get_verified_unusable_accounts',
                           new_callable=AsyncMock, side_effect=get_confirmed) as confirmed, \
              patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
                           new_callable=AsyncMock, return_value=(1, 'deleted')) as delete, \
@@ -565,11 +929,12 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             query.data = code
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             delete.assert_awaited_once_with(
-                1, {7: hashlib.sha256(b'cipher7').hexdigest()}, single_account_id=7)
+                1, {7: hashlib.sha256(b'cipher7').hexdigest()}, single_account_id=7,
+                include_revoked=True, expected_markers={7: database.CONFIRMED_ACCOUNT_DELETED})
 
     async def test_direct_targeted_preview_of_unverified_account_has_no_delete_button(self):
         with patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
-             patch.object(admin_handlers.DatabaseManager, 'get_confirmed_deleted_accounts',
+             patch.object(admin_handlers.DatabaseManager, 'get_verified_unusable_accounts',
                           new_callable=AsyncMock, return_value=[]) as confirmed, \
              patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
                           new_callable=AsyncMock) as delete, \
@@ -578,10 +943,35 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             confirmed.assert_awaited_once_with(1, account_id=9)
             self.assertNotIn('deleted_cleanup_preview', self.context.user_data)
-            self.assertIn('هیچ حساب دلیت‌شدهٔ تأییدشده‌ای', query.edit_message_text.call_args.args[0])
+            self.assertIn('هیچ حساب/سشنِ باطل یا دلیت‌شدهٔ تأییدشده‌ای',
+                          query.edit_message_text.call_args.args[0])
             markup = query.edit_message_text.call_args.kwargs['reply_markup']
             self.assertFalse(any('تأیید حذف' in b.text for row in markup.inline_keyboard for b in row))
             delete.assert_not_awaited()
+
+    async def test_generic_401_or_ban_never_unlocks_delete_button(self):
+        row = dict(id=7, bot_id=1, account_status='inactive', spam_status='dead',
+                   spam_check_result=None, phone_number='p7', session_string='cipher')
+        for reason in ('relogin_required', 'duplicated_in_use', 'disconnect_unconfirmed'):
+            with self.subTest(reason=reason), \
+                 patch.object(admin_handlers.Config, 'ADMIN_IDS', [5]), \
+                 patch.object(admin_handlers.DatabaseManager, 'get_account_by_id',
+                              new_callable=AsyncMock, return_value=row), \
+                 patch.object(admin_handlers.DatabaseManager, 'deletion_review_probe_allowed',
+                              new_callable=AsyncMock, return_value=(True, 'ready')), \
+                 patch.object(admin_handlers, 'recover_one_account', new_callable=AsyncMock,
+                              return_value=(False, reason)), \
+                 patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
+                              new_callable=AsyncMock) as delete, \
+                 patch.object(admin_handlers, 'safe_answer', new_callable=AsyncMock):
+                query = self.callback('deleted_cleanup_check_7')
+                await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+                query.data = query.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+                await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
+                markup = query.edit_message_text.call_args.kwargs['reply_markup']
+                self.assertNotIn('deleted_cleanup_preview_7',
+                                 repr([b.callback_data for row in markup.inline_keyboard for b in row]))
+                delete.assert_not_awaited()
 
     async def test_rejected_probe_never_connects_or_deletes(self):
         row = dict(id=7, bot_id=1, account_status='inactive', spam_status='dead',
@@ -722,7 +1112,7 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             query.data = code
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             delete.assert_awaited_once_with(1, {7: hashlib.sha256(b'secret-ciphertext').hexdigest()})
-            self.assertIn('✅ 1 اکانت', query.edit_message_text.call_args.args[0])
+            self.assertIn('✅ 1 ردیف', query.edit_message_text.call_args.args[0])
             await admin_handlers.deleted_account_cleanup_handler(self.update, self.context)
             delete.assert_awaited_once()
 
@@ -781,12 +1171,16 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                           new_callable=AsyncMock) as select, \
              patch.object(admin_handlers.DatabaseManager, 'get_deletion_review_page',
                           new_callable=AsyncMock) as review, \
+             patch.object(admin_handlers, 'prepare_cleanup_scan',
+                          new_callable=AsyncMock) as prepare, \
              patch.object(admin_handlers.DatabaseManager, 'delete_confirmed_deleted_accounts',
                           new_callable=AsyncMock) as delete, \
              patch.object(admin_handlers, 'recover_one_account',
                           new_callable=AsyncMock) as probe:
-            for data in ('deleted_cleanup_preview', 'deleted_cleanup_list_1',
-                         'deleted_cleanup_check_7',
+            for data in ('deleted_cleanup_preview', 'deleted_cleanup_preview_all',
+                         'deleted_cleanup_scan_start', 'deleted_cleanup_scan_status',
+                         'deleted_cleanup_scan_confirm_0123456789abcdef',
+                         'deleted_cleanup_list_1', 'deleted_cleanup_check_7',
                          'deleted_cleanup_probe_0123456789abcdef',
                          'deleted_cleanup_confirm_0123456789abcdef'):
                 with self.subTest(data=data):
@@ -796,6 +1190,8 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(query.answer.call_args.kwargs['show_alert'])
             select.assert_not_awaited()
             review.assert_not_awaited()
+            self.verified.assert_not_awaited()
+            prepare.assert_not_awaited()
             probe.assert_not_awaited()
             delete.assert_not_awaited()
 
@@ -823,7 +1219,7 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             await account_management.handle_dead_accounts_callback(self.update, self.context)
             delete.assert_not_awaited()
             old_delete.assert_not_awaited()
-            self.assertIn('تعداد با پاسخ تأییدشدهٔ حذف حساب: 0',
+            self.assertIn('حساب دلیت‌شدهٔ تأییدشده: 0',
                           query.edit_message_text.call_args.args[0])
 
     def test_admin_menu_wiring_includes_new_paths_not_legacy_bulk(self):
@@ -839,7 +1235,10 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
             callbacks = [h for h in handlers
                          if getattr(h, 'callback', None) is main.deleted_account_cleanup_handler
                          and hasattr(h, 'pattern')]
-            for callback in ('deleted_cleanup_preview', 'deleted_cleanup_preview_7',
+            for callback in ('deleted_cleanup_preview', 'deleted_cleanup_preview_all',
+                             'deleted_cleanup_preview_7', 'deleted_cleanup_scan_start',
+                             'deleted_cleanup_scan_status', 'deleted_cleanup_scan_stop',
+                             'deleted_cleanup_scan_confirm_0123456789abcdef',
                              'deleted_cleanup_list_1', 'deleted_cleanup_check_7',
                              'deleted_cleanup_probe_0123456789abcdef',
                              'deleted_cleanup_confirm_0123456789abcdef'):
