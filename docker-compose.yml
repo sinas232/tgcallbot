@@ -21,6 +21,15 @@ services:
       - 'c 10:200 rwm'
     environment:
       - WARP_SLEEP=2
+      # ── تونل کاملِ لایهٔ ۳ (TUN) — v2.3.8 ─────────────────────────────
+      # بدون این متغیر، ایمیج فقط پروکسی SOCKS5:1080 می‌سازد و ترافیکِ
+      # «غیر-پروکسی» کانتینرها مستقیم از IP هاست (ایرانی) خارج می‌شد؛ نتیجه:
+      # سیگنالینگ MTProto آن هم فقط از طریق پروکسی می‌رفت ولی مدیا/UDPِ
+      # WebRTC ویس‌کال (ntgcalls که پروکسی نمی‌فهمد) مستقیم و فیلترشده بیرون
+      # می‌زد ← علت «ghost: media connection missing». با NAT-mode کلاینت
+      # به حالت «warp» (اینترفیس CloudflareWARP + default route) می‌رود و کل
+      # ترافیکِ فضای شبکهٔ مشترک — به‌ویژه UDP ویس‌کال — از تونل WARP عبور می‌کند.
+      - WARP_ENABLE_NAT=1
       # برای WARP+ کلید را در .env بگذارید (اختیاری):
       # - WARP_LICENSE_KEY=${WARP_LICENSE_KEY:-}
     cap_add:
@@ -30,6 +39,10 @@ services:
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
+      # لازم برای NAT mode (تونل لایهٔ ۳)؛ طبق سند رسمی warp-docker:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.all.accept_ra=2
     # نام db و redis را مستقیم به IP ثابتشان می‌بندیم تا مستقل از DNSِ
     # شکستهٔ warp کار کنند. bot از همین /etc/hosts استفاده می‌کند.
     extra_hosts:
@@ -50,8 +63,10 @@ services:
       default:
         ipv4_address: 172.28.0.4
     healthcheck:
-      # تا وقتی تونل WARP واقعاً برقرار نشده (warp=on)، ربات استارت نمی‌خورد.
-      test: ["CMD-SHELL", "curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
+      # هم warp=on از پروکسی SOCKS5، هم وجودِ اینترفیس TUN (CloudflareWARP)
+      # چک می‌شود — تا «شبه‌شفافیت» رخ ندهد که پروکسی سالم است ولی تونل
+      # لایهٔ ۳ بالا نیامده (همان باگی که مدیا/UDP ویس را direct می‌انداخت).
+      test: ["CMD-SHELL", "test -d /sys/class/net/CloudflareWARP && curl -fs --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -113,14 +128,16 @@ services:
     # سقف ۲ هستهٔ ملایم انتخاب شده تا اسپایک لحظه‌ای ورودِ ۳۷ اکانت خفه نشود،
     # ولی مصرف در حالت پایدار (با uvloop + تک‌ریسمانی ffmpeg + لاگ خفه‌شده)
     # به‌راحتی زیر این سقف می‌ماند. برای سخت‌گیری بیشتر cpus را روی '1.0' بگذارید.
+    # Compose applies these to both non-Swarm and Swarm resource settings.
+    # Verify the EFFECTIVE limits after deploy with docker inspect; a value
+    # in .env alone is not proof that a container was recreated with it.
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 1536M
-    # سازگاری با اجرای غیر-swarm قدیمی‌تر (docker-compose v1) در صورت وجود:
-    mem_limit: 1536m
-    cpus: 2.0
+          cpus: "${BOT_CPU_LIMIT:-2.0}"
+          memory: ${BOT_MEM_LIMIT:-1536M}
+    mem_limit: ${BOT_MEM_LIMIT:-1536M}
+    cpus: ${BOT_CPU_LIMIT:-2.0}
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}
@@ -161,8 +178,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-telegram_bot}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Host-side maintenance only. Never publish the account/session DB on
+    # 0.0.0.0:5432: Docker-published ports can bypass host UFW rules.
+    # Containers still connect to db:5432 over the private Compose network.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     networks:
       default:
         ipv4_address: 172.28.0.2

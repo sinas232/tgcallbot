@@ -10,10 +10,9 @@ import asyncio
 import logging
 import math
 import re
-import uuid
 from datetime import datetime, timedelta
 import jdatetime
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
 from telegram.ext import ContextTypes, ConversationHandler
 from database import DatabaseManager
 from config import Config
@@ -21,7 +20,8 @@ from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
 from services.order_executor import order_executor
-from services.capacity_planner import capacity_planner
+from services.anti_spam import anti_spam
+from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,42 +31,10 @@ async def safe_answer(query):
     try: await asyncio.wait_for(query.answer(), timeout=35)
     except: pass
 
-# -------------------- 🛡 گارد ظرفیت منابع (Capacity Guard) --------------------
+# -------------------- صفحهٔ تأیید سفارش --------------------
 
-def _order_window_from_context(context) -> tuple:
-    """(زمان شروع UTC، مدت دقیقه) سفارشِ در حال ساخت — برای آنی و زمان‌بندی."""
-    plan = context.user_data.get('selected_plan') or {}
-    try:
-        duration = int(plan.get('duration_minutes') or 0)
-    except Exception:
-        duration = 0
-    if context.user_data.get('is_scheduled'):
-        start = context.user_data.get('schedule_dt') or datetime.utcnow()
-    else:
-        start = datetime.utcnow()
-    return start, duration
-
-
-def _capacity_preview_line(verdict: dict) -> str:
-    """یک خطِ وضعیت ظرفیت برای پیش‌نمایش صفحهٔ تأیید (فارسی)."""
-    try:
-        if verdict.get('degraded'):
-            return ""
-        if verdict.get('allowed', True):
-            return "🟢 ظرفیت سرور برای کل بازهٔ اجرای این سفارش: **موجود است**\n"
-        suggested = verdict.get('suggested_start_utc')
-        peak = verdict.get('peak_usage', 0)
-        eff = verdict.get('effective_pool', 0)
-        line = f"🔴 ظرفیت سرور در بازهٔ اجرای این سفارش: **تکمیل است** (اوج مصرف `{peak}` از `{eff}` اکانت مفید)\n"
-        if suggested:
-            line += f"💡 پیشنهاد دقیق سیستم برای شروع: **{format_jalali_datetime(suggested)}**\n"
-        return line
-    except Exception:
-        return ""
-
-
-def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
-    """متن مشترک صفحهٔ تأیید سفارش (+ خط پیش‌نمایش ظرفیت در صورت وجود)."""
+def _build_confirmation_text(context) -> str:
+    """متن مشترک صفحهٔ تأیید سفارش."""
     plan = context.user_data['selected_plan']
     link = context.user_data['target_link']
     is_sched = context.user_data.get('is_scheduled', False)
@@ -77,15 +45,12 @@ def _build_confirmation_text(context, capacity_verdict: dict = None) -> str:
     else:
         time_str = format_jalali_datetime(get_tehran_time())
 
-    cap_line = _capacity_preview_line(capacity_verdict) if capacity_verdict is not None else ""
-
     return (
         "🧾 **تایید نهایی سفارش**\n\n"
         f"📦 سرویس: {plan['name']}\n"
         f"🔢 تعداد: {plan['accounts_count']}\n"
         f"🔗 لینک: {link}\n"
         f"⏰ اجرا: {time_str}\n"
-        f"{cap_line}"
         f"💰 مبلغ قابل پرداخت: **{format_price(plan['price'])} تومان**\n\n"
         "آیا اطلاعات بالا مورد تایید است؟"
     )
@@ -95,70 +60,6 @@ _CONFIRM_KB = lambda: InlineKeyboardMarkup(
     [[InlineKeyboardButton("✅ پرداخت و ثبت", callback_data="confirm_order_pay")],
      [InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]]
 )
-
-
-def _build_capacity_rejection(verdict: dict) -> tuple:
-    """پیام ردّ ظرفیت + دکمه‌های «رزرو ساعت پیشنهادی / بررسی مجدد / لغو».
-
-    طبق نیاز محصول، ردّ باید «محاسبه‌شده» باشد: به‌جای یک «بعداً امتحان کنید»
-    مبهم، اولین زمانِ شروعی که «کل بازهٔ سفارش» در آن جا می‌شود پیشنهاد و
-    رزروِ همان با یک دکمه ممکن است.
-    """
-    need = verdict.get('accounts_needed', 0)
-    pool = verdict.get('pool_size', 0)
-    eff = verdict.get('effective_pool', 0)
-    peak = verdict.get('peak_usage', 0)
-    busy_until = verdict.get('busy_until_utc')
-    suggested = verdict.get('suggested_start_utc')
-    reason = verdict.get('reason')
-
-    if reason == 'too_big':
-        txt = (
-            "⛔️ **امکان ثبت این سفارش وجود ندارد.**\n\n"
-            f"درخواست شما `{need}` اکانت است، اما کل ظرفیت سالم سرور `{pool}` اکانت است.\n\n"
-            "💡 لطفاً پلن کوچک‌تری انتخاب کنید یا با پشتیبانی در تماس باشید."
-        )
-        kb = [[InlineKeyboardButton("❌ بستن", callback_data="cancel_order")]]
-        return txt, InlineKeyboardMarkup(kb)
-
-    lines = [
-        "⛔️ **ظرفیت سرور برای این بازه تکمیل است — سفارش ثبت نشد.**\n",
-        "🛡 برای جلوگیری از لغو زنجیره‌ای سفارش‌ها، قبل از پذیرش، مصرف منابع در «کل بازهٔ اجرای سفارش» سنجیده می‌شود:\n",
-        f"🧮 اوج مصرف در بازهٔ درخواستی: `{peak}` از `{eff}` اکانت مفید (ظرفیت کل: `{pool}`)",
-        f"🔢 درخواست شما: `{need}` اکانت",
-    ]
-    if busy_until:
-        lines.append(f"⏳ ظرفیت از این ساعت آزاد می‌شود: **{format_jalali_datetime(busy_until)}**")
-    lines.append("")
-
-    kb = []
-    if suggested:
-        lines.append(
-            f"💡 **پیشنهاد دقیق سیستم:** برای ساعت **{format_jalali_datetime(suggested)}** اقدام کنید "
-            "(اولین بازه‌ای که کل سفارش شما در آن جا می‌شود) — یا همان را همین حالا رزرو کنید:"
-        )
-        kb.append([InlineKeyboardButton(
-            f"📅 رزرو در {format_jalali_datetime(suggested)}",
-            # epoch مستقل از timezone محیط (naive-UTC؛ ساعت سرور تهران است!)
-            callback_data=f"cap_slot_{int((suggested - _EPOCH).total_seconds())}"
-        )])
-    else:
-        lines.append("💡 لطفاً در ساعات دیگری تلاش کنید یا پلن کوچک‌تری انتخاب کنید.")
-    lines.append("\n⚠️ تا آزاد شدن ظرفیت، سفارش جدیدی پذیرفته نمی‌شود.")
-
-    kb.append([InlineKeyboardButton("🔄 بررسی مجدد ظرفیت", callback_data="cap_retry")])
-    kb.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_order")])
-    return "\n".join(lines), InlineKeyboardMarkup(kb)
-
-
-# مبنای تبدیل epoch مستقل از timezone (datetimeهای سیستم naive-UTC هستند و
-# .timestamp() روی سرور با TZ=Asia/Tehran خطای ۳:۳۰ ایجاد می‌کرد)
-_EPOCH = datetime(1970, 1, 1)
-
-
-def _naive_utc_from_epoch(epoch_seconds: int) -> datetime:
-    """epoch ثانیه → datetime naive-UTC (بدون وابستگی به TZ محیط)."""
-    return _EPOCH + timedelta(seconds=int(epoch_seconds))
 
 
 # -------------------- ثبت سفارش جدید --------------------
@@ -171,11 +72,32 @@ async def new_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user:
         tg_user = update.effective_user
         user = await DatabaseManager.create_or_update_user({
-            'id': user_id, 
-            'username': tg_user.username, 
-            'first_name': tg_user.first_name, 
+            'id': user_id,
+            'username': tg_user.username,
+            'first_name': tg_user.first_name,
             'last_name': tg_user.last_name
         }, bot_id=bot_id)
+
+    # 🛡 ضد اسپم: اگر کاربر اخیراً سفارشی را لغو کرده، تا پایان مهلتِ تنظیم‌شده
+    # (پیش‌فرض ۲۰ دقیقه — از پنل سوپرادمین قابل تغییر) نمی‌تواند سفارش جدید بزند.
+    try:
+        block_left = await anti_spam.user_order_block_seconds(user, bot_id=bot_id)
+    except Exception:
+        block_left = 0
+    if block_left > 0:
+        minutes_left = max(1, math.ceil(block_left / 60))
+        try:
+            cd_min = await anti_spam.get_cancel_cooldown_minutes(bot_id)
+        except Exception:
+            cd_min = 0
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            "⏳ **ثبت سفارش جدید موقتاً برای شما محدود است.**\n\n"
+            f"به دلیل لغو سفارش قبلی، تا **{minutes_left} دقیقه** دیگر نمی‌توانید سفارش جدید ثبت کنید.\n"
+            + (f"(قانون: پس از هر لغو، {cd_min} دقیقه وقفهٔ اجباری)\n" if cd_min > 0 else "")
+            + "\nلطفاً کمی صبر کنید و دوباره تلاش کنید. 🙏",
+        )
+        return ConversationHandler.END
 
     kb = ReplyKeyboardMarkup(PLAN_TYPES_MENU, resize_keyboard=True)
     await send_safe(context.bot, update.effective_chat.id, "🛍 **خرید سرویس جدید**\n\nلطفاً نوع سرویس را انتخاب کنید:", reply_markup=kb)
@@ -254,16 +176,25 @@ async def handle_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['selected_plan'] = plan
     
     await query.delete_message()
-    await send_safe(context.bot, update.effective_chat.id, "🔗 **لطفاً لینک (گروه/کانال/ویس) مقصد را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+    await send_safe(context.bot, update.effective_chat.id, link_help_text() if Config.ORDER_LINK_MODE == "private" else "🔗 **لطفاً لینک (گروه/کانال/ویس) مقصد را ارسال کنید:**", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
     return AWAITING_ORDER_LINK
 
 async def receive_order_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = update.message.text
+    link = update.message.text or update.message.caption or ""
     if BTN_CANCEL in link:
         from handlers.general_handlers import start_command
         return await start_command(update, context)
         
-    context.user_data['target_link'] = link
+    hidden_urls = []
+    for entity in (update.message.entities or update.message.caption_entities or ()):
+        if entity.type == MessageEntity.TEXT_LINK and entity.url:
+            hidden_urls.append(entity.url)
+    ok, normalized, error = validate_order_link(link, hidden_urls)
+    if not ok:
+        await send_safe(context.bot, update.effective_chat.id, rejection_message(error),
+                        reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True))
+        return AWAITING_ORDER_LINK
+    context.user_data['target_link'] = normalized
     
     # انتخاب نوع زمان اجرا
     kb = ReplyKeyboardMarkup(ORDER_TIMING_MENU, resize_keyboard=True)
@@ -405,22 +336,7 @@ async def handle_time_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return AWAITING_SCHEDULE_TIME
 
 async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    plan = context.user_data['selected_plan']
-    bot_id = context.bot_data.get('bot_id', 1)
-
-    # 🛡 پیش‌نمایش زندهٔ ظرفیت قبل از پرداخت (fail-open: خطا = بدون خط اضافه)
-    capacity_verdict = None
-    try:
-        cap_start, cap_duration = _order_window_from_context(context)
-        capacity_verdict = await capacity_planner.check_order(
-            bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
-        )
-    except Exception:
-        logger.exception("capacity preview failed (non-fatal)")
-        capacity_verdict = None
-
-    txt = _build_confirmation_text(context, capacity_verdict)
-
+    txt = _build_confirmation_text(context)
     await update.message.reply_text(txt, reply_markup=_CONFIRM_KB())
     return AWAITING_ORDER_CONFIRMATION
 
@@ -434,82 +350,66 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text("❌ سفارش لغو شد.", reply_markup=ReplyKeyboardMarkup(USER_MAIN_MENU, resize_keyboard=True))
         return ConversationHandler.END
 
-    # ── 🛡 گارد ظرفیت: پذیرش «رزرو ساعت پیشنهادی» و «بررسی مجدد» ──
-    if data.startswith("cap_slot_"):
-        try:
-            epoch = int(data.split("_")[2])
-            suggested_dt = _naive_utc_from_epoch(epoch)
-        except Exception:
-            return AWAITING_ORDER_CONFIRMATION
-        context.user_data['is_scheduled'] = True
-        context.user_data['schedule_dt'] = suggested_dt
-        try:
-            txt = _build_confirmation_text(context)
-        except Exception:
-            txt = "✅ زمان پیشنهادی روی سفارش اعمال شد. لطفاً مجدداً تایید کنید."
-        try:
-            await query.edit_message_text(txt, reply_markup=_CONFIRM_KB())
-        except Exception:
-            pass
-        return AWAITING_ORDER_CONFIRMATION
-
-    if data == "cap_retry":
-        # بازبینی ظرفیت با همان مشخصات (مثلاً کاربر می‌گوید «الان چی؟»)
-        bot_id = context.bot_data.get('bot_id', 1)
-        plan = context.user_data.get('selected_plan') or {}
-        capacity_verdict = None
-        try:
-            cap_start, cap_duration = _order_window_from_context(context)
-            capacity_verdict = await capacity_planner.check_order(
-                bot_id, cap_start, cap_duration, int(plan.get('accounts_count', 0) or 0)
-            )
-        except Exception:
-            capacity_verdict = None
-        try:
-            try:
-                txt = _build_confirmation_text(context, capacity_verdict)
-            except Exception:
-                txt = "🔄 ظرفیت بازبینی شد. لطفاً مجدداً تایید کنید یا سفارش را از نو ثبت کنید."
-            await query.edit_message_text(txt, reply_markup=_CONFIRM_KB())
-        except Exception:
-            pass
-        return AWAITING_ORDER_CONFIRMATION
-
     if data == "confirm_order_pay":
         user_id = update.effective_user.id
         bot_id = context.bot_data.get('bot_id', 1)
         plan = context.user_data['selected_plan']
         link = context.user_data['target_link']
-        
+        # Revalidate immediately before the wallet transaction.
+        ok, link, error = validate_order_link(link)
+        if not ok:
+            context.user_data.pop('target_link', None)
+            await query.edit_message_text(rejection_message(error))
+            return AWAITING_ORDER_LINK
+        context.user_data['target_link'] = link
+
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
+        # 🛡 گارد دوبارهٔ ممنوعیت پس از لغو — اگر کاربر وسط فلو یک سفارشِ دیگر
+        # را لغو کرده باشد، پرداخت نهایی این سفارش هم نباید انجام شود.
+        try:
+            block_left = await anti_spam.user_order_block_seconds(user, bot_id=bot_id)
+        except Exception:
+            block_left = 0
+        if block_left > 0:
+            await query.edit_message_text(
+                "⏳ **ثبت سفارش جدید موقتاً برای شما محدود است.**\n\n"
+                f"به دلیل لغو سفارش قبلی، تا **{max(1, math.ceil(block_left / 60))} دقیقه** دیگر نمی‌توانید سفارش ثبت کنید."
+            )
+            return ConversationHandler.END
+        # The confirmation page may be hours old. Refuse an outdated,
+        # disabled or different-bot plan before touching the wallet.
+        current_plan = await DatabaseManager.get_plan_by_id(plan['id'])
+        billed_fields = ('service_type', 'accounts_count', 'duration_minutes', 'price')
+        if (not current_plan or current_plan.get('bot_id') != bot_id
+                or not current_plan.get('is_active')
+                or any(current_plan.get(field) != plan.get(field) for field in billed_fields)):
+            await query.edit_message_text(
+                '⛔️ پلن تغییر کرده یا دیگر فعال نیست؛ بدون کسر اعتبار، از فهرست پلن‌ها دوباره انتخاب کنید.')
+            return ConversationHandler.END
+        plan = current_plan
         if user['credit'] < plan['price']:
             await query.edit_message_text(f"❌ **موجودی کافی نیست!**\nمبلغ سفارش: {format_price(plan['price'])}\nموجودی شما: {format_price(user['credit'])}\n\nلطفاً حساب خود را شارژ کنید.")
+            return ConversationHandler.END
+
+        # User policy: best-effort up to the plan's account limit. Fewer
+        # available/connected accounts do NOT reduce the plan price; billing
+        # is by elapsed service time once at least one account joins. Refuse
+        # only the clearly impossible zero-eligible case before charging.
+        # DB 'active' is not proof of Telegram or WebRTC reachability.
+        eligible = await DatabaseManager.count_active_accounts(bot_id=bot_id)
+        requested = int(plan.get('accounts_count') or 0)
+        if requested <= 0 or eligible <= 0:
+            await query.edit_message_text(
+                ('⛔️ این پلن تعداد اکانت معتبر ندارد. ' if requested <= 0 else
+                 '⛔️ اکنون هیچ اکانت فعالی برای شروع خدمت موجود نیست. ') +
+                'سفارشی ثبت و اعتباری کسر نشد؛ لطفاً بعداً دوباره تلاش کنید.')
             return ConversationHandler.END
 
         # 🔒 قفل لینک هوشمند: بررسی تداخل زمانی
         schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
         start_time = schedule_time if schedule_time else datetime.utcnow()
         duration = plan.get('duration_minutes', 0)
-        
-        # ── 🛡 گارد ظرفیت منابع: سنجش «کل بازهٔ اجرا» قبل از پذیرش ──
-        # سفارش فقط وقتی پذیرفته می‌شود که منابعِ کافی برای کل بازهٔ
-        # [شروع، شروع+مدت] آزاد باشد؛ وگرنه ردّ محاسبه‌شده با پیشنهادِ
-        # دقیق اولین بازهٔ آزاد (قابل رزرو با یک دکمه).
-        try:
-            verdict = await capacity_planner.check_order(
-                bot_id, start_time, duration or 0, int(plan.get('accounts_count', 0) or 0)
-            )
-        except Exception:
-            logger.exception("capacity gate failed → fail-open")
-            verdict = {'allowed': True, 'degraded': True}
-        if not verdict.get('allowed', True):
-            reject_txt, reject_kb = _build_capacity_rejection(verdict)
-            try:
-                await query.edit_message_text(reject_txt, reply_markup=reject_kb)
-            except Exception:
-                await query.message.reply_text(reject_txt, reply_markup=reject_kb)
-            return AWAITING_ORDER_CONFIRMATION
-        
+
         # بررسی تداخل زمانی با سفارشات موجود برای همین لینک
         has_overlap = await DatabaseManager.has_time_overlap_order(link, start_time, duration, bot_id=bot_id)
         if has_overlap:
@@ -522,18 +422,52 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
             )
             return ConversationHandler.END
 
-        await DatabaseManager.update_user_credit(user['id'], -plan['price'], "order", f"خرید {plan['name']}", bot_id=bot_id)
-        
-        schedule_time = context.user_data.get('schedule_dt') if context.user_data.get('is_scheduled') else None
-        
-        order = await DatabaseManager.create_order(
-            user['id'], plan['service_type'], link,
-            plan['accounts_count'], plan['duration_minutes'], plan['price'],
-            plan_id=plan['id'], scheduled_for=schedule_time, bot_id=bot_id
+        # Wallet debit, order row and transaction ledger commit TOGETHER.
+        # The DB locks the wallet row and rechecks the confirmed plan; never
+        # charge without an order if insert/commit fails.
+        order, reason = await DatabaseManager.create_paid_order(
+            user['id'], plan['id'], link, bot_id=bot_id,
+            scheduled_for=schedule_time, expected_plan=plan,
         )
+        if not order:
+            details = {
+                'insufficient_credit': 'اعتبار کافی نیست.',
+                'plan_changed': 'پلن پس از تأیید تغییر کرده است.',
+                'plan_unavailable': 'پلن دیگر در دسترس نیست.',
+                'user_missing': 'حساب کاربر یافت نشد.',
+                'duplicate_purchase': 'سفارش مشابه هنوز در حال پردازش است؛ خرید تکراری انجام نشد.',
+                'order_capacity': 'سقف سفارش‌های هم‌زمان پر است؛ بدون برداشت وجه بعداً دوباره تلاش کنید.',
+                'maintenance': 'حالت تعمیرات سراسری فعال است؛ بدون برداشت وجه سفارش تازه پذیرفته نمی‌شود.',
+                'invalid_link': 'لینک مقصد خالی یا نامعتبر است.',
+            }
+            await query.edit_message_text(
+                '⛔️ سفارش ثبت نشد و اعتباری کسر نشد. ' +
+                details.get(reason, 'لطفاً دوباره تلاش کنید.'))
+            return ConversationHandler.END
         
         if not schedule_time:
-            await order_executor.submit_order(order['id'], order)
+            try:
+                started = await order_executor.submit_order(order['id'], order)
+            except Exception as exc:
+                # The wallet/order transaction already COMMITTED. Never tell
+                # the customer no order exists or silently swallow this. Keep
+                # the pending row for operator review; do not auto-charge or
+                # issue an uncoordinated refund from the callback.
+                logger.error('Order %s created but executor submit failed (%s)',
+                             order['id'], type(exc).__name__)
+                await query.edit_message_text(
+                    f"⚠️ سفارش `{order['id']}` ثبت و مبلغ آن کسر شد، اما شروع خدمت "
+                    'تأیید نشد. لطفاً با این کد پیگیری به پشتیبانی اطلاع دهید؛ '
+                    'از ثبت دوبارهٔ همین سفارش خودداری کنید.')
+                return ConversationHandler.END
+            if not started:
+                # A concurrent cancellation may have claimed and refunded
+                # the order before its worker could be registered. Never tell
+                # the customer that service started when there is no worker.
+                await query.edit_message_text(
+                    f"ℹ️ سفارش `{order['id']}` ثبت شد اما شروع نشد؛ "
+                    'وضعیت و عودت آن را در سفارش‌ها بررسی کنید. دوباره پرداخت نکنید.')
+                return ConversationHandler.END
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🛑 لغو سفارش", callback_data=f"cancel_order_{order['id']}")]]
@@ -570,8 +504,6 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await safe_answer(query)
 
     data = query.data or ""
-    _eu = update.effective_user
-    logger.info("cancel pressed: data=%s user=%s", data, _eu.id if _eu else None)
     try:
         # فرمت: cancel_order_<id>
         order_id = int(data.split("_")[2])
@@ -580,6 +512,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     bot_id = context.bot_data.get('bot_id', 1)
     tg_user_id = update.effective_user.id
+    logger.info("cancel_order_callback fired: user=%s order_id=%s", tg_user_id, order_id)
 
     try:
         user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)
@@ -593,63 +526,44 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         status = order['status']
-
-        if status not in ['running', 'scheduled']:
+        if status not in ('running', 'scheduled', 'pending'):
             await query.edit_message_text("ℹ️ این سفارش دیگر فعال نیست و امکان لغو آن وجود ندارد.")
             return ConversationHandler.END
 
-        total_price = float(order.get('price_paid') or 0)
-        refund_amount = 0.0
-        spent_amount = 0.0
-
-        # سفارش هنوز شروع نشده (رزرو شده) → بازگشت کامل
-        if status == 'scheduled':
-            if not await DatabaseManager.cancel_order_once(order_id):
-                await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")
-                return ConversationHandler.END
-            refund_amount = total_price
-            msg_prefix = "✅ سفارش زمان‌بندی شده با موفقیت لغو شد."
-            # گزارش لغو در انتهای تابع (به‌همراه جزئیات مالی) یک‌بار ارسال می‌شود.
-        else:
-            # سفارش در حال اجرا → تسویه از «تنها مرجع محاسبه» تا هیچ‌وقت با
-            # مسیر ادمین اختلاف نداشته باشد (ثانیه‌ای دقیق / حجمی از روی پیشرفت).
-            spent_amount, refund_amount, _elapsed = order_executor.compute_order_settlement(order)
-
-            if not await DatabaseManager.cancel_order_once(order_id):
-                await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.")
-                return ConversationHandler.END
-
-            # توقف سفارش و خروج سریع اکانت‌ها / قطع ویس‌کال
-            await order_executor.stop_active_order(
-                order_id,
-                is_expired=False,
-                reason="User cancelled order via inline button",
-                # گزارش کاملِ لغو را پایین‌تر همین هندلر می‌فرستد؛ جلوی گزارش
-                # «cancelled» تکراری/ناقصِ order_executor را بگیر.
-                suppress_cancel_log=True,
+        # Claim this order and settle its wallet in ONE DB transaction. The
+        # locked row must still belong to this customer and this bot.
+        try:
+            settlement = await order_executor.settle_and_refund_order(
+                order_id, do_refund=True, canceled_by_role='کاربر',
+                cancellation_reason='لغو دستی توسط کاربر', bot_id=bot_id,
+                expected_user_id=user['id'],
             )
-            msg_prefix = "✅ سفارش فعال با موفقیت لغو شد."
+        except ValueError:
+            await query.edit_message_text('ℹ️ این سفارش قبلاً لغو یا تکمیل شده است.')
+            return ConversationHandler.END
+        total_price = settlement['total_cost']
+        spent_amount = settlement['used_cost']
+        refund_amount = settlement['refund_amount']
+        refund_tx_id = settlement.get('refund_tx_id') or '—'
+        new_balance = settlement['user_wallet_balance']
+        msg_prefix = ('✅ سفارش زمان‌بندی‌شده با موفقیت لغو شد.'
+                      if status == 'scheduled' else '✅ سفارش با موفقیت لغو شد.')
 
-        # شناسهٔ یکتای تراکنش عودت (refund_tx_id) — برای درج در دیتابیس و گزارش
-        refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-
-        # عودت وجه به کیف پول کاربر (تراکنش اتمیک: اعتبار + رکورد تراکنش در یک commit)
-        new_balance = None
-        if refund_amount > 0:
-            ok, new_balance = await DatabaseManager.update_user_credit(
-                user['id'],
-                refund_amount,
-                "order_refund",
-                f"عودت لغو سفارش {order_id} | {refund_tx_id}",
-                bot_id=bot_id
-            )
-
-        # موجودی فعلی کیف پول برای نمایش (اگر عودتی نبود، از رکورد کاربر بخوان)
-        if new_balance is None:
-            fresh_user = await DatabaseManager.get_user_by_id(user['id'])
-            new_balance = (fresh_user or {}).get('credit', user.get('credit', 0))
-
-        spent_amount = max(0.0, total_price - refund_amount)
+        # 🛡 ضد اسپم: بعد از لغو موفقِ کاربر، ثبت سفارش جدید برای مدتِ
+        # تنظیم‌شده (پیش‌فرض ۲۰ دقیقه — از پنل سوپرادمین قابل تغییر) مسدود است.
+        cd_until = None
+        try:
+            cd_until = await anti_spam.stamp_user_cancel_cooldown(user['id'], bot_id=bot_id)
+        except Exception:
+            cd_until = None
+        cd_note = ""
+        if cd_until is not None:
+            try:
+                cd_min = await anti_spam.get_cancel_cooldown_minutes(bot_id)
+            except Exception:
+                cd_min = 0
+            if cd_min > 0:
+                cd_note = f"\n\n⏳ توجه: تا **{cd_min} دقیقه** امکان ثبت سفارش جدید نخواهید داشت."
 
         txt = (
             f"{msg_prefix}\n\n"
@@ -658,6 +572,7 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"💵 مبلغ عودت داده شده به کیف پول: {format_price(refund_amount)} تومان\n"
             f"🧾 کد پیگیری عودت: {refund_tx_id}\n"
             f"👛 موجودی فعلی کیف‌پول: {format_price(new_balance)} تومان"
+            f"{cd_note}"
         )
 
         await query.edit_message_text(txt)
@@ -668,30 +583,6 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         return ConversationHandler.END
-
-    # گزارش شکیل لغو + تسویهٔ مالی به کانال لاگ (نقش لغوکننده = کاربر)
-    try:
-        cancel_name, _ = order_executor._user_display(user)
-        await order_executor._log_to_channel(
-            "cancelled",
-            order_id,
-            order,
-            user=user,
-            bot_id=bot_id,
-            reason="لغو دستی توسط کاربر",
-            extra={
-                "canceled_by_role": "کاربر",
-                "canceled_by_name": cancel_name,
-                "cancellation_reason": "لغو دستی توسط کاربر",
-                "total_cost": total_price,
-                "used_cost": spent_amount,
-                "refund_amount": refund_amount,
-                "user_wallet_balance": new_balance,
-                "refund_tx_id": refund_tx_id,
-            },
-        )
-    except Exception:
-        pass
 
     return ConversationHandler.END
 

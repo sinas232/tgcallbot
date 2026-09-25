@@ -31,8 +31,8 @@ Design goals (100-500 accounts per order):
     VoiceCallManager); the Brain only paces NEW waves and never bypasses a
     server wait.
 
-The module is intentionally dependency-free (stdlib + config) so it can be
-unit-tested without Telegram/DB infrastructure.
+The module only imports stdlib, config and the pure session classifier; it
+can be unit-tested without Telegram/DB infrastructure.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ import time
 from typing import Dict, List, Optional
 
 from config import Config
+from services.session_ownership import is_auth_key_duplicated, is_fatal_auth_error
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +63,14 @@ def classify_message(msg: str) -> str:
     so it mirrors the important buckets without importing heavy modules.
     """
     text = (msg or "").upper()
-    if any(k in text for k in (
-        "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-        "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401", "DEAD",
-    )):
-        return OUTCOME_DEAD
+    if is_auth_key_duplicated(text):
+        return OUTCOME_DEAD  # skip this order slot; text alone cannot authorize DB deletion
     if any(k in text for k in (
         "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
     )):
         return OUTCOME_FLOOD
+    if is_fatal_auth_error(text):
+        return OUTCOME_DEAD
     if any(k in text for k in (
         "INVALID LINK", "USERNAME_INVALID", "ACCOUNT RESTRICTED", "PEER_ID_INVALID",
         "COULD NOT RESOLVE", "CANNOT FIND", "MEMBERSHIP", "VOICE CHAT NOT ACTIVE",

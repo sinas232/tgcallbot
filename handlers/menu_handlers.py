@@ -8,12 +8,13 @@ import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
-from database import DatabaseManager
+from database import CLEANUP_REVIEW_406_HOLD, DatabaseManager
 from constants import ACCOUNT_MENU, ADMIN_MAIN_MENU, BTN_BACK, BTN_LEAVE_ALL_CHATS, AWAITING_SETTINGS_ACTION
 from handlers.middleware import require_admin
 from helpers.message_utils import send_safe
 from config import Config
 from telegram_client import TelegramAccountClient
+from services.account_recovery import recover_one_account, recovery_message
 
 try:
     from utils.helpers import format_jalali_datetime
@@ -300,7 +301,11 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         status_line = f"❌ غیرفعال ({html.escape(raw_status)})"
 
     spam_status = str(acc.get('spam_status') or "unknown").lower()
-    if spam_status == 'limited':
+    is_conflict = (spam_status == 'cooldown' and
+                   str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
+    if is_conflict:
+        spam_line = "🔒 تداخل سشن ۴۰۶؛ تا بررسی ایمن از سفارش کنار گذاشته شده"
+    elif spam_status == 'limited':
         spam_line = "⛔️ محدود شده (اسپم‌بلاک)"
     elif spam_status in ('free', 'ok', 'clean'):
         spam_line = "🟢 بدون محدودیت"
@@ -325,7 +330,10 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
         f"🗓 افزوده شده: {html.escape(str(created))}"
     )
 
-    kb = InlineKeyboardMarkup([
+    held_406 = raw_status == 'inactive' and acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD
+    # A held key cannot fetch codes, refresh its profile or be checked for
+    # spam. Do not offer a generic delete on a merely quarantined account.
+    rows = [] if held_406 else [
         [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data=f"acc_edit_{acc['id']}")],
         [
             InlineKeyboardButton("📩 دریافت کد ورود", callback_data=f"acc_getcode_{acc['id']}"),
@@ -335,8 +343,15 @@ async def account_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("🔄 بروزرسانی اطلاعات", callback_data=f"acc_refresh_{acc['id']}"),
             InlineKeyboardButton("🗑 حذف اکانت", callback_data=f"acc_del_{acc['id']}")
         ],
-        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")]
-    ])
+    ]
+    if held_406:
+        rows.append([InlineKeyboardButton(
+            "🔑 راهنمای ورود دوباره (بدون پروب)", callback_data=f"acc_recover_{acc['id']}")])
+    elif raw_status == 'inactive' or (raw_status == 'active' and is_conflict):
+        rows.append([InlineKeyboardButton(
+            "🧪 بررسی امن فقط همین سشنِ درگیر", callback_data=f"acc_recover_{acc['id']}")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"acc_page_{back_page}")])
+    kb = InlineKeyboardMarkup(rows)
 
     try:
         await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -377,6 +392,66 @@ async def account_action_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("❌ اکانت یافت نشد.", show_alert=True)
         return
 
+    is_conflict = (acc.get('account_status') == 'active' and
+                   acc.get('spam_status') == 'cooldown' and
+                   str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
+    if action in ("recover", "recoverdo"):
+        if acc.get('account_status') != 'inactive' and not is_conflict:
+            await query.answer("این اکانت نه غیرفعال است و نه در قرنطینهٔ ۴۰۶.", show_alert=True)
+            return
+        if (acc.get('account_status') == 'inactive' and
+                acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+            await query.answer()
+            await query.edit_message_text(
+                recovery_message('duplicate_key_relogin_required'),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 کارت اکانت", callback_data=f"acc_view_{aid}")],
+                ]))
+            return
+        if action == "recover":
+            await query.answer()
+            await query.edit_message_text(
+                "🧪 <b>بررسی زندهٔ فقط همین اکانت</b>\n\n"
+                "برای تأیید اعتبار سشن، ربات یک اتصال کوتاه به تلگرام باز می‌کند. "
+                "فقط اگر هویت تأیید شود، اتصال واقعاً قطع شود و سشنِ ذخیره‌شده "
+                "در این فاصله عوض نشده باشد، غیرفعال به فعال/قرنطینهٔ ۴۰۶ به آزاد تبدیل می‌شود.\n\n"
+                "⚠️ اگر کپی همین سشن در برنامه/سرور دیگری وصل است، "
+                "پیش از تأیید آن را قطع کنید؛ تلاش‌های پی‌درپی با کلید تکراری "
+                "ممکن است به ابطال کلید منجر شود.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ فقط همین اکانت را بررسی کن", callback_data=f"acc_recoverdo_{aid}")],
+                    [InlineKeyboardButton("🔙 انصراف", callback_data=f"acc_view_{aid}")],
+                ]), parse_mode=ParseMode.HTML)
+            return
+
+        await query.answer("⏳ بررسی یک سشن؛ لطفاً صبر کنید...")
+        await query.edit_message_text("⏳ اتصال و قطع امن فقط همین اکانت در حال بررسی است...")
+        try:
+            _, reason = await recover_one_account(aid, bot_id)
+        except Exception as exc:
+            logger.warning("Recovery DB error for account %s: %s", aid, type(exc).__name__)
+            reason = 'error'
+        await query.edit_message_text(
+            recovery_message(reason),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 کارت اکانت", callback_data=f"acc_view_{aid}")],
+            ]))
+        return
+
+    if (acc.get('account_status') == 'inactive' and
+            acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD and
+            action in ('getcode', 'spam', 'refresh', 'del', 'delyes')):
+        await query.answer()
+        await query.edit_message_text(
+            recovery_message('duplicate_key_relogin_required'),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔙 کارت اکانت', callback_data=f'acc_view_{aid}')],
+            ]))
+        return
+    if is_conflict and action in ("getcode", "spam", "refresh"):
+        await query.answer("سشن در قرنطینهٔ ۴۰۶ است؛ پیش از اتصال دوباره شاهد تایپ‌شده را بررسی یا با شماره وارد شوید.",
+                           show_alert=True)
+        return
     client = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
 
     if action == "getcode":
@@ -453,6 +528,11 @@ async def _sync_account_names(bot_id, page=1, limit=8):
     accounts, _ = await DatabaseManager.get_accounts_paginated(limit=limit, offset=offset, active_only=False, bot_id=bot_id)
     updated = 0
     for acc in accounts:
+        # Never mass-probe historical inactive rows or a 406 quarantine just
+        # because the admin refreshed the list of cached account names.
+        if (str(acc.get('account_status') or '').lower() != 'active' or
+                str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:')):
+            continue
         # فقط اکانت‌هایی که نام کش‌شده ندارند
         if acc.get('first_name') or acc.get('last_name') or acc.get('username'):
             continue

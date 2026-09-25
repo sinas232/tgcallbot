@@ -50,6 +50,7 @@ if os.name != "nt":
 
 import html
 import json
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -63,6 +64,7 @@ from telegram.request import HTTPXRequest
 from config import Config
 from database import DatabaseManager
 from services.order_executor import order_executor
+from services.instance_lock import InstanceDatabaseLock, InstanceAlreadyRunning
 from services.payment_service import payment_service
 from services.health_checker import health_checker_service
 from services.bot_manager import bot_manager
@@ -151,7 +153,13 @@ logger = logging.getLogger(__name__)
 # الگوی دکمه‌های ناوبری که نباید به‌عنوان «متن آزاد» مصرف شوند.
 # نکته: 💬 (چت در ویس‌کال) هم جزو دکمه‌های اصلی است و باید از STD_TEXT مستثنا شود
 # تا وقتی کاربر داخل یک مکالمه (کیف پول/پروفایل/...) است، این دکمه بلعیده نشود.
-REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+REGEX_NAV_BUTTONS = r"^(🔙|🛍|💰|💬|📦|🆘|🔐|📋|👤|👥|⚙️|☠️|➕|➖|📩|🔧|❌|🔎|📝|📊|📥|خروج|انصراف|بازگشت به منوی اصلی)"
+_DELETED_CLEANUP_CALLBACK_RE = (r"^deleted_cleanup_(?:menu|preview(?:_all|_[1-9][0-9]{0,9})?"
+                                r"|scan_(?:start|status|stop|confirm_[0-9a-f]{16})"
+                                r"|cancel|list_[1-9][0-9]{0,3}|check_[1-9][0-9]{0,9}"
+                                r"|probe_[0-9a-f]{16}|confirm_[0-9a-f]{16}"
+                                r"|retire406(?:_[1-9][0-9]{0,9}|_confirm_[0-9a-f]{16})?"
+                                r"|retire22(?:_confirm_[0-9a-f]{16})?)$")
 FILTER_NAV_BUTTONS = filters.Regex(REGEX_NAV_BUTTONS)
 FILTER_BACK = filters.Regex(REGEX_BACK) | filters.Regex("^🔙")
 # فیلتر متن استاندارد (بدون دستورات و دکمه‌های اصلی)
@@ -235,7 +243,11 @@ async def process_payment_success(transaction, app, bot_id, extra_data=None):
         logger.error(f"Payment success processing error: {e}")
 
 def get_html_response(title, message, color="#4CAF50", icon="✅"):
-    """تولید صفحه HTML برای نمایش نتیجه پرداخت در مرورگر"""
+    """HTML for gateway results: never render raw remote error/ref strings."""
+    title = html.escape(str(title), quote=True)
+    message = html.escape(str(message), quote=True)
+    icon = html.escape(str(icon), quote=True)
+    color = color if color in ("#4CAF50", "#F44336") else "#333333"
     return f"""
     <html>
     <head>
@@ -299,8 +311,14 @@ async def ap_callback_handler(request):
                 extra={"card_pan": card_pan, "tracking_number": tracking_number},
             )
             if success:
-                await DatabaseManager.update_payment_status(trans_id, 'paid')
-                await DatabaseManager.update_user_credit(transaction['user_id'], int(float(transaction['amount'])), "online_charge", f"شارژ آنلاین (کد: {trans_id})", bot_id=bot_id)
+                credited = await DatabaseManager.credit_verified_payment_once(
+                    trans_id, bot_id=bot_id, gateway_slug='aqayepardakht',
+                    description=f"شارژ آنلاین (کد: {trans_id})",
+                )
+                if not credited:
+                    return web.Response(text=get_html_response(
+                        "پرداخت تکراری", "این تراکنش قبلاً ثبت شده یا نیازمند بررسی پشتیبانی است."),
+                        content_type='text/html')
                 if app: await process_payment_success(transaction, app, bot_id, result_data)
                 return web.Response(text=get_html_response("پرداخت موفق", "حساب شما با موفقیت شارژ شد."), content_type='text/html')
             else:
@@ -342,14 +360,14 @@ async def zp_callback_handler(request):
             success, result_data = await payment_service.verify_payment(authority, amount_toman, "zarinpal", bot_id=bot_id)
             
             if success:
-                await DatabaseManager.update_payment_status(authority, 'paid')
-                await DatabaseManager.update_user_credit(
-                    transaction['user_id'],
-                    int(float(transaction['amount'])),
-                    "online_charge", 
-                    f"شارژ آنلاین زرین‌پال (Ref: {result_data.get('ref_id')})", 
-                    bot_id=bot_id
+                credited = await DatabaseManager.credit_verified_payment_once(
+                    authority, bot_id=bot_id, gateway_slug='zarinpal',
+                    description=f"شارژ آنلاین زرین‌پال (Ref: {result_data.get('ref_id')})",
                 )
+                if not credited:
+                    return web.Response(text=get_html_response(
+                        "پرداخت تکراری", "این تراکنش قبلاً ثبت شده یا نیازمند بررسی پشتیبانی است."),
+                        content_type='text/html')
                 if app: await process_payment_success(transaction, app, bot_id, result_data)
                 return web.Response(text=get_html_response("پرداخت موفق", f"کد پیگیری: {result_data.get('ref_id')}", icon="✅"), content_type='text/html')
             else:
@@ -391,23 +409,34 @@ async def pay_redirect_handler(request):
         )
 
     pay_url = transaction.get('pay_url')
-    if not pay_url:
+    parsed_url = None
+    try:
+        parsed_url = urlsplit(str(pay_url or ''))
+        host = parsed_url.hostname
+    except ValueError:
+        host = None
+    if (not pay_url or parsed_url is None or parsed_url.scheme != 'https'
+            or parsed_url.username or parsed_url.password
+            or host not in {'payment.zarinpal.com', 'panel.aqayepardakht.ir'}):
+        # Never emit an arbitrary DB/API URL into a meta refresh/HTML link.
         return web.Response(
-            text=get_html_response("خطا", "آدرس درگاه برای این تراکنش ثبت نشده است.",
+            text=get_html_response("خطا", "آدرس درگاه معتبر نیست؛ با پشتیبانی تماس بگیرید.",
                                    color="#F44336", icon="❌"),
             content_type='text/html', status=500,
         )
 
+    safe_url = html.escape(str(pay_url), quote=True)
+    safe_id = html.escape(str(trans_id), quote=True)
     amount = int(float(transaction.get('amount', 0)))
     # صفحهٔ فاکتور با هدایت خودکار (meta refresh + JS) به درگاه. چون این صفحه
     # روی دامنهٔ اصلی ما بارگذاری می‌شود، مرورگر هنگام رفتن به درگاه، همین دامنه
     # را به‌عنوان Referrer ارسال می‌کند و الزام تطابق دامنه رعایت می‌شود.
-    html = f"""<!DOCTYPE html>
+    html_body = f"""<!DOCTYPE html>
 <html lang="fa">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="1;url={pay_url}">
+    <meta http-equiv="refresh" content="1;url={safe_url}">
     <title>در حال انتقال به درگاه پرداخت</title>
     <style>
         body {{ font-family: Tahoma, Arial, sans-serif; text-align: center; padding: 50px; direction: rtl; background:#f4f4f9; }}
@@ -417,19 +446,18 @@ async def pay_redirect_handler(request):
         .btn {{ display:inline-block; margin-top:24px; padding:12px 26px; background:#0088cc; color:#fff; text-decoration:none; border-radius:8px; font-weight:bold; }}
         .muted {{ color:#888; font-size:13px; margin-top:16px; }}
     </style>
-    <script>setTimeout(function(){{ window.location.href = "{pay_url}"; }}, 900);</script>
 </head>
 <body>
     <div class="card">
         <h1>در حال انتقال به درگاه پرداخت…</h1>
         <div class="amount">مبلغ: {amount:,} تومان</div>
         <p>لطفاً چند لحظه صبر کنید. اگر به‌صورت خودکار منتقل نشدید، روی دکمهٔ زیر بزنید:</p>
-        <a class="btn" href="{pay_url}">ورود به درگاه پرداخت</a>
-        <div class="muted">شناسهٔ تراکنش: {trans_id}</div>
+        <a class="btn" href="{safe_url}">ورود به درگاه پرداخت</a>
+        <div class="muted">شناسهٔ تراکنش: {safe_id}</div>
     </div>
 </body>
 </html>"""
-    return web.Response(text=html, content_type='text/html')
+    return web.Response(text=html_body, content_type='text/html')
 
 async def health_handler(request):
     """اندپوینت سلامت برای بررسی دسترس‌پذیری وب‌سرور از اینترنت.
@@ -469,8 +497,19 @@ async def start_web_server():
 # ---------------------------------------------------------
 
 async def auto_spam_check_job(context: ContextTypes.DEFAULT_TYPE):
-    try: await health_checker_service.run_auto_check()
-    except Exception as e: logger.error(f"Auto check job error: {e}")
+    # A Telegram-account health job must not open sessions while operators
+    # deliberately keep the bot in global maintenance for a 406 incident.
+    # Check the canonical DB flag too: stale bot_data must not open a key.
+    if context.bot_data.get('maintenance_mode', True):
+        return
+    try:
+        if await DatabaseManager.global_maintenance_enabled_strict():
+            return
+        if await DatabaseManager.cleanup_406_incident_blocked(1):
+            return
+        await health_checker_service.run_auto_check()
+    except Exception as e:
+        logger.warning('Automatic spam check skipped/failed: %s', type(e).__name__)
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """پشتیبان‌گیری خودکار زمان‌بندی شده و ارسال به کانال پشتیبان."""
@@ -515,14 +554,42 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Auto backup job error: {e}")
 
+async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
+    """🛡 اجرای خروج‌های به‌تأخیرافتادهٔ گروه/کانال — دونه‌به‌دونه و به‌ترتیب.
+
+    با پایان/لغو سفارش، خروج اکانت‌ها از خودِ گروه در pending_group_leaves
+    زمان‌بندی می‌شود (پیش‌فرض یک هفته بعد). این جاب رکوردهای سررسید را با
+    فاصلهٔ تنظیم‌شده از پنل (پیش‌فرض ۶۰ ثانیه بین هر خروج) و با claim اتمیک
+    اجرا می‌کند؛ اگر برای همان مقصد سفارش جدید آمده باشد خروج‌ها قبلاً لغو
+    شده‌اند. هر ۶۰ ثانیه، برای همهٔ ربات‌ها (bot_id=None → کل صف) و بدون
+    بستن ربات روی خطا.
+    """
+    try:
+        from services.group_leave_scheduler import group_leave_scheduler
+        n = await group_leave_scheduler.process_due(
+            bot_id=None,
+            limit=int(getattr(Config, "GROUP_LEAVE_SWEEP_BATCH", 25) or 25),
+        )
+        if n:
+            logger.info("[GroupLeave] sweeper processed %s scheduled leave(s)", n)
+    except Exception as e:
+        logger.error(f"Group leave sweeper error: {e}")
+
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         due_orders = await DatabaseManager.get_due_scheduled_orders()
         if not due_orders: return
         for order in due_orders:
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            # submit_order owns the status transition AND task registration.
+            # Marking running first stranded paid scheduled orders if submit
+            # raised before creating a worker (they were no longer 'due').
+            started = await order_executor.submit_order(order['id'], order)
+            if not started:
+                # User/admin may have cancelled and atomically refunded after
+                # get_due_scheduled_orders took its snapshot. Do not announce
+                # a new service or resurrect the settled order.
+                continue
             try:
                 app = bot_manager.active_bots.get(bot_id)
                 if app:
@@ -547,11 +614,10 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
                 order = item['order']
                 duration = order.get('duration_minutes', 0)
                 if duration <= 0: continue
-                # مبنای انقضا: شروع قابل‌محاسبه (started_at) و در صورت نبود آن
-                # (سفارش گیرکرده در فاز ساخت) زمان ثبت سفارش. بدون این fallback،
-                # سفارش‌های بدون started_at هیچ‌وقت منقضی نمی‌شدند و برای همیشه
-                # running می‌ماندند.
-                start_time = order.get('started_at') or order.get('created_at')
+                # زمان ثبت سفارش شروع خدمت نیست. سفارش بدون started_at
+                # هرگز نباید با عنوان «خدمت تکمیل شد» منقضی شود؛ رسیدگی به
+                # سفارش گیرکرده در build یک مسیر جداگانه می‌خواهد.
+                start_time = order.get('started_at')
                 if not start_time: continue
                 end_time = start_time + timedelta(minutes=duration)
                 
@@ -590,12 +656,23 @@ def register_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    # 🛡 ضداسپم — گروهٔ جداگانهٔ 3- (بعد از دکمهٔ لغو در 4-، قبل از نگهبان
+    # تعمیرات در 2-).
+    #
+    # نکتهٔ حیاتی دربارهٔ PTB نسخهٔ 20 به بعد: در هر گروه «فقط یک» هندلر
+    # اجرا می‌شود — پس از اجرای اولین هندلرِ مچ‌شده، حلقهٔ همان گروه با
+    # break تمام می‌شود (پارامتر block فقط حالت زمان‌بندیِ اجراست و دیگر
+    # به معنای «عبور آپدیت به هندلر بعدیِ همان گروه» نیست). در نتیجه هر
+    # هندلری که با «هر» آپدیتی مچ شود (مانند همین گارد که TypeHandler
+    # روی کلاس Update است) اگر در یک گروه با بقیهٔ هندلرها باشد، آن‌ها را
+    # برای همیشه ساکت می‌کند — دقیقاً باگی که دکمهٔ «لغو سفارش»، نگهبان
+    # تعمیرات و پیش‌روتر منوها را مرده کرده بود. راه‌حل: هر مرحلهٔ
+    # سراسری در گروهِ مستقلِ خودش.
     #
     # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
     # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
     # آپدیت‌هایش بی‌صدا دور ریخته می‌شود تا ربات برای بقیه کند نشود.
-    # گادها (ADMIN_IDS) از این محدودیت معاف‌اند.
+    # سوپرادمین‌ها (ADMIN_IDS) از این محدودیت معاف‌اند.
     # ─────────────────────────────────────────────────────────────
     _SPAM_WINDOW_SEC = 2.0
     _SPAM_MAX_HITS = 5
@@ -652,10 +729,30 @@ def register_handlers(application: Application) -> None:
     _spam_guard._hits = _spam_hits
     _spam_guard._muted = _spam_muted_until
     _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
-    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+
+    # 🔝 دکمهٔ «لغو سفارش» کاربر — گروهٔ 4-، اولین چیزی که اصلاً پردازش
+    # می‌شود. باید در همهٔ حالت‌ها جواب بدهد (حتی برای کاربرِ میوت‌شده
+    # یا در حالت تعمیرات): لغوِ سفارشِ خودِ کاربر امن و idempotent است و
+    # چیزی از آن از دست نمی‌رود. چون در PTB>=v20 هر گروه فقط یک هندلر
+    # اجرا می‌کند، ثبت این هندلر در هر گروهِ مشترکِ دیگری (مثل گروهِ گارد
+    # ضداسپم که با هر آپدیتی مچ می‌شود) یعنی هیچ‌وقت اجرا نشدنش.
+    application.add_handler(
+        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
+        group=-4,
+    )
+
+    # گارد ضداسپم در گروهٔ مستقل 3-: تنها هندلرِ همین گروه است پس بلعیدنِ
+    # آپدیت فقط به همین گروه ختم می‌شود و گروه‌های بعدی (نگهبان تعمیرات،
+    # پیش‌روتر، مکالمه‌ها) سالم می‌مانند. توقفِ میوت با raise
+    # ApplicationHandlerStop اعمال می‌شود و چون کالبک await است
+    # (block پیش‌فرض)، توقف واقعاً در همین نقطه و قبل از گروه‌های بعدی
+    # اتفاق می‌افتد.
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-3)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
+    # 🛠 نگهبان «حالت تعمیرات» — group=-2 (بعد از ضداسپم، قبل از پیش‌روتر
+    # و مکالمه‌ها). سه الگوی این نگهبان متقابلاً انحصاری‌اند (پیام متنی /
+    # دستور استارت / کال‌بک)، پس یک گروه مشترک مشکلی ندارد.
     #
     # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
     # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
@@ -688,19 +785,10 @@ def register_handlers(application: Application) -> None:
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user:
             return
-        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
         try:
-            _q0 = update.callback_query
-            if _q0 is not None:
-                _u0 = update.effective_user
-                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
-        except Exception:
-            pass
-        try:
-            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
-            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
-            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
-            flag = context.bot_data.get('maintenance_mode', False)
+            # Read only the cached flag on the hot path; a missing cache is
+            # unsafe after a DB outage on startup, so fail CLOSED instead.
+            flag = context.bot_data.get('maintenance_mode', True)
             if not flag:
                 return
             if await _is_super_admin_user(update, context):
@@ -743,23 +831,21 @@ def register_handlers(application: Application) -> None:
             raise ApplicationHandlerStop
         except ApplicationHandlerStop:
             raise
-        except Exception:
-            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
-            return
+        except Exception as exc:
+            # An unhandled guard error is UNKNOWN, never permission to buy.
+            logger.error("maintenance guard failed closed (%s)", type(exc).__name__)
+            raise ApplicationHandlerStop
 
+    # نگهبان تعمیرات در گروهٔ مستقل 2- (هندلرهایش await می‌شوند تا
+    # raise ApplicationHandlerStop واقعاً در همین نقطه جلوی گروه‌های بعدی
+    # را بگیرد). در حالت خاموش/سوپرادمین فقط همین گروه مصرف می‌شود و آپدیت
+    # به پیش‌روتر و مکالمه‌ها می‌رسد.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
-        group=-1,
+        group=-2,
     )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
-
-
-    # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
-    application.add_handler(
-        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
-        group=-1,
-    )
+    application.add_handler(CommandHandler("start", _maintenance_guard), group=-2)
+    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-2)
 
     # ─────────────────────────────────────────────────────────────
     # 🧭 پیش‌روتر منوها (group=-1): رفع ریشه‌ای «دکمه‌ها جواب نمی‌دهند».
@@ -771,9 +857,10 @@ def register_handlers(application: Application) -> None:
     # ست نمی‌شد و دکمه‌های بعدی هیچ handler فعالی نداشتند.
     #
     # این پیش‌روتر قبل از همهٔ مکالمه‌ها اجرا می‌شود، دکمه‌های شناخته‌شدهٔ
-    # منو را تشخیص می‌دهد و stateهای کهنه را تمیز می‌کند؛ سپس آپدیت را
-    # رها می‌کند تا به‌صورت عادی به handler درست برسد (جلوی انتشار را
-    # نمی‌گیرد و چیزی هم ارسال نمی‌کند).
+    # منو را تشخیص می‌دهد و stateهای کهنه را تمیز می‌کند؛ در گروهٔ مستقلِ
+    # -1 ثبت می‌شود تا با «تنها-یک-هندلر-در-هر-گروه» بودنِ PTB>=v20، آپدیت
+    # پس از تمیزکاری به گروه ۰ (مکالمه‌ها و هندلرهای عمومی) برسد.
+    # چیزی هم ارسال نمی‌کند.
     # ─────────────────────────────────────────────────────────────
     import re as _re
 
@@ -795,12 +882,13 @@ def register_handlers(application: Application) -> None:
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
         r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|🛡 ضد اسپم و محافظت|🛡 ضد اسپم"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
         r"|👤 مدیریت کاربران|👤 ادمین عادی|⭐️ سوپر ادمین|➕ افزودن ادمین جدید|➖ حذف ادمین"
         r"|📋 لیست ادمین‌ها|🔎 جستجوی کاربر|📞 پیام خصوصی|📢 پیام همگانی"
-        r"|👥 مدیریت اکانت‌های ربات|📊 گزارش کلی|📉 آمار کل ربات|🚑 گزارش سلامت اکانت‌ها"
+        r"|👥 مدیریت اکانت‌های ربات|☠️ حذف اکانت‌های دلیت‌شده|📊 گزارش کلی|📉 آمار کل ربات|🚑 گزارش سلامت اکانت‌ها"
         r"|📅 وضعیت اعتبار ربات)"
     )
     _ACCOUNT_SUBMENU_RE = (
@@ -1001,9 +1089,12 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
             CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+            CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
             CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
-            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+            CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
+            CallbackQueryHandler(deleted_account_cleanup_handler, pattern=_DELETED_CLEANUP_CALLBACK_RE),
+            CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
             CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
         ],
         states={
@@ -1040,10 +1131,13 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت|🛡 ضد اسپم)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+                # 🛡 ضد اسپم و محافظت از اکانت‌ها (سوپرادمین) — منو از مسیر
+                # settings_menu_handler باز می‌شود؛ اینجا فقط کالبک‌های آن.
+                CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
 
@@ -1077,8 +1171,11 @@ def register_handlers(application: Application) -> None:
                 # آمار
                 MessageHandler(filters.Regex("^📉 آمار کل ربات$"), bot_stats_handler),
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
+                MessageHandler(filters.Regex("^☠️ حذف اکانت‌های دلیت‌شده$"), deleted_account_cleanup_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
-                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
+                CallbackQueryHandler(deleted_account_cleanup_handler, pattern=_DELETED_CLEANUP_CALLBACK_RE),
+                CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
@@ -1142,6 +1239,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            AWAITING_ANTISPAM_VALUE: [MessageHandler(STD_TEXT, receive_antispam_value)],
 
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
@@ -1264,7 +1362,7 @@ def register_handlers(application: Application) -> None:
             # دکمه‌های شیشه‌ای کهنهٔ خرید (بعد از /start یا ری‌استارت).
             CallbackQueryHandler(handle_plan_callback, pattern="^buy_"),
             CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)"),
-            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$"),
+            CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$"),
         ],
         states={
             AWAITING_SELECT_PLAN: [
@@ -1278,7 +1376,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SCHEDULE_DATE: [CallbackQueryHandler(handle_calendar_selection, pattern="^(cal_|ignore)")],
             AWAITING_SCHEDULE_TIME: [MessageHandler(STD_TEXT, handle_time_selection)],
             AWAITING_ORDER_LINK: [MessageHandler(STD_TEXT, receive_order_link)],
-            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order|cap_retry|cap_slot_\d+)$")]
+            AWAITING_ORDER_CONFIRMATION: [CallbackQueryHandler(handle_order_confirmation, pattern="^(confirm_order_pay|cancel_order)$")]
         },
         fallbacks=STANDARD_FALLBACKS,
         name="buy", persistent=True,
@@ -1311,15 +1409,84 @@ def register_handlers(application: Application) -> None:
 
     # مدیریت لیست اکانت‌ها به‌صورت شیشه‌ای (کارت جزئیات + عملیات)
     application.add_handler(CallbackQueryHandler(account_view_callback, pattern=r"^acc_view_\d+$"), group=0)
-    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|del|delyes|sync)_\d+$"), group=0)
+    application.add_handler(CallbackQueryHandler(account_action_callback, pattern=r"^acc_(getcode|spam|refresh|recover|recoverdo|del|delyes|sync)_\d+$"), group=0)
     # صفحه‌بندی/بستن لیست‌های شیشه‌ای انتخاب اکانت (پروفایل و دریافت کد)
     application.add_handler(CallbackQueryHandler(profile_picker_page_callback, pattern=r"^profpage_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(getcode_picker_page_callback, pattern=r"^codepage_\d+$"), group=0)
     application.add_handler(CallbackQueryHandler(account_picker_close_callback, pattern=r"^acc_pickclose$"), group=0)
 
 
+# ─────────────────────────────────────────────────────────────
+# 🔒 قفل تک‌نمونه‌ای (singleton) — جلوی فاجعهٔ AUTH_KEY_DUPLICATED
+#
+# یک فرایند دیگر با همان دیتابیس *می‌تواند* باعث تداخل 406 شود؛ اما اجرای
+# هم‌زمانِ دو فرایند از لاگِ بوت به‌تنهایی ثابت نمی‌شود. کپی سشن در نمایندگی
+# حتی در همان یک پردازه نیز اتصال دوباره می‌ساخت (گارد auth-key جداگانه).
+#
+# flock روی فایل ثابت پروژه برای هاست/کانتینر با volume مشترک است؛ قفل
+# advisory دیتابیس پایین‌تر، نمونه‌های نسخهٔ جدید روی فایل‌سیستم‌های جدا
+# را هم هماهنگ می‌کند. پس از مرگ فرایند هر دو خودکار آزاد می‌شوند.
+_INSTANCE_LOCK_FILE = None
+
+
+def _acquire_instance_singleton_lock() -> None:
+    """Lock the real project data dir; NEVER run without flock on Linux.
+
+    A relative path depends on the caller's working directory. For example,
+    `cd /tmp; python /opt/tgcallbot/main.py` previously locked /tmp/data,
+    not /opt/tgcallbot/data, even though both processes used the same DB.
+    This local guard complements the DB-wide lock below.
+    """
+    global _INSTANCE_LOCK_FILE
+    import errno
+    import fcntl
+
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "data", ".bot_instance.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "a+")
+    try:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise  # fail CLOSED on permission / unsupported filesystem
+                logger.critical(
+                    "🔒 نمونهٔ دیگری از ربات قفل %s را دارد؛ این نمونه بدون "
+                    "اتصال به سشن‌ها منتظر می‌ماند. A second bot is running; "
+                    "waiting rather than duplicating Telegram auth keys.", lock_path)
+                time.sleep(30)
+        _INSTANCE_LOCK_FILE = fh
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.flush()
+        logger.info("Local singleton lock acquired: %s", lock_path)
+    except BaseException:
+        fh.close()
+        raise
+
+
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
+    _acquire_instance_singleton_lock()
+
+    # A second checkout/container/server may share the PostgreSQL account
+    # table without sharing ./data. Acquire the DB-wide lock BEFORE bot/MTProto
+    # start. If its connection is lost, PostgreSQL releases our lock; exit
+    # immediately so a replacement cannot overlap our still-open sockets.
+    instance_lock = InstanceDatabaseLock(Config.get_normalized_database_url())
+    try:
+        await instance_lock.acquire(on_lost=lambda: os._exit(75))
+    except InstanceAlreadyRunning as exc:
+        logger.critical("🔒 %s", exc)
+        raise
+    # A killed container's old MTProto TCP connections may outlive the DB
+    # lock by a few seconds. Do not race them on a rapid Docker rebuild.
+    await asyncio.sleep(10)
+    instance_lock.ensure_held()
     # عیب‌یابی wedge: با SIGUSR1 استک همهٔ نخ‌ها در لاگ چاپ می‌شود (بدون توقف).
     # docker kill -s USR1 telegram_bot_container
     try:
@@ -1377,18 +1544,20 @@ async def main_loop():
         .build()
     )
     
+    register_handlers(main_app)
+    instance_lock.ensure_held()
+    await main_app.initialize()
+    instance_lock.ensure_held()
+    # initialize() restores PTB persistence and may overwrite bot_data. Set
+    # authoritative runtime identity/maintenance only AFTER it has completed.
     main_app.bot_data['bot_id'] = 1
     main_app.bot_data['owner_id'] = 0
-    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
     try:
         main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
+            DatabaseManager.global_maintenance_enabled_strict(), timeout=10)
     except Exception as e:
-        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
-        main_app.bot_data['maintenance_mode'] = False
-    
-    register_handlers(main_app)
-    await main_app.initialize()
+        logger.error("maintenance flag load failed (%s) — failing CLOSED (ON)", type(e).__name__)
+        main_app.bot_data['maintenance_mode'] = True
     await main_app.start()
 
     # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها
@@ -1422,6 +1591,8 @@ async def main_loop():
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        # 🛡 ضد اسپم: اجرای خروج‌های به‌تأخیرافتادهٔ دونه‌به‌دونه از گروه‌ها
+        main_app.job_queue.run_repeating(group_leave_sweeper_job, interval=60, first=45)
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
@@ -1505,6 +1676,20 @@ async def main_loop():
             await asyncio.wait(_pending, timeout=5)
     except Exception:
         pass
+    # If a disconnect was unconfirmed (or a task outlived the shutdown
+    # deadline), do NOT give up the DB lock with live local MTProto sockets.
+    # Exit the process so the OS closes its sockets and DB connection together;
+    # the next instance waits at startup before touching any auth keys.
+    from services.session_ownership import session_ownership
+    voice_holds = session_ownership.voice_held_accounts()
+    ad_hoc_holds = session_ownership.ad_hoc_held_accounts()
+    if voice_holds or ad_hoc_holds:
+        logger.critical("MTProto teardown unconfirmed: %d voice + %d ad-hoc holds; exiting fail-closed",
+                        len(voice_holds), len(ad_hoc_holds))
+        os._exit(75)
+    # Release the database-wide lock LAST: no replacement instance may
+    # connect to these session strings until our MTProto clients are gone.
+    await instance_lock.close()
     logger.info("🛑 Shutdown complete.")
 
 if __name__ == "__main__":

@@ -43,12 +43,14 @@ import time
 import json
 import traceback
 import wave
+from weakref import WeakKeyDictionary
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import deque
 
 from pyrogram import Client
 from pyrogram.errors import (
+    AuthKeyDuplicated,
     AuthKeyInvalid,
     AuthKeyUnregistered,
     FloodWait,
@@ -66,7 +68,10 @@ from database import DatabaseManager
 from security import SecurityManager
 from telegram_client import TelegramAccountClient
 from services.voice_cooldown import voice_cooldown
-from services.session_ownership import session_ownership
+from services.session_ownership import (session_ownership, SessionInUseError,
+                                        is_auth_key_duplicated, is_fatal_auth_error,
+                                        fatal_auth_category)
+from services.session_client import close_pyrogram_client
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -88,6 +93,29 @@ from services.presence_reconciler import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _process_rss_mb() -> int:
+    """Current process RSS (not host memory); 0 when /proc is unavailable."""
+    try:
+        with open('/proc/self/status', encoding='ascii') as status:
+            for line in status:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+async def _disconnect_voice_app(app: Client, timeout: float = 5.0) -> bool:
+    """Tear down even after a join wave cancels our current task."""
+    try:
+        return await close_pyrogram_client(app, timeout=timeout)
+    except asyncio.CancelledError:
+        # close_pyrogram_client awaited its shielded cleanup before raising.
+        # The caller will re-raise its original CancelledError after it has
+        # decided whether to release or quarantine the auth-key reservation.
+        return not getattr(app, "is_connected", False) and getattr(app, "session", None) is None
 
 
 def _patch_pyrogram_channel_id_range() -> None:
@@ -204,9 +232,50 @@ VOICE_FLOOD_INLINE_WAIT_MAX = max(
     0, int(getattr(Config, "VOICE_FLOOD_INLINE_WAIT_MAX", 30))
 )
 
-CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 8)))
+# 406/AUTH_KEY_DUPLICATED بعد از هر ری‌استارت/کرش دیده می‌شد: ساخت هم‌زمانِ
+# زیادی کلاینت (پیش‌فرض قدیمی ۸) در لحظهٔ resume ده‌ها اتصال تکراری برای
+# کلیدهای نیمه‌بازِ قبلی می‌ساخت و تلگرام کلیدها را باطل می‌کرد. پیش‌فرض
+# محافظه‌کار ۲ + مکث تصادفی بین هر ساخت — از .env قابل تنظیم است.
+CLIENT_CREATE_CONCURRENCY = max(1, int(getattr(Config, 'CLIENT_CREATE_CONCURRENCY', 2)))
 GLOBAL_JOIN_CONCURRENCY = max(1, int(getattr(Config, 'GLOBAL_JOIN_CONCURRENCY', 24)))
 CLIENT_CREATE_SEMAPHORE = asyncio.Semaphore(CLIENT_CREATE_CONCURRENCY)
+
+
+def _is_fatal_session_reason(reason: str) -> bool:
+    # A number in an unrelated error (e.g. FloodWait:401 seconds) is not an
+    # authentication failure. Use the same strict predicate as the executor.
+    return is_fatal_auth_error(reason)
+
+
+async def _mark_session_dead(account_id: int, reason: str, encrypted_session: str) -> None:
+    """Disable only an explicitly revoked *matching* stored key; never 406.
+
+    A concurrent phone login may replace this account's session while an
+    older voice client is failing. Compare-and-swap in the DB prevents that
+    OLD client's failure from disabling the NEW valid session.
+
+    AUTH_KEY_DUPLICATED (406) تداخل کلید را نشان می‌دهد؛ منشأ اتصال‌های موازی
+    از خود خطا معلوم نیست. اگر پاسخ تایپ‌شدهٔ تلگرام باشد، **کلید سشن باطل
+    است** و ورود تازه لازم است، ولی حساب تلگرام حذف نشده است. متن خطای مبهم
+    شاهد قطعی نیست. برای جلوگیری از حذف حساب بر اساس متن، ردیف حفظ و برای
+    تخصیص جدید قرنطینه می‌شود؛ کلید باطل را دوباره پروب نکنید.
+    """
+    try:
+        from database import DatabaseManager as _DB
+        if not _is_fatal_session_reason(reason):
+            if is_auth_key_duplicated(reason):
+                logger.warning(
+                    "Session %s AUTH_KEY_DUPLICATED — not auto-disabled. "
+                    "Check same-key reseller rows, old processes and other servers. "
+                    "A typed Telegram 406 invalidates this auth key (not the account). "
+                    "Do not retry the same key; re-login with the phone number.", account_id)
+                await _DB.note_session_conflict_if_current(int(account_id), encrypted_session)
+            return
+        category = fatal_auth_category(reason)
+        if category:
+            await _DB.mark_account_auth_invalid(int(account_id), encrypted_session, category)
+    except Exception as exc:
+        logger.warning('Unable to persist auth result for acc=%s: %s', account_id, type(exc).__name__)
 
 # ─── ADAPTIVE PARALLEL JOIN ARCHITECTURE ────────────────────────────────
 # For voice_chat, each order owns a JOIN GATE whose capacity is the order's
@@ -519,8 +588,8 @@ def _classify_error(err: Exception, message: str = "") -> str:
        or "flood" in s or "slow_mode" in s:
         return FAILURE_RATE_LIMITED
     if isinstance(err, (AuthKeyInvalid, AuthKeyUnregistered, SessionRevoked)) or \
-       "session_revoked" in s or "auth_key" in s or "session revoked" in s or \
-       "401" in s or "user_deactivated" in s or "active user required" in s:
+       is_fatal_auth_error(err) or is_fatal_auth_error(message) or \
+       "auth_key" in s or "active user required" in s:
         return FAILURE_AUTHENTICATION
     # GROUPCALL_FORBIDDEN and GROUPCALL_INVALID are often transient if they occur
     # during join. Classify them as voice_call_state (retryable) rather than permanent.
@@ -615,9 +684,25 @@ class VoiceCallManager:
         self._order_accounts: Dict[int, Set[int]] = {}
         self._reservations: Dict[int, Set[int]] = {}
         self._session_cache: Dict[int, str] = {}
+        # A disconnect that could not be confirmed is NOT permission to
+        # reconnect. Keep its hold until shutdown (never burn the same key).
+        self._quarantined_accounts: Set[int] = set()
+        self._shutting_down = False
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._reservation_lock = asyncio.Lock()
         self._keepalive_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+        self._client_last_used: Dict[int, float] = {}
+        self._busy_accounts: Dict[int, int] = {}  # includes prewarm and full join lifecycle
+        self._idle_reaper_task: Optional[asyncio.Task] = None
+        self._last_memory_log = 0.0
+        self._reaped_total = 0
+        self._listener_bindings: Set[Tuple[int, int]] = set()
+        self._listener_trials: Dict[int, Tuple[int, float]] = {}
+        self._listener_proven_chats: Set[int] = set()
+        self._listener_disabled_chats: Set[int] = set()
+        self._listener_failures = 0
+        self._listener_drops = 0
+        self._listener_globally_disabled = False
 
         # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
         # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
@@ -670,10 +755,12 @@ class VoiceCallManager:
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
         self._active_call_cache: Dict[int, Tuple[float, object]] = {}
 
-        # Shared chat-info cache (peer + access_hash + InputGroupCall): ONE
-        # account resolves the chat, every other account reuses the cached
-        # objects instead of issuing its own resolve_peer/GetFullChannel flood.
-        self._chat_info_cache: Dict[int, Tuple[float, object, object]] = {}
+        # A channel's InputPeer access_hash is specific to the MTProto account.
+        # Sharing it across accounts produces CHANNEL_INVALID and monitor RPC
+        # storms. Only InputGroupCall (call id/hash) is shared across accounts;
+        # resolved peers are cached separately by actual Client instance.
+        self._chat_info_cache: Dict[int, Tuple[float, object]] = {}
+        self._peer_cache: WeakKeyDictionary = WeakKeyDictionary()
 
         # Group leave reference count: {(account_id, chat_id): active_order_count}
         self._group_refcount: Dict[Tuple[int, int], int] = {}
@@ -940,84 +1027,70 @@ class VoiceCallManager:
             pass
 
     # ─── SHARED CHAT-INFO CACHE (one account resolves, all reuse) ──────
-    def _chat_info_get(self, chat_id: int) -> Optional[Tuple[object, object]]:
-        """Return cached (peer, input_group_call) for a chat, if still fresh."""
+    def _chat_info_get(self, chat_id: int) -> Optional[object]:
+        """Return the shared InputGroupCall only (never another account's peer)."""
         cached = self._chat_info_cache.get(int(chat_id))
-        if not cached:
+        if cached is None:
             return None
-        ts, peer, call = cached
+        ts, call = cached
         if time.time() - ts > CHAT_INFO_CACHE_TTL:
             self._chat_info_cache.pop(int(chat_id), None)
             return None
-        return peer, call
+        return call
 
-    def _chat_info_put(self, chat_id: int, peer: object, call: object) -> None:
-        self._chat_info_cache[int(chat_id)] = (time.time(), peer, call)
+    def _chat_info_put(self, chat_id: int, call: object) -> None:
+        self._chat_info_cache[int(chat_id)] = (time.time(), call)
 
     async def _resolve_cached_peer(self, app: Client, chat_id: int) -> object:
-        """Resolve the raw peer ONCE (cached) and reuse it for all accounts.
+        """Resolve a peer on THIS client; channel access hashes aren't global.
 
-        ONE account does resolve_peer (a single API call); every other account
-        reuses the cached raw peer object.  A peer's channel id + access_hash
-        are GLOBAL (not per-account), so sharing the object is safe and removes
-        the biggest per-IP API-flood source.
+        Weak client keys mean disconnected clients release their cached peers.
+        A chat cache refresh can also clear all per-client entries for that
+        chat. This never tries a peer resolved by another session.
         """
         chat_id = int(chat_id)
-        cached = self._chat_info_get(chat_id)
-        if cached and cached[0] is not None:
-            return cached[0]
+        by_chat = self._peer_cache.setdefault(app, {})
+        cached = by_chat.get(chat_id)
+        if cached and time.time() - cached[0] <= CHAT_INFO_CACHE_TTL:
+            return cached[1]
         peer = await app.resolve_peer(chat_id)
-        cached = self._chat_info_get(chat_id)
-        self._chat_info_put(chat_id, peer, cached[1] if cached else None)
+        by_chat[chat_id] = (time.time(), peer)
         return peer
 
     async def _get_cached_group_call(self, app: Client, chat_id: int, force_refresh: bool = False) -> object:
-        """Get the active group-call object for a chat, cached & shared.
-
-        Returns the raw InputGroupCall, or None when there is no active call.
-        با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
-        گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
-        """
+        """Share only the InputGroupCall across accounts; use own peer for RPC."""
         chat_id = int(chat_id)
         if not force_refresh:
-            cached = self._chat_info_get(chat_id)
-            if cached and cached[1] is not None:
-                return cached[1]
+            call = self._chat_info_get(chat_id)
+            if call is not None:
+                return call
         peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
-        self._chat_info_put(chat_id, peer, call)
+        self._chat_info_put(chat_id, call)
         return call
 
     def _clear_chat_cache(self, chat_id: int) -> None:
+        chat_id = int(chat_id)
         self._chat_refresh_cache.pop(chat_id, None)
         self._input_group_call_cache.pop(chat_id, None)
-        self._active_call_cache.pop(int(chat_id), None)
-        self._chat_info_cache.pop(int(chat_id), None)
+        self._active_call_cache.pop(chat_id, None)
+        self._chat_info_cache.pop(chat_id, None)
+        for per_client in list(self._peer_cache.values()):
+            per_client.pop(chat_id, None)
 
     async def _get_group_call_for_account(self, app: Client, chat_id: int,
                                           force_refresh: bool = False) -> object:
-        """مرجع InputGroupCall را برای «همین اکانت» برمی‌گرداند.
-
-        نکتهٔ کلیدی: access_hash یک کانال، مختصِ هر سشن/اکانت است و سراسری
-        نیست. بنابراین برای فراخوانی channels.GetFullChannel باید peer با سشنِ
-        همین اکانت resolve شود، وگرنه خطای CHANNEL_INVALID رخ می‌دهد. اما خودِ
-        InputGroupCall (call id + access_hash تماس) سراسری است و می‌تواند بین
-        اکانت‌ها به‌اشتراک گذاشته شود؛ پس اگر قبلاً کش شده باشد از آن استفاده
-        می‌کنیم و از GetFullChannel صرف‌نظر می‌کنیم.
-        """
+        """Resolve the channel on this account, but share its group-call id."""
         chat_id = int(chat_id)
         if not force_refresh:
-            cached = self._chat_info_get(chat_id)
-            if cached and cached[1] is not None:
-                return cached[1]
-        # peer را با سشنِ همین اکانت resolve کن (نه از کش مشترک)
-        peer = await app.resolve_peer(chat_id)
+            call = self._chat_info_get(chat_id)
+            if call is not None:
+                return call
+        peer = await self._resolve_cached_peer(app, chat_id)
         full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
         call = getattr(full.full_chat, "call", None)
-        # فقط مرجعِ تماس (سراسری) را کش کن؛ peerِ مختصِ اکانت را کش نمی‌کنیم
-        prev = self._chat_info_get(chat_id)
-        self._chat_info_put(chat_id, prev[0] if prev else peer, call)
+        self._chat_info_put(chat_id, call)
         return call
 
     # ─── IN-CALL MESSAGES & REACTIONS (Telegram Layer 216+) ─────────────
@@ -1243,7 +1316,8 @@ class VoiceCallManager:
         return {"sent": sent, "failed": failed, "total": len(account_ids), "errors": errors[:5]}
 
     def _account_in_any_order(self, account_id: int) -> bool:
-        return any(aid == account_id for (oid, aid) in self.active_calls.keys())
+        return (any(aid == account_id for (_oid, aid) in self.active_calls)
+                or any(account_id in recs for recs in self.joined_accounts_by_order.values()))
 
     def get_in_use_account_ids(self) -> Set[int]:
         return {aid for (oid, aid) in self.active_calls.keys()}
@@ -1313,6 +1387,28 @@ class VoiceCallManager:
         """Return the persistent joined-account records for an order."""
         return self.joined_accounts_by_order.get(order_id, {})
 
+    def get_binding_status_counts(self, order_id: int) -> Dict[str, int]:
+        """Observed native call bindings, distinct from durable joined slots.
+
+        A native binding is NOT proof of uninterrupted UDP packet delivery.
+        An observation older than two monitor cycles is counted as unknown.
+        Never use this snapshot alone to invalidate a Telegram auth key.
+        """
+        out = {'present': 0, 'missing': 0, 'unknown': 0}
+        freshness = max(15.0, 2.0 * KEEPALIVE_INTERVAL + 10.0)
+        now = time.time()
+        for rec in self.get_joined_accounts(order_id).values():
+            checked_at = float(rec.get('media_binding_checked_at') or 0.0)
+            if checked_at <= 0 or now - checked_at > freshness:
+                out['unknown'] += 1
+            elif rec.get('media_binding_alive') is True:
+                out['present'] += 1
+            elif rec.get('media_binding_alive') is False:
+                out['missing'] += 1
+            else:
+                out['unknown'] += 1
+        return out
+
     # ─── LIVE PRESENCE RECONCILER (additive, deterministic) ───
 
     def _get_presence_reconciler(self, order_id: int, target_count: int = 0,
@@ -1375,9 +1471,9 @@ class VoiceCallManager:
         Actual per-wave concurrency is decided adaptively by the Join Brain
         between VOICE_JOIN_MIN_CONCURRENCY and this ceiling.
         """
-        return max(
+        return (1 if getattr(Config, "VOICE_JOIN_SEQUENTIAL", False) else max(
             1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))
-        ), 0.0
+        )), 0.0
 
 # ─── ORDER JOIN GATE helper ───
 
@@ -1392,7 +1488,8 @@ class VoiceCallManager:
         """
         gate = self._order_join_locks.get(order_id)
         if gate is None:
-            capacity = max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10)))
+            capacity = (1 if getattr(Config, "VOICE_JOIN_SEQUENTIAL", False)
+                        else max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))))
             gate = asyncio.Semaphore(capacity)
             self._order_join_locks[order_id] = gate
         return gate
@@ -1825,159 +1922,311 @@ class VoiceCallManager:
 
     # ─── Client management ───
 
+    @staticmethod
+    async def _assert_session_assignable(account_id: int, encrypted_session: str) -> None:
+        """Cached pool entries must not bypass a NEW persisted 406 hold.
+
+        Fail closed on stale ciphertext and DB errors; this is checked on
+        both the prewarm path and reuse/reconnect of a cached voice client.
+        """
+        row = await DatabaseManager.get_account_by_id(int(account_id))
+        if not row or row.get('session_string') != encrypted_session:
+            raise SessionInUseError(account_id, 'stale')
+        if str(row.get('account_status') or '').lower() != 'active':
+            raise SessionInUseError(account_id, 'inactive')
+        if str(row.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
+            raise SessionInUseError(account_id, 'quarantined')
+
+    async def _create_pyrogram_client_locked(
+        self, account_id: int, session_string: str, decrypted_session: str, timeout: float,
+    ) -> Client:
+        """Only call under the per-account lock (both warmup and join paths).
+
+        Hold the *auth-key* reservation until a confirmed disconnect. This
+        includes timeout/cancellation during start or the post-start pacing
+        sleep; those paths used to leak an untracked live MTProto transport.
+        """
+        async with CLIENT_CREATE_SEMAPHORE:
+            if self._shutting_down:
+                raise RuntimeError("voice engine shutting down")
+            await self._assert_session_assignable(account_id, session_string)
+            held = await session_ownership.acquire_voice(account_id, decrypted_session)
+            if not held:
+                # A previous hold exists but the manager has no cached app:
+                # do not treat reference counting as permission to open one.
+                session_ownership.release_voice(account_id)
+                raise SessionInUseError(account_id, "uncertain")
+            app = None
+            try:
+                if self._shutting_down:
+                    raise RuntimeError("voice engine shutting down")
+                helper = TelegramAccountClient("temp", session_string, account_id)
+                api_id, api_hash = await helper._get_api_credentials()
+                app = Client(
+                    f"shared_client_{account_id}",
+                    session_string=decrypted_session,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    no_updates=False,  # PyTgCalls needs raw Telegram updates
+                    in_memory=True,
+                    proxy=_voice_proxy_config(),
+                    **_client_device_fingerprint(account_id),
+                )
+                await asyncio.wait_for(app.start(), timeout=timeout)
+                await asyncio.sleep(random.uniform(0.8, 2.0))
+                if self._shutting_down:
+                    raise RuntimeError("voice engine shutting down")
+            except BaseException as exc:
+                closed = app is None or await _disconnect_voice_app(app)
+                if closed:
+                    session_ownership.release_voice(account_id, disconnected=app is not None)
+                else:
+                    self._quarantined_accounts.add(account_id)
+                    self.pyrogram_clients[account_id] = app
+                    logger.critical("acc=%s MTProto teardown unconfirmed; quarantined until process exit", account_id)
+                if isinstance(exc, AuthKeyDuplicated):
+                    await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED client_start", session_string)
+                raise
+            self.pyrogram_clients[account_id] = app
+            self._session_cache[account_id] = session_string
+            self._client_last_used[account_id] = time.time()
+            self.ensure_background_maintenance()
+            return app
+
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
-        # Database sessions are encrypted. Passing the encrypted value to
-        # Pyrogram makes every account fail during client initialisation.
         decrypted_session = SecurityManager.decrypt_session(session_string)
         if not decrypted_session:
             raise ValueError(f"Invalid encrypted session for account {account_id}")
-        self._session_cache[account_id] = session_string
 
         async with self._lock(account_id):
-            # Check existing pyrogram client
+            if self._shutting_down:
+                raise RuntimeError("voice engine shutting down")
+            if account_id in self._quarantined_accounts:
+                raise SessionInUseError(account_id, "uncertain")
+            await self._assert_session_assignable(account_id, session_string)
             app = self.pyrogram_clients.get(account_id)
             if app:
-                try:
-                    if not app.is_connected:
+                cached = self._session_cache.get(account_id)
+                if cached and SecurityManager.decrypt_session(cached) != decrypted_session:
+                    raise SessionInUseError(account_id, "replaced")
+                if not session_ownership.is_voice_held(account_id):
+                    self._quarantined_accounts.add(account_id)
+                    raise SessionInUseError(account_id, "uncertain")
+                if not app.is_connected:
+                    try:
+                        # Reconnect the SAME client; never create another
+                        # client while its previous transport might be alive.
                         await asyncio.wait_for(app.start(), timeout=15)
-                except FloodWait as e:
-                    wait_s = int(getattr(e, "value", 3) or 3)
-                    voice_cooldown.record(account_id, wait_s,
-                                         operation="client_start", source="pyrogram reconnect")
-                    raise
-                except Exception as e:
-                    logger.warning(f"reconnect pyrogram acc={account_id}: {e}")
-                    try:
-                        if hasattr(app, 'disconnect'):
-                            await app.disconnect()
-                    except Exception:
-                        pass
-                    app = None
-                    self.pyrogram_clients.pop(account_id, None)
-                    # The session tied to this dead client is gone; release
-                    # the exclusive hold so the fresh client below re-acquires.
-                    session_ownership.release_voice(account_id)
-
-            if not app:
-                async with CLIENT_CREATE_SEMAPHORE:
-                    held = await session_ownership.acquire_voice(account_id)
-                    try:
-                        helper = TelegramAccountClient("temp", session_string, account_id)
-                        api_id, api_hash = await helper._get_api_credentials()
-                        app = Client(
-                            f"shared_client_{account_id}",
-                            session_string=decrypted_session,
-                            api_id=api_id,
-                            api_hash=api_hash,
-                            # PyTgCalls needs raw Telegram updates to complete
-                            # the voice transport handshake and participant sync.
-                            no_updates=False,
-                            in_memory=True,
-                            proxy=_voice_proxy_config(),
-                            **_client_device_fingerprint(account_id),
-                        )
-                        await asyncio.wait_for(app.start(), timeout=20)
-                    except Exception:
-                        # Best-effort teardown of the half-open client: without
-                        # this, our own lingering connection can DUPLICATE the
-                        # session key of the next retry and burn a healthy
-                        # account (AUTH_KEY_DUPLICATED invalidates the key
-                        # server-side, so the session can never be reused).
-                        try:
-                            if app is not None:
-                                try:
-                                    await asyncio.wait_for(app.disconnect(), timeout=5)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        if held:
-                            session_ownership.release_voice(account_id)
+                    except BaseException as exc:
+                        if isinstance(exc, FloodWait):
+                            voice_cooldown.record(account_id, int(getattr(exc, "value", 3) or 3),
+                                                  operation="client_start", source="pyrogram reconnect")
+                        if await _disconnect_voice_app(app):
+                            self.pyrogram_clients.pop(account_id, None)
+                            self.clients.pop(account_id, None)
+                            session_ownership.release_voice(account_id, disconnected=True)
+                        else:
+                            self._quarantined_accounts.add(account_id)
+                            logger.critical("acc=%s reconnect teardown unconfirmed; quarantined", account_id)
                         raise
-                    self.pyrogram_clients[account_id] = app
+            else:
+                app = await self._create_pyrogram_client_locked(
+                    account_id, session_string, decrypted_session, timeout=20)
 
-            # Check existing pytgcalls handle (keyed by account_id, NOT order_id)
+            # Check existing pytgcalls handle (keyed by account_id, NOT order_id).
             pytg = self.clients.get(account_id)
             if pytg:
-                # PyTgCalls 2.x has NO `is_connected` attribute — reading it
-                # raised AttributeError on EVERY reuse, which forced a
-                # stop()+rebuild of a perfectly healthy engine (and kicked the
-                # account's call). Query the binding's call map instead; the
-                # engine is reusable as long as that coroutine answers.
-                healthy = False
+                # A failed binding query is UNKNOWN, not permission to leave
+                # every chat and construct a second engine. PyTgCalls has no
+                # safe stop() method; the old fallback did exactly that and
+                # dropped healthy orders on transient native/API errors.
                 try:
-                    await pytg.group_calls
-                    healthy = True
-                except Exception as e:
+                    await asyncio.wait_for(pytg.group_calls, timeout=3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
                     logger.warning(
-                        "pytgcalls engine unhealthy acc=%s (%s) — rebuilding",
-                        account_id, e,
+                        "pytgcalls binding check unavailable acc=%s (%s); "
+                        "keeping original engine, no mass leave/rebuild",
+                        account_id, type(exc).__name__,
                     )
-                if not healthy:
-                    # PyTgCalls 2.x has no stop(); leave each held call so the
-                    # engine (and its WebRTC connections) is truly torn down
-                    # before the fresh instance is built below.
-                    try:
-                        for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                            try:
-                                await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    pytg = None
-                    self.clients.pop(account_id, None)
+                    raise SessionInUseError(account_id, "uncertain") from exc
 
             if not pytg:
                 async with CLIENT_CREATE_SEMAPHORE:
                     pytg = PyTgCalls(app)
                     self._attach_engine_handlers(pytg, account_id)
-                    await asyncio.wait_for(pytg.start(), timeout=15)
+                    # start() can time out AFTER native WebRTC initialized.
+                    # Retain the original engine before awaiting it. A retry
+                    # must never construct a second engine on a transport that
+                    # may still be using the same Telegram authorization key.
                     self.clients[account_id] = pytg
+                    try:
+                        await asyncio.wait_for(pytg.start(), timeout=15)
+                    except BaseException:
+                        self._quarantined_accounts.add(account_id)
+                        logger.error("acc=%s engine startup unconfirmed; existing client "
+                                     "quarantined (no second engine)", account_id)
+                        raise
 
+            self._client_last_used[account_id] = time.time()
             return pytg
 
     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
-        # Only cleanup if account is not used by any other active call
-        if not force:
-            still_active = any(
-                aid == account_id
-                for (oid, aid) in self.active_calls.keys()
-                if oid != order_id
-            )
-            if still_active:
+        # IMPORTANT: use the SAME per-account lock as the warmup/create path.
+        # Previously we popped the client (and even removed its lock) BEFORE
+        # disconnecting it. A new wave could connect to that key while the old
+        # transport was still open, even within a single bot process.
+        async with self._lock(account_id):
+            if not force and self._account_has_other_calls(account_id, order_id):
+                # Monitor bookkeeping can temporarily lose active_calls while
+                # the durable joined slot still exists. Never pop its engine.
                 return
-
-        pytg = self.clients.pop(account_id, None)
-        if pytg:
-            # PyTgCalls 2.x has NO stop() method (the old hasattr(pytg,'stop')
-            # check was a silent no-op — engines were NEVER torn down, so
-            # half-dead WebRTC connections outlived their calls and later
-            # caused 'Connection cannot be initialized more than once').
-            # leave_call() = engine stop + LeaveGroupCall, which is exactly
-            # what a real teardown should do.
-            try:
-                for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                    try:
-                        await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # Only remove pyrogram client if not used by any other order
-        if force or not self._account_in_any_order(account_id):
-            app = self.pyrogram_clients.pop(account_id, None)
-            if app:
+            pytg = self.clients.pop(account_id, None)
+            if pytg:
+                # PyTgCalls 2.x has no stop(); leave its held calls before
+                # closing the MTProto client (unless shutting down globally).
                 try:
-                    await asyncio.wait_for(app.disconnect(), timeout=5)
+                    for cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
+                        try:
+                            await asyncio.wait_for(pytg.leave_call(int(cid)), timeout=5)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-            # Session is no longer connected by the voice engine — release
-            # the exclusive hold so short-lived clients may use it again.
-            session_ownership.release_voice(account_id)
+
+            if force or not self._account_in_any_order(account_id):
+                app = self.pyrogram_clients.get(account_id)
+                if app and not await _disconnect_voice_app(app):
+                    self._quarantined_accounts.add(account_id)
+                    logger.critical("acc=%s cleanup disconnect unconfirmed; keeping auth-key hold", account_id)
+                    return
+                self.pyrogram_clients.pop(account_id, None)
+                session_ownership.release_voice(account_id, disconnected=app is not None)
+                self._session_cache.pop(account_id, None)
+                self._quarantined_accounts.discard(account_id)
+
+    # ─── Conservative idle-client maintenance ───
+
+    def _client_referenced(self, account_id: int) -> bool:
+        return (bool(self._busy_accounts.get(account_id))
+                or self._account_in_any_order(account_id)
+                or account_id in self.get_reserved_account_ids()
+                or account_id in self._quarantined_accounts
+                or any(aid == account_id for aid, _ in self._inflight_joins))
+
+    async def _close_idle_client(self, account_id: int) -> bool:
+        """Disconnect only when both app bookkeeping AND native bindings are clear.
+
+        Recheck under the same account lock as warmup/start_call; a transient
+        missing order record or an unavailable binding query is NOT license
+        to leave an active voice chat or release a held auth key.
+        """
+        async with self._lock(account_id):
+            if self._client_referenced(account_id):
+                return False
+            pytg = self.clients.get(account_id)
+            if pytg is not None:
+                try:
+                    calls = await asyncio.wait_for(pytg.group_calls, timeout=3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return False  # unknown binding state, fail closed
+                if calls:
+                    return False
+            # group_calls is an await: a new start/stop can reserve this
+            # account while that native query is pending. Do not close its
+            # existing transport until the pending operation has finished.
+            if self._client_referenced(account_id):
+                return False
+            app = self.pyrogram_clients.get(account_id)
+            if app is None:
+                return False  # engine without a known client: not proven safe
+            if not await _disconnect_voice_app(app):
+                self._quarantined_accounts.add(account_id)
+                logger.critical("[VoiceReaper] acc=%s disconnect unconfirmed; hold retained", account_id)
+                return False
+            self.clients.pop(account_id, None)
+            self.pyrogram_clients.pop(account_id, None)
+            session_ownership.release_voice(account_id, disconnected=True)
             self._session_cache.pop(account_id, None)
-            self._client_locks.pop(account_id, None)
+            self._client_last_used.pop(account_id, None)
+            return True
+
+    async def reap_idle_clients(self, *, force: bool = False) -> int:
+        """Close unused MTProto clients after TTL (or immediately on pressure).
+
+        Even force never closes a busy, reserved, joined, quarantined or
+        natively-bound client. No Telegram request/probe is made for accounts
+        not already connected in this process.
+        """
+        if not force and not getattr(Config, "VOICE_IDLE_REAPER", True):
+            return 0
+        ttl = max(60, int(getattr(Config, "VOICE_IDLE_CLIENT_TTL", 300)))
+        now = time.time()
+        closed = 0
+        for aid in list(self.pyrogram_clients):
+            if self._client_referenced(aid):
+                continue
+            if not force and now - self._client_last_used.get(aid, now) < ttl:
+                continue
+            if await self._close_idle_client(aid):
+                closed += 1
+        self._reaped_total += closed
+        return closed
+
+    def memory_report(self) -> Dict[str, Any]:
+        """Order-safe process-only inventory; presence is NOT implied by slots."""
+        return {
+            "rss_mb": _process_rss_mb(),
+            "clients": len(self.pyrogram_clients),
+            "engines": len(self.clients),
+            "native_slot_records": len(self.active_calls),
+            "durable_slots": sum(len(v) for v in self.joined_accounts_by_order.values()),
+            "idle_clients": sum(not self._client_referenced(aid) for aid in self.pyrogram_clients),
+            "quarantined": len(self._quarantined_accounts),
+            "listeners": len(self._listener_bindings),
+            "listener_proven_chats": len(self._listener_proven_chats),
+            "listener_disabled_chats": len(self._listener_disabled_chats),
+            "reaped_total": self._reaped_total,
+        }
+
+    def ensure_background_maintenance(self) -> None:
+        if not getattr(Config, "VOICE_IDLE_REAPER", True) or self._shutting_down:
+            return
+        if self._idle_reaper_task is not None and not self._idle_reaper_task.done():
+            return
+        try:
+            self._idle_reaper_task = asyncio.get_running_loop().create_task(self._idle_reaper_loop())
+        except RuntimeError:
+            pass
+
+    async def _idle_reaper_loop(self) -> None:
+        sweep = max(5, int(getattr(Config, "VOICE_IDLE_SWEEP_INTERVAL", 60)))
+        log_interval = max(60, int(getattr(Config, "VOICE_MEMORY_LOG_INTERVAL", 600)))
+        try:
+            while not self._shutting_down:
+                await asyncio.sleep(sweep)
+                try:
+                    rss = _process_rss_mb()
+                    soft = max(0, int(getattr(Config, "VOICE_RAM_SOFT_LIMIT_MB", 0)))
+                    closed = await self.reap_idle_clients(force=bool(soft and rss > soft))
+                    if closed:
+                        logger.info("[VoiceReaper] closed %s idle client(s)", closed)
+                    if soft and rss > soft:
+                        logger.warning("[VoiceMemory] RSS %s MB > soft %s MB; "
+                                       "only unreferenced clients can be reaped", rss, soft)
+                    now = time.time()
+                    if now - self._last_memory_log >= log_interval:
+                        self._last_memory_log = now
+                        logger.info("[VoiceMemory] %s", self.memory_report())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[VoiceReaper] sweep failed: %s", type(exc).__name__)
+        except asyncio.CancelledError:
+            pass
 
     # ─── Protocol helpers ───
 
@@ -2043,6 +2292,8 @@ class VoiceCallManager:
                     order_id, account_id, cid, "chat_left_update",
                     reason=f"engine chat update: {status}",
                 )
+                if order_id is not None and (account_id, cid) in self._listener_bindings:
+                    self._disable_listener_chat(cid, account_id, "left_call_update")
         except Exception as exc:
             logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
 
@@ -2067,6 +2318,8 @@ class VoiceCallManager:
             if int(chat_id) not in calls:
                 # Binding is gone; monitor recovery/rejoin owns this now.
                 return
+            if (account_id, int(chat_id)) in self._listener_bindings:
+                self._disable_listener_chat(chat_id, account_id, "stream_end")
             await self._play_silence(pytg, int(chat_id))
             order_id = self._order_id_for_account(account_id, chat_id)
             self._vc_event_log(order_id, account_id, "silence_restarted", {"chat_id": chat_id})
@@ -2094,37 +2347,60 @@ class VoiceCallManager:
             return False
         return True
 
-    async def _rebuild_engine_for_account(self, order_id: int, account_id: int) -> Optional[PyTgCalls]:
-        """Discard the poisoned PyTgCalls engine and build a FRESH one on the
-        SAME pyrogram session.
+    def _account_has_other_calls(self, account_id: int, order_id: int) -> bool:
+        return (any(aid == account_id and oid != order_id
+                    for oid, aid in self.active_calls)
+                or any(oid != order_id and account_id in recs
+                       for oid, recs in self.joined_accounts_by_order.items()))
 
-        'Connection cannot be initialized more than once' is raised by the
-        ntgcalls WebRTC layer when an engine still holds a half-dead peer
-        connection for a chat: no amount of per-chat stop() clears it, and a
-        new play() on the same engine can never initialize a new connection.
-        A brand-new PyTgCalls instance (fresh NTgCalls binding) has a clean
-        connection registry.  IMPORTANT: we do NOT send LeaveGroupCall — the
-        account stays inside the call while the new engine re-issues the
-        standard JoinGroupCall rejoin.
+    def _other_orders_in_chat(self, order_id: int, account_id: int, chat_id: int) -> Set[int]:
+        """Order IDs sharing the exact native binding, including durable-only slots."""
+        result = {oid for (oid, aid), info in self.active_calls.items()
+                  if oid != order_id and aid == account_id
+                  and int((info or {}).get('chat_id') or 0) == chat_id}
+        result.update(oid for oid, recs in self.joined_accounts_by_order.items()
+                      if oid != order_id and account_id in recs
+                      and int((recs[account_id] or {}).get('chat_id') or 0) == chat_id)
+        return result
+
+    async def _rebuild_engine_for_account(self, order_id: int, account_id: int,
+                                          chat_id: int) -> Optional[PyTgCalls]:
+        """Rebuild a broken binding ONLY if doing so cannot drop healthy calls.
+
+        PyTgCalls 2.x has no stop(). The old implementation left EVERY call on
+        this account (and sent LeaveGroupCall to Telegram for each) before a
+        rebuild. A broken chat must never kick an unrelated, healthy order.
+        If a binding query fails or any other call is held, defer the rebuild
+        rather than guessing and disconnecting other participants.
         """
         session_string = self._session_cache.get(account_id)
         if not session_string:
             return None
-        old = self.clients.pop(account_id, None)
+        if self._account_has_other_calls(account_id, order_id):
+            logger.warning("[VoiceEngine] acc=%s chat=%s rebuild deferred: other orders active",
+                           account_id, chat_id)
+            return None
+        old = self.clients.get(account_id)
         if old is not None:
-            # Best-effort: leave any calls the OLD engine still believes it
-            # holds, then drop the engine object (its poisoned WebRTC state
-            # dies with it).
             try:
-                for _cid in list(await asyncio.wait_for(old.group_calls, timeout=3) or {}):
-                    try:
-                        await asyncio.wait_for(old.leave_call(int(_cid)), timeout=5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        # _get_or_create_client re-uses the live pyrogram client and builds a
-        # fresh PyTgCalls(app) because self.clients no longer has one.
+                calls = await asyncio.wait_for(old.group_calls, timeout=3)
+            except Exception as exc:
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: binding status unknown (%s)",
+                               account_id, type(exc).__name__)
+                return None
+            if any(int(cid) != int(chat_id) for cid in (calls or {})):
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: other chat bindings still live",
+                               account_id)
+                return None
+            if any(int(cid) == int(chat_id) for cid in (calls or {})):
+                # L2 leave_call already failed to clear this binding; replacing
+                # the engine would orphan a live media call. Keep it and retry
+                # after verified cleanup instead of creating parallel engines.
+                logger.warning("[VoiceEngine] acc=%s rebuild deferred: target binding still live",
+                               account_id)
+                return None
+            self.clients.pop(account_id, None)
+        # Keep the SAME Pyrogram connection and auth-key reservation.
         return await self._get_or_create_client(order_id, account_id, session_string)
 
     # Unrecoverable PyTgCalls/ntgcalls engine states that no per-chat
@@ -2207,10 +2483,14 @@ class VoiceCallManager:
                         account_id, cid, msg1[:120],
                     )
                     # ── L2: explicit WebRTC session cleanup, then rejoin ──
-                    # leave_call() inside try/except as required: it stops the
-                    # engine's connection for this chat and (if the engine
-                    # still lists it) sends LeaveGroupCall, so the NEXT play()
-                    # starts from a fully clean session.
+                    # This sends LeaveGroupCall for the target if bound. Do
+                    # NOT do it while this same MTProto account serves another
+                    # order (including another order in this chat).
+                    if self._account_has_other_calls(account_id, order_id):
+                        self._vc_event_log(order_id, account_id, "media_restore_deferred", {
+                            "chat_id": cid, "reason": "other_active_order",
+                        })
+                        return
                     try:
                         await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
                     except Exception as e_leave:
@@ -2242,7 +2522,7 @@ class VoiceCallManager:
                                 "chat_id": cid, "reason": msg2[:120],
                             })
                             try:
-                                fresh = await self._rebuild_engine_for_account(order_id, account_id)
+                                fresh = await self._rebuild_engine_for_account(order_id, account_id, cid)
                                 if fresh is None:
                                     result = "rebuild_failed:no_client"
                                 else:
@@ -2318,15 +2598,100 @@ class VoiceCallManager:
         except Exception:
             return 0.0
 
-    async def _play_silence(self, pytg: PyTgCalls, chat_id: int) -> None:
-        """Join + play the LOOPING silence stream (stay-alive media).
+    def _choose_listener(self, chat_id: int, account_id: int) -> bool:
+        mode = getattr(Config, "VOICE_SILENCE_MODE", "media")
+        if mode not in ("auto", "listener") or self._listener_globally_disabled:
+            return False
+        if chat_id in self._listener_disabled_chats:
+            return False
+        if mode == "listener":
+            return True
+        if chat_id in self._listener_proven_chats:
+            return True
+        # A single, known canary per chat. Reserve synchronously before the
+        # first await so simultaneous joins cannot all become trial listeners.
+        trial = self._listener_trials.get(chat_id)
+        if trial is not None and trial[0] != account_id:
+            return False
+        if trial is None:
+            self._listener_trials[chat_id] = (account_id, time.time())
+        return True
 
-        ``pytg.play()`` COMPLETING is the authoritative "the account is inside
-        the call" signal: it returns only after Telegram accepted the
-        JoinGroupCall and the WebRTC transport is up (or immediately when the
-        account is already in the call).  The silence is looped forever with
-        ``-stream_loop -1`` so the transport can never die of EOF.
+    def _disable_listener_chat(self, chat_id: int, account_id: int, reason: str) -> None:
+        self._listener_disabled_chats.add(int(chat_id))
+        self._listener_proven_chats.discard(int(chat_id))
+        self._listener_trials.pop(int(chat_id), None)
+        self._listener_bindings.discard((int(account_id), int(chat_id)))
+        self._listener_failures += 1
+        if self._listener_failures >= max(1, int(getattr(Config, "VOICE_LISTENER_MAX_FAILURES", 2))):
+            self._listener_globally_disabled = True
+        logger.warning("[VoiceListener] chat=%s acc=%s disabled after %s (media fallback); "
+                       "global_disabled=%s", chat_id, account_id, reason,
+                       self._listener_globally_disabled)
+        self._vc_event_log(None, account_id, "listener_disabled",
+                           {"chat_id": chat_id, "reason": reason[:80]})
+
+    def _listener_probe_observe(self, account_id: int, chat_id: int,
+                                telegram_present: Optional[bool],
+                                binding_alive: Optional[bool]) -> None:
+        key = (int(account_id), int(chat_id))
+        if key not in self._listener_bindings:
+            return
+        if telegram_present is False and binding_alive is False:
+            self._listener_drops += 1
+            self._disable_listener_chat(chat_id, account_id, "confirmed participant+binding drop")
+            if self._listener_drops >= max(1, int(getattr(Config, "VOICE_LISTENER_MAX_DROPS", 3))):
+                self._listener_globally_disabled = True
+            return
+        trial = self._listener_trials.get(chat_id)
+        if (trial and trial[0] == account_id and telegram_present is True
+                and binding_alive is True
+                and time.time() - trial[1] >= max(30, int(getattr(Config, "VOICE_LISTENER_PROBE_SECONDS", 60)))):
+            self._listener_proven_chats.add(chat_id)
+            self._listener_trials.pop(chat_id, None)
+            logger.info("[VoiceListener] chat=%s canary survived probe; listener allowed", chat_id)
+            self._vc_event_log(None, account_id, "listener_proven", {"chat_id": chat_id})
+
+    async def _play_silence(self, pytg: PyTgCalls, chat_id: int,
+                            account_id: Optional[int] = None) -> None:
+        """Join as a verified listener canary, or loop media silence.
+
+        A listener is never counted as successfully joined *only* because
+        play(None) returned; Telegram must confirm its participant listing.
+        The existing media stream remains the fallback on any uncertainty.
         """
+        chat_id = int(chat_id)
+        if account_id is not None and self._choose_listener(chat_id, account_id):
+            try:
+                await pytg.play(chat_id)  # PyTgCalls supports stream=None
+                app = self.pyrogram_clients.get(account_id)
+                # A native binding alone does not prove Telegram lists the
+                # listener as present. An unknown answer is NOT a success.
+                if app is None or await self._is_in_voice_call(app, chat_id) is not True:
+                    raise RuntimeError("listener participant unconfirmed")
+                self._listener_bindings.add((account_id, chat_id))
+                self._vc_event_log(None, account_id, "listener_join", {"chat_id": chat_id})
+                return
+            except asyncio.CancelledError:
+                # The native join may still be in flight; the caller owns the
+                # same-key in-flight task. Never start a second media join now.
+                raise
+            except Exception as exc:
+                if (is_auth_key_duplicated(str(exc)) or is_fatal_auth_error(str(exc))
+                        or isinstance(exc, (AuthKeyDuplicated, SessionRevoked,
+                                            AuthKeyInvalid, AuthKeyUnregistered,
+                                            FloodWait, SessionInUseError))):
+                    raise
+                self._disable_listener_chat(chat_id, account_id, type(exc).__name__)
+                try:
+                    binding_known = chat_id in (await pytg.group_calls)
+                except Exception:
+                    binding_known = False
+                if not binding_known:
+                    # The earlier native join may still be unresolved. Never
+                    # issue a second JoinGroupCall just to attempt a fallback.
+                    raise
+                # Fallback on the SAME bound engine (set_stream_sources).
         # Always cap ffmpeg at a single decode thread (CPU). When looping is on
         # we also add ``-stream_loop -1``; otherwise fall back to the
         # threads-only input options so the non-loop path is still bounded.
@@ -2351,6 +2716,8 @@ class VoiceCallManager:
                 return
             logger.debug("voice media negotiation failed chat=%s: %s", chat_id, e)
             raise
+        if account_id is not None:
+            self._listener_bindings.discard((account_id, chat_id))
         # Mute the local microphone (kept muted by default so the account is
         # indistinguishable from a listener and never echoes).  Muting is
         # best-effort: presence does not depend on it.
@@ -2365,6 +2732,17 @@ class VoiceCallManager:
             await pytg.mute(int(chat_id))
         except Exception:
             pass
+
+    @staticmethod
+    def _media_presence_verdict(participant_presence: Optional[bool],
+                                media_binding: Optional[bool]) -> Optional[bool]:
+        """A missing binding isn't proof of departure if Telegram is unknown.
+
+        A positive local binding proves the client holds a call. A negative
+        binding proves only local media loss; the Telegram participant list
+        must independently confirm absence before the rejoin path may run.
+        """
+        return True if media_binding is True else participant_presence
 
     async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
         """Authoritative per-chat media transport liveness.
@@ -2566,7 +2944,11 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return set()  # no active call → nobody present
+                # A missing call reference on this cycle is not proof that
+                # EACH participant left (a stale/temporarily inaccessible
+                # channel looks identical here). Preserve their slots until
+                # a separate definitive presence/call-ended signal arrives.
+                return None
 
             present_ids: Set[int] = set()
 
@@ -2642,6 +3024,13 @@ class VoiceCallManager:
           False - account confirmed NOT present (full participant list checked).
           None  - presence could not be determined (API error / pagination failure).
         """
+        # One failed SHARED snapshot should never trigger a second, per-account
+        # pagination sweep for every member of a large order. An unknown
+        # response stays unknown; otherwise RPC floods can create the very
+        # timeouts and apparent absences the monitor is trying to fix.
+        snapshot = self._participant_snapshot.get(int(chat_id))
+        if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
+            return None
         my_id = None
         try:
             me = getattr(app, "me", None)
@@ -2673,7 +3062,7 @@ class VoiceCallManager:
                 if call is not None:
                     self._active_call_cache[int(chat_id)] = (time.time(), call)
             if not call:
-                return False
+                return None  # missing call reference is not proof of leave
 
             # 1) First page via GetGroupCall (cheap)
             try:
@@ -2723,8 +3112,8 @@ class VoiceCallManager:
         """
         # Shared chat-info cache: if another account already confirmed the call
         # is active (cached InputGroupCall), answer instantly — no API call.
-        cached_info = self._chat_info_get(int(chat_id))
-        if cached_info and cached_info[1] is not None:
+        cached_call = self._chat_info_get(int(chat_id))
+        if cached_call is not None:
             return True
         try:
             call = await self._get_cached_group_call(app, int(chat_id))
@@ -2754,7 +3143,8 @@ class VoiceCallManager:
                     }
                     self._order_accounts.setdefault(order_id, set()).add(account_id)
                 try:
-                    await DatabaseManager.update_voice_call_session(account_id, int(chat_id), "joined")
+                    await DatabaseManager.update_voice_call_session(
+                        account_id, int(chat_id), "joined", order_id=order_id)
                 except Exception:
                     pass
                 return True
@@ -2810,7 +3200,8 @@ class VoiceCallManager:
                 join_key = (account_id, int(chat_id))
                 join_task = self._inflight_joins.get(join_key)
                 if join_task is None or join_task.done():
-                    join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
+                    join_task = asyncio.create_task(
+                        self._play_silence(pytg, int(chat_id), account_id=account_id))
                     self._inflight_joins[join_key] = join_task
 
                 def _consume_join_task_result(task: asyncio.Task) -> None:
@@ -3287,9 +3678,14 @@ class VoiceCallManager:
                             media_alive = None  # unknown → rely on the listing
 
                         media_known = media_alive is not None
-                        if media_alive is True:
-                            present = True
-                        elif media_alive is False:
+                        if (acc_id, cid) in self._listener_bindings:
+                            self._listener_probe_observe(acc_id, cid, present, media_alive)
+                            if media_alive is False and (acc_id, cid) in self._listener_bindings:
+                                self._disable_listener_chat(cid, acc_id, "binding lost")
+                        rec['media_binding_alive'] = media_alive
+                        rec['media_binding_checked_at'] = time.time()
+                        present = self._media_presence_verdict(present, media_alive)
+                        if media_alive is False:
                             if present is True:
                                 # ── GHOST-MEDIA-ONLY (presence intact) ──────────
                                 # The participant listing says the account is
@@ -3321,10 +3717,9 @@ class VoiceCallManager:
                                     )
                                 except RuntimeError:
                                     pass
-                            else:
-                                # Media binding gone AND the listing does not
-                                # confirm presence → treat as a real loss
-                                # (existing fail-cycle / recovery logic below).
+                            elif present is False:
+                                # Two independent negatives: no binding AND a
+                                # complete Telegram participant list says absent.
                                 self._vc_event_log(order_id, acc_id, "media_transport_lost", {
                                     "chat_id": cid,
                                     "verdict": "confirmed_media_disconnect",
@@ -3332,7 +3727,15 @@ class VoiceCallManager:
                                 self._record_drop(order_id, acc_id, cid, "media_transport_lost",
                                                   reason="engine media connection missing (ghost)",
                                                   extra={"media_known": media_known})
-                                present = False
+                            else:
+                                # Participant query failed: no rejoin/leave
+                                # based on an ambiguous snapshot. Report it
+                                # so the stable paid count is not mistaken for
+                                # confirmed, continuous media presence.
+                                self._vc_event_log(order_id, acc_id, "media_presence_unknown", {
+                                    "chat_id": cid,
+                                    "reason": "media_binding_lost_and_participant_query_unknown",
+                                })
 
                         # ── DL HOLD-RISK (online deep-learning model) ───
                         # Score every cycle, learn from the resolved outcome, and
@@ -3375,12 +3778,18 @@ class VoiceCallManager:
                             pass
 
                         if present is True:
-                            # JOINED — confirmed present (or media transport alive).
-                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
+                            # Telegram presence and local media binding are
+                            # different signals. A ghost stays durably counted
+                            # but is NOT reported as media-healthy JOINED.
+                            observed_state = (
+                                "JOINED" if media_alive is True else
+                                "MEDIA_LOST" if media_alive is False else "MEDIA_UNKNOWN"
+                            )
+                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = observed_state
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
                             rec.pop("unrecoverable", None)
-                            rec["status"] = "JOINED"
+                            rec["status"] = observed_state
                             rec["last_ok"] = time.time()
                             # Ensure transport bookkeeping still present (idempotent).
                             if (order_id, acc_id) not in self.active_calls:
@@ -3532,70 +3941,74 @@ class VoiceCallManager:
 
         async def _warm_one(acc: Dict) -> None:
             nonlocal warmed
-            account_id = acc.get("id")
-            session_string = acc.get("session_string")
+            account_id = acc["id"]
+            session_string = acc["session_string"]
+            self._busy_accounts[account_id] = self._busy_accounts.get(account_id, 0) + 1
             try:
                 async with self._lock(account_id):
-                    # Re-check under the lock (a concurrent join may have
-                    # already created this client).
-                    if account_id in self.pyrogram_clients:
+                    if account_id in self.pyrogram_clients or account_id in self._quarantined_accounts:
                         return
-                    # Never warm an account whose server-directed FloodWait
-                    # timer is still active — warming opens a new connection
-                    # and would extend the wait for the whole IP.
                     if voice_cooldown.remaining(account_id) > 0:
                         return
-                    decrypted_session = SecurityManager.decrypt_session(session_string)
-                    if not decrypted_session:
+                    decrypted = SecurityManager.decrypt_session(session_string)
+                    if not decrypted:
                         return
-                    async with CLIENT_CREATE_SEMAPHORE:
-                        held = await session_ownership.acquire_voice(account_id)
-                        try:
-                            helper = TelegramAccountClient("temp", session_string, account_id)
-                            api_id, api_hash = await helper._get_api_credentials()
-                            app = Client(
-                                f"shared_client_{account_id}",
-                                session_string=decrypted_session,
-                                api_id=api_id,
-                                api_hash=api_hash,
-                                # Voice clients must receive raw updates from Telegram.
-                                no_updates=False,
-                                in_memory=True,
-                                proxy=_voice_proxy_config(),
-                                **_client_device_fingerprint(account_id),
-                            )
-                            await asyncio.wait_for(app.start(), timeout=15)
-                        except FloodWait as e:
-                            if held:
-                                session_ownership.release_voice(account_id)
-                            wait_s = int(getattr(e, "value", 3) or 3)
-                            voice_cooldown.record(
-                                account_id, wait_s,
-                                operation="warmup_start", source="client.start",
-                            )
-                            self._vc_event_log(None, account_id, "warmup_floodwait",
-                                               {"wait_s": wait_s})
-                            return
-                        except Exception:
-                            if held:
-                                session_ownership.release_voice(account_id)
-                            raise
-                        self.pyrogram_clients[account_id] = app
-                        self._session_cache[account_id] = session_string
-                        warmed += 1
-            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid):
+                    # Same lifecycle/cleanup as the real join path. There
+                    # must NOT be a second implementation of Client.start()
+                    # with its own incomplete CancelledError handling.
+                    await self._create_pyrogram_client_locked(
+                        account_id, session_string, decrypted, timeout=15)
+                    warmed += 1
+            except FloodWait as exc:
+                wait_s = int(getattr(exc, "value", 3) or 3)
+                voice_cooldown.record(account_id, wait_s, operation="warmup_start", source="client.start")
+                self._vc_event_log(None, account_id, "warmup_floodwait", {"wait_s": wait_s})
+            except AuthKeyDuplicated:
+                self._vc_event_log(None, account_id, "warmup_auth_key_duplicated", {})
+            except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as exc:
                 self._vc_event_log(None, account_id, "session_revoked_warmup", {})
+                await _mark_session_dead(account_id, f"warmup {type(exc).__name__}", session_string)
+            except SessionInUseError as exc:
+                logger.info("warmup acc=%s skipped: %s", account_id, exc.technical)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                self._vc_event_log(None, account_id, "warmup_error", {"exc": str(e)[:60]})
+            except Exception as exc:
+                self._vc_event_log(None, account_id, "warmup_error", {"exc": str(exc)[:60]})
+            finally:
+                count = self._busy_accounts.get(account_id, 1) - 1
+                if count > 0:
+                    self._busy_accounts[account_id] = count
+                else:
+                    self._busy_accounts.pop(account_id, None)
+                if account_id in self.pyrogram_clients:
+                    self._client_last_used[account_id] = time.time()
+                else:
+                    self._client_last_used.pop(account_id, None)
 
         if candidates:
             await asyncio.gather(*(_warm_one(acc) for acc in candidates), return_exceptions=True)
         return warmed
 
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
-        """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
+        """Keep an idle-reaper hold for the ENTIRE join lifecycle."""
+        self._busy_accounts[account_id] = self._busy_accounts.get(account_id, 0) + 1
+        try:
+            return await self._start_call_impl(order_id, account_id, session_string,
+                                               chat_link, duration_minutes)
+        finally:
+            count = self._busy_accounts.get(account_id, 1) - 1
+            if count > 0:
+                self._busy_accounts[account_id] = count
+            else:
+                self._busy_accounts.pop(account_id, None)
+            if account_id in self.pyrogram_clients:
+                self._client_last_used[account_id] = time.time()
+            else:
+                self._client_last_used.pop(account_id, None)
+
+    async def _start_call_impl(self, order_id: int, account_id: int, session_string: str,
+                               chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
+        """Start a voice call for one account — PARALLEL-safe (per-order gate)."""
         key = (order_id, account_id)
 
         # If already durably joined & counted for this order, return success
@@ -3658,9 +4071,20 @@ class VoiceCallManager:
             logger.info(f"[VoiceScheduler] Order {order_id}: creating Pyrogram client for account {account_id}")
             try:
                 pytg = await self._get_or_create_client(order_id, account_id, session_string)
+            except AuthKeyDuplicated as e:
+                # Do NOT label a 406 as SESSION_REVOKED: order_executor used
+                # that prefix to mark the account inactive regardless of the
+                # v2.3.9 non-fatal gate. Stop retries for this order instead.
+                self._set_state(order_id, account_id, FAILED, "AUTH_KEY_DUPLICATED")
+                await _mark_session_dead(account_id, "AUTH_KEY_DUPLICATED start_call", session_string)
+                return False, f"AUTH_KEY_DUPLICATED: {e}", 0
             except (SessionRevoked, AuthKeyUnregistered, AuthKeyInvalid) as e:
                 self._set_state(order_id, account_id, FAILED, f"session revoked: {e}")
+                await _mark_session_dead(account_id, f"start_call {type(e).__name__}", session_string)
                 return False, f"SESSION_REVOKED: {e}", 0
+            except SessionInUseError as e:
+                self._set_state(order_id, account_id, RETRY_PENDING, e.technical)
+                return False, f"SESSION_IN_USE: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
                 voice_cooldown.record(account_id, wait_s,
@@ -3759,6 +4183,15 @@ class VoiceCallManager:
                 acid = int(cf.get("chat_id") or chat_id)
                 self._group_refcount[(account_id, acid)] = self._group_refcount.get((account_id, acid), 0) + 1
 
+                # 🛡 این اکانت دوباره وارد همین چت شده → اگر خروج به‌تأخیرافتادهٔ
+                # قدیمی‌ای برایش در صف باشد (مثلاً از سفارش قبلی همین گروه)،
+                # باید لغو شود؛ وگرنه وسط سفارش جدید اکانت از گروه بیرون می‌رود.
+                try:
+                    from services.group_leave_scheduler import group_leave_scheduler as _gls
+                    await _gls.cancel_for_account_chat(account_id, int(acid))
+                except Exception:
+                    pass
+
                 # STEP 7: Ensure the SHARED per-order monitor is running.
                 self._ensure_monitor(order_id)
 
@@ -3774,26 +4207,68 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, FAILED, f"start call error: {e}")
                 return False, f"Start call error: {str(e)[:80]}", 0
 
-    async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
-        """Stop a single account's voice call. leave_group: also leave the Telegram group (refcount-based)."""
+    async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False,
+                        cleanup_client: bool = False) -> Tuple[bool, str]:
+        """Stop one order without disrupting other orders on the same binding.
+
+        Serialize join/restore/leave for this account+chat. Simultaneous order
+        cancellations must not both decide they are the final holder.
+        """
+        # stop_call removes order records before Telegram confirms its leave.
+        # Hold a reaper reservation for the whole in-flight leave, including
+        # network awaits and the final disconnect, so an idle sweep cannot
+        # disconnect the same client halfway through cleanup.
+        self._busy_accounts[account_id] = self._busy_accounts.get(account_id, 0) + 1
+        try:
+            current = self.active_calls.get((order_id, account_id)) or {}
+            saved = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id) or {}
+            chat_id = int(current.get('chat_id') or saved.get('chat_id')
+                          or self.order_chat_ids.get(order_id) or 0)
+            async with self._call_join_locks.setdefault((account_id, chat_id), asyncio.Lock()):
+                return await self._stop_call_locked(
+                    order_id, account_id, leave_group=leave_group,
+                    cleanup_client=cleanup_client,
+                )
+        finally:
+            count = self._busy_accounts.get(account_id, 1) - 1
+            if count > 0:
+                self._busy_accounts[account_id] = count
+            else:
+                self._busy_accounts.pop(account_id, None)
+            if account_id in self.pyrogram_clients:
+                self._client_last_used[account_id] = time.time()
+            else:
+                self._client_last_used.pop(account_id, None)
+
+    async def _stop_call_locked(self, order_id: int, account_id: int,
+                                leave_group: bool = False,
+                                cleanup_client: bool = False) -> Tuple[bool, str]:
+        """Remove THIS order's durable record, then leave only if no holders remain."""
         key = (order_id, account_id)
         info = self.active_calls.pop(key, None)
         chat_id = int((info or {}).get("chat_id") or 0)
         if not chat_id:
             chat_id = int(self.order_chat_ids.get(order_id) or 0)
-        if info is None and not chat_id:
-            # Still clean up persistent joined state for this order if present.
-            recorder = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
-            if recorder:
-                chat_id = int(recorder.get("chat_id") or 0)
-        inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
-        if inflight and not inflight.done():
-            inflight.cancel()
-        if chat_id <= 0 and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
+        recorder = (self.joined_accounts_by_order.get(order_id) or {}).get(account_id)
+        if not chat_id and recorder:
+            chat_id = int(recorder.get('chat_id') or 0)
+        if not chat_id and info is None and recorder is None:
             return True, "Not active"
 
-        # Remove from persistent joined state (order is ending / cancelling).
+        # Remove only THIS order's state. A negative chat id is valid in
+        # Telegram; never mistake it for 'no call' and silently skip cleanup.
         removed = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
+        shared_orders = self._other_orders_in_chat(order_id, account_id, chat_id)
+        if not shared_orders:
+            self._listener_bindings.discard((account_id, int(chat_id)))
+            if not any(cid == int(chat_id) for _aid, cid in self._listener_bindings):
+                self._listener_proven_chats.discard(int(chat_id))
+            trial = self._listener_trials.get(int(chat_id))
+            if trial and trial[0] == account_id:
+                self._listener_trials.pop(int(chat_id), None)
+            inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
+            if inflight and not inflight.done():
+                inflight.cancel()
         if removed is not None:
             # Remove ONLY this account's state — never wipe the whole order's
             # state dict (that would drop every other account's machine).
@@ -3812,52 +4287,98 @@ class VoiceCallManager:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
 
-        # Leave the voice call IMMEDIATELY (retry twice, then verify)
+        # One native binding can serve multiple orders in this same chat.
+        # Ending only one order MUST NOT send leave_call/LeaveGroupCall; it
+        # would eject the participant that the other paid order still uses.
         pytg = self.clients.get(account_id)
         app = self.pyrogram_clients.get(account_id)
-        if pytg and chat_id:
-            for _ in range(2):
+        if shared_orders:
+            logger.info("[VoiceLeave] acc=%s chat=%s retained for %s other order(s)",
+                        account_id, chat_id, len(shared_orders))
+        else:
+            if pytg and chat_id:
+                for _ in range(2):
+                    try:
+                        await asyncio.wait_for(pytg.leave_call(int(chat_id)), timeout=10)
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.5)
+            if app and chat_id:
                 try:
-                    await asyncio.wait_for(pytg.leave_call(int(chat_id)), timeout=10)
-                    break
+                    if await self._is_in_voice_call(app, int(chat_id)) is True:
+                        peer = await app.resolve_peer(int(chat_id))
+                        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+                        call = getattr(full.full_chat, "call", None)
+                        if call:
+                            await app.invoke(
+                                functions.phone.LeaveGroupCall(call=call, source=0)
+                            )
                 except Exception:
-                    await asyncio.sleep(0.5)
-        if app and chat_id:
-            try:
-                if await self._is_in_voice_call(app, int(chat_id)) is True:
-                    peer = await app.resolve_peer(int(chat_id))
-                    full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-                    call = getattr(full.full_chat, "call", None)
-                    if call:
-                        await app.invoke(
-                            functions.phone.LeaveGroupCall(call=call, source=0)
-                        )
-            except Exception:
-                pass
+                    pass
 
         try:
-            await DatabaseManager.update_voice_call_session(account_id, chat_id, "left")
+            await DatabaseManager.update_voice_call_session(
+                account_id, chat_id, "left", order_id=order_id)
         except Exception:
             pass
 
-        # Decrement group refcount; leave group only when no orders remain for this account+chat
+        # Derive from remaining actual holders, not an occasionally stale
+        # counter. No group exit may be scheduled while another order holds it.
         if chat_id:
             ref_key = (account_id, int(chat_id))
-            self._group_refcount[ref_key] = self._group_refcount.get(ref_key, 1) - 1
-            if self._group_refcount[ref_key] <= 0:
+            if shared_orders:
+                self._group_refcount[ref_key] = len(shared_orders)
+            else:
                 self._group_refcount.pop(ref_key, None)
                 if leave_group:
-                    app = self.pyrogram_clients.get(account_id)
-                    if app:
-                        for _ in range(2):
-                            try:
-                                await app.leave_chat(int(chat_id))
-                                break
-                            except Exception:
-                                await asyncio.sleep(0.5)
-                        self._clear_chat_cache(int(chat_id))
+                    # 🛡 ضد اسپم: خروج از خودِ گروه «بلافاصله» نیست — در صف
+                    # خروجِ به‌تأخیرافتاده (پیش‌فرض یک هفته بعد) ثبت می‌شود و
+                    # جاب زمان‌بند آن را دونه‌به‌دونه اجرا می‌کند. اگر کاربر برای
+                    # همان مقصد سفارش تازه بزند، خروج لغو می‌ماند. در صورت
+                    # غیرفعال بودن قابلیت یا خطای زمان‌بندی → رفتار قبلی (خروج
+                    # فوری) حفظ می‌شود.
+                    scheduled = False
+                    try:
+                        from services.group_leave_scheduler import group_leave_scheduler as _gls
+                        _order = None
+                        try:
+                            _order = await DatabaseManager.get_order(order_id)
+                        except Exception:
+                            _order = None
+                        scheduled = await _gls.schedule(
+                            account_id=account_id,
+                            chat_id=int(chat_id),
+                            target_link=(
+                                (_order or {}).get("target_link")
+                                or (info or {}).get("target")
+                                or (removed or {}).get("target")
+                            ),
+                            order_id=order_id,
+                            bot_id=int((_order or {}).get("bot_id") or 1),
+                        )
+                    except Exception as _sched_err:
+                        logger.debug("[VoiceLeave] delayed group-leave schedule failed acc=%s: %s", account_id, _sched_err)
+                        scheduled = False
+                    if scheduled:
+                        logger.info(
+                            "[VoiceLeave] order=%s acc=%s group exit SCHEDULED (delayed, one-by-one) chat=%s",
+                            order_id, account_id, chat_id,
+                        )
+                    else:
+                        app = self.pyrogram_clients.get(account_id)
+                        if app:
+                            for _ in range(2):
+                                try:
+                                    await app.leave_chat(int(chat_id))
+                                    break
+                                except Exception:
+                                    await asyncio.sleep(0.5)
+                            self._clear_chat_cache(int(chat_id))
 
-        await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+        await self._cleanup_client(
+            account_id, order_id=order_id,
+            force=cleanup_client and not self._account_in_any_order(account_id),
+        )
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
         self._record_drop(order_id, account_id, chat_id, "stopped",
                           deliberate=True, reason="order-managed stop")
@@ -3890,11 +4411,29 @@ class VoiceCallManager:
         self._stop_monitor(order_id)
 
         if keys:
-            gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-            gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
-            jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
-            jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-            max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+            # 🛡 ضد اسپم: وقتی «حالت ضد اسپم» فعال است، pacing خروج از ویس‌کال
+            # هم انسانی‌تر می‌شود (فاصله‌های بزرگ‌تر + jitter، سقف کمتر). در
+            # غیر این صورت دقیقاً مقادیر Config قبلی استفاده می‌شود.
+            _anti = None
+            _profile = None
+            _bid = 1
+            try:
+                from services.anti_spam import anti_spam as _anti_mod
+                _anti = _anti_mod
+                try:
+                    _o = await DatabaseManager.get_order(order_id)
+                    _bid = int((_o or {}).get("bot_id") or 1)
+                except Exception:
+                    _bid = 1
+                _profile = await _anti.get_profile(_bid)
+                gap_min, gap_max, jitter_min, jitter_max, max_conc = _anti.effective_leave_pacing(_profile)
+            except Exception:
+                _anti, _profile = None, None
+                gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+                gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+                jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+                jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+                max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
             # Shuffle so the leave order is not the same join order every time
             # (harder for anti-spam fingerprinting of a fixed sequence).
             random.shuffle(keys)
@@ -3934,6 +4473,16 @@ class VoiceCallManager:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+            # 🛡 استراحت اکانت پس از اتمام کار (ضد اسپم): اکانتی که تازه کارش
+            # تمام شده، تا پایان مهلت استراحت برای سفارش بعدی انتخاب نمی‌شود.
+            # با rest=0 یا ضد اسپم خاموش، این حلقه no-op است.
+            if _anti is not None and keys:
+                for (_oid, _aid) in keys:
+                    try:
+                        await _anti.note_account_finished(_aid, _bid)
+                    except Exception:
+                        pass
+
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)
         self.order_chat_ids.pop(order_id, None)
@@ -3953,6 +4502,10 @@ class VoiceCallManager:
             self._media_restore_failures.pop(key, None)
         for key in [k for k in list(self._media_restore_paused_until) if k[0] == order_id]:
             self._media_restore_paused_until.pop(key, None)
+        # A lookahead warmup may not have reached a call. Close only clients
+        # that are now unused, not native bindings serving another order.
+        if getattr(Config, "VOICE_IDLE_REAPER", True):
+            await self.reap_idle_clients(force=True)
         return len(keys)
 
     async def cleanup_all(self) -> None:
@@ -3978,11 +4531,16 @@ class VoiceCallManager:
 
         Without this, `docker restart` SIGKILLs the process with live
         connections; Telegram keeps them half-open and the fresh container's
-        reconnects trigger AUTH_KEY_DUPLICATED — which permanently burns the
-        accounts. Disconnecting cleanly prevents that race.
+        reconnects may trigger AUTH_KEY_DUPLICATED and invalidate their keys.
+        Disconnecting cleanly and holding the instance lock through shutdown
+        prevent an avoidable local restart race (not third-party key reuse).
 
         Returns the number of accounts disconnected.
         """
+        # Block new warmup/join connections before taking the client snapshot.
+        self._shutting_down = True
+        if self._idle_reaper_task and not self._idle_reaper_task.done():
+            self._idle_reaper_task.cancel()
         # Stop monitors / keepalives / inflight joins first: nothing new may spawn.
         for oid in list(self._monitor_tasks.keys()):
             try:
@@ -4003,7 +4561,8 @@ class VoiceCallManager:
                     inf.cancel()
             except Exception:
                 pass
-        aids = list({*self.pyrogram_clients.keys(), *self.clients.keys()})
+        aids = list({*self.pyrogram_clients.keys(), *self.clients.keys(),
+                     *session_ownership.voice_held_accounts()})
         if not aids:
             return 0
         logger.info("[VoiceShutdown] disconnecting %d clients (fast path, no API leaves)...", len(aids))
@@ -4012,25 +4571,19 @@ class VoiceCallManager:
 
         async def _one(aid: int) -> None:
             nonlocal done
-            async with sem:
-                # Engine dies with its client; no leave_call on the shutdown
-                # path (Telegram purges dead call participants server-side).
+            async with sem, self._lock(aid):
+                # Fast path: do not leave Telegram groups on shutdown. But
+                # NEVER free the key until its Pyrogram client is closed.
                 self.clients.pop(aid, None)
-                app = self.pyrogram_clients.pop(aid, None)
-                if app is not None:
-                    try:
-                        await asyncio.wait_for(app.disconnect(), timeout=5)
-                    except Exception:
-                        pass
-                try:
-                    session_ownership.release_voice(aid)
-                except Exception:
-                    pass
-                try:
-                    self._session_cache.pop(aid, None)
-                    self._client_locks.pop(aid, None)
-                except Exception:
-                    pass
+                app = self.pyrogram_clients.get(aid)
+                if app is not None and not await _disconnect_voice_app(app):
+                    self._quarantined_accounts.add(aid)
+                    logger.critical("[VoiceShutdown] acc=%s still connected; session hold retained", aid)
+                    return
+                self.pyrogram_clients.pop(aid, None)
+                session_ownership.release_voice(aid, disconnected=app is not None)
+                self._session_cache.pop(aid, None)
+                self._quarantined_accounts.discard(aid)
                 done += 1
 
         try:

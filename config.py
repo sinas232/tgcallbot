@@ -71,6 +71,14 @@ class Config:
 
     # Order Settings
     MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
+    if MAX_CONCURRENT_ORDERS < 0:
+        raise ValueError('MAX_CONCURRENT_ORDERS must not be negative')
+    # Preserve the permissive default for existing installs; 'private' opts in.
+    ORDER_LINK_MODE = os.getenv('ORDER_LINK_MODE', 'any').strip().lower()
+    if ORDER_LINK_MODE not in ('any', 'private'):
+        raise ValueError('ORDER_LINK_MODE must be any or private')
+    ORDER_LINK_REGEX = os.getenv('ORDER_LINK_REGEX', '').strip()
+    ORDER_LINK_EXAMPLE = os.getenv('ORDER_LINK_EXAMPLE', '').strip()
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)
@@ -104,6 +112,37 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Historical sequential mode is opt-in so existing wave installations do
+    # not change cadence unexpectedly. In this mode the per-order wave stays
+    # at 1 until the preceding account finishes group+voice verification.
+    VOICE_JOIN_SEQUENTIAL = os.getenv('VOICE_JOIN_SEQUENTIAL', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Both legacy gap spellings are accepted; the account-gap names win when
+    # explicitly supplied. Never treat INITIAL_CONCURRENCY=1 as sequential:
+    # adaptive mode can widen later.
+    VOICE_JOIN_ACCOUNT_GAP_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MIN', os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MIN', '1.0')))
+    VOICE_JOIN_ACCOUNT_GAP_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MAX', os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MAX', '2.0')))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN', '0.0'))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX', '0.5'))
+    # A prewarm opens the *next* client's MTProto transport before its join.
+    # Off by default to avoid extra simultaneous auth-key connections.
+    VOICE_JOIN_SEQUENTIAL_PREWARM = os.getenv('VOICE_JOIN_SEQUENTIAL_PREWARM', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_SECOND_CHANCE_ROUNDS = int(os.getenv('VOICE_SECOND_CHANCE_ROUNDS', '0'))
+    VOICE_SECOND_CHANCE_COOLDOWN_SECONDS = float(os.getenv('VOICE_SECOND_CHANCE_COOLDOWN_SECONDS', '60'))
+    VOICE_IDLE_REAPER = os.getenv('VOICE_IDLE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+    VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+    VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    VOICE_RAM_SOFT_LIMIT_MB = int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0'))
+    # 'auto' tests one canary per chat; other accounts use media until a
+    # participant-list AND native-binding observation proves its dwell time.
+    # 'media' keeps the existing behaviour; 'listener' opts in explicitly.
+    VOICE_SILENCE_MODE = os.getenv('VOICE_SILENCE_MODE', 'media').strip().lower()
+    VOICE_LISTENER_PROBE_SECONDS = int(os.getenv('VOICE_LISTENER_PROBE_SECONDS', '60'))
+    VOICE_LISTENER_MAX_FAILURES = int(os.getenv('VOICE_LISTENER_MAX_FAILURES', '2'))
+    VOICE_LISTENER_MAX_DROPS = int(os.getenv('VOICE_LISTENER_MAX_DROPS', '3'))
+    # Legacy name: minimum delay before an OPERATOR-initiated in-bot,
+    # single-account conflict check. No automatic 406 retry is safe.
+    VOICE_SESSION_CONFLICT_RETRY_SECONDS = int(os.getenv('VOICE_SESSION_CONFLICT_RETRY_SECONDS', '60'))
     # First wave size. 2 is the safe default: combined with the staggered
     # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
@@ -266,6 +305,50 @@ class Config:
     # Session guard: if an account's MTProto session silently died, reconnect it
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🛡 حالت ضد اسپم (Anti-Spam Protection) — services/anti_spam.py
+    # ═══════════════════════════════════════════════════════════════════
+    # این مقادیر «پیش‌فرضِ fallback» هستند؛ مقدارِ نهاییِ زنده از دیتابیس
+    # (پنل سوپرادمین → «🛡 ضد اسپم و محافظت») خوانده می‌شود و تغییر آن‌ها در
+    # پنل بدون ری‌استارت اعمال می‌شود. env فقط وقتی استفاده می‌شود که کلید
+    # متناظر در دیتابیس هنوز ست نشده باشد.
+    #
+    # سوییچ کلی حالت ضد اسپم (join آهسته‌تر + خروج انسانی‌تر + استراحت اکانت).
+    ANTISPAM_ENABLED = os.getenv('ANTISPAM_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # فاصلهٔ شروع join دو اکانت متوالی در حالت ضد اسپم (ثانیه) — پراکندگی RPC.
+    ANTISPAM_JOIN_GAP_MIN = float(os.getenv('ANTISPAM_JOIN_GAP_MIN', '3.0'))
+    ANTISPAM_JOIN_GAP_MAX = float(os.getenv('ANTISPAM_JOIN_GAP_MAX', '8.0'))
+    # jitter انسانیِ اضافه روی فاصلهٔ join (ضد fingerprint پریودیک).
+    ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
+    # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
+    ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
+    # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
+    ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
+    ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
+    ANTISPAM_LEAVE_JITTER_MAX = float(os.getenv('ANTISPAM_LEAVE_JITTER_MAX', '1.2'))
+    ANTISPAM_LEAVE_MAX_CONCURRENCY = int(os.getenv('ANTISPAM_LEAVE_MAX_CONCURRENCY', '2'))
+    # استراحت هر اکانت بین دو سفارش (دقیقه). 0 = خاموش. با مقدار >0 اکانتی که
+    # تازه کارش تمام شده تا پایان استراحت برای سفارش جدید انتخاب نمی‌شود.
+    ANTISPAM_ACCOUNT_REST_MINUTES = float(os.getenv('ANTISPAM_ACCOUNT_REST_MINUTES', '0'))
+
+    # ── خروج به‌تأخیرافتاده از گروه (services/group_leave_scheduler.py) ──
+    # پس از پایان/لغو سفارش، اکانت‌ها از «ویس‌کال» بلافاصله خارج می‌شوند ولی
+    # خروج از خودِ گروه/کانال زمان‌بندی می‌شود؛ اگر کاربر برای همان مقصد دوباره
+    # سفارش بزند خروج‌ها لغو می‌شوند (بدون چرخهٔ leave/rejoin مضر).
+    GROUP_LEAVE_ENABLED = os.getenv('GROUP_LEAVE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # تأخیر خروج از گروه بعد از پایان سفارش (ساعت). پیش‌فرض ۱۶۸ = یک هفته.
+    GROUP_LEAVE_DELAY_HOURS = float(os.getenv('GROUP_LEAVE_DELAY_HOURS', '168'))
+    # فاصلهٔ زمانی بین خروج دو اکانتِ متوالی از یک گروه (ثانیه) — دونه‌به‌دونه و
+    # به‌ترتیب، نه یک‌جا (مشهورترین الگوی ربات برای آنتی‌اسپم).
+    GROUP_LEAVE_INTERVAL_SEC = float(os.getenv('GROUP_LEAVE_INTERVAL_SEC', '60'))
+    # حداکثر تعداد خروج پردازش‌شده در هر اجرای زمان‌بند (job هر ۶۰ ثانیه).
+    GROUP_LEAVE_SWEEP_BATCH = int(os.getenv('GROUP_LEAVE_SWEEP_BATCH', '25'))
+
+    # ── ممنوعیت ثبت سفارش جدید پس از لغو (Cancel Cooldown) ──
+    # کاربری که سفارشش را لغو می‌کند تا این مدت (دقیقه) نمی‌تواند سفارش جدید
+    # ثبت کند. 0 = خاموش. از پنل سوپرادمین قابل تنظیم است.
+    CANCEL_COOLDOWN_MINUTES = int(os.getenv('CANCEL_COOLDOWN_MINUTES', '20'))
 
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).

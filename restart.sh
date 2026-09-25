@@ -1,22 +1,9 @@
-#!/bin/bash
-
-echo "🔧 Setting Google DNS..."
-cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-
-echo "🧹 Cleaning up disk space..."
-# حذف فایل سنگین که باعث پر شدن دیسک شده
-rm -f silence.raw
-# پاکسازی داکر
-docker-compose down --remove-orphans
-docker system prune -a -f
-docker builder prune -f
-
-echo "🏗️ Rebuilding..."
-docker-compose up --build -d
-
-echo "⏳ Waiting 5s..."
-sleep 5
-
-echo "📜 Logs:"
-docker logs -f telegram_bot_container
+#!/usr/bin/env bash
+# Compatibility entry point. Historical versions changed /etc/resolv.conf,
+# ran docker compose down and pruned ALL Docker images before starting the bot.
+# That can terminate paid orders, damage sessions and remove unrelated images.
+# Refuse unattended restart; the guarded updater performs its own preflight.
+set -euo pipefail
+cd "$(dirname "$0")"
+echo "restart.sh now delegates to the guarded existing-server updater. Read docs/deploy-final.fa.md first; it will NOT modify host DNS, run down, or prune Docker." >&2
+exec bash ./deploy-warp.sh "${1:-deploy}"

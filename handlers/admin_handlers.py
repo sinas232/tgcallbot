@@ -4,6 +4,10 @@ handlers/admin_handlers.py
 """
 import asyncio
 import logging
+import hashlib
+import hmac
+import secrets
+import time
 import os
 import json
 import html
@@ -11,7 +15,12 @@ import re
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from database import DatabaseManager
+from database import (CLEANUP_REVIEW_406_HOLD, CONFIRMED_ACCOUNT_DELETED,
+                      CONFIRMED_SESSION_REVOKED, INCIDENT_INACTIVE_RETIRE_COUNT,
+                      DatabaseManager)
+from services.account_recovery import recover_one_account, recovery_message
+from services.cleanup_review import (CleanupScanTooLarge, prepare_cleanup_scan,
+                                     run_cleanup_scan)
 from helpers.message_utils import send_safe
 from constants import *
 from utils.helpers import clean_number, format_jalali_datetime, format_price
@@ -72,7 +81,10 @@ def require_super_admin(func):
         user = await DatabaseManager.get_user(user_id, bot_id=bot_id)
         if user and user.get('admin_role') == 'super_admin':
             return await func(update, context, *args, **kwargs)
-        await update.message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
+        if update.callback_query:
+            await update.callback_query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔️ دسترسی محدود به سوپر ادمین.")
         return AWAITING_SETTINGS_ACTION
     return wrapper
 
@@ -81,7 +93,10 @@ def require_god_admin(func):
         user_id = update.effective_user.id
         if user_id in Config.ADMIN_IDS:
             return await func(update, context, *args, **kwargs)
-        await update.message.reply_text("⛔️ دسترسی محدود به مدیر کل.")
+        if update.callback_query:
+            await update.callback_query.answer("⛔️ دسترسی محدود به مدیر کل.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔️ دسترسی محدود به مدیر کل.")
         return AWAITING_SETTINGS_ACTION
     return wrapper
 
@@ -174,6 +189,7 @@ async def admin_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if is_main_bot and is_god: settings_and_admins.insert(0, "🤖 مدیریت نمایندگی‌ها")
         elif not is_main_bot: settings_and_admins.insert(0, "📅 وضعیت اعتبار ربات")
         menu.insert(3, settings_and_admins)
+        menu.insert(4, ["☠️ حذف اکانت‌های دلیت‌شده"])
         
     role_name = 'مدیر کل' if is_god else ('سوپر ادمین' if is_super else 'ادمین عادی')
     bot_name = f" (نمایندگی {bot_id})" if not is_main_bot else " (اصلی)"
@@ -206,11 +222,15 @@ async def settings_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
             _is_super_maint = False
     if _is_super_maint:
         kb.insert(5, ["🛠 حالت تعمیرات"])
-    
+    # 🛡 پنل ضد اسپم/محافظت اکانت‌ها فقط برای سوپرادمین‌ها نمایش داده می‌شود.
+    if _is_super_maint:
+        kb.insert(6, ["🛡 ضد اسپم و محافظت"])
+
     if update.message:
         text = update.message.text
         if "مدیریت سفارشات" in text: return await admin_orders_menu(update, context)
         if "حالت تعمیرات" in text: return await maintenance_menu(update, context)
+        if "ضد اسپم" in text: return await anti_spam_menu(update, context)
         if "مدیریت سرویس‌ها" in text and is_god and bot_id == 1: return await services_management_menu(update, context)
         if BTN_BACKUP_RESTORE in text and is_god and bot_id == 1: return await backup_restore_menu(update, context)
         if "تنظیمات بررسی سلامت" in text: return await spam_check_settings_menu(update, context)
@@ -259,10 +279,10 @@ async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def _maintenance_text(on):
     status = "🔴 فعال — فقط سوپرادمین" if on else "🟢 غیرفعال — ربات عادی"
     return (
-        "🛠 **حالت تعمیرات (Maintenance)**\\n\\n"
-        f"وضعیت فعلی: {status}\\n\\n"
+        "🛠 **حالت تعمیرات (Maintenance)**\n\n"
+        f"وضعیت فعلی: {status}\n\n"
         "وقتی فعال باشد، هیچ کاربری (حتی ادمین عادی) نمی‌تواند با ربات "
-        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\\n"
+        "کار کند یا سفارش بزند؛ فقط سوپرادمین بدون محدودیت کار می‌کند.\n"
         "برای آپدیت امن: اول فعال کنید، آپدیت کنید، بعد خاموش کنید."
     )
 
@@ -276,15 +296,18 @@ def _maintenance_kb(on):
 @require_super_admin
 async def maintenance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """منوی حالت تعمیرات — فقط سوپرادمین."""
-    bot_id = context.bot_data.get('bot_id', 1)
     try:
         on = context.bot_data.get('maintenance_mode')
         if on is None:
-            on = (await asyncio.wait_for(DatabaseManager.get_setting(
-                "maintenance_mode", "0", bot_id=bot_id), timeout=10)) == "1"
+            # All bot apps use bot_id=1 as the canonical, global flag.
+            # get_setting() swallows DB errors and returns the OFF default;
+            # the strict read is required whenever the cache is absent.
+            on = await asyncio.wait_for(
+                DatabaseManager.global_maintenance_enabled_strict(), timeout=10)
             context.bot_data['maintenance_mode'] = on
     except Exception:
-        on = False
+        on = True  # unknown DB/cache state must never look safely OFF
+        context.bot_data['maintenance_mode'] = True
     await send_safe(context.bot, update.effective_chat.id, _maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     return AWAITING_SETTINGS_ACTION
 
@@ -308,36 +331,27 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
             pass
         return AWAITING_SETTINGS_ACTION
     on = (query.data == "maint_on")
+    from services.bot_manager import bot_manager as _bm
     try:
-        await asyncio.wait_for(DatabaseManager.set_setting(
-            "maintenance_mode", "1" if on else "0", bot_id=bot_id), timeout=15)
+        # Coordinate with publication of a newly initialized reseller app.
+        # Both the canonical DB write and the in-process cache update belong
+        # to the same critical section. The DB admission lock separately
+        # serializes paid orders, even across processes.
+        async with _bm.maintenance_lock:
+            await asyncio.wait_for(DatabaseManager.set_setting(
+                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
+            for _bid, _app in list(_bm.active_bots.items()):
+                try:
+                    _app.bot_data['maintenance_mode'] = on
+                except Exception:
+                    logger.exception('Bot %s: maintenance cache update failed', _bid)
+            context.bot_data['maintenance_mode'] = on
     except Exception:
         try:
             await query.answer("\u274c \u062e\u0637\u0627 \u062f\u0631 \u0630\u062e\u06cc\u0631\u0647 \u062a\u0646\u0638\u06cc\u0645 (\u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a).", show_alert=True)
         except Exception:
             pass
         return AWAITING_SETTINGS_ACTION
-    # 🌍 حالت تعمیرات «سراسری» است: اگر فقط bot_data همین اپ به‌روز شود،
-    # ربات‌های نمایندگی (اپ‌های جدا با bot_data جدا) همچنان باز می‌مانند و
-    # کاربرانشان می‌توانند سفارش بزنند (باگ گزارش‌شده). راه‌حل:
-    # ۱) تنظیم اصلی در bot_id=1 ذخیره می‌شود (مرجع لودِ استارت‌آپ همهٔ اپ‌ها)
-    # ۲) پرچم همهٔ اپ‌های فعال همین حالا فلیپ می‌شود
-    if bot_id != 1:
-        try:
-            await asyncio.wait_for(DatabaseManager.set_setting(
-                "maintenance_mode", "1" if on else "0", bot_id=1), timeout=15)
-        except Exception:
-            pass
-    try:
-        from services.bot_manager import bot_manager as _bm
-        for _bid, _app in list(_bm.active_bots.items()):
-            try:
-                _app.bot_data['maintenance_mode'] = on
-            except Exception:
-                pass
-    except Exception:
-        pass
-    context.bot_data['maintenance_mode'] = on
     try:
         await query.answer("✅ حالت تعمیرات فعال شد." if on else "✅ ربات به حالت عادی برگشت.")
     except Exception:
@@ -346,6 +360,885 @@ async def maintenance_toggle_callback(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text(_maintenance_text(on), reply_markup=_maintenance_kb(on), parse_mode='Markdown')
     except Exception:
         pass
+    return AWAITING_SETTINGS_ACTION
+
+
+def _deletion_review_candidate(account: dict) -> bool:
+    """An uncertain row may be reviewed, but may NEVER be deleted by status."""
+    status = account.get('account_status')
+    marker = account.get('spam_check_result')
+    return ((status == 'inactive' and marker not in
+             (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED)) or
+            (status == 'active' and account.get('spam_status') == 'cooldown' and
+             str(marker or '').startswith('AUTH_KEY_DUPLICATED:')))
+
+
+def _masked_account_phone(phone: object) -> str:
+    """Only a small, non-identifying hint on an inline button."""
+    digits = ''.join(c for c in str(phone or '') if c.isdigit())
+    return '•••' + digits[-4:] if digits else 'بدون شماره'
+
+
+# Ephemeral main-process state: never pickle PTB Tasks or session ciphertext.
+# A restart stops the scan; completed proof markers stay in the DB, but no
+# task resumes itself and no row is ever deleted by the worker.
+_cleanup_scan_jobs: dict[int, dict] = {}
+# Claim the start BEFORE the first preflight await. Two admins (even across
+# reseller bots in this process) must not each pass the running-job check
+# while the other's DB/alias snapshot is pending and launch two workers.
+_cleanup_scan_starting: set[int] = set()
+
+
+def _cleanup_scan_running(job: dict | None) -> bool:
+    return bool(job and not job.get('finished') and
+                (job.get('task') is None or not job['task'].done()))
+
+
+_CLEANUP_SCAN_STOP_LABELS = {
+    'cancelled': 'بررسی با درخواست توقف/خاموشی لغو شد؛ ممکن است همهٔ سشن‌ها بررسی نشده باشند.',
+    'maintenance': 'حالت تعمیرات خاموش شد.',
+    'busy': 'سفارش فعال/نزدیک آغاز شد.',
+    'too_many': 'فهرست/سشن‌ها تغییر کرده یا از سقف ایمن بیشتر شدند.',
+    'unavailable': 'خطای غیرمنتظره در پیش‌شرط یا پروب؛ جزئیات نوع خطا در لاگ خصوصی است.',
+    'unsafe_probe': '۴۰۶ یا قطع نامطمئن رخ داد؛ بررسی را از اول تکرار نکنید. اگر ۴۰۶ تایپ‌شده باشد، کلید همان سشن باطل است. برای ردیف نشان‌دار می‌توانید ورود تازه کنید یا با تأیید جداگانه کلید ذخیره‌شده را حذف کنید؛ تا بررسی علت، بقیه را پروب نکنید.',
+    'held_406': 'حادثهٔ ۴۰۶ هنوز قفل است؛ حتی پس از حذف ردیف‌های نشان‌دار، برای حفظ کلیدهای نامعلوم هیچ کلید دیگری پروب نشد.',
+    'repeated_uncertain': 'سه نتیجهٔ نامطمئنِ یکسان پیاپی؛ ابتدا علت مشترک را بررسی کنید.',
+}
+
+_CLEANUP_SCAN_REASON_LABELS = {
+    'changed_before_probe': 'ردشده پیش از اتصال (تغییر ردیف/کلید)',
+    'changed_during_probe': 'تغییر ردیف حین بررسی',
+    'not_found': 'ردیف یافت نشد',
+    'not_inactive': 'دیگر غیرفعال نیست',
+    'conflict_cooldown': 'مهلت ایمنی ۴۰۶',
+    'shared': 'کلید مشترک/قفل‌شده',
+    'busy': 'سشن مشغول/قفل‌شده',
+    'duplicated_in_use': 'تداخل ۴۰۶ (پاسخ تایپ‌شده: کلید باطل)',
+    'relogin_required': 'احراز هویت مبهم/بن (نیاز به بررسی ورود)',
+    'timeout': 'مهلت اتصال تمام شد',
+    'disconnect_unconfirmed': 'قطع اتصال نامطمئن',
+    'incident_hold': 'توقف به‌علت قفل ذخیره‌شدهٔ حادثهٔ ۴۰۶',
+    'error': 'خطای دیگر (نوع در لاگ خصوصی)',
+    'other': 'علت دیگر',
+}
+
+
+def _cleanup_scan_progress(job: dict) -> str:
+    done, total, deleted, revoked, active, uncertain = job['progress']
+    reason_counts = job.get('reasons') or ()
+    summary = ('\nعلت نامطمئن‌ها: ' + ' • '.join(
+        f'{_CLEANUP_SCAN_REASON_LABELS.get(code, "علت دیگر")}: {count}'
+        for code, count in reason_counts) if reason_counts else '')
+    return (f'🧪 بررسی مرحله‌ای: {done}/{total}\n'
+            f'حساب واقعاً دلیت‌شده: {deleted} • سشن باطل/منقضی‌شده: {revoked}\n'
+            f'سشن سالم و دوباره فعال‌شده: {active} • نامطمئن/عوض‌شده: {uncertain}'
+            + summary + '\nهیچ ردیفی در مرحلهٔ بررسی حذف نمی‌شود.')
+
+
+async def _run_cleanup_review_job(bot, chat_id: int, bot_id: int, job: dict,
+                                  approved: tuple[tuple[int, str], ...]) -> None:
+    async def notify(checked, total, deleted, revoked, active, uncertain, reasons):
+        job['progress'] = (checked, total, deleted, revoked, active, uncertain)
+        job['reasons'] = reasons
+        try:
+            await send_safe(bot, chat_id, _cleanup_scan_progress(job), parse_mode=None)
+        except Exception as exc:
+            logger.warning('Cleanup progress message failed: %s', type(exc).__name__)
+
+    try:
+        result = await run_cleanup_scan(bot_id, approved, notify)
+        job['progress'] = (result.checked, result.total, result.deleted_accounts,
+                           result.revoked_sessions, result.reactivated, result.uncertain)
+        job['reasons'] = result.reasons
+        job['stop_reason'] = result.stop_reason
+        if result.stop_reason:
+            why = _CLEANUP_SCAN_STOP_LABELS.get(result.stop_reason,
+                                                'پیش‌شرط ایمنی برقرار نبود.')
+            text = '⛔️ بررسی نیمه‌تمام متوقف شد: ' + why + '\n' + _cleanup_scan_progress(job)
+        elif not (result.deleted_accounts or result.revoked_sessions or result.reactivated):
+            text = ('⚠️ بررسی پایان یافت، اما شاهد قابل حذف یا احیا به‌دست نیامد. '
+                    '«نامطمئن» به معنی دلیت‌شدن حساب نیست؛ با گزارش دلیل‌ها و '
+                    'لاگ خصوصی علت را بررسی کنید، ۲۵ پروب را کورکورانه تکرار نکنید.\n'
+                    + _cleanup_scan_progress(job))
+        else:
+            text = ('✅ بررسی مرحله‌ای پایان یافت.\n' + _cleanup_scan_progress(job) +
+                    '\nحالا فهرست دقیق موارد تأییدشده را ببینید و جداگانه حذف را تأیید کنید.')
+    except asyncio.CancelledError:
+        text = ('🛑 بررسی مرحله‌ای لغو شد؛ حساب‌های بررسی‌شده خودکار حذف نشدند. '
+                'نشانگرهای تأییدشدهٔ قبلی برای پیش‌نمایش باقی‌اند.')
+        job['stop_reason'] = 'cancelled'
+        job['finished'] = True
+        try:
+            await send_safe(bot, chat_id, text, parse_mode=None)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        logger.warning('Cleanup review stopped: %s', type(exc).__name__)
+        job['stop_reason'] = 'unavailable'
+        text = ('⛔️ بررسی مرحله‌ای به‌علت خطا متوقف شد؛ هیچ حذف خودکاری رخ نداد. '
+                'وضعیت را بررسی کنید.')
+    job['finished'] = True
+    try:
+        await send_safe(bot, chat_id, text, parse_mode=None,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton('🗑 پیش‌نمایش حذف همهٔ تأییدشده‌ها',
+                                                  callback_data='deleted_cleanup_preview_all')],
+                            [InlineKeyboardButton('🔙 منوی حذف',
+                                                  callback_data='deleted_cleanup_menu')],
+                        ]))
+    except Exception as exc:
+        logger.warning('Cleanup result message failed: %s', type(exc).__name__)
+
+
+@require_super_admin
+async def deleted_account_cleanup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Superadmin menu: verified deletion OR explicit stored-key retirement.
+
+    Opening/listing/previews never connect to Telegram. Verification requires
+    a separate opt-in; the incident retirement is instead the owner's explicit
+    decision to discard the exact 22 unknown inactive keys WITHOUT testing
+    them. Neither action removes the underlying Telegram accounts. Both have
+    independent previews/nonces and transaction-level rechecks.
+    """
+    query = update.callback_query
+    data = query.data if query else 'deleted_cleanup_menu'
+    bot_id = int(context.bot_data.get('bot_id', 1))
+    if query:
+        await safe_answer(query)
+
+    async def display(text, buttons=None):
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        if query:
+            try:
+                await query.edit_message_text(text, reply_markup=markup, parse_mode=None)
+            except Exception as exc:
+                # Refresh is useful even when DB counts did not change. PTB
+                # receives a BadRequest on editing with identical text/markup.
+                if type(exc).__name__ == 'BadRequest' and 'not modified' in str(exc).lower():
+                    return
+                logger.warning('Deleted-account menu edit failed: %s', type(exc).__name__)
+                await send_safe(context.bot, update.effective_chat.id, text,
+                                reply_markup=markup, parse_mode=None)
+        else:
+            await send_safe(context.bot, update.effective_chat.id, text,
+                            reply_markup=markup, parse_mode=None)
+
+    back = [[InlineKeyboardButton('🔙 منوی حذف', callback_data='deleted_cleanup_menu')]]
+    # Any navigation away from the batch preview invalidates its old button.
+    # The actual running job is process-local and is not affected by menus.
+    if data != 'deleted_cleanup_scan_start' and not data.startswith('deleted_cleanup_scan_confirm_'):
+        context.user_data.pop('deleted_cleanup_scan', None)
+    if not (data == 'deleted_cleanup_retire406' or
+            data.startswith('deleted_cleanup_retire406_')):
+        context.user_data.pop('deleted_cleanup_retire406', None)
+    if not (data == 'deleted_cleanup_retire22' or
+            data.startswith('deleted_cleanup_retire22_confirm_')):
+        context.user_data.pop('deleted_cleanup_retire22', None)
+
+    if data in ('deleted_cleanup_scan_status', 'deleted_cleanup_scan_stop'):
+        job = _cleanup_scan_jobs.get(bot_id)
+        running = _cleanup_scan_running(job)
+        if data == 'deleted_cleanup_scan_stop' and running:
+            if (job['user_id'] != update.effective_user.id or
+                    job['chat_id'] != update.effective_chat.id):
+                await display('⛔️ فقط آغازکنندهٔ همین بررسی می‌تواند آن را متوقف کند.', back)
+                return AWAITING_SETTINGS_ACTION
+            job['task'].cancel()  # close_pyrogram_client still awaits disconnect
+            await display('🛑 توقف بررسی درخواست شد. پایان اتصال در جریان را صبر کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        if not job:
+            await display('ℹ️ بررسی گروهی فعالی وجود ندارد.', back)
+            return AWAITING_SETTINGS_ACTION
+        buttons = ([
+            [InlineKeyboardButton('♻️ وضعیت بررسی', callback_data='deleted_cleanup_scan_status')],
+            [InlineKeyboardButton('🛑 توقف بررسی', callback_data='deleted_cleanup_scan_stop')],
+        ] if running else [
+            [InlineKeyboardButton('🗑 پیش‌نمایش حذف همهٔ تأییدشده‌ها',
+                                  callback_data='deleted_cleanup_preview_all')],
+        ]) + back
+        status = _cleanup_scan_progress(job)
+        if not running and job.get('stop_reason'):
+            status = ('⛔️ بررسی نیمه‌تمام متوقف شد: '
+                      + _CLEANUP_SCAN_STOP_LABELS.get(job['stop_reason'],
+                                                      'علت توقف را در لاگ بررسی کنید.')
+                      + '\n' + status)
+        elif not running:
+            status = '✅ بررسی پایان یافته است.\n' + status
+        await display(status, buttons)
+        return AWAITING_SETTINGS_ACTION
+
+    if data == 'deleted_cleanup_scan_start':
+        context.user_data.pop('deleted_cleanup_probe', None)
+        context.user_data.pop('deleted_cleanup_preview', None)
+        context.user_data.pop('deleted_cleanup_scan', None)
+        job = _cleanup_scan_jobs.get(bot_id)
+        if _cleanup_scan_running(job):
+            await display('⏳ یک بررسی مرحله‌ای هم‌اکنون در جریان است.\n'
+                          + _cleanup_scan_progress(job), [
+                              [InlineKeyboardButton('♻️ وضعیت بررسی',
+                                                    callback_data='deleted_cleanup_scan_status')],
+                              *back])
+            return AWAITING_SETTINGS_ACTION
+        try:
+            plan = await prepare_cleanup_scan(bot_id)
+        except CleanupScanTooLarge:
+            await display('⛔️ تعداد اکانت‌ها برای بررسی محدود و امن بیش از حد است؛ '
+                          'هیچ اتصالی باز نشد. از انتخاب تک‌اکانتی استفاده کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        except Exception as exc:
+            logger.warning('Cleanup scan plan failed: %s', type(exc).__name__)
+            await display('⛔️ فهرست امن اکانت‌ها قابل تهیه نیست؛ هیچ اتصال یا حذفی انجام نشد.',
+                          back)
+            return AWAITING_SETTINGS_ACTION
+        summary = (f'نامزدهای inactive: {plan.uncertain_total} • قابل بررسی پس از رفع خطر: '
+                   f'{len(plan.candidates)}\nکلید مشترک: {plan.skipped_shared} • '
+                   f'سشن ناخوانا: {plan.skipped_unreadable} • '
+                   f'نشانگرهای ۴۰۶: {plan.skipped_cooldown} • '
+                   f'قرنطینهٔ ثبت‌شدهٔ بررسی زنده: {len(plan.pending_406_ids)}')
+        if plan.pending_406_ids or plan.incident_blocked:
+            held = '، '.join(str(aid) for aid in plan.pending_406_ids[:8])
+            extra = ' و موارد دیگر' if len(plan.pending_406_ids) > 8 else ''
+            options = []
+            if plan.pending_406_ids:
+                options.append([InlineKeyboardButton('🗑 حذف سشن‌های ۴۰۶ِ قرنطینه‌شده',
+                    callback_data='deleted_cleanup_retire406')])
+            if (bot_id == 1 and plan.incident_blocked and not plan.pending_406_ids
+                    and plan.uncertain_total == INCIDENT_INACTIVE_RETIRE_COUNT):
+                options.append([InlineKeyboardButton('🗑 حذف آگاهانهٔ همهٔ ۲۲ inactive (بدون پروب)',
+                    callback_data='deleted_cleanup_retire22')])
+            options.append([InlineKeyboardButton('🗑 پیش‌نمایش فقط موارد تأییدشده',
+                callback_data='deleted_cleanup_preview_all')])
+            await display(
+                '⛔️ بررسی گروهی قفل است؛ هیچ اتصال یا حذفی انجام نشد. '
+                'تکرار پروب ممکن است کلید بعدی را هم باطل کند. '
+                + ('سشن‌های نشان‌دار ۴۰۶ را می‌توان جداگانه با رضایت حذف کرد. '
+                   if plan.pending_406_ids else
+                   'نشانگر ۴۰۶ باقی نمانده اما قفل حادثه باقی است. اگر می‌خواهید '
+                   'از دقیقاً ۲۲ کلید ناشناختهٔ inactive صرف‌نظر کنید، '
+                   'مسیر حذف آگاهانهٔ جداگانه را با پیش‌نمایش انتخاب کنید؛ '
+                   'ممکن است سشن‌ها هنوز معتبر باشند. ')
+                + 'هیچ‌یک حذف حساب تلگرام یا رفع علت ۴۰۶ نیست و قفل باز نمی‌شود.\n\n'
+                + summary + '\nشناسه‌های نشان‌دار: ' + (held + extra if held else 'ندارد'),
+                [*options, *back])
+            return AWAITING_SETTINGS_ACTION
+        if not plan.candidates:
+            await display('📭 هیچ سشن غیرفعالِ یکتای قابل بررسی وجود ندارد.\n'
+                          + summary + '\nحساب‌های تأییدشده را جداگانه پیش‌نمایش کنید.', [
+                              [InlineKeyboardButton('🗑 پیش‌نمایش حذف همهٔ تأییدشده‌ها',
+                                                    callback_data='deleted_cleanup_preview_all')],
+                              *back])
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_scan'] = {
+            'nonce': nonce, 'expires': time.time() + 300,
+            'bot_id': bot_id, 'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id,
+            'candidates': plan.candidates,
+        }
+        await display('⚠️ بررسی مرحله‌ای سشن‌های غیرفعال (بدون حذف)\n'
+                      + summary + '\n\nهر حساب یکتا جداگانه و به‌ترتیب در همین پردازه '
+                      'به تلگرام وصل و قطع می‌شود. سشن سالم فعال می‌ماند؛ '
+                      'فقط USER_DEACTIVATED یا ابطال/انقضای تایپ‌شدهٔ ۴۰۱ '
+                      'با قطع اتصال تأییدشده برای حذف آماده می‌شود. '
+                      '۴۰۶، بن، خطای مبهم و timeout حذف نمی‌شوند.\n'
+                      'قبل از شروع، تعمیرات سراسری، نبود سفارش/مصرف‌کنندهٔ دیگر '
+                      'و بکاپ خصوصی معتبر را تأیید کنید. بررسی ممکن است چند دقیقه طول بکشد؛ '
+                      'حذف نیازمند پیش‌نمایش و تأیید جداگانه است.', [
+                          [InlineKeyboardButton('✅ شروع بررسی مرحله‌ای همین فهرست',
+                                                callback_data=f'deleted_cleanup_scan_confirm_{nonce}')],
+                          [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+                      ])
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_scan_confirm_'):
+        pending = context.user_data.pop('deleted_cleanup_scan', None)
+        if (not pending or pending.get('nonce') != data.removeprefix('deleted_cleanup_scan_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید بررسی گروهی منقضی/نامعتبر است؛ دوباره پیش‌نمایش بگیرید.',
+                          back)
+            return AWAITING_SETTINGS_ACTION
+        if (_cleanup_scan_starting or
+                any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values())):
+            await display('⛔️ بررسی مرحله‌ای دیگری در همین پردازه فعال است؛ '
+                          'اتصال موازی به سشن‌ها باز نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        _cleanup_scan_starting.add(bot_id)
+        try:
+            try:
+                allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
+                current = await prepare_cleanup_scan(bot_id) if allowed else None
+            except Exception as exc:
+                logger.warning('Cleanup scan preflight failed: %s', type(exc).__name__)
+                allowed, reason, current = False, 'unavailable', None
+            if current and (current.pending_406_ids or current.incident_blocked):
+                await display('⛔️ ۴۰۶ِ قرنطینه‌شده یا قفل حادثه ثبت شده است؛ '
+                              'تأیید قدیمی اجازهٔ پروب بقیهٔ کلیدها را نمی‌دهد. '
+                              'اگر سشن قدیمی را نمی‌خواهید از منوی حذف ۴۰۶ِ '
+                              'قرنطینه‌شده استفاده کنید، نه بررسی گروهی.', back)
+                return AWAITING_SETTINGS_ACTION
+            if not allowed or not current or current.candidates != pending['candidates']:
+                await display('⛔️ تعمیرات/سفارش/فهرست سشن‌ها تغییر کرده است؛ '
+                              'هیچ اتصالی باز نشد. دوباره پیش‌نمایش بگیرید. '
+                              f'({reason if not allowed else "changed"})', back)
+                return AWAITING_SETTINGS_ACTION
+            job = {'user_id': update.effective_user.id, 'chat_id': update.effective_chat.id,
+                   'finished': False, 'progress': (0, len(current.candidates), 0, 0, 0, 0),
+                   'reasons': (), 'task': None}
+            _cleanup_scan_jobs[bot_id] = job
+            worker = _run_cleanup_review_job(context.bot, update.effective_chat.id,
+                                             bot_id, job, current.candidates)
+            try:
+                job['task'] = context.application.create_task(worker)
+            except Exception as exc:
+                worker.close()
+                job['finished'] = True
+                logger.warning('Cleanup scan could not start: %s', type(exc).__name__)
+                await display('⛔️ اجرای بررسی گروهی ممکن نشد؛ هیچ اتصالی باز نشد.', back)
+                return AWAITING_SETTINGS_ACTION
+        finally:
+            _cleanup_scan_starting.discard(bot_id)
+        await display('🧪 بررسی مرحله‌ای آغاز شد. هیچ حسابی خودکار حذف نمی‌شود.\n'
+                      + _cleanup_scan_progress(job), [
+                          [InlineKeyboardButton('♻️ وضعیت بررسی',
+                                                callback_data='deleted_cleanup_scan_status')],
+                          [InlineKeyboardButton('🛑 توقف بررسی',
+                                                callback_data='deleted_cleanup_scan_stop')],
+                          *back])
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_probe_'):
+        # Pop BEFORE awaiting anything: this exact preview can start at most
+        # one Telegram connection. A stale/cross-bot/cross-chat callback is a
+        # no-op, and no ciphertext is persisted in PTB user_data.
+        pending = context.user_data.pop('deleted_cleanup_probe', None)
+        if (not pending or pending.get('nonce') != data.removeprefix('deleted_cleanup_probe_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید بررسی منقضی یا نامعتبر است؛ دوباره یک حساب را انتخاب کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        aid = pending['account_id']
+        try:
+            allowed, reason = await DatabaseManager.deletion_review_probe_allowed(bot_id)
+        except Exception as exc:
+            logger.warning('Deletion review preflight failed: %s', type(exc).__name__)
+            allowed, reason = False, 'unavailable'
+        if not allowed:
+            why = {
+                'maintenance': 'برای بررسی تک‌اکانتی، تعمیرات سراسری را از منو روشن کنید.',
+                'busy': 'سفارش فعال/در صف یا سررسید نزدیک وجود دارد؛ صبر کنید.',
+                'unavailable': 'امکان تأیید امن وضعیت سفارش/تعمیرات نیست.',
+            }.get(reason, 'پیش‌شرط بررسی فراهم نیست.')
+            await display('⛔️ هیچ اتصال یا حذفی انجام نشد. ' + why, back)
+            return AWAITING_SETTINGS_ACTION
+        acc = await DatabaseManager.get_account_by_id(aid)
+        if (not acc or int(acc.get('bot_id') or 0) != bot_id
+                or not _deletion_review_candidate(acc)
+                or not isinstance(acc.get('session_string'), str)
+                or not hmac.compare_digest(
+                    hashlib.sha256(acc['session_string'].encode('utf-8')).hexdigest(),
+                    pending['fingerprint'])):
+            await display('⚠️ حساب یا سشن آن از زمان انتخاب تغییر کرده؛ هیچ بررسی‌ای انجام نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            if await DatabaseManager.cleanup_406_incident_blocked(bot_id):
+                await display(recovery_message('incident_hold'), back)
+                return AWAITING_SETTINGS_ACTION
+        except Exception as exc:
+            logger.warning('Single review incident guard unavailable: %s', type(exc).__name__)
+            await display('⛔️ وضعیت حادثه قابل تأیید نیست؛ سشن باز نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        await display(f'⏳ بررسی و قطع اتصال امن فقط حساب #{aid} در جریان است...')
+        try:
+            _, verdict = await recover_one_account(
+                aid, bot_id, expected_session_fingerprint=pending['fingerprint'])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning('Deletion review failed for account %s: %s', aid, type(exc).__name__)
+            verdict = 'error'
+        buttons = (
+            [[InlineKeyboardButton(f'🧾 پیش‌نمایش حذف فقط حساب #{aid}',
+                                   callback_data=f'deleted_cleanup_preview_{aid}')]]
+            if verdict in ('account_deleted', 'session_revoked') else []
+        ) + [
+            [InlineKeyboardButton('📋 انتخاب حساب دیگر', callback_data='deleted_cleanup_list_1')],
+            [InlineKeyboardButton('🔙 منوی حذف', callback_data='deleted_cleanup_menu')],
+        ]
+        await display(recovery_message(verdict), buttons)
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_check_'):
+        aid = int(data.removeprefix('deleted_cleanup_check_'))
+        context.user_data.pop('deleted_cleanup_probe', None)
+        context.user_data.pop('deleted_cleanup_preview', None)
+        acc = await DatabaseManager.get_account_by_id(aid)
+        if not acc or int(acc.get('bot_id') or 0) != bot_id:
+            await display('❌ حساب مربوط به این ربات یافت نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (acc.get('account_status') == 'inactive' and
+                acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+            await display(recovery_message('duplicate_key_relogin_required'), [
+                [InlineKeyboardButton(f'🗑 پیش‌نمایش حذف سشن #{aid} بدون اتصال',
+                                      callback_data=f'deleted_cleanup_retire406_{aid}')], *back])
+            return AWAITING_SETTINGS_ACTION
+        if (acc.get('account_status') == 'inactive' and
+                acc.get('spam_check_result') in
+                    (CONFIRMED_ACCOUNT_DELETED, CONFIRMED_SESSION_REVOKED)):
+            await display('☠️ این حساب/سشن قبلاً با پاسخ صریح تلگرام تأیید شده است.', [
+                [InlineKeyboardButton(f'🧾 پیش‌نمایش حذف فقط حساب #{aid}',
+                                      callback_data=f'deleted_cleanup_preview_{aid}')], *back])
+            return AWAITING_SETTINGS_ACTION
+        if not _deletion_review_candidate(acc) or not isinstance(acc.get('session_string'), str):
+            await display('ℹ️ این حساب دیگر نامزد بررسی نیست؛ سشن دست‌نخورده ماند.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            if await DatabaseManager.cleanup_406_incident_blocked(bot_id):
+                await display(recovery_message('incident_hold'), back)
+                return AWAITING_SETTINGS_ACTION
+        except Exception as exc:
+            logger.warning('Single review incident guard unavailable: %s', type(exc).__name__)
+            await display('⛔️ وضعیت حادثه از دیتابیس قابل تأیید نیست؛ '
+                          'هیچ اتصال یا حذفی انجام نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_probe'] = {
+            'nonce': nonce, 'expires': time.time() + 300, 'bot_id': bot_id,
+            'user_id': update.effective_user.id, 'chat_id': update.effective_chat.id,
+            'account_id': aid,
+            'fingerprint': hashlib.sha256(acc['session_string'].encode('utf-8')).hexdigest(),
+        }
+        await display(
+            f'🧪 بررسی زندهٔ فقط حساب #{aid} ({_masked_account_phone(acc.get("phone_number"))})\n\n'
+            'این دکمه فقط یک‌بار یک اتصال کوتاه در همین پردازه باز می‌کند. '
+            'اگر سشن معتبر باشد، پس از قطع قطعی اتصال همین حساب به فعال برمی‌گردد؛ '
+            'اگر تلگرام USER_DEACTIVATED یا ابطال/انقضای تایپ‌شدهٔ همین کلید را '
+            'اعلام کند، تازه در فهرست حذف قرار می‌گیرد.\n'
+            '۴۰۶، SESSION_REVOKED تاریخی، ۴۰۱ نامشخص یا timeout اجازهٔ حذف نمی‌دهند. '
+            'قبل از تأیید مطمئن شوید همین کلید در برنامه یا سرور دیگری وصل نیست. '
+            'تأیید پنج دقیقه معتبر است.', [
+                [InlineKeyboardButton('✅ بررسی زنده فقط همین حساب',
+                                      callback_data=f'deleted_cleanup_probe_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_list_'):
+        context.user_data.pop('deleted_cleanup_probe', None)
+        page = int(data.removeprefix('deleted_cleanup_list_'))
+        accounts, total = await DatabaseManager.get_deletion_review_page(bot_id, page=page)
+        if not accounts:
+            text = ('📭 حسابی نیازمند بررسی تک‌اکانتی نیست.' if total == 0
+                    else 'فهرست تغییر کرده؛ از صفحهٔ اول دوباره شروع کنید.')
+            await display(text, [
+                [InlineKeyboardButton('♻️ صفحهٔ اول', callback_data='deleted_cleanup_list_1')],
+                *back,
+            ])
+            return AWAITING_SETTINGS_ACTION
+        rows = [[InlineKeyboardButton(
+            f'🧪 حساب #{acc["id"]} • {_masked_account_phone(acc.get("phone_number"))}',
+            callback_data=f'deleted_cleanup_check_{acc["id"]}',
+        )] for acc in accounts]
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton('⬅️ قبلی', callback_data=f'deleted_cleanup_list_{page-1}'))
+        if page * 8 < total:
+            nav.append(InlineKeyboardButton('بعدی ➡️', callback_data=f'deleted_cleanup_list_{page+1}'))
+        if nav:
+            rows.append(nav)
+        rows.extend(back)
+        await display(
+            f'📋 حساب‌های نیازمند بررسی دستی | ربات {bot_id}\n'
+            f'کل: {total} • صفحهٔ {page}/{(total + 7) // 8}\n\n'
+            'هر دکمه فقط کارت انتخاب همان حساب را باز می‌کند؛ '
+            'اتصال به تلگرام یا حذف، خودکار و انبوه انجام نمی‌شود.', rows)
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_retire22_confirm_'):
+        # Pop before the first await, even for a wrong nonce: old inline
+        # messages, concurrent taps and a different chat cannot replay it.
+        pending = context.user_data.pop('deleted_cleanup_retire22', None)
+        if (not pending or
+                pending.get('nonce') != data.removeprefix('deleted_cleanup_retire22_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id or bot_id != 1
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید حذف ۲۲ سشن غیرفعال نامعتبر یا منقضی است؛ '
+                          'دوباره پیش‌نمایش بگیرید. هیچ ردیفی حذف نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (_cleanup_scan_starting or
+                any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values())):
+            await display('⛔️ بررسی زندهٔ سشن هنوز در جریان است؛ '
+                          'تا پایان قطعی آن هیچ ردیفی حذف نمی‌شود.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            deleted, result = await DatabaseManager.retire_incident_inactive_accounts(
+                bot_id, pending['fingerprints'])
+        except Exception as exc:
+            logger.warning('Incident unknown-key retirement failed (bot=%s): %s',
+                           bot_id, type(exc).__name__)
+            await display('❌ خطای دیتابیس؛ حذف تأیید نشد. وضعیت را بررسی کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        if result == 'deleted' and deleted == INCIDENT_INACTIVE_RETIRE_COUNT:
+            logger.warning('Superadmin %s discarded %s unknown inactive stored keys from bot %s; IDs=%s',
+                           update.effective_user.id, deleted, bot_id,
+                           sorted(pending['fingerprints']))
+            await display(f'✅ دقیقاً {deleted} ردیف inactive و کلید ذخیره‌شدهٔ '
+                          'آنها از ربات اصلی/DB حذف شد؛ این بررسی اعتبار سشن '
+                          'یا حذف حساب‌های تلگرام نبود. activeها، ربات‌های '
+                          'نمایندگی و سوابق مالی/سفارش باقی‌اند. خروج‌های '
+                          'تأخیری این ردیف‌ها لغو شد. قفل حادثه همچنان فعال است.', back)
+        elif result == 'deleted':
+            # DB promises all-or-nothing; never report a partial success as
+            # success. Keep maintenance on and inspect/restore the DB backup.
+            logger.error('Unexpected partial incident retirement: %s', deleted)
+            await display('⚠️ نتیجهٔ حذف غیرمنتظره است؛ تعمیرات را روشن نگه '
+                          'دارید و وضعیت دیتابیس/بکاپ را بررسی کنید.', back)
+        else:
+            reason = {
+                'maintenance': 'تعمیرات سراسری باید روشن باشد.',
+                'busy': 'سفارش فعال، در صف یا نزدیک وجود دارد.',
+                'payments': 'پرداخت pending تازه/با زمان نامعلوم وجود دارد.',
+                'incident': 'قفل حادثه ثبت نیست یا نشانگر تازهٔ ۴۰۶ دیده شد.',
+                'changed': 'تعداد/شناسه/محتوای ردیف‌ها پس از پیش‌نمایش تغییر کرده است.',
+            }.get(result, 'پیش‌شرط حذف برقرار نیست.')
+            await display('⛔️ هیچ ردیفی حذف نشد. ' + reason +
+                          ' برای تأیید دوباره از ابتدا پیش‌نمایش بگیرید.', back)
+        return AWAITING_SETTINGS_ACTION
+
+    if data == 'deleted_cleanup_retire22':
+        # The owner's decision was for ONE snapshot of EXACTLY 22 unknown
+        # inactive keys on bot 1. It is not a generic delete-all button.
+        if bot_id != 1:
+            await display('⛔️ این تصمیم فقط برای ۲۲ ردیف ربات اصلی است.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (_cleanup_scan_starting or
+                any(_cleanup_scan_running(job) for job in _cleanup_scan_jobs.values())):
+            await display('⛔️ بررسی سشن هنوز در جریان است؛ پیش‌نمایش حذف متوقف شد.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            blocked = await DatabaseManager.cleanup_406_incident_blocked(bot_id)
+            held = await DatabaseManager.get_held_cleanup_406_accounts(bot_id)
+            snapshot = (await DatabaseManager.get_incident_inactive_snapshot(bot_id)
+                        if blocked and not held else [])
+        except Exception as exc:
+            logger.warning('Incident inactive preview failed: %s', type(exc).__name__)
+            await display('⛔️ خواندن امن پیش‌نمایش ممکن نشد؛ هیچ حذفی انجام نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        if not blocked or held or len(snapshot) != INCIDENT_INACTIVE_RETIRE_COUNT or len({
+                row['id'] for row in snapshot}) != INCIDENT_INACTIVE_RETIRE_COUNT:
+            await display('⛔️ این مسیر فقط برای دقیقاً ۲۲ ردیف inactive نامعلومِ '
+                          'ربات اصلی، بدون نشانگر تازهٔ ۴۰۶ و با قفل فعال است. '
+                          'تعداد/فهرست تغییر کرده یا پیش‌شرط برقرار نیست؛ '
+                          'هیچ ردیفی حذف نشد. بدون بررسی دستی دوباره پروب نکنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        ids = '، '.join(str(row['id']) for row in snapshot)
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_retire22'] = {
+            'nonce': nonce, 'expires': time.time() + 300,
+            'bot_id': bot_id, 'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id,
+            'fingerprints': {int(row['id']): row['fingerprint'] for row in snapshot},
+        }
+        await display(
+            f'⚠️ تصمیم آگاهانه: حذف هر {INCIDENT_INACTIVE_RETIRE_COUNT} ردیف '
+            f'inactive نامعلوم از ربات اصلی\nشناسه‌های دقیق: {ids}\n\n'
+            'این ۲۲ سشن بررسی نشده‌اند و ممکن است هنوز کار کنند. این گزینه '
+            'بدون اتصال/OTP و بدون ادعای خرابی یا حذف حساب تلگرام، ردیف و '
+            'کلید ذخیره‌شدهٔ هر ۲۲ مورد را از لیست/DB حذف می‌کند. '
+            'activeها، نمایندگی‌ها و سوابق مالی/سفارش حذف نمی‌شوند. '
+            'خروج‌های تأخیری آن‌ها لغو و قفل حادثه حفظ می‌شود.\n'
+            '⚠️ غیرقابل‌بازگشت بدون بکاپ خصوصی معتبر. قبل از تأیید: '
+            'تعمیرات سراسری روشن؛ بدون سفارش مشغول/نزدیک یا پرداخت تازه. '
+            'تغییر حتی یک ردیف یا تغییر شمار به معنی رد کل حذف است. '
+            'این تأیید فقط ۵ دقیقه اعتبار دارد.', [
+                [InlineKeyboardButton(f'🗑 بله، هر {INCIDENT_INACTIVE_RETIRE_COUNT} کلید را حذف کن',
+                                      callback_data=f'deleted_cleanup_retire22_confirm_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_retire406_confirm_'):
+        # Pop before the first await: no replay, including across admins/chats.
+        pending = context.user_data.pop('deleted_cleanup_retire406', None)
+        if (not pending or
+                pending.get('nonce') != data.removeprefix('deleted_cleanup_retire406_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید حذف سشن‌های ۴۰۶ نامعتبر یا منقضی است؛ '
+                          'دوباره پیش‌نمایش بگیرید. هیچ ردیفی حذف نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            kwargs = ({'single_account_id': pending['account_id']}
+                      if pending['account_id'] is not None else {})
+            deleted, result = await DatabaseManager.delete_held_cleanup_406_accounts(
+                bot_id, pending['fingerprints'], **kwargs)
+        except Exception as exc:
+            logger.warning('406 session retirement failed (bot=%s): %s',
+                           bot_id, type(exc).__name__)
+            await display('❌ خطای دیتابیس؛ حذف تأیید نشد. وضعیت را بررسی کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        if result == 'deleted':
+            logger.warning('Superadmin %s retired %s stored 406 keys from bot %s',
+                           update.effective_user.id, deleted, bot_id)
+            await display(f'✅ {deleted} سشن ۴۰۶ِ قرنطینه‌شده و ردیف مرتبط '
+                          'از فهرست/DB حذف شد. خود حساب تلگرام حذف نشده است؛ '
+                          'سشن‌های بررسی‌نشده دست‌نخورده‌اند. قفل بررسیِ '
+                          'گروهی/تک‌اکانتیِ کلیدهای قدیمی باقی می‌ماند تا '
+                          'علت تداخل مشخص شود.', back)
+        else:
+            reason = {
+                'maintenance': 'تعمیرات سراسری باید روشن باشد.',
+                'busy': 'سفارش فعال، در صف یا نزدیک وجود دارد.',
+                'changed': 'فهرست، نشانگر، وضعیت یا سشن پس از پیش‌نمایش تغییر کرده است.',
+                'empty': 'سشن نشان‌دار قابل‌حذفی وجود ندارد.',
+            }.get(result, 'پیش‌شرط حذف برقرار نیست.')
+            await display('⛔️ هیچ ردیفی حذف نشد. ' + reason, back)
+        return AWAITING_SETTINGS_ACTION
+
+    if (data == 'deleted_cleanup_retire406' or
+            re.fullmatch(r'deleted_cleanup_retire406_[1-9][0-9]{0,9}', data)):
+        context.user_data.pop('deleted_cleanup_preview', None)
+        context.user_data.pop('deleted_cleanup_probe', None)
+        target = (None if data == 'deleted_cleanup_retire406'
+                  else int(data.removeprefix('deleted_cleanup_retire406_')))
+        accounts = await DatabaseManager.get_held_cleanup_406_accounts(
+            bot_id, **({'account_id': target} if target is not None else {}))
+        if not accounts:
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('📭 هیچ ردیف inactive با نشانگر دقیق بررسی ۴۰۶ برای '
+                          'حذف بدون اتصال وجود ندارد؛ هیچ حذفی انجام نشد. '
+                          'قفل حادثه حتی با شمار صفر ممکن است باقی بماند.', back)
+            return AWAITING_SETTINGS_ACTION
+        if (len(accounts) > 100 or
+                (target is not None and
+                 (len(accounts) != 1 or int(accounts[0]['id']) != target))):
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('⛔️ فهرست از سقف ایمن بزرگ‌تر یا تغییر کرده است؛ '
+                          'حذف گروهی متوقف شد. یک ردیف انتخاب کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        ids = '، '.join(str(acc['id']) for acc in accounts)
+        if len(ids) > 2400:
+            context.user_data.pop('deleted_cleanup_retire406', None)
+            await display('⛔️ فهرست شناسه‌ها برای یک پیش‌نمایش کامل بیش از حد '
+                          'بزرگ است؛ حذف انجام نشد.', back)
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        context.user_data['deleted_cleanup_retire406'] = {
+            'nonce': nonce, 'expires': time.time() + 300,
+            'bot_id': bot_id, 'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id, 'account_id': target,
+            'fingerprints': {
+                int(acc['id']): hashlib.sha256(
+                    acc['session_string'].encode('utf-8')).hexdigest()
+                for acc in accounts
+            },
+        }
+        await display(
+            f'⚠️ حذف آگاهانهٔ {len(accounts)} سشن ۴۰۶ِ قرنطینه‌شده '
+            f'از ربات {bot_id}\nشناسه‌های دقیق: {ids}\n\n'
+            'این عملیات بدون اتصال به تلگرام ردیف و کلید ذخیره‌شده را '
+            'از DB/لیست حذف می‌کند؛ به معنی حذف خود حساب تلگرام نیست. '
+            'کلیدهای بررسی‌نشده و سوابق مالی/سفارش حذف نمی‌شوند. بعد از حذف '
+            'هم قفل بررسی قدیمی‌ها باقی می‌ماند تا علت تداخل مشخص شود.\n'
+            'حذف غیرقابل‌بازگشت است؛ بکاپ خصوصی معتبر و تعمیرات روشن لازم است. '
+            'در زمان سفارش فعال/در صف/نزدیک، حذف رد می‌شود. '
+            'این تأیید تا ۵ دقیقه اعتبار دارد.', [
+                [InlineKeyboardButton(f'✅ حذف فقط همین {len(accounts)} سشن ۴۰۶',
+                                      callback_data=f'deleted_cleanup_retire406_confirm_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
+        return AWAITING_SETTINGS_ACTION
+
+    if data.startswith('deleted_cleanup_confirm_'):
+        pending = context.user_data.pop('deleted_cleanup_preview', None)
+        if (not pending or pending.get('nonce') != data.removeprefix('deleted_cleanup_confirm_')
+                or pending.get('expires', 0) < time.time()
+                or pending.get('bot_id') != bot_id
+                or pending.get('user_id') != update.effective_user.id
+                or pending.get('chat_id') != update.effective_chat.id):
+            await display('⛔️ تأیید نامعتبر یا منقضی است؛ دوباره پیش‌نمایش بگیرید.', back)
+            return AWAITING_SETTINGS_ACTION
+        try:
+            kwargs = ({'single_account_id': pending['account_id']}
+                      if pending.get('account_id') is not None else {})
+            if pending.get('include_revoked'):
+                kwargs.update(include_revoked=True, expected_markers=pending['markers'])
+            deleted, result = await DatabaseManager.delete_confirmed_deleted_accounts(
+                bot_id, pending['fingerprints'], **kwargs)
+        except Exception as exc:
+            logger.exception('Deleted-account cleanup failed (bot=%s, error=%s)',
+                             bot_id, type(exc).__name__)
+            await display('❌ خطای دیتابیس؛ حذف انجام نشد. وضعیت را بررسی کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        if result == 'deleted':
+            logger.warning('Superadmin %s removed %s verified-unusable accounts/sessions from bot %s',
+                           update.effective_user.id, deleted, bot_id)
+            await display(f'✅ {deleted} ردیف با تأیید تلگرام (حذف حساب یا ابطال سشن) '
+                          'از فهرست و دیتابیس حذف شد. سشن‌های دیگر دست‌نخورده‌اند.', back)
+        else:
+            reason = {
+                'maintenance': 'ابتدا حالت تعمیرات سراسری را فعال کنید.',
+                'busy': 'سفارش در حال اجرا/در صف یا نزدیک وجود دارد؛ حذف متوقف شد.',
+                'changed': 'فهرست یا سشن‌ها پس از پیش‌نمایش تغییر کرده‌اند؛ دوباره بررسی کنید.',
+                'empty': 'هیچ حساب تأییدشده‌ای برای حذف موجود نیست.',
+            }.get(result, 'شرایط حذف فراهم نیست.')
+            await display(f'⛔️ هیچ حسابی حذف نشد. {reason}', back)
+        return AWAITING_SETTINGS_ACTION
+
+    if data == 'deleted_cleanup_cancel':
+        context.user_data.pop('deleted_cleanup_preview', None)
+        context.user_data.pop('deleted_cleanup_probe', None)
+        context.user_data.pop('deleted_cleanup_scan', None)
+    elif (data in ('deleted_cleanup_preview', 'deleted_cleanup_preview_all') or
+          data.startswith('deleted_cleanup_preview_')):
+        context.user_data.pop('deleted_cleanup_probe', None)
+        target = (int(data.removeprefix('deleted_cleanup_preview_'))
+                  if data.startswith('deleted_cleanup_preview_') and
+                  data != 'deleted_cleanup_preview_all' else None)
+        including_revoked = data != 'deleted_cleanup_preview'
+        # No ciphertext or session key may go to Telegram or PTB user_data.
+        if including_revoked:
+            accounts = (await DatabaseManager.get_verified_unusable_accounts(bot_id, account_id=target)
+                        if target is not None
+                        else await DatabaseManager.get_verified_unusable_accounts(bot_id))
+        else:
+            accounts = await DatabaseManager.get_confirmed_deleted_accounts(bot_id)
+        if not accounts:
+            context.user_data.pop('deleted_cleanup_preview', None)
+            await display('هیچ حساب/سشنِ باطل یا دلیت‌شدهٔ تأییدشده‌ای برای حذف موجود نیست. '
+                          'فهرست سوخته‌های غیرفعال را بررسی کنید؛ صرف برچسب قدیمی '
+                          'مجوز حذف نیست.', [
+                              [InlineKeyboardButton('🧪 بررسی مرحله‌ای سوخته‌ها',
+                                                    callback_data='deleted_cleanup_scan_start')],
+                              *back])
+            return AWAITING_SETTINGS_ACTION
+        if target is not None and (len(accounts) != 1 or int(accounts[0]['id']) != target):
+            context.user_data.pop('deleted_cleanup_preview', None)
+            await display('⛔️ فهرست حساب انتخاب‌شده تغییر کرده؛ دوباره بررسی کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        ids = '، '.join(str(acc['id']) for acc in accounts)
+        if len(ids) > 2400:
+            context.user_data.pop('deleted_cleanup_preview', None)
+            await display('فهرست برای یک پیش‌نمایش کامل بیش از حد بزرگ است؛ '
+                          'حذف گروهی متوقف شد. از حذف تک‌اکانتی استفاده کنید.', back)
+            return AWAITING_SETTINGS_ACTION
+        nonce = secrets.token_hex(8)
+        types = ({CONFIRMED_ACCOUNT_DELETED: 0, CONFIRMED_SESSION_REVOKED: 0}
+                 if including_revoked else None)
+        if types is not None:
+            for account in accounts:
+                types[account['marker']] += 1
+        context.user_data['deleted_cleanup_preview'] = {
+            'nonce': nonce,
+            'expires': time.time() + 300,
+            'bot_id': bot_id,
+            'user_id': update.effective_user.id,
+            'chat_id': update.effective_chat.id,
+            'account_id': target,
+            'include_revoked': including_revoked,
+            'markers': ({int(acc['id']): acc['marker'] for acc in accounts}
+                        if including_revoked else {}),
+            'fingerprints': {
+                int(acc['id']): hashlib.sha256(acc['session_string'].encode('utf-8')).hexdigest()
+                for acc in accounts
+            },
+        }
+        await display(
+            (f'⚠️ تأیید نهایی حذف فقط حساب #{target} از ربات {bot_id}\n'
+             if target is not None
+             else f'⚠️ تأیید نهایی حذف {len(accounts)} اکانت از ربات {bot_id}\n')
+            + f'شناسه‌ها: {ids}\n'
+            + (f'حساب دلیت‌شده: {types[CONFIRMED_ACCOUNT_DELETED]} • '
+               f'سشنِ واقعاً باطل/منقضی‌شده: {types[CONFIRMED_SESSION_REVOKED]}\n\n'
+               if types is not None else '\n')
+            + 'فقط پاسخ‌های تایپ‌شدهٔ USER_DEACTIVATED یا ابطال/انقضای کلید '
+            'پس از قطع اتصال قطعی مجوز حذف دارند. SESSION_REVOKED تاریخی، ۴۰۶، '
+            'بن/مسدودی، ۴۰۱ نامشخص و صرفاً inactive شامل نمی‌شوند.\n'
+            'این کار غیرقابل‌بازگشت است. بکاپ خصوصی بگیرید؛ تعمیرات باید روشن '
+            'و سفارش فعال/نزدیک صفر باشد. تأیید تا ۵ دقیقه اعتبار دارد.', [
+                [InlineKeyboardButton(f'🗑 تأیید حذف همین {len(accounts)} مورد',
+                                      callback_data=f'deleted_cleanup_confirm_{nonce}')],
+                [InlineKeyboardButton('❌ انصراف', callback_data='deleted_cleanup_cancel')],
+            ])
+        return AWAITING_SETTINGS_ACTION
+
+    context.user_data.pop('deleted_cleanup_preview', None)
+    context.user_data.pop('deleted_cleanup_retire406', None)
+    context.user_data.pop('deleted_cleanup_retire22', None)
+    context.user_data.pop('deleted_cleanup_probe', None)
+    context.user_data.pop('deleted_cleanup_scan', None)
+    accounts = await DatabaseManager.get_verified_unusable_accounts(bot_id)
+    held_406 = await DatabaseManager.get_held_cleanup_406_accounts(bot_id)
+    incident_blocked = await DatabaseManager.cleanup_406_incident_blocked(bot_id)
+    unknown_count = (await DatabaseManager.count_incident_inactive_accounts(bot_id)
+                     if bot_id == 1 else 0)
+    deleted_count = sum(acc['marker'] == CONFIRMED_ACCOUNT_DELETED for acc in accounts)
+    revoked_count = len(accounts) - deleted_count
+    job = _cleanup_scan_jobs.get(bot_id)
+    running = _cleanup_scan_running(job)
+    buttons = [
+        [InlineKeyboardButton(f'🗑 حذف همهٔ تأییدشده‌ها ({len(accounts)})',
+                              callback_data='deleted_cleanup_preview_all')],
+    ]
+    if held_406:
+        buttons.append([InlineKeyboardButton(
+            f'🗑 حذف سشن‌های ۴۰۶ِ قرنطینه‌شده ({len(held_406)})',
+            callback_data='deleted_cleanup_retire406')])
+    if (bot_id == 1 and incident_blocked and not held_406 and not running
+            and not _cleanup_scan_starting and
+            unknown_count == INCIDENT_INACTIVE_RETIRE_COUNT):
+        buttons.append([InlineKeyboardButton(
+            '🗑 حذف آگاهانهٔ همهٔ ۲۲ inactive نامعلوم (بدون پروب)',
+            callback_data='deleted_cleanup_retire22')])
+    buttons.extend([
+        [InlineKeyboardButton('🧪 بررسی مرحله‌ای همهٔ سوخته‌های غیرفعال'
+                              + (' (قفل حادثه)' if held_406 or incident_blocked else ''),
+                              callback_data='deleted_cleanup_scan_start')],
+        [InlineKeyboardButton('📋 انتخاب حساب مشکوک (تک‌اکانتی)',
+                              callback_data='deleted_cleanup_list_1')],
+    ])
+    if running or (job and job.get('finished')):
+        buttons.append([InlineKeyboardButton('♻️ نتیجه/وضعیت آخرین بررسی',
+                                             callback_data='deleted_cleanup_scan_status')])
+    if running:
+        last_review = (f'\n\n⏳ بررسی هنوز در جریان است: '
+                       f'{job["progress"][0]}/{job["progress"][1]}. '
+                       'شمار صفر در منو نتیجهٔ نهایی نیست.')
+    elif job and job.get('finished') and job['progress'][5]:
+        last_review = ('\n\n⚠️ آخرین بررسی موارد نامطمئن داشت؛ علت‌ها را از '
+                       '«نتیجه/وضعیت آخرین بررسی» ببینید. با شمار صفر، '
+                       'دکمهٔ حذف چیزی پاک نمی‌کند.')
+    else:
+        last_review = ''
+    buttons.extend([
+        [InlineKeyboardButton('♻️ بروزرسانی منو', callback_data='deleted_cleanup_menu')],
+        [InlineKeyboardButton('🔙 گزارش سلامت اکانت‌ها', callback_data='health_back')],
+    ])
+    await display(
+        f'☠️ مدیریت حذف حساب/سشن | ربات {bot_id}\n\n'
+        f'حساب دلیت‌شدهٔ تأییدشده: {deleted_count}\n'
+        f'سشن خارج‌شده/باطلِ تأییدشده: {revoked_count}\n'
+        f'سشن ۴۰۶ِ قرنطینه‌شده (حذف آگاهانه بدون پروب): {len(held_406)}\n'
+        + (f'کلیدهای inactive نامعلوم ربات اصلی (بررسی‌نشده): {unknown_count}\n'
+           if bot_id == 1 else '')
+        + 'حذف موارد تأییدشده، حذف نشانگرهای ۴۰۶ و صرف‌نظر آگاهانه از '
+        'کل ۲۲ سشن نامعلوم سه مسیر متفاوت‌اند؛ هیچ‌کدام حساب تلگرام را '
+        'حذف نمی‌کند. کلیدهای نامعلوم را پروب نکنید. گزینهٔ آخر فقط با '
+        'شمار دقیق ۲۲ و پیش‌نمایش/تأیید فعال می‌شود؛ ممکن است سشن‌ها سالم باشند. '
+        'قفل حادثه بعد از حذف هم خودکار باز نمی‌شود.'
+        + ('\n⛔️ قفل حادثهٔ ۴۰۶ در دیتابیس فعال است؛ بررسی گروهی/تک‌اکانتی '
+           'کلیدهای قدیمی متوقف می‌ماند.' if incident_blocked else '')
+        + last_review,
+        buttons)
     return AWAITING_SETTINGS_ACTION
 
 
@@ -362,30 +1255,32 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
             if not accounts:
                 await query.edit_message_text("✅ هیچ اکانت غیرفعالی (سوخته) یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
                 return AWAITING_SETTINGS_ACTION
-            txt = "💀 **لیست اکانت‌های غیرفعال (سوخته):**\n\n"
-            for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت: {acc.get('spam_check_result', 'Unknown')}\n\n"
+            txt = ("🧪 **اکانت‌های غیرفعال (اعتبار سشن نامعلوم):**\n"
+                   "علت تاریخی، به‌ویژه خطای ۴۰۶، لزوماً به معنی ابطال کلید نیست. "
+                   "از بررسی انبوه یا فعال‌سازی کور خودداری کنید.\n\n")
+            for acc in accounts: txt += f"📱 `{acc['phone_number']}` (ID: `{acc['id']}`)\n⚠️ علت ثبت‌شده: {acc.get('spam_check_result', 'Unknown')}\n\n"
             if len(txt) > 4000: txt = txt[:4000] + "\n..."
-            kb_dead = [[InlineKeyboardButton("🗑 حذف همه سوخته‌ها", callback_data="dead_del_all")], [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]
+            kb_dead = [
+                [InlineKeyboardButton(f"🧪 بررسی اکانت #{acc['id']}", callback_data=f"acc_view_{acc['id']}")]
+                for acc in accounts[:8]
+            ] + [
+                [InlineKeyboardButton("📋 فهرست همهٔ اکانت‌ها", callback_data="acc_page_1")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")],
+            ]
             await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_dead))
             return AWAITING_SETTINGS_ACTION
-        elif data == "dead_del_all":
-            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
-            if not accounts:
-                await query.edit_message_text("✅ هیچ اکانت غیرفعالی (سوخته) یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
-                return AWAITING_SETTINGS_ACTION
-            kb_confirm = [[InlineKeyboardButton(f"🗑 بله، حذف {len(accounts)} اکانت سوخته", callback_data="dead_del_yes")], [InlineKeyboardButton("🔙 بازگشت", callback_data="view_dead_accounts")]]
-            await query.edit_message_text(f"⚠️ **حذف {len(accounts)} اکانت سوخته؟**\n\nاین عمل غیرقابل بازگشت است.", reply_markup=InlineKeyboardMarkup(kb_confirm))
-            return AWAITING_SETTINGS_ACTION
-        elif data == "dead_del_yes":
-            accounts = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
-            n = 0
-            for acc in accounts:
-                try:
-                    if await DatabaseManager.delete_account(acc['id'], update.effective_user.id):
-                        n += 1
-                except Exception:
-                    pass
-            await query.edit_message_text(f"✅ **{n} اکانت سوخته حذف شد.**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")]]))
+        elif data in ("acc_resync_all", "dead_del_all", "dead_del_yes"):
+            # Old messages may still contain these bulk action buttons. A
+            # historical inactive/dead flag is NOT proof of a revoked key;
+            # don't accidentally probe or delete all 25 on a stale callback.
+            await query.edit_message_text(
+                "⚠️ عملیات انبوه برای اکانت‌های غیرفعال متوقف است. "
+                "برای بازیابی، از فهرست یک اکانت را انتخاب و فقط همان سشن را بررسی کنید. "
+                "حذفِ تک‌اکانتی از کارت اکانت همچنان در دسترس است.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 فهرست اکانت‌ها", callback_data="acc_page_1")],
+                    [InlineKeyboardButton("🔙 بازگشت", callback_data="health_back")],
+                ]))
             return AWAITING_SETTINGS_ACTION
         elif data == "view_limited_accounts":
             accounts = await DatabaseManager.get_limited_accounts(bot_id=bot_id)
@@ -401,8 +1296,10 @@ async def health_report_handler(update: Update, context: ContextTypes.DEFAULT_TY
     accs_stats = await DatabaseManager.get_all_account_stats(bot_id=bot_id)
     dead_accs = await DatabaseManager.get_dead_accounts(bot_id=bot_id)
     dead_count = len(dead_accs)
-    txt = (f"🚑 **گزارش سلامت اکانت‌ها**\n\n🤖 کل اکانت‌ها: `{accs_stats['total']}`\n✅ فعال و سالم: `{accs_stats['active']}`\n⛔️ محدود (Limited): `{accs_stats['limited']}`\n💀 غیرفعال (سوخته/نشست بسته): `{dead_count}`\n\n👇 برای مشاهده جزئیات کلیک کنید:")
-    kb = [[InlineKeyboardButton("💀 مشاهده لیست سوخته‌ها", callback_data="view_dead_accounts")], [InlineKeyboardButton("⛔️ مشاهده لیست محدودها", callback_data="view_limited_accounts")]]
+    txt = (f"🚑 **گزارش وضعیت اکانت‌ها**\n\n🤖 کل اکانت‌ها: `{accs_stats['total']}`\n✅ ثبت‌شده به‌عنوان فعال: `{accs_stats['active']}`\n⛔️ محدود (Limited): `{accs_stats['limited']}`\n🧪 غیرفعال (اعتبار سشن نامعلوم): `{dead_count}`\n\n👇 برای مشاهده جزئیات کلیک کنید:")
+    kb = [[InlineKeyboardButton("🧪 مشاهده غیرفعال‌ها", callback_data="view_dead_accounts")], [InlineKeyboardButton("⛔️ مشاهده لیست محدودها", callback_data="view_limited_accounts")]]
+    if dead_count > 0:
+        kb.insert(0, [InlineKeyboardButton("📋 بررسی تک‌اکانتی از فهرست", callback_data="acc_page_1")])
     if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     else:
         if msg: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -794,13 +1691,16 @@ async def stop_order_execute(update, context):
         
     if order['status'] == 'scheduled':
         # سفارش زمان‌بندی‌شده هنوز شروع نشده → عودت کامل بدون محاسبهٔ ثانیه‌ای
-        await order_executor.settle_and_refund_order(
-            oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
-            canceled_by_name=update.effective_user.first_name,
-            cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
-            bot_id=context.bot_data.get('bot_id', 1),
-        )
-        msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        try:
+            await order_executor.settle_and_refund_order(
+                oid, do_refund=True, canceled_by_role="پشتیبانی/ادمین",
+                canceled_by_name=update.effective_user.first_name,
+                cancellation_reason="لغو سفارش زمان‌بندی‌شده توسط ادمین",
+                bot_id=context.bot_data.get('bot_id', 1),
+            )
+            msg = "✅ سفارش زمان‌بندی شده لغو و مبلغ کامل به کیف پول کاربر عودت داده شد."
+        except ValueError:
+            msg = "ℹ️ سفارش پیش‌تر لغو یا تکمیل شده؛ عودت تکراری انجام نشد."
         await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ADMIN_MAIN_MENU, resize_keyboard=True))
     else:
         # سفارش فعال → دو گزینه برای ادمین: لغو با عودت (تسویهٔ ثانیه‌ای) یا بدون عودت
@@ -925,12 +1825,16 @@ async def admin_cancel_order_callback(update: Update, context: ContextTypes.DEFA
         return
 
     do_refund = (mode == "refund")
-    result = await order_executor.settle_and_refund_order(
-        oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
-        canceled_by_name=update.effective_user.first_name,
-        cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
-        bot_id=bot_id,
-    )
+    try:
+        result = await order_executor.settle_and_refund_order(
+            oid, do_refund=do_refund, canceled_by_role="پشتیبانی/ادمین",
+            canceled_by_name=update.effective_user.first_name,
+            cancellation_reason=("لغو با عودت وجه توسط ادمین" if do_refund else "لغو بدون عودت وجه توسط ادمین"),
+            bot_id=bot_id,
+        )
+    except ValueError:
+        await query.edit_message_text("ℹ️ سفارش پیش‌تر لغو یا تکمیل شده؛ عودتِ تکراری انجام نشد.")
+        return AWAITING_SETTINGS_ACTION
 
     if do_refund:
         txt = (
@@ -1671,6 +2575,7 @@ async def list_resellers_handler(update, context):
         await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb))
     return AWAITING_SETTINGS_ACTION
 
+@require_god_admin
 async def handle_reseller_action(update, context):
     query = update.callback_query
     data = query.data
@@ -1697,7 +2602,6 @@ async def handle_reseller_action(update, context):
         txt = (f"🤖 **مدیریت ربات #{reseller['id']}**\n\n👤 مدیر: `{reseller['owner_id']}`\n📅 انقضا: {exp_j}\n⏳ باقی‌مانده: {days_left} روز\n💡 وضعیت: {status_txt}")
         kb = [
             [InlineKeyboardButton("🔋 تمدید / شارژ", callback_data=f"reseller_renew_{rid}"), InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"reseller_edit_{rid}")],
-            [InlineKeyboardButton("➕ تزریق اکانت از ربات اصلی", callback_data=f"reseller_sync_accs_{rid}")],
             [InlineKeyboardButton("🗑 حذف کامل", callback_data=f"reseller_delete_{rid}")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_reseller_list")]
         ]
@@ -1753,26 +2657,20 @@ async def handle_reseller_action(update, context):
         except: pass
         return AWAITING_SETTINGS_ACTION
     elif data.startswith("reseller_sync_accs_"):
-        try:
-            rid = int(data.split("_")[3])
-            if rid == 1: return AWAITING_SETTINGS_ACTION
-            await query.answer("⏳ کپی...", show_alert=False)
-            main_accounts = await DatabaseManager.get_all_active_accounts(bot_id=1)
-            target_uid = None
-            reseller = await DatabaseManager.get_reseller(rid)
-            if reseller:
-                 u = await DatabaseManager.get_user(reseller['owner_id'], bot_id=rid)
-                 if not u: u = await DatabaseManager.create_or_update_user({'id': reseller['owner_id'], 'username': 'Owner', 'first_name': 'Reseller', 'last_name': 'Admin'}, bot_id=rid)
-                 target_uid = u['id']
-            if not target_uid:
-                await query.answer("ادمین یافت نشد.", show_alert=True)
-                return AWAITING_SETTINGS_ACTION
-            count = 0
-            for acc in main_accounts:
-                res, _ = await DatabaseManager.add_telegram_account(target_uid, acc['phone_number'], acc['session_string'], bot_id=rid, api_id=acc.get('api_id'), api_hash=acc.get('api_hash'), first_name=acc.get('first_name'), last_name=acc.get('last_name'), username=acc.get('username'))
-                if res: count += 1
-            await query.edit_message_text(f"✅ {count} اکانت کپی شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data=f"reseller_manage_{rid}")]]))
-        except: pass
+        # Stale admin messages may still carry this button. Copying an
+        # encrypted string also copies the *same* MTProto auth key into a
+        # second bot; a second connection could invalidate BOTH sessions.
+        # There is no safe silent sync: log in separately on each bot.
+        await safe_answer(query)
+        await query.edit_message_text(
+            "⛔️ کپی سشن از ربات اصلی به نمایندگی غیرفعال است؛ هر دو ردیف "
+            "با همان کلید تلگرام وصل می‌شدند و خطر خروج اجباری داشتند. "
+            "اکانت را با شماره در خودِ ربات نمایندگی جداگانه لاگین کنید "
+            "تا کلید تازه بسازد؛ ایمپورتِ همان Session String کلید تازه نمی‌سازد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 فهرست نمایندگی‌ها", callback_data="back_to_reseller_list")],
+            ]),
+        )
         return AWAITING_SETTINGS_ACTION
     await safe_answer(query)
     return AWAITING_SETTINGS_ACTION
@@ -2191,3 +3089,260 @@ async def receive_backup_interval(update, context):
     await DatabaseManager.set_setting("auto_backup_interval_hours", text, bot_id=bot_id)
     await update.message.reply_text(f"✅ بازه پشتیبان‌گیری خودکار تنظیم شد: هر {text} ساعت.")
     return await backup_restore_menu(update, context)
+
+# ===================== 🛡 ANTI-SPAM PROTECTION PANEL (سوپرادمین) =====================
+#
+# پنل «ضد اسپم و محافظت از اکانت‌ها»:
+#   • تاگل کلی حالت ضد اسپم + تاگل خروج به‌تأخیرافتاده از گروه
+#   • تنظیم تأخیر خروج از گروه (پیش‌فرض ۱۶۸ ساعت = یک هفته)
+#   • تنظیم فاصلهٔ خروج دونه‌به‌دونه (پیش‌فرض ۶۰ ثانیه بین هر خروج)
+#   • تنظیم ممنوعیت ثبت سفارش جدید پس از لغو (پیش‌فرض ۲۰ دقیقه؛ ۰ = خاموش)
+#   • تنظیم استراحت اکانت بین دو سفارش (پیش‌فرض خاموش، دقیقه)
+#   • مشاهده/پاک‌سازی صف خروج‌های زمان‌بندی‌شده
+#
+# تنظیمات در bot_settings ذخیره و بلافاصله (با invalidate کش ۱۰ثانیه‌ای
+# services/anti_spam.py) روی موج‌های بعدی اعمال می‌شوند؛ بدون ری‌استارت.
+
+async def _antispam_is_super(update, context) -> bool:
+    """فقط گاد (ADMIN_IDS) یا ادمین با نقش super_admin اجازه دارد."""
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+    except Exception:
+        return False
+    if not uid:
+        return False
+    if uid in Config.ADMIN_IDS:
+        return True
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        u = await asyncio.wait_for(DatabaseManager.get_user(uid, bot_id=bot_id), timeout=10)
+    except Exception:
+        return False
+    return bool(u and u.get('admin_role') == 'super_admin')
+
+
+# نقشهٔ فیلدهای قابل ویرایش: callback → (کلید دیتابیس، عنوان فارسی، حداقل، حداکثر)
+ANTISPAM_FIELD_SPECS = {
+    "antispam_set_delay_hours": ("group_leave_delay_hours", "⏳ تأخیر خروج از گروه", "ساعت", 1, 720),
+    "antispam_set_interval_sec": ("group_leave_interval_sec", "👣 فاصلهٔ خروج دونه‌به‌دونه", "ثانیه", 5, 3600),
+    "antispam_set_cancel_cd": ("cancel_cooldown_minutes", "⛔️ ممنوعیت سفارش پس از لغو", "دقیقه", 0, 10080),
+    "antispam_set_rest_min": ("account_rest_minutes", "😴 استراحت اکانت بین سفارش‌ها", "دقیقه", 0, 1440),
+}
+
+
+async def _antispam_profile(bot_id: int):
+    """خواندن امن پروفایل ضد اسپم (fail-open: None → مقادیر پیش‌فرض Config)."""
+    try:
+        from services.anti_spam import anti_spam
+        return await anti_spam.get_profile(bot_id)
+    except Exception:
+        return None
+
+
+async def anti_spam_menu(update, context):
+    """منوی «🛡 ضد اسپم و محافظت» — وضعیت کلی + میان‌برهای تنظیم."""
+    if not await _antispam_is_super(update, context):
+        try:
+            if update.callback_query:
+                await safe_answer(update.callback_query)
+            await send_safe(context.bot, update.effective_chat.id, "⛔️ دسترسی محدود به سوپر ادمین.")
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    profile = await _antispam_profile(bot_id)
+
+    enabled = profile.enabled if profile else Config.ANTISPAM_ENABLED
+    status = "✅ فعال" if enabled else "❌ غیرفعال"
+    gleave_on = profile.group_leave_enabled if profile else Config.GROUP_LEAVE_ENABLED
+    gleave_txt = "✅ فعال" if gleave_on else "❌ غیرفعال"
+    delay_h = int(round((profile.group_leave_delay_seconds if profile else Config.GROUP_LEAVE_DELAY_HOURS * 3600) / 3600))
+    interval = int(round(profile.group_leave_interval_sec if profile else Config.GROUP_LEAVE_INTERVAL_SEC))
+    cd_min = profile.cancel_cooldown_minutes if profile else Config.CANCEL_COOLDOWN_MINUTES
+    rest_m = int(round((profile.rest_seconds if profile else Config.ANTISPAM_ACCOUNT_REST_MINUTES * 60) / 60))
+    if profile:
+        join_txt = f"{profile.join_gap_min:.1f}-{profile.join_gap_max:.1f}s (سقف موج {profile.max_join_concurrency})"
+        leave_txt = f"{profile.leave_gap_min:.1f}-{profile.leave_gap_max:.1f}s"
+    else:
+        join_txt = f"{Config.ANTISPAM_JOIN_GAP_MIN:.1f}-{Config.ANTISPAM_JOIN_GAP_MAX:.1f}s (سقف موج {Config.ANTISPAM_MAX_JOIN_CONCURRENCY})"
+        leave_txt = f"{Config.ANTISPAM_LEAVE_GAP_MIN:.1f}-{Config.ANTISPAM_LEAVE_GAP_MAX:.1f}s"
+
+    try:
+        pending_n = await DatabaseManager.count_pending_group_leaves(bot_id)
+    except Exception:
+        pending_n = 0
+
+    txt = (
+        "🛡 **ضد اسپم و محافظت از اکانت‌ها**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"🔰 حالت ضد اسپم: **{status}**\n"
+        f"   🌊 آهنگ ورود به کال: `{join_txt}`\n"
+        f"   🚶 آهنگ خروج از کال: `{leave_txt}`\n"
+        f"   😴 استراحت اکانت بین سفارش‌ها: **{str(rest_m) + ' دقیقه' if rest_m > 0 else 'خاموش'}**\n\n"
+        f"🚪 خروج به‌تأخیرافتاده از گروه: **{gleave_txt}**\n"
+        f"   ⏳ تأخیر خروج: **{delay_h} ساعت** (پیش‌فرض ۱۶۸ = یک هفته)\n"
+        f"   👣 فاصلهٔ خروج: **هر {interval} ثانیه یک اکانت**\n"
+        f"   📋 خروج‌های زمان‌بندی‌شده در صف: **{pending_n}** مورد\n\n"
+        f"⛔️ ممنوعیت سفارش پس از لغو: **{str(cd_min) + ' دقیقه' if cd_min > 0 else 'خاموش'}**\n\n"
+        "ℹ️ با خروج تأخیری، اکانت‌ها در پایان سفارش فقط از «ویس‌کال» خارج\n"
+        "می‌شوند؛ اگر تا پایان مهلت سفارش مجددی برای همان گروه ثبت نشود،\n"
+        "به‌ترتیب و دونه‌به‌دونه (نه یک‌جا) از گروه خارج خواهند شد — این دو\n"
+        "مهم‌ترین الگوهایی هستند که باعث حذف اکانت توسط تلگرام می‌شوند."
+    )
+
+    kb = [
+        [InlineKeyboardButton(f"🔰 حالت ضد اسپم: {status}", callback_data="antispam_toggle_master")],
+        [InlineKeyboardButton(f"🚪 خروج تأخیری از گروه: {gleave_txt}", callback_data="antispam_toggle_gleave")],
+        [
+            InlineKeyboardButton(f"⏳ تأخیر خروج ({delay_h}h)", callback_data="antispam_set_delay_hours"),
+            InlineKeyboardButton(f"👣 فاصله خروج ({interval}s)", callback_data="antispam_set_interval_sec"),
+        ],
+        [
+            InlineKeyboardButton(f"⛔️ محدودیت لغو ({cd_min}m)", callback_data="antispam_set_cancel_cd"),
+            InlineKeyboardButton(f"😴 استراحت اکانت ({rest_m}m)", callback_data="antispam_set_rest_min"),
+        ],
+        [InlineKeyboardButton("🧹 لغو کل خروج‌های در صف", callback_data="antispam_clear_queue")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="antispam_back")],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, reply_markup=markup)
+        except Exception:
+            await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=markup)
+    else:
+        await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=markup)
+    return AWAITING_SETTINGS_ACTION
+
+
+async def anti_spam_callback(update, context):
+    """کالبک‌های منوی ضد اسپم: تاگل‌ها، تنظیم اعداد، پاک‌سازی صف، بازگشت."""
+    query = update.callback_query
+    await safe_answer(query)
+    if not await _antispam_is_super(update, context):
+        try:
+            await query.answer("⛔️ دسترسی محدود به سوپر ادمین.", show_alert=True)
+        except Exception:
+            pass
+        return AWAITING_SETTINGS_ACTION
+
+    data = query.data or ""
+    bot_id = context.bot_data.get('bot_id', 1)
+
+    if data == "antispam_back":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return await settings_menu_handler(update, context)
+
+    if data in ("antispam_toggle_master", "antispam_toggle_gleave"):
+        from services.anti_spam import anti_spam as _anti
+        key = _anti.K_ENABLED if data == "antispam_toggle_master" else _anti.K_GLEAVE_ENABLED
+        default = Config.ANTISPAM_ENABLED if data == "antispam_toggle_master" else Config.GROUP_LEAVE_ENABLED
+        try:
+            curr = (await DatabaseManager.get_setting(key, str(default).lower(), bot_id=bot_id)).lower() == "true"
+        except Exception:
+            curr = default
+        new_val = "false" if curr else "true"
+        await DatabaseManager.set_setting(key, new_val, bot_id=bot_id)
+        try:
+            _anti.invalidate(bot_id)
+        except Exception:
+            pass
+        try:
+            await query.answer("✅ فعال شد." if new_val == "true" else "❌ غیرفعال شد.")
+        except Exception:
+            pass
+        return await anti_spam_menu(update, context)
+
+    if data == "antispam_clear_queue":
+        try:
+            n = await DatabaseManager.cancel_all_pending_group_leaves(bot_id)
+        except Exception:
+            n = 0
+        try:
+            await query.answer(f"🧹 {n} خروجِ در صف لغو شد؛ اکانت‌ها عضو می‌مانند.", show_alert=True)
+        except Exception:
+            pass
+        return await anti_spam_menu(update, context)
+
+    if data in ANTISPAM_FIELD_SPECS:
+        _key_db, title_fa, unit_fa, lo, hi = ANTISPAM_FIELD_SPECS[data]
+        context.user_data['antispam_field'] = data
+        off_txt = " (۰ = خاموش)" if lo == 0 else ""
+        # همان الگوی set_spam_interval: پیام جدید با کیبورد انصراف (ReplyKeyboard
+        # در edit_message_text معتبر نیست — فقط InlineKeyboard ممکن است).
+        await send_safe(
+            context.bot, update.effective_chat.id,
+            f"{title_fa}\n\n"
+            f"عدد جدید را به **{unit_fa}** وارد کنید{off_txt}:\n"
+            f"🔢 بازهٔ مجاز: {lo} تا {hi}\n\n"
+            "برای انصراف دکمهٔ «🔙 انصراف» را بزنید.",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    return AWAITING_SETTINGS_ACTION
+
+
+async def receive_antispam_value(update, context):
+    """دریافت مقدار عددیِ تنظیمات ضد اسپم (با اعتبارسنجی بازه)."""
+    if not await _antispam_is_super(update, context):
+        return AWAITING_SETTINGS_ACTION
+
+    raw = update.message.text or ""
+    if BTN_CANCEL in raw:
+        context.user_data.pop('antispam_field', None)
+        return await anti_spam_menu(update, context)
+
+    field = context.user_data.get('antispam_field')
+    spec = ANTISPAM_FIELD_SPECS.get(field)
+    if not spec:
+        context.user_data.pop('antispam_field', None)
+        return await anti_spam_menu(update, context)
+
+    key_db, title_fa, unit_fa, lo, hi = spec
+    text = clean_number(raw).strip()
+    if not text.replace(".", "", 1).isdigit():
+        await update.message.reply_text(
+            f"❌ مقدار نامعتبر است. لطفاً فقط عدد بفرستید (به {unit_fa}).",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    try:
+        value = int(float(text))
+    except Exception:
+        value = lo
+    if value < lo or value > hi:
+        await update.message.reply_text(
+            f"❌ خارج از بازهٔ مجاز است. مقدار باید بین **{lo}** و **{hi}** {unit_fa} باشد.",
+            reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+        )
+        return AWAITING_ANTISPAM_VALUE
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    await DatabaseManager.set_setting(key_db, str(value), bot_id=bot_id)
+    try:
+        from services.anti_spam import anti_spam as _anti
+        _anti.invalidate(bot_id)
+    except Exception:
+        pass
+    context.user_data.pop('antispam_field', None)
+
+    friendly = {
+        "group_leave_delay_hours": f"⏳ تأخیر خروج از گروه روی **{value} ساعت** تنظیم شد.",
+        "group_leave_interval_sec": f"👣 فاصلهٔ خروج دونه‌به‌دونه روی **هر {value} ثانیه یک اکانت** تنظیم شد.",
+        "cancel_cooldown_minutes": (
+            f"⛔️ ممنوعیت ثبت سفارش پس از لغو روی **{value} دقیقه** تنظیم شد."
+            if value > 0 else "✅ ممنوعیت ثبت سفارش پس از لغو **خاموش** شد."
+        ),
+        "account_rest_minutes": (
+            f"😴 استراحت اکانت بین سفارش‌ها روی **{value} دقیقه** تنظیم شد."
+            if value > 0 else "✅ استراحت اکانت بین سفارش‌ها **خاموش** شد."
+        ),
+    }.get(key_db, "✅ تنظیم شد.")
+    await update.message.reply_text(f"✅ {friendly}")
+    return await anti_spam_menu(update, context)

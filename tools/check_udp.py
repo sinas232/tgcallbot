@@ -1,104 +1,90 @@
 #!/usr/bin/env python3
-"""
-check_udp.py — UDP egress diagnostic for the voice bot.
+"""Read-only DNS/UDP-53 connectivity probe; DOES NOT test Telegram media.
 
-WHY THIS EXISTS
-===============
-Voice calls (py-tgcalls / ntgcalls) send their audio over UDP/WebRTC to
-Telegram's media servers.  If the server/provider blocks or heavily drops
-outbound UDP, accounts join the call (MTProto control plane = TCP, still
-works) but the media transport never stays up → the "ghost /
-media_transport_lost" drops after 6-30s that you see in the logs.
+Run from the server project directory (no extra MTProto login or credentials):
+    python tools/check_udp.py
+    docker compose exec -T bot python tools/check_udp.py
 
-Docker's *bridge* network does NOT block outbound UDP (it NATs it), so a
-broken UDP path is almost always the VPS firewall/provider — not Docker.
-This tool separates those two cases in ~10 seconds.
-
-HOW TO RUN (from the repo root on the server)
-=============================================
-    python tools/check_udp.py                      # on the host
-    docker compose exec bot python tools/check_udp.py   # inside the container
-
-It sends a minimal DNS-over-UDP query to 3 public resolvers and waits for
-ANY reply.  Getting a reply proves UDP egress + reply path work.
-
-EXIT CODE: 0 = UDP egress OK, 1 = problem detected.
+It sends one DNS A query to each of three public resolvers and validates the
+source, transaction ID and response bit. A reply proves only THAT DNS/UDP-53
+request and response traversed that path at that moment. Neither success nor
+failure proves the health of WARP's UDP relay, Telegram's media servers,
+WebRTC/ntgcalls, packet loss, or whether a saved session key is valid. A
+resolver may block queries while other UDP services work. Exit 0 if at least
+one DNS resolver answered; 1 if none answered (investigate; inconclusive).
 """
 import asyncio
+import secrets
 import socket
 import struct
 import sys
 
-# Public DNS resolvers (UDP/53) — a real reply = UDP egress works.
 PROBES = [
-    ("1.1.1.1", 53, "Cloudflare DNS"),
-    ("8.8.8.8", 53, "Google DNS"),
-    ("9.9.9.9", 53, "Quad9 DNS"),
+    ('1.1.1.1', 53, 'Cloudflare DNS'),
+    ('8.8.8.8', 53, 'Google DNS'),
+    ('9.9.9.9', 53, 'Quad9 DNS'),
 ]
 TIMEOUT_S = 4.0
 
 
-def _dns_query(name: bytes = b"example.com") -> bytes:
-    """Minimal valid DNS query (standard header + one A-record question)."""
-    header = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
-    q = b""
-    for part in name.split(b"."):
-        q += bytes([len(part)]) + part
-    q += b"\x00" + struct.pack(">HH", 1, 1)  # type=A, class=IN
-    return header + q
+def _dns_query(name: bytes = b'example.com', transaction_id: int = 0x1234) -> bytes:
+    """Minimal A query. The caller supplies a fresh ID for each socket."""
+    header = struct.pack('>HHHHHH', transaction_id, 0x0100, 1, 0, 0, 0)
+    question = b''.join(bytes([len(part)]) + part for part in name.split(b'.'))
+    return header + question + b'\x00' + struct.pack('>HH', 1, 1)
+
+
+def _dns_response_matches(packet: bytes, sender: tuple, ip: str, port: int,
+                          transaction_id: int) -> bool:
+    if sender[:2] != (ip, port) or len(packet) < 12:
+        return False
+    received_id, flags, questions, *_ = struct.unpack('>HHHHHH', packet[:12])
+    return (received_id == transaction_id and bool(flags & 0x8000) and questions == 1)
 
 
 async def probe(ip: str, port: int) -> bool:
     loop = asyncio.get_running_loop()
+    transaction_id = secrets.randbits(16)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
-    got_reply = asyncio.Event()
     try:
-        loop.add_reader(sock.fileno(), lambda: got_reply.set())
-        sock.sendto(_dns_query(), (ip, port))
-        try:
-            await asyncio.wait_for(got_reply.wait(), timeout=TIMEOUT_S)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        await loop.sock_sendto(sock, _dns_query(transaction_id=transaction_id), (ip, port))
+        deadline = loop.time() + TIMEOUT_S
+        while loop.time() < deadline:
+            try:
+                reply, source = await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 4096), timeout=max(0.0, deadline - loop.time()))
+            except asyncio.TimeoutError:
+                return False
+            if _dns_response_matches(reply, source, ip, port, transaction_id):
+                return True
+        return False
     except OSError:
         return False
     finally:
-        try:
-            loop.remove_reader(sock.fileno())
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
+        sock.close()
 
 
 async def main() -> int:
-    print("=" * 64)
-    print("UDP egress check (voice media path precondition)")
-    print("=" * 64)
-    all_ok = True
+    print('=' * 64)
+    print('DNS/UDP-53 connectivity diagnostic (NOT a Telegram media test)')
+    print('=' * 64)
+    any_ok = False
     for ip, port, label in PROBES:
         ok = await probe(ip, port)
-        all_ok = all_ok and ok
-        print(f"  UDP {ip}:{port:<5} ({label:<16}) -> "
-              f"{'OK  (reply received)' if ok else 'BLOCKED / TIMEOUT'}")
-    print("-" * 64)
-    if all_ok:
-        print("RESULT: UDP egress OK.")
-        print("  → Docker bridge is NOT blocking your UDP. If ghost drops")
-        print("    still happen, the cause is inside the join flow (see")
-        print("    services/voice_call_manager.py logging) — not the socket.")
+        any_ok = any_ok or ok
+        print(f'  UDP {ip}:{port:<5} ({label:<16}) -> '
+              f'{"valid DNS reply" if ok else "no DNS reply / timeout"}')
+    print('-' * 64)
+    if any_ok:
+        print('RESULT: at least one DNS/UDP-53 reply received.')
+        print('  This does NOT prove Telegram WebRTC UDP/media or stable voice presence.')
     else:
-        print("RESULT: UDP egress is BLOCKED or heavily dropped.")
-        print("  → Voice media (WebRTC) CANNOT work reliably from this")
-        print("    machine. Check the VPS firewall / provider UDP policy,")
-        print("    or move to a provider with clean UDP egress. No code")
-        print("    change (including network_mode: host) fixes a blocked")
-        print("    provider egress rule.")
-    return 0 if all_ok else 1
+        print('RESULT: DNS/UDP-53 inconclusive (no resolver answered).')
+        print('  This does NOT prove all UDP blocked or Telegram voice impossible.')
+        print('  Compare host vs container; check WARP route and provider firewall.')
+    return 0 if any_ok else 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(asyncio.run(main()))

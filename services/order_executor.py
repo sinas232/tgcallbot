@@ -4,7 +4,6 @@ import math
 import random
 import re
 import time
-import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,8 +13,11 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
-from services.session_ownership import SessionInUseError
+from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
+                                        is_fatal_auth_error, fatal_auth_category)
 from services import self_healing
+from services.anti_spam import anti_spam
+from services.voice_cooldown import voice_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,9 @@ class OrderExecutor:
 		# duration-maintenance calls of the same order.
 		self._voice_pool: Dict[int, List[Dict]] = {}          # eligible account pool (merged/refreshed)
 		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
-		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
+		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> dropped for this pass
+		self._voice_terminal: Dict[int, Set[int]] = {}        # revoked, 406 or replaced key: NEVER second-chance
+		self._voice_second_chance: Dict[int, int] = {}       # bounded transient retry rounds
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
@@ -129,9 +133,10 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+		"""Claim a paid open order and register its worker; False if settled."""
 		if order_id in self.active_orders:
-			return
+			return False
 		self.active_orders[order_id] = {
 			"status": "running",
 			"data": order_data,
@@ -145,12 +150,35 @@ class OrderExecutor:
 			"swapped_accounts": 0,
 		}
 		try:
-			await DatabaseManager.mark_order_as_running(order_id)
+			claimed = await DatabaseManager.mark_order_as_running(
+				order_id, expected_status=(
+					'scheduled' if order_data.get('scheduled_for') else 'pending'))
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
+		if not claimed:
+			self.active_orders.pop(order_id, None)
+			return False
+		# 🛡 ضد اسپم: سفارش جدید برای این مقصد → خروج‌های به‌تأخیرافتادهٔ قبلیِ
+		# همین مقصد لغو می‌شود؛ اکانت‌ها عضو باقی می‌مانند (بدون چرخهٔ مضر
+		# leave → rejoin که دلیل اصلی بن شدن اکانت‌هاست).
+		try:
+			from services.group_leave_scheduler import group_leave_scheduler as _gls
+			await _gls.cancel_for_target(
+				order_data.get("target_link"),
+				int(order_data.get("bot_id", 1) or 1),
+			)
+		except Exception:
+			pass
+		# Cancellation/refund can happen while the async group-leave step runs.
+		# A cleared in-memory order must NEVER be resurrected by creating a
+		# worker after the wallet was already refunded.
+		if not self._is_order_active(order_id):
+			self.active_orders.pop(order_id, None)
+			return False
 		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
 		self.active_orders[order_id]["task"] = task
+		return True
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
 	    joined_list: List[Dict[str, Any]] = []
@@ -256,16 +284,35 @@ class OrderExecutor:
 	            return
 
 	        # ────────────────────────────────────────────────────────────
-	        # DURATION PHASE — the billable timer starts ONLY NOW that the
-	        # required accounts are present (join/build time is free).
+	        # DURATION PHASE — user-approved best-effort account count. Once at
+	        # least ONE account joined, start the clock at the FULL plan price;
+	        # the number joined does not discount time. Build time stays free.
 	        # ────────────────────────────────────────────────────────────
 	        if duration > 0:
-	            try:
-	                started_at = await DatabaseManager.start_order_duration(order_id)
-	            except Exception as exc:
-	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
-	                started_at = None
-	            started_at = started_at or datetime.utcnow()
+	            # A local timestamp is not a paid start: after a DB outage it
+	            # would be forgotten, making elapsed time/settlement incorrect.
+	            # Keep the joined call intact and retry persistence without
+	            # starting the paid clock until the DB confirms it.
+	            started_at = None
+	            while self._is_order_active(order_id):
+	                try:
+	                    started_at = await DatabaseManager.start_order_duration(order_id)
+	                    break
+	                except asyncio.CancelledError:
+	                    raise
+	                except Exception as exc:
+	                    logger.warning(
+	                        "Order %s: billable start not persisted (%s); "
+	                        "retrying without starting paid time",
+	                        order_id, type(exc).__name__,
+	                    )
+	                    await asyncio.sleep(5)
+	            if not started_at:
+	                # None = order no longer running (e.g. canceled mid-build).
+	                # Never overwrite an externally stopped/completed status.
+	                await self._cleanup_order(order_id, joined_list, data)
+	                self.active_orders.pop(order_id, None)
+	                return
 	            end_time = started_at + timedelta(minutes=duration)
 	            total_secs = duration * 60
 	            logger.info(
@@ -350,9 +397,18 @@ class OrderExecutor:
 	                    if order_id in self.active_orders:
 	                        self.active_orders[order_id]["live_count"] = live
 	                        self.active_orders[order_id]["joined_accounts"] = joined_list
+	                    # Durable live count is not continuous media presence.
+	                    # Surface the native binding signal separately (it too
+	                    # cannot guarantee end-to-end WebRTC packet delivery).
+	                    _binding = None
+	                    if order_type == "voice_chat":
+	                        _vcm = _get_voice_call_manager()
+	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
+	                            _binding = _vcm.get_binding_status_counts(order_id)
 	                    logger.info(
-	                        f"Order {order_id}: stable live={live}/{exact} "
-	                        f"(rejoin by monitor; unrecoverable slots replaced)"
+	                        "Order %s: durable_live=%s/%s | native_binding=%s "
+	                        "(not proof of UDP packet delivery)",
+	                        order_id, live, exact, _binding,
 	                    )
 
 	                await asyncio.sleep(min(1.0, max(0.0, remaining_now)))
@@ -387,6 +443,8 @@ class OrderExecutor:
 	    self._voice_pool.setdefault(order_id, [])
 	    self._voice_attempts.setdefault(order_id, {})
 	    self._voice_banned.setdefault(order_id, set())
+	    self._voice_terminal.setdefault(order_id, set())
+	    self._voice_second_chance.setdefault(order_id, 0)
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
@@ -399,6 +457,8 @@ class OrderExecutor:
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
 	    self._voice_banned.pop(order_id, None)
+	    self._voice_terminal.pop(order_id, None)
+	    self._voice_second_chance.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
@@ -430,13 +490,22 @@ class OrderExecutor:
 	        return
 	    # Refresh: keep previously-known accounts that are STILL active (same
 	    # relative order), drop ones no longer eligible, append newly added.
-	    fetched_ids = {a.get("id") for a in fetched if a.get("id")}
+	    fetched_by_id = {a.get("id"): a for a in fetched if a.get("id")}
 	    merged: List[Dict] = []
 	    seen: Set[int] = set()
 	    for acc in current:
 	        aid = acc.get("id")
-	        if aid and aid in fetched_ids and aid not in seen:
-	            merged.append(acc)
+	        if aid and aid in fetched_by_id and aid not in seen:
+	            fresh = fetched_by_id[aid]
+	            if fresh.get("session_string") != acc.get("session_string"):
+	                seen.add(aid)
+	                # An account was re-authorised mid-order. Do not reuse the old
+	                # encrypted key or race its still-running voice client against
+	                # the replacement. The next order will pick up the new session.
+	                self._voice_banned[order_id].add(aid)
+	                self._voice_terminal[order_id].add(aid)
+	                continue
+	            merged.append(fresh)
 	            seen.add(aid)
 	    for acc in fetched:
 	        aid = acc.get("id")
@@ -478,6 +547,13 @@ class OrderExecutor:
 	        # cancellation and restarts): never re-issue early.
 	        if vcm is not None and vcm.flood_wait_remaining(aid) > 0:
 	            continue
+	        # 🛡 استراحت ضد اسپم: اکانتی که تازه سفارش قبلی‌اش را تمام کرده،
+	        # تا پایان مهلت استراحت برای join جدید انتخاب نمی‌شود.
+	        try:
+	            if anti_spam.rest_remaining(aid) > 0:
+	                continue
+	        except Exception:
+	            pass
 	        chosen.append(acc)
 	    self._voice_cursor[order_id] = cursor % n if n else 0
 	    return chosen
@@ -505,10 +581,57 @@ class OrderExecutor:
 	            flood_when = now + vcm.flood_wait_remaining(aid)
 	            if flood_when > when:
 	                when = flood_when
+	        # 🛡 استراحت ضد اسپم هم در زمان‌بندی موج لحاظ می‌شود تا موتور موج
+	        # به‌جای «پول تمام شد»، تا اتمام نزدیک‌ترین استراحت صبر کند.
+	        try:
+	            rest_when = now + anti_spam.rest_remaining(aid)
+	            if rest_when > when:
+	                when = rest_when
+	        except Exception:
+	            pass
 	        if when <= 0:
 	            return 0.0
 	        best = when if best is None else min(best, when)
 	    return best
+
+	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
+	                                    joined_ids: Set[int]) -> bool:
+	    """Give transiently exhausted accounts ONE new attempt per bounded round.
+
+	    Never retry a revoked key, a 406 conflict, or a key replaced while this
+	    order was running. A global FloodWait never bypasses Telegram's cooldown.
+	    """
+	    # Direct starts must respect the same ceiling as the deploy preflight.
+	    max_rounds = min(5, max(0, int(getattr(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0))))
+	    if self._voice_second_chance[order_id] >= max_rounds:
+	        return False
+
+	    def eligible() -> List[int]:
+	        return [acc["id"] for acc in self._voice_pool[order_id]
+	                if acc["id"] in self._voice_banned[order_id]
+	                and acc["id"] not in self._voice_terminal[order_id]
+	                and acc["id"] not in joined_ids
+	                and not voice_cooldown.remaining(acc["id"])]
+
+	    if not eligible():
+	        return False
+	    cooldown = max(0.0, float(getattr(Config, "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS", 60)))
+	    if cooldown:
+	        await asyncio.sleep(cooldown)
+	    if not self._is_order_active(order_id):
+	        return False
+	    await self._voice_load_pool(bot_id, order_id)
+	    retry_ids = eligible()
+	    if not retry_ids:
+	        return False
+	    budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    for aid in retry_ids:
+	        self._voice_banned[order_id].discard(aid)
+	        self._voice_attempts[order_id][aid] = max(0, budget - 1)
+	    self._voice_second_chance[order_id] += 1
+	    logger.info("[VoiceFill] order=%s second chance %s/%s accounts=%s",
+	                order_id, self._voice_second_chance[order_id], max_rounds, len(retry_ids))
+	    return True
 
 	async def _voice_batched_fill(
 	    self,
@@ -541,7 +664,29 @@ class OrderExecutor:
 
 	    await self._voice_load_pool(bot_id, order_id)
 	    adaptive = bool(getattr(Config, "VOICE_JOIN_ADAPTIVE", True))
-	    if adaptive:
+	    sequential = bool(getattr(Config, "VOICE_JOIN_SEQUENTIAL", False))
+	    # 🛡 ضد اسپم: سقف موج join در حالت محافظت پایین‌تر نگه داشته می‌شود تا
+	    # نرخ JoinGroupCall از یک IP هرگز وارد ناحیهٔ ریسک حذف اکانت نشود.
+	    try:
+	        _as_profile = await anti_spam.get_profile(bot_id)
+	    except Exception:
+	        _as_profile = None
+	    if sequential:
+	        # Also cap monitor recovery joins via the same per-order gate in VCM.
+	        join_brain.register_order(order_id, initial=1, min_window=1, max_window=1)
+	    elif _as_profile is not None and _as_profile.enabled:
+	        _cap = max(1, min(
+	            int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 2)),
+	            _as_profile.max_join_concurrency,
+	        ))
+	        _initial = max(1, min(int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 1)), _cap))
+	        join_brain.register_order(
+	            order_id,
+	            initial=_initial,
+	            min_window=max(1, int(getattr(Config, "VOICE_JOIN_MIN_CONCURRENCY", 1))),
+	            max_window=_cap,
+	        )
+	    elif adaptive:
 	        join_brain.register_order(order_id)
 	    else:
 	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
@@ -550,6 +695,10 @@ class OrderExecutor:
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
+	    # A run of 406 errors suggests a systemic auth-key collision (including
+	    # same-process reseller copies), not proof of another server or a usable
+	    # key. Abort the wave to avoid hammering possibly invalidated keys.
+	    dup406_streak = 0
 	    live = int(vcm.get_active_count(order_id))
 
 	    while self._is_order_active(order_id) and live < target_count:
@@ -557,7 +706,7 @@ class OrderExecutor:
 	        if not self._is_order_active(order_id):
 	            break
 
-	        window = join_brain.get_window(order_id)
+	        window = 1 if sequential else join_brain.get_window(order_id)
 	        need = max(0, target_count - live)
 	        window = max(1, min(int(window), int(need)))
 	        now = time.time()
@@ -572,10 +721,11 @@ class OrderExecutor:
 	        # Pipeline: warm the NEXT wave's Pyrogram clients while this wave
 	        # is joining (client start is the slowest single step).
 	        warm_task: Optional[asyncio.Task] = None
-	        if candidates:
+	        if candidates and (not sequential or getattr(Config, "VOICE_JOIN_SEQUENTIAL_PREWARM", False)):
 	            in_flight_ids = {c["id"] for c in candidates if c.get("id")}
 	            lookahead = self._voice_candidates(
-	                order_id, max(1, window * 2), joined_ids | in_flight_ids, set(), now,
+	                order_id, 1 if sequential else max(1, window * 2),
+	                joined_ids | in_flight_ids, set(), now,
 	            )
 	            if lookahead:
 	                try:
@@ -596,6 +746,8 @@ class OrderExecutor:
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
+	                    continue
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -611,18 +763,20 @@ class OrderExecutor:
 	        wave_started = time.monotonic()
 	        # ── STAGGERED WAVE STARTS (managed pacing) ─────────────────
 	        # NEVER fire the whole wave in the same millisecond. Each account's
-	        # join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds after the
+	        # join starts stagger_min..stagger_max seconds (+jitter) after the
 	        # previous one, so the phone.JoinGroupCall RPCs spread over several
-	        # seconds (~1 join/second — clearly a bot, but far below the burst
-	        # threshold that makes Telegram answer with FloodWait 3s loops).
-	        # The wave still overlaps: a single join takes 30-45s, so with a
-	        # window of 3-10 the build speed is nearly unchanged.
-	        stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 6.0)))
-	        stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 10.0)))
-	        # Subtle human-like jitter added on top of the base gap so the RPC
-	        # cadence is never perfectly periodic (harder for anti-spam to flag).
-	        jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_JITTER_MIN", 0.5)))
-	        jitter_max = max(jitter_min, float(getattr(Config, "VOICE_JOIN_START_JITTER_MAX", 1.5)))
+	        # seconds. The wave still overlaps: a single join takes 30-45s, so
+	        # the build speed is nearly unchanged; only the *starts* are paced.
+	        # 🛡 ضد اسپم: وقتی فعال است، فاصله‌ها از پروفایل محافظتیِ پنل می‌آیند
+	        # (بزرگ‌تر + jitter انسانی، با کش ۱۰ثانیه‌ای — تغییر پنل سریع اعمال می‌شود).
+	        try:
+	            _wave_profile = await anti_spam.get_profile(bot_id)
+	            stagger_min, stagger_max, jitter_min, jitter_max, _ = anti_spam.effective_join_pacing(_wave_profile)
+	        except Exception:
+	            stagger_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MIN", 6.0)))
+	            stagger_max = max(stagger_min, float(getattr(Config, "VOICE_JOIN_START_STAGGER_MAX", 10.0)))
+	            jitter_min = max(0.0, float(getattr(Config, "VOICE_JOIN_START_JITTER_MIN", 0.5)))
+	            jitter_max = max(jitter_min, float(getattr(Config, "VOICE_JOIN_START_JITTER_MAX", 1.5)))
 	        logger.info(
 	            f"Order {order_id}: wave {wave_no} — joining {len(candidates)} accounts "
 	            f"staggered (window={window}, start-gap={stagger_min:.1f}-{stagger_max:.1f}s"
@@ -645,15 +799,17 @@ class OrderExecutor:
 	        done_w, pending_w = await asyncio.wait(
 	            wave_tasks, timeout=wave_timeout, return_when=asyncio.ALL_COMPLETED,
 	        )
+	        pending_unsettled: Set[asyncio.Task] = set()
 	        if pending_w:
 	            logger.warning(
 	                f"Order {order_id}: wave {wave_no} hit {wave_timeout:.0f}s deadline - "
-	                f"{len(pending_w)} account(s) still joining; deferred to a later wave"
+	                f"{len(pending_w)} account(s) still joining; cancelling first"
 	            )
 	            for _t in pending_w:
 	                _t.cancel()
-	            # Let cancellation settle so the vcm state machines unwind cleanly.
-	            await asyncio.wait(list(pending_w), timeout=10)
+	            # A non-cooperative cancellation MUST NOT overlap another wave:
+	            # its underlying JoinGroupCall might still own a live transport.
+	            _, pending_unsettled = await asyncio.wait(list(pending_w), timeout=10)
 	        results: Dict[asyncio.Task, Any] = {}
 	        for _t in wave_tasks:
 	            if _t in done_w:
@@ -688,6 +844,7 @@ class OrderExecutor:
 	                    joined_list.append(res)
 	                    joined_ids.add(aid)
 	                wave_ok += 1
+	                dup406_streak = 0  # success breaks the streak
 	                join_brain.report_result(order_id, OUTCOME_OK)
 	                try:
 	                    self_healing.report("", True, key=f"{order_id}:{aid}")
@@ -717,27 +874,52 @@ class OrderExecutor:
 	                    wave_fail += 1
 	                    continue
 
-	                upper = msg.upper()
-	                # NOTE: AUTH_KEY_DUPLICATED means Telegram INVALIDATED the
-	                # session key (used in 2 places at once) — the account is
-	                # burned until re-login, so mark it dead immediately instead
-	                # of wasting retries/backoffs on a session that can never
-	                # connect again.
-	                if status == "dead" or any(x in upper for x in (
-	                    "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-	                    "AUTH_KEY_DUPLICATED",
-	                    "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401",
-	                )):
-	                    # Account itself is dead — mark inactive & replace.
-	                    dead_count += 1
+	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
+	                # this auth key, NOT the account. This result is text-only, so
+	                # it cannot prove the RPC type or identify the other TCP
+	                # connection. Preserve the DB row; stop this order's attempts.
+	                if is_auth_key_duplicated(msg):
+	                    dead_count += 1  # order statistics, not a DB auto-disable
 	                    wave_dead += 1
+	                    wave_fail += 1
 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    self._voice_terminal[order_id].add(aid)
+	                    dup406_streak += 1
 	                    try:
-	                        await self._mark_account_dead(aid)
+	                        await DatabaseManager.note_session_conflict_if_current(
+	                            aid, acc["session_string"])
 	                    except Exception:
 	                        pass
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} AUTH_KEY_DUPLICATED - "
+	                        "no auto-disable; row preserved; typed Telegram 406 invalidates the key; "
+	                        "re-login with phone"
+	                    )
 	                    join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                    continue
+	                if status == "dead" or is_fatal_auth_error(msg):
+	                        dup406_streak = 0  # non-dup fatal event breaks the streak
+	                        # Account itself is dead — mark inactive & replace.
+	                        dead_count += 1
+	                        wave_dead += 1
+	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                        self._voice_banned.setdefault(order_id, set()).add(aid)
+	                        self._voice_terminal[order_id].add(aid)
+	                        if status != "dead":  # already persisted by _join_single_account
+	                                try:
+	                                        await self._mark_account_dead(aid, acc["session_string"], msg)
+	                                except Exception:
+	                                        pass
+	                        join_brain.report_result(order_id, OUTCOME_DEAD, msg)
+	                        wave_fail += 1
+	                        continue
+
+	                if "SESSION_IN_USE" in msg.upper():
+	                    # A local owner is serving this key; do not turn the
+	                    # second-chance loop into repeated connection probes.
+	                    self._voice_banned[order_id].add(aid)
+	                    self._voice_terminal[order_id].add(aid)
 	                    wave_fail += 1
 	                    continue
 
@@ -796,6 +978,18 @@ class OrderExecutor:
 	                )
 	                wave_fail += 1
 
+	        if dup406_streak >= 5:
+	            logger.error(
+	                f"Order {order_id}: {dup406_streak} consecutive AUTH_KEY_DUPLICATED - "
+	                "aborting build waves to avoid further key conflicts. "
+	                "Check copied reseller sessions, other processes/servers; re-login if keys were invalidated"
+	            )
+	            try:
+	                self.active_orders[order_id]["build_abort_reason"] = "AUTH_KEY_DUPLICATED_SYSTEMIC"
+	            except Exception:
+	                pass
+	            break
+
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))
 	        wave_duration = time.monotonic() - wave_started
@@ -817,6 +1011,25 @@ class OrderExecutor:
                 f"in {wave_duration:.0f}s) | "
                 f"{join_brain.format_progress(order_id, live, target_count)}"
             )
+	        if pending_unsettled:
+	            logger.error("[VoiceFill] order=%s build halted: %s join task(s) did not unwind",
+	                         order_id, len(pending_unsettled))
+	            if order_id in self.active_orders:
+	                self.active_orders[order_id]["build_abort_reason"] = "JOIN_CANCELLATION_UNCONFIRMED"
+	            break
+	        if sequential and live < target_count and self._is_order_active(order_id):
+	            gap_lo = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MIN", 1.0)))
+	            gap_hi = max(gap_lo, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_MAX", 2.0)))
+	            jit_lo = max(0.0, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN", 0.0)))
+	            jit_hi = max(jit_lo, float(getattr(Config, "VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX", 0.5)))
+	            # The configured gap is a floor; never shorten the anti-spam
+	            # profile for this bot by enabling sequential mode.
+	            if _as_profile is not None and _as_profile.enabled:
+	                gap_lo = max(gap_lo, stagger_min)
+	                gap_hi = max(gap_lo, gap_hi, stagger_max)
+	                jit_lo = max(jit_lo, jitter_min)
+	                jit_hi = max(jit_lo, jit_hi, jitter_max)
+	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
 
 	    # Return only the accounts this call newly joined; the CALLER owns
 	    # merging them into the order's running joined_accounts list (the
@@ -923,6 +1136,11 @@ class OrderExecutor:
 		batch_size = max(1, int(getattr(Config, 'BATCH_SIZE', 20)))
 		offset = 0
 		active_count = 0
+		# 🛡 استراحت ضد اسپم: اکانت‌های «در استراحت» بیرون گذاشته می‌شوند؛ اگر
+		# پول فقط به‌خاطر استراحت تمام شود، نزدیک‌ترین پایان استراحت را صبر کرده
+		# و با سقف محدود دوباره اسکن می‌کنیم (بدون rest این منطق no-op است).
+		rest_pending_wait: Optional[float] = None
+		rest_rescans = 0
 
 		vcm = _get_voice_call_manager()
 
@@ -931,10 +1149,36 @@ class OrderExecutor:
 				bot_id=bot_id, offset=offset, limit=batch_size,
 			)
 			if not batch:
+				if rest_pending_wait is not None and rest_rescans < 2:
+					wait_s = min(max(2.0, rest_pending_wait), 45.0)
+					logger.info(
+						f"Order {order_id}: pool exhausted (account rest active); "
+						f"re-scan in {wait_s:.0f}s (pass {rest_rescans + 1}/2)"
+					)
+					try:
+						await asyncio.sleep(wait_s)
+					except asyncio.CancelledError:
+						break
+					offset = 0
+					rest_rescans += 1
+					rest_pending_wait = None
+					continue
 				break
 			offset += len(batch)
 
-			fresh = [a for a in batch if a["id"] not in seen_ids]
+			fresh: List[Dict] = []
+			for a in batch:
+				if a["id"] in seen_ids:
+					continue
+				try:
+					_rr = anti_spam.rest_remaining(a["id"])
+				except Exception:
+					_rr = 0.0
+				if _rr > 0:
+					if rest_pending_wait is None or _rr < rest_pending_wait:
+						rest_pending_wait = _rr
+					continue
+				fresh.append(a)
 
 			if fresh:
 				# NOTE: For voice_chat we deliberately do NOT warm up the whole
@@ -1007,16 +1251,40 @@ class OrderExecutor:
 		dead_count = 0
 		batch_size = max(1, int(getattr(Config, 'BATCH_SIZE', 20)))
 		offset = 0
+		rest_pending_wait: Optional[float] = None
+		rest_rescans = 0
 
 		while self._is_order_active(order_id) and need > 0:
 			batch = await DatabaseManager.get_active_accounts_batch(
 				bot_id=bot_id, offset=offset, limit=batch_size,
 			)
 			if not batch:
+				if rest_pending_wait is not None and rest_rescans < 1:
+					wait_s = min(max(2.0, rest_pending_wait), 30.0)
+					try:
+						await asyncio.sleep(wait_s)
+					except asyncio.CancelledError:
+						break
+					offset = 0
+					rest_rescans += 1
+					rest_pending_wait = None
+					continue
 				break
 			offset += len(batch)
 
-			fresh = [a for a in batch if a["id"] not in seen_ids]
+			fresh: List[Dict] = []
+			for a in batch:
+				if a["id"] in seen_ids:
+					continue
+				try:
+					_rr = anti_spam.rest_remaining(a["id"])
+				except Exception:
+					_rr = 0.0
+				if _rr > 0:
+					if rest_pending_wait is None or _rr < rest_pending_wait:
+						rest_pending_wait = _rr
+					continue
+				fresh.append(a)
 			if not fresh:
 				continue
 
@@ -1142,17 +1410,27 @@ class OrderExecutor:
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
 					if ok: return {"success": True, "acc": acc, "chat_id": cid}
-					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
-						await self._mark_account_dead(acc["id"])
+					if is_fatal_auth_error(msg):
+						await self._mark_account_dead(acc["id"], acc["session_string"], msg)
 						return {"success": False, "status": "dead"}
 					return {"success": False, "status": "failed", "msg": msg, "retry_managed": True}
 
 			if order_type in ["group_join", "channel_join"]:
 				client = TelegramAccountClient(acc["phone_number"], acc["session_string"], acc["id"])
 				ok, msg = await client.join_chat(target)
-				if ok: return {"success": True, "acc": acc, "chat_id": None}
-				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
-					await self._mark_account_dead(acc["id"])
+				# 🛡 آی‌دی چت واقعی join‌شده نگه داشته می‌شود تا «خروج به‌تأخیرافتاده»
+				# دقیقاً با همان chat_id زمان‌بندی شود (وابسته به حدس لینک نباشد).
+				_cid = getattr(client, "last_joined_chat_id", None) if ok else None
+				if ok: return {"success": True, "acc": acc, "chat_id": _cid}
+				if is_auth_key_duplicated(msg):
+					# Group/channel joins also use this auth key. Persist the same
+					# quarantine as voice, and never send a second outer attempt.
+					await DatabaseManager.note_session_conflict_if_current(
+						acc["id"], acc["session_string"])
+					return {"success": False, "status": "failed",
+							"msg": "AUTH_KEY_DUPLICATED", "retry_managed": True}
+				if is_fatal_auth_error(msg):
+					await self._mark_account_dead(acc["id"], acc["session_string"], msg)
 					return {"success": False, "status": "dead"}
 				return {"success": False, "status": "failed", "msg": msg}
 			return None
@@ -1163,9 +1441,13 @@ class OrderExecutor:
 		except Exception as e:
 			return {"success": False, "status": "error", "msg": str(e)}
 
-	async def _mark_account_dead(self, account_id):
-		await DatabaseManager.update_account_status(account_id, "inactive")
-		await DatabaseManager.update_account_spam_status(account_id, "dead", "SESSION_REVOKED detected")
+	async def _mark_account_dead(self, account_id, encrypted_session, reason):
+		"""Never disable a replacement key because an old join failed."""
+		category = fatal_auth_category(reason)
+		if not category:
+			return False
+		return await DatabaseManager.mark_account_auth_invalid(
+			account_id, encrypted_session, category)
 
 	async def _finish_order(self, order_id, data, joined_accounts, dead_count):
 		# 1) IMMEDIATE exit from voice chat + group
@@ -1250,7 +1532,10 @@ class OrderExecutor:
 					pass
 				return True, "Order cancelled and accounts left."
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))
-			await self._fail_order(order_id, "Stopped.")
+			# A manual settlement already claimed 'stopped' atomically. Never
+			# turn it into 'failed' merely because the worker had no task handle.
+			await DatabaseManager.update_order_status(order_id, "stopped")
+			self.active_orders.pop(order_id, None)
 			return True, "Stopped"
 		vcm = _get_voice_call_manager()
 		if vcm:
@@ -1274,13 +1559,70 @@ class OrderExecutor:
 		if order_type == "voice_chat":
 			# Voice leaves are handled only by VCM.stop_all_for_order.
 			return
-		gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
-		gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
-		jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
-		jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
-		max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
+		bot_id = int((data or {}).get("bot_id", 1) or 1)
+
+		# 🛡 ضد اسپم: «خروج به‌تأخیرافتاده از گروه» — به‌جای خروج فوریِ انبوه
+		# از گروه/کانال (الگوی کلاسیک ربات)، برای هر اکانت یک خروج زمان‌بندی‌
+		# شده (پیش‌فرض یک هفته بعد) ثبت می‌کنیم که جاب، دونه‌به‌دونه و به‌ترتیب
+		# اجرایش می‌کند. هر ورودی که زمان‌بندی‌اش نشد (قابلیت خاموش/خطا) از مسیر
+		# فوریِ pacedِ پایین خارج می‌شود — هیچ اکانتی هرگز در گروه «گیر» نمی‌کند.
+		try:
+			from services.group_leave_scheduler import group_leave_scheduler as _gls
+			delayed_entries = []
+			unscheduled = []
+			for entry in list(accounts_list):
+				acc = entry.get("acc") or {}
+				aid = acc.get("id")
+				if not aid:
+					continue
+				sched = False
+				try:
+					sched = await _gls.schedule(
+						account_id=aid,
+						chat_id=int(entry["chat_id"]) if entry.get("chat_id") else None,
+						target_link=(data or {}).get("target_link"),
+						order_id=order_id,
+						bot_id=bot_id,
+					)
+				except Exception:
+					sched = False
+				(delayed_entries if sched else unscheduled).append(entry)
+			if delayed_entries and not unscheduled:
+				logger.info(
+					"Order %s: group exits SCHEDULED (delayed, one-by-one) for %s account(s)",
+					order_id, len(delayed_entries),
+				)
+				for entry in delayed_entries:
+					acc = entry.get("acc") or {}
+					if acc.get("id"):
+						try:
+							await anti_spam.note_account_finished(acc["id"], bot_id)
+						except Exception:
+							pass
+				return
+			if not delayed_entries:
+				entries = list(accounts_list)
+			else:
+				logger.info(
+					"Order %s: %s exit(s) scheduled delayed; %s leaving immediately (fallback)",
+					order_id, len(delayed_entries), len(unscheduled),
+				)
+				entries = list(unscheduled)
+		except Exception as _gls_err:
+			logger.warning("Order %s: delayed-leave scheduling failed, immediate path: %s", order_id, _gls_err)
+			entries = list(accounts_list)
+
+		# 🛡 pacing خروج فوری — در حالت ضد اسپم از پروفایل محافظتی استفاده می‌شود.
+		try:
+			_profile = await anti_spam.get_profile(bot_id)
+			gap_min, gap_max, jitter_min, jitter_max, max_conc = anti_spam.effective_leave_pacing(_profile)
+		except Exception:
+			gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
+			gap_max = max(gap_min, float(getattr(Config, "VOICE_LEAVE_STAGGER_MAX", 1.5)))
+			jitter_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_JITTER_MIN", 0.0)))
+			jitter_max = max(jitter_min, float(getattr(Config, "VOICE_LEAVE_JITTER_MAX", 0.4)))
+			max_conc = max(1, int(getattr(Config, "VOICE_LEAVE_MAX_CONCURRENCY", 2)))
 		sem = asyncio.Semaphore(max_conc)
-		entries = list(accounts_list)
 		random.shuffle(entries)
 		logger.info(
 			"Order %s: paced eject of %s account(s) (gap=%.1f-%.1fs conc=%s type=%s)",
@@ -1305,6 +1647,14 @@ class OrderExecutor:
 			tasks.append(asyncio.create_task(_one(entry)))
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
+		# 🛡 استراحت اکانت پس از اتمام کار (ضد اسپم) — با rest=0 یا خاموش، no-op است.
+		for entry in entries:
+			acc = entry.get("acc") or {}
+			if acc.get("id"):
+				try:
+					await anti_spam.note_account_finished(acc["id"], bot_id)
+				except Exception:
+					pass
 
 	async def _fail_order(self, order_id, reason):
 		info = self.active_orders.get(order_id)
@@ -1325,7 +1675,24 @@ class OrderExecutor:
 			except Exception as exc:
 				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
 		self._voice_forget_order(order_id)
-		await DatabaseManager.update_order_status(order_id, "failed")
+		# A failed build with no started_at provided ZERO billable time. The
+		# old path marked 'failed' but retained the whole prepayment and made
+		# the user unable to cancel/refund it. Claim status + prorated refund
+		# together; retries cannot pay the wallet a second time. If DB is down,
+		# leave it unclaimed for manual recovery instead of marking it failed
+		# without a refund (do not touch an already settled order).
+		try:
+			settled = await DatabaseManager.settle_cancel_order(
+				order_id, bot_id=int(data.get('bot_id') or 1), do_refund=True,
+				settlement_calculator=self.compute_order_settlement,
+				final_status='failed',
+			)
+			if settled:
+				logger.warning("Order %s failed; billable used=%s refunded=%s (atomic)",
+				               order_id, settled['used_cost'], settled['refund_amount'])
+		except Exception as exc:
+			logger.error("Order %s failure settlement unavailable (%s); "
+			             "status left for operator review", order_id, type(exc).__name__)
 		self.active_orders.pop(order_id, None)
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
@@ -1346,8 +1713,8 @@ class OrderExecutor:
 		تابع استفاده کنند تا «پیش‌نمایش» و «اجرا» هیچ‌وقت با هم اختلاف نداشته باشند:
 		- scheduled → هنوز مصرفی نشده: عودت کامل.
 		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
-		- مدتی → ثانیه‌ای دقیق؛ اگر started_at خالی است (گیرکرده در فاز build)
-		  مبنا created_at است تا عودت کاملِ اشتباه رخ ندهد.
+		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
+		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
 		"""
 		order = order or {}
 		total_price = float(order.get("price_paid") or 0)
@@ -1364,8 +1731,7 @@ class OrderExecutor:
 			else:
 				used = 0.0
 			return used, max(0.0, total_price - used), 0.0
-		if not started_at:
-			started_at = order.get("created_at")
+		# Never bill the build phase: created_at is NOT a service start.
 		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
 
 	@staticmethod
@@ -1399,6 +1765,7 @@ class OrderExecutor:
 	async def settle_and_refund_order(
 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
 		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+		expected_user_id=None,
 	):
 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
 
@@ -1408,25 +1775,23 @@ class OrderExecutor:
 		خروجی: dict شامل total_cost/used_cost/refund_amount/refund_tx_id/
 		        user_wallet_balance برای نمایش به تماس‌گیرنده.
 		"""
-		order = await DatabaseManager.get_order(order_id) or {}
-		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
-		total_price = float(order.get("price_paid") or 0)
-		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
-		if not do_refund:
-			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
-			used_cost = total_price
-			refund_amount = 0.0
-
-		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-		new_balance = None
-		if do_refund and refund_amount > 0 and user:
-			ok, new_balance = await DatabaseManager.update_user_credit(
-				user["id"], refund_amount, "order_refund",
-				f"عودت لغو سفارش {order_id} | {refund_tx_id}", bot_id=bot_id,
-			)
-		if new_balance is None and user:
-			fresh = await DatabaseManager.get_user_by_id(user["id"])
-			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+		# Row-locked, atomic claim + settlement: a second callback must not
+		# credit the wallet twice or refund a completed/cancelled order. Price
+		# depends on elapsed time and the FULL plan, never the joined-account ratio.
+		settled = await DatabaseManager.settle_cancel_order(
+			order_id, bot_id=bot_id, do_refund=do_refund,
+			settlement_calculator=self.compute_order_settlement,
+			expected_user_id=expected_user_id,
+		)
+		if settled is None:
+			raise ValueError("سفارش قبلاً لغو/تکمیل شده یا متعلق به این ربات نیست.")
+		order = settled['order']
+		user = await DatabaseManager.get_user_by_id(order.get('user_id')) if order.get('user_id') else None
+		total_price = settled['total_cost']
+		used_cost = settled['used_cost']
+		refund_amount = settled['refund_amount']
+		refund_tx_id = settled['refund_tx_id']
+		new_balance = settled['user_wallet_balance']
 
 		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
 		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
@@ -1523,7 +1888,9 @@ class OrderExecutor:
 		plan_minutes = int(data.get("duration_minutes") or order_rec.get("duration_minutes") or 0)
 
 		created_at = order_rec.get("created_at")
-		started_at = order_rec.get("started_at") or created_at or datetime.utcnow()
+		started_at = order_rec.get("started_at")  # never substitute the build date
+		operation_start = started_at or created_at or datetime.utcnow()
+		start_label = format_jalali_datetime(started_at) if started_at else "آغاز نشده"
 		ended_at = order_rec.get("completed_at") or datetime.utcnow()
 
 		# متغیرهای کارنامهٔ عملکرد (swap / stability)
@@ -1548,7 +1915,7 @@ class OrderExecutor:
 				f"├ 🔢 **تعداد اکانت:** `{count}` عدد",
 				f"├ ⏳ **مدت پلن:** `{plan_minutes}` دقیقه",
 				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
-				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(started_at)}`",
+				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(operation_start)}`",
 				sep,
 				"🛡️ *سیستم مانیتورینگ لحظه‌ای و خودکار فعال است.*",
 			]
@@ -1588,7 +1955,7 @@ class OrderExecutor:
 				"│",
 				f"├ 🚫 **لغو شده توسط:** `{canceled_by_role}` ({canceled_by_name})",
 				f"├ 📝 **علت لغو:** `{cancellation_reason}`",
-				f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+				f"├ 🚀 **زمان شروع:** `{start_label}`",
 				f"├ ⏱️ **زمان کارکرد واقعی:** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
 				"│",
 				"├ 💳 **جزئیات مالی و عودت وجه:**",
@@ -1599,7 +1966,8 @@ class OrderExecutor:
 				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
 				f"└ 👛 **موجودی فعلی کیف‌پول:** `{_p(wallet_balance)}` تومان",
 				sep,
-				"⚡ *مبلغ باقی‌مانده بلافاصله و بدون کسر کارمزد به کیف پول حساب شما اضافه شد.*",
+				("⚡ *مبلغ باقی‌مانده به کیف پول اضافه شد.*" if refund_amount
+				 else "ℹ️ *عودت وجهی انجام نشد.*"),
 			]
 			return "\n".join(lines)
 
@@ -1620,7 +1988,7 @@ class OrderExecutor:
 			f"├ 🔗 **لینک مقصد:** `{link}`",
 			"│",
 			f"├ ⏳ **پلن درخواستی:** `{plan_minutes}` دقیقه",
-			f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+			f"├ 🚀 **زمان شروع:** `{start_label}`",
 			f"├ 🏁 **زمان پایان:** `{format_jalali_datetime(ended_at)}`",
 			f"├ ⏱️ **مدت اجرای واقعی:** `{actual_duration_formatted}`",
 			"│",
