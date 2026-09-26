@@ -1,0 +1,2432 @@
+diff --git a/config.py b/config.py
+index a95d3c1..cd0237b 100644
+--- a/config.py
++++ b/config.py
+@@ -7,6 +7,32 @@ from dotenv import load_dotenv
+ 
+ load_dotenv()
+ 
++# ── مقیاس‌پذیری خودکار هم‌روندی از روی سخت‌افزار واقعی ──────────────────────
++# os.cpu_count() تعداد هسته‌های هاست را می‌دهد، نه سهمیه‌ای که cgroup به
++# کانتینر داده است. host_resources سهمیهٔ واقعی را می‌خواند.
++# قاعده: اگر متغیر env صریحاً تنظیم شده باشد همان عدد برنده است؛ اگر تنظیم
++# نشده باشد (صفر) مقدار از روی تعداد هسته محاسبه می‌شود.
++from services.host_resources import (  # noqa: E402 (بعد از load_dotenv)
++    recommended_client_create_concurrency as _rec_client_create,
++    recommended_global_join_concurrency as _rec_global_join,
++    recommended_join_max_concurrency as _rec_join_max,
++)
++from services.env_sanity import check_and_warn as _check_env  # noqa: E402
++
++ENV_DUPLICATE_KEYS = _check_env()
++
++
++def _env_int(key: str) -> int:
++    """عددِ صریحِ env یا صفر. صفر یعنی «تنظیم نشده» ⇒ محاسبهٔ خودکار."""
++    _raw = os.getenv(key)
++    if _raw is None or not str(_raw).strip():
++        return 0
++    try:
++        return int(str(_raw).strip())
++    except ValueError:
++        return 0
++
++
+ 
+ def _safe_encode_db_url(raw: str) -> str:
+     """
+@@ -70,7 +96,9 @@ class Config:
+     RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '30'))
+ 
+     # Order Settings
+-    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
++    # تنها سقف تجاریِ ربات: تعداد سفارش‌های همزمان. بقیهٔ کنترل‌های هم‌روندی از
++    # روی سهمیهٔ واقعی CPU محاسبه می‌شوند نه به‌صورت عدد ثابت.
++    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '5'))
+     if MAX_CONCURRENT_ORDERS < 0:
+         raise ValueError('MAX_CONCURRENT_ORDERS must not be negative')
+     # Preserve the permissive default for existing installs; 'private' opts in.
+@@ -93,8 +121,11 @@ class Config:
+     # System-wide hard cap on simultaneous native join operations (across ALL
+     # orders). Bumped up so several 100-500-account orders can build in
+     # parallel without starving each other.
+-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
+-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
++    # AUTO: ۸ به ازای هر هستهٔ در دسترس، کف ۸، سقف ۹۶. عمدتاً انتظار I/O است
++    # نه CPU، پس ضریب بالایی می‌گیرد. مقدار صریحِ env همیشه برنده است.
++    GLOBAL_JOIN_CONCURRENCY = _env_int('GLOBAL_JOIN_CONCURRENCY') or _rec_global_join()
++    # AUTO: ۲ به ازای هر هسته، کف ۴، سقف ۱۶ (هر ساخت = یک handshake کامل MTProto).
++    CLIENT_CREATE_CONCURRENCY = _env_int('CLIENT_CREATE_CONCURRENCY') or _rec_client_create()
+     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
+     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
+     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
+@@ -150,11 +181,14 @@ class Config:
+     # voice handshake. The Join Brain may still widen this (up to the max).
+     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
+     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
+-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
+-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
+-    # than ~2 concurrent media setups is where transports start dying AND
+-    # where Telegram's per-IP burst budget starts answering with FloodWait.
+-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
++    # Per-order ceiling. Previously a hard-coded 2 (a 'small VPS' assumption):
++    # every simultaneous voice handshake consumes CPU/ffmpeg + a WebRTC stack,
++    # and Telegram's per-IP burst budget answers bursts with FloodWait.
++    # AUTO: ۲ به ازای هر هسته، کف ۲، سقف ۱۶. این فقط یک «سقف» است — Join Brain
++    # تعداد واقعی هر موج را تطبیقی و زیر این سقف انتخاب می‌کند و در صورت فشار
++    # تلگرام تا VOICE_JOIN_MIN_CONCURRENCY پایین می‌آید؛ پس سقف بالاتر به معنی
++    # «همیشه این‌قدر join بزن» نیست.
++    VOICE_JOIN_MAX_CONCURRENCY = _env_int('VOICE_JOIN_MAX_CONCURRENCY') or _rec_join_max()
+     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
+     # Accounts of one wave do NOT fire their joins in the same millisecond:
+     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
+@@ -362,6 +396,18 @@ class Config:
+     # Hard deadline per adaptive wave: stragglers are cancelled and deferred
+     # to the next wave so one slow/stuck account never freezes the build.
+     VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
++    # ── CROSS-ORDER STARVATION WAIT (incident 1405-07-04) ─────────────────
++    # If every remaining pool account is held by ANOTHER live order, wait a
++    # bounded number of rounds for that order to release them instead of
++    # silently delivering a short order. The wait is bounded so a stalled
++    # order can never hang forever, and an account is never stolen.
++    VOICE_STARVED_WAIT_ROUNDS = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS', '6'))
++    VOICE_STARVED_WAIT_SECONDS = int(os.getenv('VOICE_STARVED_WAIT_SECONDS', '20'))
++    # ── RESTART RECOVERY (incident 1405-07-04) ────────────────────────────
++    # Re-submit orders that were `running` when the process died (OOM kill /
++    # deploy) for whatever paid time is left, and tell the user. Turn off to
++    # get the old behaviour, where such orders stayed `running` forever.
++    ORDER_RECOVERY_ENABLED = os.getenv('ORDER_RECOVERY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+     # Telegram JoinGroupCall supports joining muted; keep the account muted by
+     # default while the silent stream maintains the media transport.
+     VOICE_JOIN_MUTED = os.getenv('VOICE_JOIN_MUTED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+diff --git a/database.py b/database.py
+index 18a3fd5..e33f272 100644
+--- a/database.py
++++ b/database.py
+@@ -2194,11 +2194,28 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
+ 
+     @staticmethod
+     async def reset_stuck_orders():
++        """Reset ONLY the voice-session rows left `joined` by a restart.
++
++        ⚠️ This used to flip every `running` order to `stopped` as well.
++        That silently destroyed paid, still-valid orders after an OOM
++        kill / deploy (incident 1405-07-04: orders 859 & 860 were paid,
++        the process restarted mid-build, and both ended up listed under
++        "cancelled" with no re-join, no message and no refund — because
++        the admin filter for `cancelled` is `status IN (stopped, failed)`).
++        Order recovery now lives in `main._recover_interrupted_orders`.
++        """
+         async with AsyncSessionLocal() as db_session:
+-            await db_session.execute(update(Order).where(Order.status == 'running').values(status='stopped'))
+             await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.status == 'joined').values(status='reset'))
+             await db_session.commit()
+ 
++    @staticmethod
++    async def get_running_orders():
++        """Orders still marked `running` — i.e. interrupted by a restart."""
++        async with AsyncSessionLocal() as db_session:
++            q = select(Order).filter(Order.status == 'running').order_by(Order.id)
++            res = await db_session.execute(q)
++            return [to_dict(o) for o in res.scalars().all()]
++
+     @staticmethod
+     async def get_gateway(slug: str, bot_id=1):
+         async with AsyncSessionLocal() as db_session:
+diff --git a/docker-compose.yml b/docker-compose.yml
+index d95edf9..26582f4 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -134,10 +134,10 @@ services:
+     deploy:
+       resources:
+         limits:
+-          cpus: "${BOT_CPU_LIMIT:-2.0}"
+-          memory: ${BOT_MEM_LIMIT:-1536M}
+-    mem_limit: ${BOT_MEM_LIMIT:-1536M}
+-    cpus: ${BOT_CPU_LIMIT:-2.0}
++          cpus: "${BOT_CPU_LIMIT:-8.0}"
++          memory: ${BOT_MEM_LIMIT:-6G}
++    mem_limit: ${BOT_MEM_LIMIT:-6G}
++    cpus: ${BOT_CPU_LIMIT:-8.0}
+     environment:
+       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
+       - TZ=${TZ:-Asia/Tehran}
+diff --git a/main.py b/main.py
+index 25df9c1..c661875 100644
+--- a/main.py
++++ b/main.py
+@@ -575,6 +575,98 @@ async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
+     except Exception as e:
+         logger.error(f"Group leave sweeper error: {e}")
+ 
++async def _recover_interrupted_orders() -> None:
++    """بازیابی سفارش‌هایی که موقع ری‌استارت پروسه در حال اجرا بودند.
++
++    قبل از این، `reset_stuck_orders` همهٔ سفارش‌های `running` را بی‌صدا به
++    `stopped` تبدیل می‌کرد: بعد از OOM-kill / دیپلوی، سفارشِ پول‌داده‌شده نه
++    دوباره join می‌شد، نه پیامی می‌رفت و نه عودتی — و چون فیلتر `cancelled`
++    در دیتابیس `['stopped','failed']` است، در پنل ادمین زیر «لغو/ناموفق»
++    می‌افتاد. (رویداد ۱۴۰۵/۰۷/۰۴ — سفارش‌های ۸۵۹ و ۸۶۰)
++
++    حالا: اگر از زمان پرداخت‌شدهٔ سفارش چیزی باقی مانده باشد، سفارش برای همان
++    «مدت باقی‌مانده» دوباره submit می‌شود (زمان ورود مجدد رایگان است) و به
++    کاربر اطلاع داده می‌شود؛ اگر زمانی نمانده باشد، سفارش بسته می‌شود و کاربر
++    بی‌خبر نمی‌ماند.
++    """
++    if not bool(getattr(Config, "ORDER_RECOVERY_ENABLED", True)):
++        logger.info("♻️ Order recovery disabled (ORDER_RECOVERY_ENABLED=false)")
++        return
++    try:
++        orders = await DatabaseManager.get_running_orders()
++    except Exception as e:
++        logger.error(f"♻️ Order recovery: cannot read running orders ({e})")
++        return
++    if not orders:
++        return
++    logger.warning(
++        f"♻️ Found {len(orders)} order(s) still marked `running` at startup "
++        f"(process restarted mid-order) — attempting recovery"
++    )
++    now = datetime.utcnow()
++    for order in orders:
++        oid = order.get("id")
++        bot_id = order.get("bot_id", 1)
++        duration = int(order.get("duration_minutes") or 0)
++        start = order.get("started_at") or order.get("created_at")
++        app = bot_manager.active_bots.get(bot_id)
++        tg_id = None
++        try:
++            user = await DatabaseManager.get_user_by_id(order.get("user_id"))
++            tg_id = (user or {}).get("telegram_id")
++        except Exception:
++            tg_id = None
++
++        end = (start + timedelta(minutes=duration)) if (start and duration > 0) else None
++        remaining = int((end - now).total_seconds() // 60) if end else 0
++
++        if end is None or remaining <= 0:
++            # زمانی برای تحویل نمانده — ببند و به کاربر بگو.
++            try:
++                await DatabaseManager.update_order_status(oid, "stopped")
++            except Exception:
++                pass
++            logger.warning(f"♻️ Order {oid}: interrupted by restart with no paid time left — closed")
++            if tg_id and app:
++                try:
++                    await app.bot.send_message(
++                        tg_id,
++                        "⚠️ **سرور در میانهٔ سفارش شما راه‌اندازی مجدد شد.**\n"
++                        f"🆔 کد سفارش: `{oid}`\n"
++                        "زمانی از سفارش باقی نمانده بود، بنابراین سفارش بسته شد. "
++                        "برای پیگیری/عودت با پشتیبانی تماس بگیرید."
++                    )
++                except Exception:
++                    pass
++            continue
++
++        keep = max(1, remaining)
++        resume = dict(order)
++        resume["duration_minutes"] = keep
++        logger.warning(f"♻️ Order {oid}: resuming with {keep} minute(s) left (originally {duration})")
++        try:
++            await order_executor.submit_order(oid, resume)
++        except Exception as e:
++            logger.error(f"♻️ Order {oid}: resume failed ({e}) — marking stopped")
++            try:
++                await DatabaseManager.update_order_status(oid, "stopped")
++            except Exception:
++                pass
++            continue
++        if tg_id and app:
++            try:
++                await app.bot.send_message(
++                    tg_id,
++                    "♻️ **سرور راه‌اندازی مجدد شد و سفارش شما در حال بازیابی است.**\n"
++                    f"🆔 کد سفارش: `{oid}`\n"
++                    f"⏳ مدت باقی‌مانده: `{keep}` دقیقه\n"
++                    "اکانت‌ها دوباره وارد ویس‌کال می‌شوند؛ زمان ورود مجدد رایگان "
++                    "است و از مدت سفارش کم نمی‌شود."
++                )
++            except Exception:
++                pass
++
++
+ async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
+     try:
+         due_orders = await DatabaseManager.get_due_scheduled_orders()
+@@ -1586,6 +1678,16 @@ async def main_loop():
+     # راه‌اندازی ربات‌های نمایندگی
+     await bot_manager.start_all_active_bots()
+     
++    # ── Recovery for orders the process restart interrupted ──────────────
++    # Must run AFTER start_all_active_bots so each order's bot is available
++    # to send the resume/notice message. reset_stuck_orders() deliberately
++    # no longer flips `running` -> `stopped`, so these orders are still
++    # visible here.
++    try:
++        await _recover_interrupted_orders()
++    except Exception as e:
++        logger.error(f"♻️ Order recovery failed: {e}")
++    
+     # زمان‌بندی جاب‌ها
+     if main_app.job_queue:
+         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
+diff --git a/services/cgroup_paths.py b/services/cgroup_paths.py
+new file mode 100644
+index 0000000..5c0ada8
+--- /dev/null
++++ b/services/cgroup_paths.py
+@@ -0,0 +1,156 @@
++"""کشف مسیر واقعی cgroup — چون `/sys/fs/cgroup` همیشه ریشهٔ cgroupِ خودِ پروسه نیست.
++
++باگِ واقعی که این ماژول رفع می‌کند
++----------------------------------
++`memory_guard` و `host_resources` فرض می‌کردند فایل‌های cgroup مستقیماً زیر
++`/sys/fs/cgroup` هستند. روی خیلی از میزبان‌ها (Docker با cgroupns، یا
++sandbox/systemd با زیرگروه نام‌دار) این غلط است: `/proc/self/cgroup` مسیر
++`0::/user` را می‌دهد و فایل‌ها زیر `/sys/fs/cgroup/user/` قرار دارند، در حالی که
++خودِ `/sys/fs/cgroup/` اصلاً `memory.max` ندارد.
++
++نتیجهٔ عملی‌اش روی سرور دیده شد:
++
++    snapshot = {... 'mem_percent': None, 'mem_limit_mb': None}
++
++یعنی گارد حافظه هیچ‌وقت عددی نمی‌دید و **fail-open** می‌ماند — دقیقاً وقتی که
++بیشترین نیاز به آن بود. بدتر: `detect_cpu_cores()` هم سهمیه را نمی‌دید و به
++`os.cpu_count()` برمی‌گشت؛ روی آن سرور تصادفاً درست بود (۸ = ۸) ولی در
++کانتینری که کمتر از هاست سهمیه دارد، عددِ غلطِ بزرگ‌تر برمی‌گرداند.
++
++راه‌حل: `/proc/self/cgroup` را بخوان و مسیر نسبی را به‌عنوان پیشوند امتحان کن،
++بعد مسیرهای قدیمی را به‌عنوان fallback.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Iterator, List, Optional
++
++PROC_SELF_CGROUP = "/proc/self/cgroup"
++CG_ROOT = "/sys/fs/cgroup"
++
++
++def _rel_parts(proc_path: str = PROC_SELF_CGROUP) -> List[str]:
++    """مسیرهای نسبیِ cgroupِ خودِ پروسه، از `/proc/self/cgroup`.
++
++    قالب cgroup v2 (یک خط):  `0::/user`          → «user»
++    قالب cgroup v1 (چند خط): `4:memory:/docker/abc` → «docker/abc»
++    ریشه:                     `0::/`               → «»
++    """
++    try:
++        with open(proc_path, "r", encoding="utf-8") as fh:
++            raw = fh.read()
++    except OSError:
++        return []
++
++    out: List[str] = []
++    for line in raw.splitlines():
++        parts = line.split(":", 2)
++        if len(parts) != 3:
++            continue
++        path = parts[2].strip()
++        if not path or path == "/":
++            rel = ""
++        else:
++            rel = path.lstrip("/")
++        if rel not in out:
++            out.append(rel)
++    return out
++
++
++def candidate_dirs(proc_path: str = PROC_SELF_CGROUP) -> Iterator[str]:
++    """دایرکتوری‌های cgroup v2 به ترتیب اولویت.
++
++    اول مسیر واقعیِ خودِ پروسه، بعد ریشهٔ mount (رفتار قدیمی).
++    """
++    for rel in _rel_parts(proc_path):
++        yield os.path.join(CG_ROOT, rel) if rel else CG_ROOT
++    if CG_ROOT not in _rel_parts(proc_path):
++        yield CG_ROOT
++
++
++def candidate_file(
++    name: str,
++    subdir: Optional[str] = None,
++    proc_path: str = PROC_SELF_CGROUP,
++) -> List[str]:
++    """همهٔ مسیرهای ممکن برای یک فایلِ cgroup v2.
++
++    >>> candidate_file("memory.max")
++    ['/sys/fs/cgroup/user/memory.max', '/sys/fs/cgroup/memory.max']
++    """
++    out: List[str] = []
++    for d in candidate_dirs(proc_path):
++        p = os.path.join(d, name) if not subdir else os.path.join(d, subdir, name)
++        if p not in out:
++            out.append(p)
++    return out
++
++
++def candidate_file_v1(
++    name: str,
++    controller: str,
++    proc_path: str = PROC_SELF_CGROUP,
++) -> List[str]:
++    """مسیرهای ممکن برای cgroup v1 (`/sys/fs/cgroup/<controller>/…`)."""
++    base = os.path.join(CG_ROOT, controller)
++    out: List[str] = []
++    for rel in _rel_parts(proc_path):
++        p = os.path.join(base, rel, name) if rel else os.path.join(base, name)
++        if p not in out:
++            out.append(p)
++    plain = os.path.join(base, name)
++    if plain not in out:
++        out.append(plain)
++    return out
++
++
++def first_readable(paths: List[str]) -> Optional[str]:
++    """اولین مسیرِ خواندنی، یا `None`."""
++    for p in paths:
++        if os.access(p, os.R_OK):
++            return p
++    return None
++
++
++def probe(proc_path: str = PROC_SELF_CGROUP) -> dict:
++    """گزارش تشخیصی: برای هر مسیرِ نامزد، مقدارش یا دلیلِ خوانده‌نشدن.
++
++    برای وقتی که `snapshot()` مقدار `None` برمی‌گرداند و باید فهمید چرا.
++    """
++    wanted = {
++        "v2": [("memory.max", None), ("memory.current", None),
++               ("cpu.max", None), ("cpu.stat", None)],
++        "v1": [("memory.limit_in_bytes", "memory"),
++               ("memory.usage_in_bytes", "memory"),
++               ("cpu.cfs_quota_us", "cpu"),
++               ("cpu.cfs_period_us", "cpu"),
++               ("cpuacct.usage", "cpuacct")],
++    }
++    out: dict = {"proc_self_cgroup": None, "rel_paths": _rel_parts(proc_path),
++                 "v2": {}, "v1": {}}
++    try:
++        with open(proc_path, "r", encoding="utf-8") as fh:
++            out["proc_self_cgroup"] = fh.read().strip()
++    except OSError as exc:
++        out["proc_self_cgroup"] = f"unreadable: {exc}"
++
++    for name, sub in wanted["v2"]:
++        for p in candidate_file(name, sub, proc_path):
++            out["v2"][p] = _describe(p)
++    for name, controller in wanted["v1"]:
++        for p in candidate_file_v1(name, controller, proc_path):
++            out["v1"][p] = _describe(p)
++    return out
++
++
++def _describe(path: str) -> str:
++    if not os.path.exists(path):
++        return "missing"
++    if not os.access(path, os.R_OK):
++        return "unreadable"
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.read().strip().replace("\n", " ")[:120]
++    except OSError as exc:
++        return f"error: {exc}"
+diff --git a/services/env_sanity.py b/services/env_sanity.py
+new file mode 100644
+index 0000000..0765e15
+--- /dev/null
++++ b/services/env_sanity.py
+@@ -0,0 +1,123 @@
++"""بررسی سلامت `.env` در استارتاپ — کلید تکراری یک باگِ بی‌صداست.
++
++چرا این ماژول وجود دارد
++-----------------------
++`python-dotenv` و `env_file` داکر هر دو برای کلید تکراری **آخرین مقدار** را
++نگه می‌دارند. پس اگر `.env` این‌طور باشد:
++
++    MAX_CONCURRENT_ORDERS=10      # خط ۴۹
++    ...
++    MAX_CONCURRENT_ORDERS=5       # خط ۱۸۰
++
++ربات ۵ را می‌خواند و همه‌چیز درست به نظر می‌رسد. اما این یک مین است: اگر کسی
++بلوک پایینی را پاک کند، یا یک `export` در شل باشد، یا ترتیب عوض شود، مقدار
++بی‌صدا به ۱۰ برمی‌گردد و هیچ خطایی ثبت نمی‌شود. این دقیقاً همان اتفاقی است که
++وقتی یک اسکریپت `sed` کلید را **جایگزین** نکرد و مقدار جدید را به انتهای فایل
++**اضافه** کرد رخ می‌دهد.
++
++این ماژول تکراری‌ها را در استارتاپ پیدا می‌کند و با صدای بلند هشدار می‌دهد.
++هیچ‌وقت استثنا نمی‌دهد و هیچ‌وقت جلوی بالا آمدن ربات را نمی‌گیرد.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import sys
++from typing import Dict, List, Optional, Tuple
++
++logger = logging.getLogger("env_sanity")
++
++# خطوطی که در .env تعریفِ کلید حساب نمی‌شوند
++_SKIP_PREFIXES = ("#", ";", "[")
++
++
++def find_duplicate_keys(
++    path: str = ".env",
++) -> Dict[str, List[Tuple[int, str]]]:
++    """کلیدهایی که بیش از یک بار تعریف شده‌اند.
++
++    خروجی: `{کلید: [(شمارهٔ خط, مقدار), ...]}` — فقط کلیدهای تکراری.
++    اگر فایل وجود نداشته باشد یا خوانده نشود، `{}` برمی‌گردد.
++    """
++    try:
++        with open(path, "r", encoding="utf-8", errors="replace") as fh:
++            raw_lines = fh.readlines()
++    except OSError:
++        return {}
++
++    seen: Dict[str, List[Tuple[int, str]]] = {}
++    for lineno, line in enumerate(raw_lines, start=1):
++        stripped = line.strip()
++        if not stripped or stripped.startswith(_SKIP_PREFIXES):
++            continue
++        # `export FOO=bar` هم یک تعریف است
++        if stripped.startswith("export "):
++            stripped = stripped[len("export "):].lstrip()
++        if "=" not in stripped:
++            continue
++        key, _, value = stripped.partition("=")
++        key = key.strip()
++        if not key:
++            continue
++        seen.setdefault(key, []).append((lineno, value.strip()))
++
++    return {k: v for k, v in seen.items() if len(v) > 1}
++
++
++def describe_duplicates(
++    duplicates: Dict[str, List[Tuple[int, str]]],
++) -> List[str]:
++    """یک خط توضیح فارسی برای هر کلید تکراری — آمادهٔ لاگ."""
++    out: List[str] = []
++    for key in sorted(duplicates):
++        hits = duplicates[key]
++        winner_line, winner_value = hits[-1]
++        detail = "، ".join(f"خط {n}={v or '(خالی)'}" for n, v in hits)
++        out.append(
++            f"{key} {len(hits)} بار تعریف شده ({detail}). "
++            f"مقدار برنده = «{winner_value or '(خالی)'}» از خط {winner_line} "
++            f"— چون dotenv آخرین مقدار را نگه می‌دارد."
++        )
++    return out
++
++
++def check_and_warn(
++    path: Optional[str] = None,
++    quiet: bool = False,
++) -> Dict[str, List[Tuple[int, str]]]:
++    """`.env` را بررسی و در صورت وجود کلید تکراری هشدار بده.
++
++    چون این تابع خیلی زودتر از تنظیم‌شدن handlerهای لاگ اجرا می‌شود، علاوه بر
++    `logger.warning` مستقیماً روی **stderr** هم می‌نویسد — stderr همیشه در
++    `docker logs` دیده می‌شود.
++
++    هیچ‌وقت استثنا نمی‌دهد.
++    """
++    if path is None:
++        path = os.getenv("ENV_FILE", ".env")
++    try:
++        duplicates = find_duplicate_keys(path)
++        if not duplicates:
++            return {}
++        lines = describe_duplicates(duplicates)
++        if not quiet:
++            banner = (
++                "\n" + "=" * 72 + "\n"
++                f"⚠️  {len(duplicates)} کلید تکراری در {path} پیدا شد:\n"
++                + "\n".join("   • " + ln for ln in lines)
++                + "\n   آخرین مقدار برنده است. خط‌های تکراری را پاک کنید تا\n"
++                "   تغییرات بعدی بی‌صدا خنثی نشوند.\n"
++                + "=" * 72 + "\n"
++            )
++            try:
++                sys.stderr.write(banner)
++                sys.stderr.flush()
++            except Exception:      # pragma: no cover - هرگز نباید استارت را ببندد
++                pass
++            for ln in lines:
++                logger.warning("[EnvSanity] %s", ln)
++        return duplicates
++    except Exception as exc:       # pragma: no cover - دفاعی
++        logger.debug("[EnvSanity] check failed: %r", exc)
++        return {}
+diff --git a/services/host_resources.py b/services/host_resources.py
+new file mode 100644
+index 0000000..98e9b00
+--- /dev/null
++++ b/services/host_resources.py
+@@ -0,0 +1,292 @@
++"""تشخیص منابع واقعی در دسترس ربات + مقیاس‌پذیری خودکار هم‌روندی.
++
++چرا این ماژول لازم است
++----------------------
++`os.cpu_count()` تعداد هسته‌های **هاست** را برمی‌گرداند، حتی وقتی کانتینر با
++`deploy.resources.limits.cpus` به ۲ هسته محدود شده باشد. یعنی کدی که با
++`os.cpu_count()` هم‌روندی‌اش را تنظیم کند، روی هاست ۸ هسته‌ای فکر می‌کند ۸ هسته
++دارد در حالی که cgroup فقط ۲ هسته به آن می‌دهد ⇒ صف‌های داخلی بزرگ می‌شوند،
++تأخیر بالا می‌رود و هیچ خطایی هم ثبت نمی‌شود.
++
++تنها عدد درست، **سهمیهٔ cgroup** است:
++  v2: /sys/fs/cgroup/cpu.max                → «<quota> <period>» یا «max <period>»
++  v1: /sys/fs/cgroup/cpu/cpu.cfs_quota_us   →  quota (−۱ یعنی نامحدود)
++      /sys/fs/cgroup/cpu/cpu.cfs_period_us  →  period
++
++این ماژول آن را می‌خواند و `min(cpu_count, سهمیه)` را برمی‌گرداند. مثل
++`services/memory_guard.py` **fail-open** است: اگر چیزی خوانده نشود به
++`os.cpu_count()` برمی‌گردد، چون کم‌گرفتنِ منابع هم خودش یک باگ است.
++
++همهٔ مسیرها پارامترِ تزریق‌پذیر دارند تا بدون cgroup واقعی تست شوند.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import time
++from typing import Any, Dict, Optional, Tuple
++
++from services import cgroup_paths
++
++logger = logging.getLogger("host_resources")
++
++# ─── مسیرهای پیش‌فرض (قابل override برای تست) ─────────────────────────────
++CPU_MAX_V2 = "/sys/fs/cgroup/cpu.max"
++CPU_QUOTA_V1 = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
++CPU_PERIOD_V1 = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
++CPU_STAT_V2 = "/sys/fs/cgroup/cpu.stat"
++CPUACCT_USAGE_V1 = "/sys/fs/cgroup/cpuacct/cpuacct.usage"
++
++
++def _read_text(path: str) -> Optional[str]:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.read().strip()
++    except (OSError, ValueError):
++        return None
++
++
++def _read_int(path: str) -> Optional[int]:
++    raw = _read_text(path)
++    if raw is None:
++        return None
++    try:
++        return int(raw)
++    except ValueError:
++        return None
++
++
++# ─── سهمیهٔ CPU ────────────────────────────────────────────────────────────
++def _parse_cpu_max(raw: Optional[str]) -> Optional[float]:
++    """محتوای `cpu.max` → تعداد هسته؛ `None` یعنی «max» یا محتوای نامعتبر."""
++    if not raw:
++        return None
++    parts = raw.split()
++    if len(parts) < 2:
++        return None
++    if parts[0].lower() == "max":
++        return None
++    try:
++        quota = float(parts[0])
++        period = float(parts[1])
++    except ValueError:
++        return None
++    if period <= 0 or quota <= 0:
++        return None
++    return quota / period
++
++
++def read_cgroup_cpu_quota(
++    max_v2: Optional[str] = None,
++    quota_v1: Optional[str] = None,
++    period_v1: Optional[str] = None,
++) -> Optional[float]:
++    """سهمیهٔ CPU را به «تعداد هسته» برمی‌گرداند؛ `None` یعنی نامحدود/نامعلوم.
++
++    اگر مسیر داده نشود از روی `/proc/self/cgroup` کشف می‌شود (ببینید
++    `services/cgroup_paths.py`) — چون `/sys/fs/cgroup` همیشه ریشهٔ cgroupِ
++    خودِ پروسه نیست و خواندن از ریشه بی‌صدا `None` می‌دهد.
++
++    >>> _parse_cpu_max("200000 100000")   -> 2.0
++    >>> _parse_cpu_max("max 100000")      -> None (نامحدود)
++    """
++    v2_paths = [max_v2] if max_v2 else cgroup_paths.candidate_file("cpu.max")
++    for path in v2_paths:
++        raw = _read_text(path)
++        if raw is not None:
++            # فایل خوانده شد ⇒ جواب قطعی است (حتی اگر «max» باشد)
++            return _parse_cpu_max(raw)
++
++    if quota_v1 and period_v1:
++        pairs = [(quota_v1, period_v1)]
++    else:
++        pairs = list(zip(
++            cgroup_paths.candidate_file_v1("cpu.cfs_quota_us", "cpu"),
++            cgroup_paths.candidate_file_v1("cpu.cfs_period_us", "cpu"),
++        ))
++    for qpath, ppath in pairs:
++        quota = _read_int(qpath)
++        period = _read_int(ppath)
++        if quota is None or period is None:
++            continue
++        if quota <= 0:          # −۱ = بدون محدودیت
++            return None
++        if period > 0:
++            return quota / period
++
++    return None
++
++
++def detect_cpu_cores(host_cpu_count: Optional[int] = None, **paths: Any) -> float:
++    """تعداد هستهٔ واقعاً در دسترس: `min(cpu_count, سهمیهٔ cgroup)`.
++
++    fail-open: اگر سهمیه خوانده نشود، `cpu_count` هاست برگردانده می‌شود.
++    همیشه ≥ ۱.۰ است.
++    """
++    host = int(host_cpu_count or os.cpu_count() or 1)
++    quota = read_cgroup_cpu_quota(**paths)
++    if quota is None or quota <= 0:
++        return float(max(1, host))
++    return float(max(1.0, min(float(host), quota)))
++
++
++# ─── هم‌روندیِ مشتق‌شده از سخت‌افزار ────────────────────────────────────────
++# هر سه تابع یک override صریح می‌پذیرند: اگر کاربر عدد را در .env گذاشته باشد
++# همان عدد برنده است و هیچ محاسبه‌ای انجام نمی‌شود. این یعنی رفتار قدیمی
++# (عدد ثابت) همیشه قابل بازیابی است.
++def _scaled(cores: float, per_core: float, floor: int, ceiling: int,
++            override: Optional[int]) -> int:
++    if override is not None and int(override) > 0:
++        return max(1, int(override))
++    value = int(round(float(cores) * per_core))
++    return max(floor, min(ceiling, value))
++
++
++def recommended_client_create_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """ساخت هم‌زمان کلاینت Pyrogram. هر ساخت = یک handshake کامل MTProto.
++
++    پیش‌فرض قدیمی: ۸ ثابت. حالا ۲ به ازای هر هسته، کف ۴، سقف ۱۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 2.0, 4, 16, override)
++
++
++def recommended_global_join_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """سقف سراسری join بومی PyTgCalls در یک لحظه.
++
++    این کار عمدتاً انتظار I/O است (پاسخ سرور تلگرام)، نه CPU؛ پس ضریب
++    بالاتری می‌گیرد. پیش‌فرض قدیمی: ۲۴ ثابت. حالا ۸ به ازای هر هسته،
++    کف ۸، سقف ۹۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 8.0, 8, 96, override)
++
++
++def recommended_join_max_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """سقف سختِ join برای «یک» سفارش.
++
++    ⚠️ این سقف فقط CPU نیست — FloodWait تلگرام هم سقف است. Join Brain تعداد
++    موج‌ها را زیر این سقف به‌صورت تطبیقی انتخاب می‌کند، پس بالا بردن سقف به
++    معنی «همیشه این‌قدر join بزن» نیست. پیش‌فرض قدیمی: ۲ (بسیار محافظه‌کار).
++    حالا ۲ به ازای هر هسته، کف ۲، سقف ۱۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 2.0, 2, 16, override)
++
++
++# ─── مصرف CPU (برای تله‌متری) ──────────────────────────────────────────────
++def read_cpu_usage_usec(
++    stat_v2: Optional[str] = None,
++    cpuacct_v1: Optional[str] = None,
++) -> Optional[int]:
++    """مصرف تجمعی CPU این cgroup بر حسب میکروثانیه.
++
++    v2: در `cpu.stat` به شکل `usage_usec 123456`
++    v1: در `cpuacct/cpuacct.usage` بر حسب **نانو**ثانیه (تبدیل می‌شود)
++
++    مسیرها در صورت نبودنِ آرگومان از `/proc/self/cgroup` کشف می‌شوند.
++    """
++    v2_paths = [stat_v2] if stat_v2 else cgroup_paths.candidate_file("cpu.stat")
++    for path in v2_paths:
++        raw = _read_text(path)
++        if raw is None:
++            continue
++        for line in raw.splitlines():
++            parts = line.split()
++            if len(parts) == 2 and parts[0] == "usage_usec":
++                try:
++                    return int(parts[1])
++                except ValueError:
++                    break
++
++    v1_paths = ([cpuacct_v1] if cpuacct_v1
++                else cgroup_paths.candidate_file_v1("cpuacct.usage", "cpuacct"))
++    for path in v1_paths:
++        ns = _read_int(path)
++        if ns is not None and ns >= 0:
++            return ns // 1000
++    return None
++
++
++def cpu_percent(
++    prev_usec: Optional[int],
++    prev_mono: Optional[float],
++    cores: Optional[float] = None,
++    now_usec: Optional[int] = None,
++    now_mono: Optional[float] = None,
++) -> Optional[float]:
++    """درصد مصرف CPU نسبت به کل سهمیهٔ تخصیص‌یافته (۰ تا ~۱۰۰+).
++
++    باید با دو نمونه‌برداری در دو لحظه صدا زده شود؛ نمونهٔ اول `None`
++    برمی‌گرداند چون مبنایی برای تفاضل نیست.
++    """
++    if prev_usec is None or prev_mono is None:
++        return None
++    if now_usec is None:
++        now_usec = read_cpu_usage_usec()
++    if now_usec is None:
++        return None
++    if now_mono is None:
++        now_mono = time.monotonic()
++    elapsed = float(now_mono) - float(prev_mono)
++    if elapsed <= 0:
++        return None
++    if cores is None:
++        cores = detect_cpu_cores()
++    if not cores or cores <= 0:
++        return None
++    used_cores = ((now_usec - prev_usec) / 1_000_000.0) / elapsed
++    return round((used_cores / float(cores)) * 100.0, 1)
++
++
++def snapshot(
++    prev_usec: Optional[int] = None,
++    prev_mono: Optional[float] = None,
++) -> Dict[str, Any]:
++    """یک بستهٔ تله‌متری آمادهٔ لاگ. هرگز استثنا نمی‌دهد."""
++    cores = detect_cpu_cores()
++    usage = read_cpu_usage_usec()
++    try:
++        load1 = round(os.getloadavg()[0], 2)
++    except (OSError, AttributeError):
++        load1 = None
++    out: Dict[str, Any] = {
++        "cores_available": round(cores, 2),
++        "cores_host": os.cpu_count(),
++        "cpu_percent": cpu_percent(prev_usec, prev_mono, cores=cores,
++                                   now_usec=usage, now_mono=time.monotonic()),
++        "loadavg_1m": load1,
++        "cpu_usage_usec": usage,
++    }
++    try:
++        # NOTE: pressure_percent() takes PATHS, not numbers — passing the
++        # (usage, limit) tuple we just read made it silently return None every
++        # single time.  usage_percent() is the numeric counterpart.
++        from services.memory_guard import read_cgroup_memory, usage_percent
++        mem_usage, mem_limit = read_cgroup_memory()
++        out["mem_percent"] = usage_percent(mem_usage, mem_limit)
++        out["mem_limit_mb"] = (round(mem_limit / 1048576.0)
++                               if mem_limit else None)
++        out["mem_used_mb"] = (round(mem_usage / 1048576.0)
++                              if mem_usage else None)
++    except Exception as exc:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
++        # Never swallow silently.  A bare `except Exception: pass` here is what
++        # hid a missing services/memory_guard.py in the first prod patch: the
++        # ImportError looked identical to "the host exposes no cgroup data",
++        # which sent us hunting the wrong cause for a whole round.
++        logger.warning("[HostResources] memory snapshot unavailable: %r", exc)
++        out["mem_percent"] = None
++        out["mem_limit_mb"] = None
++        out["mem_used_mb"] = None
++        out["mem_error"] = repr(exc)
++    return out
+diff --git a/services/memory_guard.py b/services/memory_guard.py
+new file mode 100644
+index 0000000..6123593
+--- /dev/null
++++ b/services/memory_guard.py
+@@ -0,0 +1,168 @@
++"""
++services/memory_guard.py
++════════════════════════
++🛡 گارد حافظهٔ cgroup — جلوی پذیرش سفارش جدید وقتی کانتینر نزدیک سقف RAM است.
++
++چرا لازم است (رویداد ۱۴۰۵/۰۷/۰۴):
++    `docker inspect` بعد از بازسازی کانتینر چیزی نشان نمی‌دهد، ولی `dmesg`
++    ۱۳ بار «Memory cgroup out of memory: Killed process (python)» در ۱۰ روز
++    ثبت کرده بود. کانتینر ربات سقف حافظه دارد و وقتی از آن رد شود کرنل
++    پروسه را با SIGKILL می‌کشد — بدون هیچ لاگی. چون هیچ مسیر بازیابی هم
++    وجود نداشت، سفارش‌های پول‌داده‌شده در میانهٔ راه از بین می‌رفتند.
++
++نکتهٔ مهم: `[VoiceMemory] rss_mb` فقط RSS پروسهٔ پایتون است. مصرف واقعیِ
++cgroup شامل این‌ها هم می‌شود:
++    * یک پروسهٔ ffmpeg به ازای هر اکانتِ داخل تماس
++    * page cache و حافظهٔ کرنل/سوکت (ده‌ها اتصال WebRTC)
++پس «rss_mb زیر سقف است» به‌هیچ‌وجه یعنی «cgroup زیر سقف است». این ماژول
++مستقیماً همان عددی را می‌خواند که کرنل برای OOM-kill نگاه می‌کند.
++
++Fail-open: اگر عدد خوانده نشود (هاست بدون cgroup، مجوز نداشتن فایل‌ها، …)
++هیچ‌وقت مسیر خرید را نمی‌بندد؛ فقط None برمی‌گرداند.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import Optional, Tuple
++
++from services import cgroup_paths
++
++logger = logging.getLogger(__name__)
++
++# cgroup v2 (docker با systemd/cgroup v2)
++_V2_USAGE = "/sys/fs/cgroup/memory.current"
++_V2_LIMIT = "/sys/fs/cgroup/memory.max"
++# cgroup v1
++_V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
++_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
++
++# هر عدد بزرگ‌تر از این یعنی «بدون سقف» (cgroup v1 مقدار ~2^63 می‌نویسد).
++_UNLIMITED_BYTES = 1 << 62
++
++
++def _read_int(path: str) -> Optional[int]:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            raw = fh.read().strip()
++    except Exception:
++        return None
++    if not raw or raw == "max":
++        return None
++    try:
++        val = int(raw)
++    except ValueError:
++        return None
++    return val if val >= 0 else None
++
++
++def _read_first(paths) -> Optional[int]:
++    """اولین مسیرِ خواندنیِ فهرست را بخوان."""
++    for p in paths:
++        val = _read_int(p)
++        if val is not None:
++            return val
++    return None
++
++
++def read_cgroup_memory(
++    usage_path_v2: Optional[str] = None,
++    limit_path_v2: Optional[str] = None,
++    usage_path_v1: Optional[str] = None,
++    limit_path_v1: Optional[str] = None,
++) -> Tuple[Optional[int], Optional[int]]:
++    """(usage_bytes, limit_bytes) یا (None, None) اگر قابل تشخیص نبود.
++
++    اگر مسیرها صریحاً داده نشوند، از روی `/proc/self/cgroup` **کشف** می‌شوند
++    (ببینید `services/cgroup_paths.py`). این مهم است: `/sys/fs/cgroup` همیشه
++    ریشهٔ cgroupِ خودِ پروسه نیست — با cgroupns یا زیرگروه نام‌دار، فایل‌ها زیر
++    `/sys/fs/cgroup/<rel>/` هستند و خواندن از ریشه بی‌صدا `None` می‌دهد، یعنی
++    گارد حافظه fail-open می‌ماند.
++
++    مسیرهای صریح فقط برای تست‌اند؛ در آن حالت کشف انجام نمی‌شود.
++    """
++    if usage_path_v2 and limit_path_v2:
++        v2 = ([usage_path_v2], [limit_path_v2])
++    else:
++        v2 = (cgroup_paths.candidate_file("memory.current"),
++              cgroup_paths.candidate_file("memory.max"))
++    if usage_path_v1 and limit_path_v1:
++        v1 = ([usage_path_v1], [limit_path_v1])
++    else:
++        v1 = (cgroup_paths.candidate_file_v1("memory.usage_in_bytes", "memory"),
++              cgroup_paths.candidate_file_v1("memory.limit_in_bytes", "memory"))
++
++    for usage_paths, limit_paths in (v2, v1):
++        usage = _read_first(usage_paths)
++        limit = _read_first(limit_paths)
++        if usage is None or limit is None:
++            continue
++        if limit >= _UNLIMITED_BYTES:      # بدون سقف → گارد بی‌معنی است
++            return None, None
++        if limit <= 0:
++            continue
++        return usage, limit
++    return None, None
++
++
++def usage_percent(usage: Optional[int], limit: Optional[int]) -> Optional[float]:
++    """درصدِ مصرف نسبت به سقف، از روی **اعداد**. None یعنی «نمی‌دانم».
++
++    این تابع جدا از `pressure_percent` است چون آن یکی مسیر می‌گیرد و این یکی
++    عدد؛ قاطی‌کردنشان باعث می‌شود بی‌صدا `None` برگردد (اتفاقی که در
++    `host_resources.snapshot()` افتاده بود).
++    """
++    if not usage or not limit or limit <= 0:
++        return None
++    return 100.0 * float(usage) / float(limit)
++
++
++def pressure_percent(
++    usage_path_v2: Optional[str] = None,
++    limit_path_v2: Optional[str] = None,
++    usage_path_v1: Optional[str] = None,
++    limit_path_v1: Optional[str] = None,
++) -> Optional[float]:
++    """درصدِ مصرفِ cgroup نسبت به سقفش؛ None یعنی «نمی‌دانم» (fail-open).
++
++    ⚠️ پیش‌فرض همهٔ آرگومان‌ها `None` است تا `read_cgroup_memory` مسیرها را از
++    `/proc/self/cgroup` **کشف** کند. اگر مثل قبل مسیرهای ثابتِ ریشه را پاس
++    بدهیم، کشف انجام نمی‌شود و روی میزبان‌هایی که cgroup زیر یک زیرگروه
++    نام‌دار است گارد برای همیشه fail-open می‌ماند.
++    """
++    usage, limit = read_cgroup_memory(
++        usage_path_v2, limit_path_v2, usage_path_v1, limit_path_v1
++    )
++    return usage_percent(usage, limit)
++
++
++def _cfg(attr: str, env_key: str, default):
++    raw = os.getenv(env_key)
++    if raw is not None and raw != "":
++        return raw
++    try:
++        from config import Config  # noqa: WPS433
++        return getattr(Config, attr, default)
++    except Exception:
++        return default
++
++
++def guard_allows_new_order(max_percent: Optional[float] = None) -> Tuple[bool, Optional[float]]:
++    """(مجاز؟, درصد مصرف) — اگر درصد خوانده نشود، اجازه می‌دهد (fail-open)."""
++    try:
++        limit = float(max_percent if max_percent is not None else _cfg(
++            "MEMORY_GUARD_MAX_PERCENT", "MEMORY_GUARD_MAX_PERCENT", 85))
++    except Exception:
++        limit = 85.0
++    pct = pressure_percent()
++    if pct is None:
++        return True, None
++    if pct >= limit:
++        logger.error(
++            "[MemoryGuard] cgroup memory at %.1f%% of limit (threshold %.0f%%) — "
++            "refusing new order to avoid an OOM kill mid-call",
++            pct, limit,
++        )
++        return False, pct
++    return True, pct
+diff --git a/services/order_executor.py b/services/order_executor.py
+index 0e19892..dac8e9f 100644
+--- a/services/order_executor.py
++++ b/services/order_executor.py
+@@ -192,8 +192,23 @@ class OrderExecutor:
+ 	        order_type = data["order_type"]
+ 
+ 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
+-	        exact = min(requested, eligible_count)
+-	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
++	        # Accounts already committed to ANOTHER live order are not available to
++	        # this one (one client/engine + one voice chat per account), so counting
++	        # them here makes "Target=N" a promise the fill can never keep and ends
++	        # in the fill silently stealing them back. Subtract them up front.
++	        held_elsewhere = 0
++	        try:
++	            _vcm0 = _get_voice_call_manager()
++	            if _vcm0 is not None:
++	                held_elsewhere = len(_vcm0.accounts_busy_in_other_orders(order_id))
++	        except Exception:
++	            held_elsewhere = 0
++	        free_count = max(0, eligible_count - held_elsewhere)
++	        exact = min(requested, free_count)
++	        logger.info(
++	            f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, "
++	            f"HeldByOtherOrders={held_elsewhere}, Target={exact}"
++	        )
+ 
+ 	        if exact <= 0:
+ 	            await self._fail_order(order_id, "No eligible active accounts available.")
+@@ -526,6 +541,20 @@ class OrderExecutor:
+ 	    banned = self._voice_banned.get(order_id, set())
+ 	    retry_after = self._voice_retry_after.get(order_id, {})
+ 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
++	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
++	    # A Telegram account can sit in exactly ONE voice chat at a time and
++	    # this process keeps ONE Pyrogram client + ONE PyTgCalls engine per
++	    # account_id (NOT per order). Handing the same account to two
++	    # concurrent orders silently drags it out of the first order's call,
++	    # so accounts held by another LIVE order are not eligible here.
++	    # Fail-open: if the manager cannot answer, keep the old behaviour
++	    # rather than stalling the build.
++	    busy_elsewhere: Set[int] = set()
++	    if vcm is not None:
++	        try:
++	            busy_elsewhere = vcm.accounts_busy_in_other_orders(order_id)
++	        except Exception:
++	            busy_elsewhere = set()
+ 	    chosen: List[Dict] = []
+ 	    cursor = self._voice_cursor.get(order_id, 0)
+ 	    n = len(pool)
+@@ -537,7 +566,7 @@ class OrderExecutor:
+ 	        aid = acc.get("id")
+ 	        if not aid:
+ 	            continue
+-	        if aid in banned or aid in joined_ids or aid in in_flight:
++	        if aid in banned or aid in joined_ids or aid in in_flight or aid in busy_elsewhere:
+ 	            continue
+ 	        if attempts.get(aid, 0) >= attempt_budget:
+ 	            continue
+@@ -567,10 +596,24 @@ class OrderExecutor:
+ 	    banned = self._voice_banned.get(order_id, set())
+ 	    retry_after = self._voice_retry_after.get(order_id, {})
+ 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
++	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
++	    # A Telegram account can sit in exactly ONE voice chat at a time and
++	    # this process keeps ONE Pyrogram client + ONE PyTgCalls engine per
++	    # account_id (NOT per order). Handing the same account to two
++	    # concurrent orders silently drags it out of the first order's call,
++	    # so accounts held by another LIVE order are not eligible here.
++	    # Fail-open: if the manager cannot answer, keep the old behaviour
++	    # rather than stalling the build.
++	    busy_elsewhere: Set[int] = set()
++	    if vcm is not None:
++	        try:
++	            busy_elsewhere = vcm.accounts_busy_in_other_orders(order_id)
++	        except Exception:
++	            busy_elsewhere = set()
+ 	    best: Optional[float] = None
+ 	    for acc in pool:
+ 	        aid = acc.get("id")
+-	        if not aid or aid in banned or aid in joined_ids:
++	        if not aid or aid in banned or aid in joined_ids or aid in busy_elsewhere:
+ 	            continue
+ 	        if attempts.get(aid, 0) >= attempt_budget:
+ 	            continue
+@@ -695,6 +738,7 @@ class OrderExecutor:
+ 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+ 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+ 	    wave_no = 0
++	    starved_rounds = 0
+ 	    # A run of 406 errors suggests a systemic auth-key collision (including
+ 	    # same-process reseller copies), not proof of another server or a usable
+ 	    # key. Abort the wave to avoid hammering possibly invalidated keys.
+@@ -748,6 +792,41 @@ class OrderExecutor:
+ 	            if earliest is None:
+ 	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
+ 	                    continue
++	                # Pool exhausted *for this order*. One more possibility:
++	                # every remaining account is held by ANOTHER live order
++	                # and will be released when that order ends. Wait a
++	                # bounded number of rounds for that instead of silently
++	                # delivering a short order - and never steal the account.
++	                busy_now: Set[int] = set()
++	                if vcm is not None:
++	                    try:
++	                        busy_now = vcm.accounts_busy_in_other_orders(order_id)
++	                    except Exception:
++	                        busy_now = set()
++	                pool_left = len([
++	                    a for a in (self._voice_pool.get(order_id) or [])
++	                    if (a.get("id") or 0) not in joined_ids
++	                ])
++	                max_rounds = max(0, int(getattr(Config, "VOICE_STARVED_WAIT_ROUNDS", 6)))
++	                starve_gap = max(5.0, float(getattr(Config, "VOICE_STARVED_WAIT_SECONDS", 20)))
++	                if busy_now and pool_left > 0 and starved_rounds < max_rounds:
++	                    starved_rounds += 1
++	                    logger.warning(
++	                        f"Order {order_id}: all {pool_left} remaining pool account(s)"
++	                        f" are held by other live order(s) - waiting {starve_gap:.0f}s for a"
++	                        f" release ({starved_rounds}/{max_rounds})"
++	                    )
++	                    try:
++	                        await asyncio.sleep(starve_gap)
++	                    except asyncio.CancelledError:
++	                        break
++	                    continue
++	                if busy_now and pool_left > 0:
++	                    logger.error(
++	                        f"Order {order_id}: giving up on {pool_left} account(s) still"
++	                        f" held by other order(s) after {starved_rounds} wait round(s)"
++	                        f" - delivering {live}/{target_count} rather than stealing them"
++	                    )
+ 	                break
+ 	            wait = max(0.0, min(earliest - now, 30.0))
+ 	            if wait <= 0:
+@@ -784,6 +863,16 @@ class OrderExecutor:
+ 	            f"live={live}/{target_count})"
+ 	        )
+ 
++	        # Publish this order's selection BEFORE the joins start, so a
++	        # second concurrent order cannot pick the same accounts during
++	        # the join window (active_calls only knows about accounts that
++	        # have already joined). Without this, _reservations stays empty
++	        # and accounts_busy_in_other_orders() cannot see in-flight picks.
++	        try:
++	            _sel = set(joined_ids) | {c.get("id") for c in candidates if c.get("id")}
++	            await vcm.reserve_accounts(order_id, _sel)
++	        except Exception:
++	            pass
+ 	        wave_tasks: List[asyncio.Task] = []
+ 	        for _i, acc in enumerate(candidates):
+ 	            if _i > 0:
+diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
+index 263629f..dcaf905 100644
+--- a/services/voice_call_manager.py
++++ b/services/voice_call_manager.py
+@@ -1329,6 +1329,36 @@ class VoiceCallManager:
+                 reserved.update(account_ids)
+         return reserved
+ 
++    def accounts_busy_in_other_orders(self, order_id: Optional[int]) -> Set[int]:
++        """Accounts this order must NOT pick: they belong to another live order.
++
++        ── Why this exists ──────────────────────────────────────────────
++        A Telegram account can sit in exactly ONE voice chat at a time, and
++        this manager keeps exactly ONE Pyrogram client and ONE PyTgCalls
++        engine per ``account_id`` (NOT per order).  So when two concurrent
++        orders are allocated the same account, the second order's join
++        physically drags the account out of the first order's call — with no
++        error raised anywhere — and the first order's teardown (``leave_call``)
++        kills the second one too.
++
++        Production incident 1405-07-04: orders 859 and 860 were both handed
++        the same 42-account pool and 860's first 10 accounts were 100%
++        already inside 859.
++
++        The result is derived from state that is ALREADY maintained and
++        cleaned up (``active_calls`` + ``_reservations``), so there is no
++        separate lifecycle to leak.
++        """
++        busy: Set[int] = set()
++        for (oid, aid) in self.active_calls.keys():
++            if order_id is None or oid != order_id:
++                busy.add(aid)
++        busy |= self.get_reserved_account_ids(exclude_order_id=order_id)
++        # Never report this order's own accounts as "busy elsewhere".
++        if order_id is not None:
++            busy -= self.get_active_account_ids(order_id)
++        return busy
++
+     def get_cached_session_account_ids(self) -> Set[int]:
+         return set(self._session_cache.keys())
+ 
+@@ -2221,6 +2251,14 @@ class VoiceCallManager:
+                     if now - self._last_memory_log >= log_interval:
+                         self._last_memory_log = now
+                         logger.info("[VoiceMemory] %s", self.memory_report())
++                        # Host/container pressure, so an OOM can be told apart
++                        # from a leak: RSS is process-local, mem_percent is
++                        # against the cgroup limit Docker will enforce.
++                        try:
++                            from services.host_resources import snapshot as _snap
++                            logger.info("[HostResources] %s", _snap())
++                        except Exception as _exc:
++                            logger.warning("[HostResources] snapshot failed: %r", _exc)
+                 except asyncio.CancelledError:
+                     raise
+                 except Exception as exc:
+@@ -3906,9 +3944,17 @@ class VoiceCallManager:
+         """
+         Track which accounts this order has *selected* so far.
+ 
+-        The same account may legitimately participate in multiple orders and
+-        multiple Voice Chats simultaneously. We only record the set for
+-        bookkeeping / de-duplication WITHIN this order.
++        CORRECTION (incident 1405-07-04): the previous docstring claimed
++        "the same account may legitimately participate in multiple orders and
++        multiple Voice Chats simultaneously".  It may NOT.  There is exactly
++        ONE Pyrogram client and ONE PyTgCalls engine per ``account_id`` — not
++        per order — and a Telegram account can only be in one voice chat at a
++        time.  A second order joining an account that a first order is already
++        using silently pulls it out of the first call.
++
++        ``accounts_busy_in_other_orders`` reads this set so the order executor
++        can exclude an account that another live order is holding.  Not calling
++        this leaves the exclusion set empty and re-opens the incident.
+         """
+         async with self._reservation_lock:
+             self._reservations[order_id] = set(account_ids)
+diff --git a/tests/test_account_exclusion.py b/tests/test_account_exclusion.py
+new file mode 100644
+index 0000000..e8c058b
+--- /dev/null
++++ b/tests/test_account_exclusion.py
+@@ -0,0 +1,158 @@
++"""Offline tests for the cross-order account exclusion added after incident 1405-07-04.
++
++رویداد: دو سفارش همزمان (۸۵۹ و ۸۶۰) از یک پولِ ۴۲ اکانتی تغذیه شدند و هر ۱۰
++اکانتِ اولِ سفارش ۸۶۰ عیناً همان اکانت‌های سفارش ۸۵۹ بودند. چون یک اکانت
++تلگرام فقط می‌تواند همزمان در یک ویس‌کال باشد و این پروسه به ازای هر
++``account_id`` فقط یک کلاینت/انجین نگه می‌دارد، ورود سفارش دوم اکانت را از
++تماس سفارش اول بیرون می‌کشید — بدون هیچ خطایی در لاگ.
++
++این تست‌ها آفلاین‌اند (بدون DB و بدون تلگرام).
++
++Run:
++    python -m pytest tests/test_account_exclusion.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import time
++import unittest
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="exclusion-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++# A REAL Fernet key (32 url-safe base64 bytes).  The previous literal was
++# NOT a valid Fernet key, so every session decrypt in the tests failed with
++# "Fernet key must be 32 url-safe base64-encoded bytes" and the voice tests
++# silently exercised the error path instead of the join path.
++os.environ.setdefault("SESSION_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++import importlib.util  # noqa: E402
++
++HAS_TG = importlib.util.find_spec("pytgcalls") is not None and \
++    importlib.util.find_spec("pyrogram") is not None
++
++if HAS_TG:
++    from services.voice_call_manager import VoiceCallManager  # noqa: E402
++    import services.order_executor as order_executor_mod  # noqa: E402
++    from services.order_executor import OrderExecutor  # noqa: E402
++
++
++class FakeVoiceManager:
++    """Minimal stand-in exposing only what candidate selection touches."""
++
++    def __init__(self, busy=None, raise_on_busy=False):
++        self._busy = set(busy or ())
++        self._raise = raise_on_busy
++
++    def accounts_busy_in_other_orders(self, order_id):
++        if self._raise:
++            raise RuntimeError("boom")
++        return set(self._busy)
++
++    def flood_wait_remaining(self, account_id):
++        return 0
++
++    def get_active_account_ids(self, order_id=None):
++        return set()
++
++
++def pool_of(*ids):
++    return [{"id": i, "phone_number": f"+{i}"} for i in ids]
++
++
++@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
++class BusySetTests(unittest.TestCase):
++    """`accounts_busy_in_other_orders` is the single source of truth."""
++
++    def setUp(self):
++        self.mgr = VoiceCallManager()
++
++    def test_reports_other_orders_active_calls(self):
++        self.mgr.active_calls[(1, 100)] = {"chat_id": 1}
++        self.mgr.active_calls[(1, 101)] = {"chat_id": 1}
++        self.mgr.active_calls[(2, 200)] = {"chat_id": 2}
++        self.assertEqual(self.mgr.accounts_busy_in_other_orders(1), {200})
++        self.assertEqual(self.mgr.accounts_busy_in_other_orders(2), {100, 101})
++
++    def test_never_reports_the_order_its_own_accounts(self):
++        self.mgr.active_calls[(1, 100)] = {"chat_id": 1}
++        self.assertEqual(self.mgr.accounts_busy_in_other_orders(1), set())
++
++    def test_reservations_close_the_join_race_window(self):
++        # A candidate that has been *picked* but not yet joined is only in
++        # _reservations, not in active_calls — it must still block others.
++        self.mgr._reservations[7] = {300, 301}
++        self.assertEqual(self.mgr.accounts_busy_in_other_orders(8), {300, 301})
++        # …but it must not block the order that reserved it.
++        self.assertEqual(self.mgr.accounts_busy_in_other_orders(7), set())
++
++
++@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
++class CandidateSelectionTests(unittest.TestCase):
++    def setUp(self):
++        self.ex = OrderExecutor()
++        self.ex._voice_state(1)
++        self.ex._voice_pool[1] = pool_of(100, 101, 102, 103)
++
++    def _candidates(self, order_id=1, window=10):
++        return self.ex._voice_candidates(order_id, window, set(), set(), time.time())
++
++    def test_skips_accounts_held_by_another_order(self):
++        with _patched_vcm(order_executor_mod, FakeVoiceManager(busy={100, 102})):
++            got = {c["id"] for c in self._candidates()}
++        self.assertEqual(got, {101, 103})
++
++    def test_incident_859_860_cannot_repeat(self):
++        """The exact production shape: same pool, everything already taken."""
++        self.ex._voice_state(2)
++        self.ex._voice_pool[2] = pool_of(100, 101, 102, 103)
++        with _patched_vcm(order_executor_mod, FakeVoiceManager(busy={100, 101, 102, 103})):
++            got = self.ex._voice_candidates(2, 10, set(), set(), time.time())
++        self.assertEqual(got, [], "must never hand a busy account to a second order")
++
++    def test_fail_open_when_the_manager_raises(self):
++        with _patched_vcm(order_executor_mod, FakeVoiceManager(raise_on_busy=True)):
++            got = self.ex._voice_candidates(1, 10, set(), set(), time.time())
++        self.assertEqual({c["id"] for c in got}, {100, 101, 102, 103})
++
++    def test_earliest_retry_ignores_busy_accounts(self):
++        """A busy account has no retry timer; counting it made the caller
++        return 0.0 and give up instantly instead of waiting for a release."""
++        with _patched_vcm(order_executor_mod, FakeVoiceManager(busy={100, 101, 102, 103})):
++            self.assertIsNone(self.ex._voice_earliest_retry(1, set()))
++        with _patched_vcm(order_executor_mod, FakeVoiceManager(busy={100})):
++            # 101 is free with no backoff → "retry now", definitely not None.
++            when = self.ex._voice_earliest_retry(1, set())
++            self.assertIsNotNone(when)
++            self.assertLessEqual(when, time.time() + 1)
++
++
++class _patched_vcm:
++    """Context manager swapping order_executor's voice-manager lookup."""
++
++    def __init__(self, module, replacement):
++        self.module = module
++        self.replacement = replacement
++        self._original = None
++
++    def __enter__(self):
++        self._original = self.module._get_voice_call_manager
++        self.module._get_voice_call_manager = lambda: self.replacement
++        return self.replacement
++
++    def __exit__(self, *exc):
++        self.module._get_voice_call_manager = self._original
++        return False
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_cgroup_paths.py b/tests/test_cgroup_paths.py
+new file mode 100644
+index 0000000..308eb7d
+--- /dev/null
++++ b/tests/test_cgroup_paths.py
+@@ -0,0 +1,165 @@
++"""Tests for services/cgroup_paths.py + two regressions it fixes.
++
++دو باگ واقعی که این تست‌ها قفل می‌کنند:
++
++۱) `memory_guard` و `host_resources` فرض می‌کردند فایل‌های cgroup زیر
++   `/sys/fs/cgroup` هستند. روی میزبانی که `/proc/self/cgroup` می‌گوید `0::/user`
++   فایل‌ها زیر `/sys/fs/cgroup/user/` اند. نتیجه روی سرور:
++   `snapshot = {..., 'mem_percent': None, 'mem_limit_mb': None}` ⇒ گارد حافظه
++   برای همیشه fail-open.
++
++۲) `host_resources.snapshot()` نتیجهٔ `read_cgroup_memory()` را که **عدد** بود
++   به `pressure_percent()` می‌داد که **مسیر** می‌گیرد ⇒ `mem_percent` حتی وقتی
++   خواندن حافظه درست کار می‌کرد هم همیشه `None` بود.
++
++Run:
++    python -m pytest tests/test_cgroup_paths.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services import cgroup_paths  # noqa: E402
++from services.memory_guard import (  # noqa: E402
++    pressure_percent,
++    read_cgroup_memory,
++    usage_percent,
++)
++
++
++def _proc(text):
++    fd, path = tempfile.mkstemp(prefix="proc-cgroup-")
++    with os.fdopen(fd, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++class RelPartsTests(unittest.TestCase):
++    def test_v2_named_subgroup(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("0::/user\n")), ["user"])
++
++    def test_v2_root(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("0::/\n")), [""])
++
++    def test_v1_multiple_controllers(self):
++        raw = ("12:pids:/docker/abc123\n4:memory:/docker/abc123\n"
++               "1:name=systemd:/init.scope\n0::/init.scope\n")
++        got = cgroup_paths._rel_parts(_proc(raw))
++        self.assertIn("docker/abc123", got)
++        self.assertIn("init.scope", got)
++
++    def test_missing_file_gives_empty_list(self):
++        self.assertEqual(cgroup_paths._rel_parts("/nonexistent/cgroup"), [])
++
++    def test_malformed_lines_are_skipped(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("garbage\n0::/ok\n")), ["ok"])
++
++    def test_duplicate_paths_are_deduplicated(self):
++        raw = "4:memory:/docker/x\n3:cpu:/docker/x\n"
++        self.assertEqual(cgroup_paths._rel_parts(_proc(raw)), ["docker/x"])
++
++
++class CandidateTests(unittest.TestCase):
++    def test_subgroup_is_tried_before_the_mount_root(self):
++        got = cgroup_paths.candidate_file("memory.max", proc_path=_proc("0::/user\n"))
++        self.assertEqual(got, ["/sys/fs/cgroup/user/memory.max",
++                               "/sys/fs/cgroup/memory.max"])
++
++    def test_root_cgroup_does_not_duplicate_the_path(self):
++        got = cgroup_paths.candidate_file("cpu.max", proc_path=_proc("0::/\n"))
++        self.assertEqual(got, ["/sys/fs/cgroup/cpu.max"])
++
++    def test_v1_paths_are_under_the_controller_directory(self):
++        got = cgroup_paths.candidate_file_v1("memory.limit_in_bytes", "memory",
++                                             proc_path=_proc("0::/docker/abc\n"))
++        self.assertEqual(got[0], "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes")
++        self.assertEqual(got[-1], "/sys/fs/cgroup/memory/memory.limit_in_bytes")
++
++    def test_first_readable_skips_missing_files(self):
++        d = tempfile.mkdtemp(prefix="cg-")
++        real = os.path.join(d, "real")
++        with open(real, "w", encoding="utf-8") as fh:
++            fh.write("42\n")
++        self.assertEqual(
++            cgroup_paths.first_readable([os.path.join(d, "nope"), real]), real)
++
++    def test_first_readable_returns_none_when_nothing_is_readable(self):
++        self.assertIsNone(cgroup_paths.first_readable(["/nope/a", "/nope/b"]))
++
++
++class ProbeTests(unittest.TestCase):
++    def test_probe_never_raises_and_reports_the_proc_line(self):
++        p = cgroup_paths.probe(proc_path=_proc("0::/user\n"))
++        self.assertEqual(p["rel_paths"], ["user"])
++        self.assertIn("v2", p)
++        self.assertIn("v1", p)
++
++    def test_probe_survives_an_unreadable_proc_file(self):
++        # With no rel_paths it falls back to probing /sys/fs/cgroup itself,
++        # which may or may not exist depending on the host - so assert only
++        # that every entry is a descriptive string and nothing raised.
++        p = cgroup_paths.probe(proc_path="/nonexistent/cgroup")
++        self.assertEqual(p["rel_paths"], [])
++        self.assertTrue(p["proc_self_cgroup"].startswith("unreadable"))
++        for entry in list(p["v2"].values()) + list(p["v1"].values()):
++            self.assertIsInstance(entry, str)
++            self.assertTrue(entry)
++
++    def test_probe_describes_a_missing_path_explicitly(self):
++        self.assertEqual(cgroup_paths._describe("/definitely/not/here"), "missing")
++
++
++class LiveDiscoveryTests(unittest.TestCase):
++    """Run against the real cgroup of whatever box executes the suite."""
++
++    def test_the_live_box_reports_consistent_numbers(self):
++        usage, limit = read_cgroup_memory()
++        if usage is None or limit is None:
++            self.skipTest("host exposes no readable cgroup memory files")
++        self.assertGreater(limit, 0)
++        self.assertGreaterEqual(usage, 0)
++        self.assertAlmostEqual(usage_percent(usage, limit),
++                               100.0 * usage / limit, places=6)
++
++
++class UsagePercentTests(unittest.TestCase):
++    def test_computes_from_numbers(self):
++        self.assertAlmostEqual(usage_percent(1, 4), 25.0)
++
++    def test_the_exact_regression_snapshot_hit(self):
++        """pressure_percent() used to receive these numbers as if they were
++        paths and returned None.  usage_percent() must not."""
++        # 705957888 / 3997061120 * 100 = 17.66192376863129
++        self.assertAlmostEqual(usage_percent(705957888, 3997061120),
++                               17.66192376863129, places=6)
++
++    def test_none_inputs(self):
++        self.assertIsNone(usage_percent(None, 100))
++        self.assertIsNone(usage_percent(100, None))
++        self.assertIsNone(usage_percent(100, 0))
++
++    def test_passing_numbers_to_pressure_percent_still_does_not_crash(self):
++        # Wrong use on purpose: it must fail open with None, never raise.
++        self.assertIsNone(pressure_percent(705957888, 3997061120))
++
++
++class PressurePercentDiscoveryTests(unittest.TestCase):
++    def test_no_arg_call_uses_discovery_not_hard_coded_root_paths(self):
++        """Regression 1: the old defaults were the root paths, which made
++        read_cgroup_memory skip discovery entirely."""
++        import inspect
++        sig = inspect.signature(pressure_percent)
++        for name in ("usage_path_v2", "limit_path_v2",
++                     "usage_path_v1", "limit_path_v1"):
++            self.assertIsNone(sig.parameters[name].default,
++                              f"{name} must default to None so discovery runs")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_env_sanity.py b/tests/test_env_sanity.py
+new file mode 100644
+index 0000000..8ae4a91
+--- /dev/null
++++ b/tests/test_env_sanity.py
+@@ -0,0 +1,134 @@
++"""Tests for services/env_sanity.py.
++
++باگِ واقعی که این ماژول برایش ساخته شد: روی سرور، `.env` هم
++`MAX_CONCURRENT_ORDERS=10` (خط ۴۹) را داشت و هم `MAX_CONCURRENT_ORDERS=5`
++(خط ۱۸۰)، چون یک اسکریپت `sed` مقدار تازه را به انتهای فایل «اضافه» کرد به‌جای
++اینکه خط قبلی را جایگزین کند. dotenv آخرین مقدار را نگه می‌دارد، پس ربات ۵ را
++خواند و همه‌چیز درست به نظر رسید — ولی مین سر جایش ماند.
++
++Run:
++    python -m pytest tests/test_env_sanity.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.env_sanity import (  # noqa: E402
++    check_and_warn,
++    describe_duplicates,
++    find_duplicate_keys,
++)
++
++
++def _write(text):
++    fd, path = tempfile.mkstemp(prefix="env-", suffix=".env")
++    with os.fdopen(fd, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++class FindDuplicateKeysTests(unittest.TestCase):
++    def test_the_exact_server_scenario(self):
++        p = _write("BOT_TOKEN=abc\nMAX_CONCURRENT_ORDERS=10\nFOO=1\n"
++                   "MAX_CONCURRENT_ORDERS=5\n")
++        d = find_duplicate_keys(p)
++        self.assertEqual(list(d), ["MAX_CONCURRENT_ORDERS"])
++        self.assertEqual(d["MAX_CONCURRENT_ORDERS"], [(2, "10"), (4, "5")])
++
++    def test_clean_file_reports_nothing(self):
++        p = _write("A=1\nB=2\nC=3\n")
++        self.assertEqual(find_duplicate_keys(p), {})
++
++    def test_comments_and_blank_lines_are_not_keys(self):
++        p = _write("# A=1\n\n;A=2\nA=3\n[section]\nA=4\n")
++        # only the two real definitions count, so this IS a duplicate pair
++        d = find_duplicate_keys(p)
++        self.assertEqual(list(d), ["A"])
++        self.assertEqual(d["A"], [(4, "3"), (6, "4")])
++
++    def test_export_prefix_counts_as_a_definition(self):
++        p = _write("A=1\nexport A=2\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2")])
++
++    def test_empty_value_is_still_a_definition(self):
++        p = _write("A=\nA=1\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, ""), (2, "1")])
++
++    def test_value_containing_equals_keeps_only_the_first_split(self):
++        p = _write("DATABASE_URL=postgres://u:p=x@h/db\nDATABASE_URL=y\n")
++        d = find_duplicate_keys(p)
++        self.assertEqual(d["DATABASE_URL"][0], (1, "postgres://u:p=x@h/db"))
++
++    def test_whitespace_around_key_and_value_is_stripped(self):
++        p = _write("  A  =  1  \nA=2\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2")])
++
++    def test_missing_file_returns_empty_and_does_not_raise(self):
++        self.assertEqual(find_duplicate_keys("/nonexistent/.env"), {})
++
++    def test_line_with_no_equals_is_ignored(self):
++        p = _write("JUST_A_WORD\nA=1\n")
++        self.assertEqual(find_duplicate_keys(p), {})
++
++    def test_three_occurrences_are_all_reported_in_order(self):
++        p = _write("A=1\nA=2\nA=3\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2"), (3, "3")])
++
++
++class DescribeDuplicatesTests(unittest.TestCase):
++    def test_names_the_winning_line_because_last_wins(self):
++        lines = describe_duplicates({"A": [(2, "10"), (4, "5")]})
++        self.assertEqual(len(lines), 1)
++        self.assertIn("خط 4", lines[0])
++        self.assertIn("5", lines[0])
++
++    def test_output_is_sorted_by_key(self):
++        lines = describe_duplicates({"Z": [(1, "1"), (2, "2")],
++                                     "A": [(1, "1"), (2, "2")]})
++        self.assertTrue(lines[0].startswith("A"))
++        self.assertTrue(lines[1].startswith("Z"))
++
++    def test_empty_input_gives_empty_output(self):
++        self.assertEqual(describe_duplicates({}), [])
++
++
++class CheckAndWarnTests(unittest.TestCase):
++    def test_quiet_mode_still_returns_the_findings(self):
++        p = _write("A=1\nA=2\n")
++        self.assertEqual(list(check_and_warn(p, quiet=True)), ["A"])
++
++    def test_clean_file_returns_empty(self):
++        self.assertEqual(check_and_warn(_write("A=1\n")), {})
++
++    def test_missing_file_returns_empty(self):
++        self.assertEqual(check_and_warn("/nonexistent/.env"), {})
++
++    def test_writes_the_banner_to_stderr_when_not_quiet(self):
++        import io
++        import contextlib
++        p = _write("MAX_CONCURRENT_ORDERS=10\nMAX_CONCURRENT_ORDERS=5\n")
++        buf = io.StringIO()
++        with contextlib.redirect_stderr(buf):
++            check_and_warn(p)
++        out = buf.getvalue()
++        self.assertIn("MAX_CONCURRENT_ORDERS", out)
++        self.assertIn("کلید تکراری", out)
++
++    def test_never_raises_on_binary_garbage(self):
++        fd, p = tempfile.mkstemp(prefix="env-bin-")
++        with os.fdopen(fd, "wb") as fh:
++            fh.write(b"\x00\x01\xff\xfeA=1\nA=2\n")
++        try:
++            check_and_warn(p, quiet=True)      # must not raise
++        finally:
++            os.unlink(p)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_host_resources.py b/tests/test_host_resources.py
+new file mode 100644
+index 0000000..d155ce6
+--- /dev/null
++++ b/tests/test_host_resources.py
+@@ -0,0 +1,364 @@
++"""Offline tests for services/host_resources.py.
++
++چرا این تست‌ها لازم‌اند: `os.cpu_count()` داخل کانتینر تعداد هسته‌های **هاست**
++را برمی‌گرداند. اگر هم‌روندی ربات با آن تنظیم شود، روی هاست ۸ هسته‌ای که
++کانتینرش به ۲ هسته محدود شده ربات فکر می‌کند ۸ هسته دارد. تنها عدد درست
++سهمیهٔ cgroup است و این تست‌ها همان خواندن را پوشش می‌دهند.
++
++Run:
++    python -m pytest tests/test_host_resources.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.host_resources import (  # noqa: E402
++    cpu_percent,
++    detect_cpu_cores,
++    read_cgroup_cpu_quota,
++    read_cpu_usage_usec,
++    recommended_client_create_concurrency,
++    recommended_global_join_concurrency,
++    recommended_join_max_concurrency,
++    snapshot,
++)
++
++
++def _w(d, name, text):
++    p = os.path.join(d, name)
++    with open(p, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return p
++
++
++class _Missing:
++    """Paths that do not exist -> the reader must fail open, never crash."""
++
++    def __init__(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-missing-")
++
++    def p(self, name):
++        return os.path.join(self.dir, name)
++
++
++class CgroupV2QuotaTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-v2-")
++        self.max = os.path.join(self.dir, "cpu.max")
++
++    def _q(self, content):
++        _w(self.dir, "cpu.max", content)
++        return read_cgroup_cpu_quota(
++            max_v2=self.max,
++            quota_v1=self.max + ".nope",
++            period_v1=self.max + ".nope",
++        )
++
++    def test_200000_over_100000_is_two_cores(self):
++        self.assertAlmostEqual(self._q("200000 100000"), 2.0)
++
++    def test_600000_over_100000_is_six_cores(self):
++        self.assertAlmostEqual(self._q("600000 100000"), 6.0)
++
++    def test_fractional_quota_below_one_core(self):
++        # 50000/100000 = half a core.  Must not round up to 1.
++        self.assertAlmostEqual(self._q("50000 100000"), 0.5)
++
++    def test_max_means_unlimited(self):
++        self.assertIsNone(self._q("max 100000"))
++
++    def test_garbage_content_is_ignored(self):
++        self.assertIsNone(self._q("nonsense"))
++
++    def test_trailing_newline_tolerated(self):
++        self.assertAlmostEqual(self._q("800000 100000\n"), 8.0)
++
++
++class CgroupV1QuotaTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-v1-")
++        self.quota = os.path.join(self.dir, "cpu.cfs_quota_us")
++        self.period = os.path.join(self.dir, "cpu.cfs_period_us")
++
++    def _q(self, quota, period):
++        _w(self.dir, "cpu.cfs_quota_us", str(quota))
++        _w(self.dir, "cpu.cfs_period_us", str(period))
++        return read_cgroup_cpu_quota(
++            max_v2=self.quota + ".nope",
++            quota_v1=self.quota,
++            period_v1=self.period,
++        )
++
++    def test_v1_quota_over_period(self):
++        self.assertAlmostEqual(self._q(400000, 100000), 4.0)
++
++    def test_v1_minus_one_means_unlimited(self):
++        self.assertIsNone(self._q(-1, 100000))
++
++    def test_v1_zero_period_does_not_divide_by_zero(self):
++        self.assertIsNone(self._q(200000, 0))
++
++
++class FailOpenTests(unittest.TestCase):
++    def test_no_cgroup_files_returns_none(self):
++        m = _Missing()
++        self.assertIsNone(read_cgroup_cpu_quota(
++            max_v2=m.p("cpu.max"),
++            quota_v1=m.p("cpu.cfs_quota_us"),
++            period_v1=m.p("cpu.cfs_period_us"),
++        ))
++
++    def test_detect_cores_falls_back_to_host_count(self):
++        m = _Missing()
++        got = detect_cpu_cores(host_cpu_count=8,
++                               max_v2=m.p("cpu.max"),
++                               quota_v1=m.p("cpu.cfs_quota_us"),
++                               period_v1=m.p("cpu.cfs_period_us"))
++        self.assertEqual(got, 8.0)
++
++    def test_detect_cores_never_below_one(self):
++        m = _Missing()
++        self.assertGreaterEqual(
++            detect_cpu_cores(host_cpu_count=0,
++                             max_v2=m.p("cpu.max"),
++                             quota_v1=m.p("cpu.cfs_quota_us"),
++                             period_v1=m.p("cpu.cfs_period_us")),
++            1.0)
++
++
++class DetectCoresTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-detect-")
++        self.max = os.path.join(self.dir, "cpu.max")
++        _w(self.dir, "cpu.max", "200000 100000")   # 2 cores
++        self.kw = dict(max_v2=self.max,
++                       quota_v1=self.max + ".nope",
++                       period_v1=self.max + ".nope")
++
++    def test_quota_caps_host_count(self):
++        # The regression this module exists for: os.cpu_count() says 8, the
++        # container is only allowed 2.  The quota must win.
++        self.assertEqual(detect_cpu_cores(host_cpu_count=8, **self.kw), 2.0)
++
++    def test_host_count_caps_a_generous_quota(self):
++        self.assertEqual(detect_cpu_cores(host_cpu_count=2, **self.kw), 2.0)
++
++    def test_unlimited_quota_uses_host_count(self):
++        _w(self.dir, "cpu.max", "max 100000")
++        self.assertEqual(detect_cpu_cores(host_cpu_count=8, **self.kw), 8.0)
++
++
++class RecommendedConcurrencyTests(unittest.TestCase):
++    def test_explicit_override_always_wins(self):
++        self.assertEqual(recommended_global_join_concurrency(8.0, override=3), 3)
++        self.assertEqual(recommended_join_max_concurrency(8.0, override=1), 1)
++        self.assertEqual(recommended_client_create_concurrency(8.0, override=2), 2)
++
++    def test_zero_or_negative_override_is_ignored(self):
++        # config._env_int returns 0 for "not set"; 0 must NOT become the value.
++        self.assertEqual(recommended_global_join_concurrency(8.0, override=0), 64)
++        self.assertEqual(recommended_join_max_concurrency(8.0, override=-5), 16)
++
++    def test_scaling_on_an_eight_core_host(self):
++        self.assertEqual(recommended_client_create_concurrency(8.0), 16)
++        self.assertEqual(recommended_global_join_concurrency(8.0), 64)
++        self.assertEqual(recommended_join_max_concurrency(8.0), 16)
++
++    def test_floors_protect_small_boxes(self):
++        self.assertEqual(recommended_client_create_concurrency(1.0), 4)
++        self.assertEqual(recommended_global_join_concurrency(1.0), 8)
++        self.assertEqual(recommended_join_max_concurrency(1.0), 2)
++
++    def test_ceilings_protect_telegram_from_bursts(self):
++        # 64 cores must not produce 512 concurrent joins: FloodWait is a
++        # Telegram-side limit that no amount of hardware lifts.
++        self.assertEqual(recommended_client_create_concurrency(64.0), 16)
++        self.assertEqual(recommended_global_join_concurrency(64.0), 96)
++        self.assertEqual(recommended_join_max_concurrency(64.0), 16)
++
++    def test_more_cores_never_reduces_concurrency(self):
++        for fn in (recommended_client_create_concurrency,
++                   recommended_global_join_concurrency,
++                   recommended_join_max_concurrency):
++            prev = 0
++            for cores in (1.0, 2.0, 4.0, 6.0, 8.0, 16.0, 64.0):
++                now = fn(cores)
++                self.assertGreaterEqual(now, prev, f"{fn.__name__} shrank at {cores}")
++                prev = now
++
++
++class CpuPercentTests(unittest.TestCase):
++    def test_first_sample_returns_none(self):
++        self.assertIsNone(cpu_percent(None, None))
++
++    def test_computes_percent_of_allocated_quota(self):
++        # 2 cores allocated; the cgroup burned 1 core-second in 1 wall second
++        # => 1 used core / 2 allocated = 50%.
++        got = cpu_percent(prev_usec=0, prev_mono=100.0,
++                          cores=2.0, now_usec=1_000_000, now_mono=101.0)
++        self.assertAlmostEqual(got, 50.0)
++
++    def test_can_exceed_one_hundred_when_over_quota(self):
++        got = cpu_percent(prev_usec=0, prev_mono=100.0,
++                          cores=2.0, now_usec=3_000_000, now_mono=101.0)
++        self.assertAlmostEqual(got, 150.0)
++
++    def test_zero_elapsed_is_not_a_division_error(self):
++        self.assertIsNone(cpu_percent(prev_usec=0, prev_mono=100.0,
++                                      cores=2.0, now_usec=1000, now_mono=100.0))
++
++    def test_zero_cores_is_not_a_division_error(self):
++        self.assertIsNone(cpu_percent(prev_usec=0, prev_mono=100.0,
++                                      cores=0.0, now_usec=1000, now_mono=101.0))
++
++
++class V1CpuacctTests(unittest.TestCase):
++    def test_nanoseconds_are_converted_to_microseconds(self):
++        d = tempfile.mkdtemp(prefix="cg-v1acct-")
++        p = _w(d, "cpuacct.usage", "1500000")   # 1.5 ms in nanoseconds
++        self.assertEqual(read_cpu_usage_usec(stat_v2=p + ".nope", cpuacct_v1=p), 1500)
++
++    def test_v2_cpu_stat_is_preferred(self):
++        d = tempfile.mkdtemp(prefix="cg-v2stat-")
++        stat = _w(d, "cpu.stat",
++                  "usage_usec 4242\nuser_usec 100\nsystem_usec 200\n")
++        self.assertEqual(read_cpu_usage_usec(stat_v2=stat,
++                                             cpuacct_v1=stat + ".nope"), 4242)
++
++    def test_missing_both_returns_none(self):
++        m = _Missing()
++        self.assertIsNone(read_cpu_usage_usec(stat_v2=m.p("cpu.stat"),
++                                              cpuacct_v1=m.p("cpuacct.usage")))
++
++
++class SnapshotTests(unittest.TestCase):
++    def test_snapshot_always_returns_the_expected_keys(self):
++        snap = snapshot()
++        for key in ("cores_available", "cores_host", "cpu_percent",
++                    "loadavg_1m", "cpu_usage_usec", "mem_percent",
++                    "mem_limit_mb"):
++            self.assertIn(key, snap)
++
++    def test_snapshot_first_call_has_no_cpu_percent_but_second_can(self):
++        first = snapshot()
++        self.assertIsNone(first["cpu_percent"])
++        usage = first["cpu_usage_usec"]
++        if usage is None:
++            self.skipTest("host exposes no cgroup cpu accounting")
++        second = snapshot(prev_usec=usage, prev_mono=0.0)
++        # prev_mono=0.0 makes the elapsed window enormous, so the percentage
++        # is tiny but MUST be a number rather than None.
++        self.assertIsNotNone(second["cpu_percent"])
++
++    def test_cores_available_never_exceeds_host_cores(self):
++        snap = snapshot()
++        if snap["cores_host"]:
++            self.assertLessEqual(snap["cores_available"], snap["cores_host"])
++
++
++class LiveCgroupSmokeTests(unittest.TestCase):
++    """Read the REAL cgroup of whatever box runs the suite."""
++
++    def test_real_reader_does_not_raise(self):
++        try:
++            quota = read_cgroup_cpu_quota()
++            cores = detect_cpu_cores()
++            usage = read_cpu_usage_usec()
++        except Exception as exc:            # pragma: no cover - would be a bug
++            self.fail(f"live cgroup read raised {exc!r}")
++        self.assertGreaterEqual(cores, 1.0)
++        self.assertTrue(quota is None or quota > 0)
++        self.assertTrue(usage is None or usage >= 0)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
++
++
++class ConfigWiringTests(unittest.TestCase):
++    """config.py must honour an explicit env value and otherwise auto-scale.
++
++    Runs in a subprocess because config.py reads os.getenv at class-body
++    evaluation time, i.e. once per interpreter.
++    """
++
++    def _values(self, env_extra=None):
++        import json
++        import subprocess
++        env = dict(os.environ)
++        for k in ("MAX_CONCURRENT_ORDERS", "GLOBAL_JOIN_CONCURRENCY",
++                  "CLIENT_CREATE_CONCURRENCY", "VOICE_JOIN_MAX_CONCURRENCY"):
++            env.pop(k, None)
++        env.update(env_extra or {})
++        code = (
++            "import json, config;"
++            "c = config.Config;"
++            "print(json.dumps(["
++            " c.MAX_CONCURRENT_ORDERS, c.GLOBAL_JOIN_CONCURRENCY,"
++            " c.CLIENT_CREATE_CONCURRENCY, c.VOICE_JOIN_MAX_CONCURRENCY]))"
++        )
++        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
++        out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
++                             capture_output=True, text=True, timeout=120)
++        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
++        return json.loads(out.stdout.strip().splitlines()[-1])
++
++    def test_defaults_come_from_the_cpu_quota_not_a_hard_coded_number(self):
++        orders, glob, create, join = self._values()
++        self.assertEqual(orders, 5)
++        from services.host_resources import detect_cpu_cores
++        cores = detect_cpu_cores()
++        self.assertEqual(glob, recommended_global_join_concurrency(cores))
++        self.assertEqual(create, recommended_client_create_concurrency(cores))
++        self.assertEqual(join, recommended_join_max_concurrency(cores))
++
++    def test_explicit_env_wins_over_the_auto_value(self):
++        got = self._values({
++            "MAX_CONCURRENT_ORDERS": "3",
++            "GLOBAL_JOIN_CONCURRENCY": "99",
++            "CLIENT_CREATE_CONCURRENCY": "7",
++            "VOICE_JOIN_MAX_CONCURRENCY": "6",
++        })
++        self.assertEqual(got, [3, 99, 7, 6])
++
++    def test_all_concurrency_values_are_at_least_one(self):
++        for value in self._values()[1:]:
++            self.assertGreaterEqual(value, 1)
++
++
++class SnapshotErrorVisibilityTests(unittest.TestCase):
++    """A missing dependency must be REPORTED, not look like 'no cgroup data'.
++
++    This is the exact failure that shipped in the first v2.3.23 patch: it
++    contained host_resources.py but not memory_guard.py, so snapshot()'s
++    `from services.memory_guard import ...` raised ModuleNotFoundError, the
++    bare `except Exception` swallowed it, and mem_percent/mem_limit_mb came
++    back None - indistinguishable from a host that exposes no cgroup files.
++    """
++
++    def test_a_broken_memory_guard_surfaces_in_the_snapshot(self):
++        import sys as _sys
++        saved = _sys.modules.get("services.memory_guard")
++        _sys.modules["services.memory_guard"] = None   # makes import raise
++        try:
++            snap = snapshot()
++        finally:
++            if saved is None:
++                _sys.modules.pop("services.memory_guard", None)
++            else:
++                _sys.modules["services.memory_guard"] = saved
++        self.assertIsNone(snap["mem_percent"])
++        self.assertIn("mem_error", snap,
++                      "snapshot must expose the failure, not hide it")
++        # the repr names ModuleNotFoundError, which is an ImportError subclass
++        self.assertIn("ModuleNotFoundError", snap["mem_error"])
++
++    def test_a_healthy_import_leaves_no_error_key(self):
++        snap = snapshot()
++        self.assertNotIn("mem_error", snap)
+diff --git a/tests/test_memory_guard.py b/tests/test_memory_guard.py
+new file mode 100644
+index 0000000..8dd7517
+--- /dev/null
++++ b/tests/test_memory_guard.py
+@@ -0,0 +1,143 @@
++"""Offline tests for the cgroup memory guard (services/memory_guard.py).
++
++ریشهٔ رویداد ۱۴۰۵/۰۷/۰۴: `dmesg` سیزده بار
++«Memory cgroup out of memory: Killed process (python)» در ده روز ثبت کرده بود.
++`docker inspect` بعد از بازسازی کانتینر چیزی نشان نمی‌دهد، پس تنها راهِ
++پیشگیری این است که خودِ ربات مصرف cgroup را بخواند و وقتی نزدیک سقف است
++سفارش جدید نپذیرد.
++
++Run:
++    python -m pytest tests/test_memory_guard.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++from datetime import datetime
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.memory_guard import (  # noqa: E402
++    guard_allows_new_order,
++    pressure_percent,
++    read_cgroup_memory,
++)
++# v2.3.x removed services/capacity_planner.py, so the four integration tests
++# below are skipped there while the cgroup-reading tests still run.
++try:  # noqa: E402
++    from services.capacity_planner import check_capacity
++except ImportError:  # pragma: no cover - depends on the branch under test
++    check_capacity = None
++
++MIB = 1024 * 1024
++
++
++class _FakeCgroup:
++    """Write cgroup-looking files into a temp dir and point the reader at them."""
++
++    def __init__(self, usage, limit, version=2):
++        self.dir = tempfile.mkdtemp(prefix="cg-")
++        if version == 2:
++            self.usage = os.path.join(self.dir, "memory.current")
++            self.limit = os.path.join(self.dir, "memory.max")
++        else:
++            self.usage = os.path.join(self.dir, "memory.usage_in_bytes")
++            self.limit = os.path.join(self.dir, "memory.limit_in_bytes")
++        with open(self.usage, "w", encoding="utf-8") as fh:
++            fh.write(str(usage))
++        with open(self.limit, "w", encoding="utf-8") as fh:
++            fh.write(str(limit))
++
++    def read(self):
++        return read_cgroup_memory(self.usage, self.limit, self.usage, self.limit)
++
++    def pct(self):
++        return pressure_percent(self.usage, self.limit, self.usage, self.limit)
++
++
++class ReadCgroupTests(unittest.TestCase):
++    def test_reads_v2_files(self):
++        cg = _FakeCgroup(800 * MIB, 1536 * MIB)
++        self.assertEqual(cg.read(), (800 * MIB, 1536 * MIB))
++        self.assertAlmostEqual(cg.pct(), 100.0 * 800 / 1536, places=6)
++
++    def test_reads_v1_files(self):
++        cg = _FakeCgroup(1400 * MIB, 1536 * MIB, version=1)
++        self.assertEqual(cg.read(), (1400 * MIB, 1536 * MIB))
++        self.assertGreater(cg.pct(), 90.0)
++
++    def test_unlimited_means_no_guard(self):
++        # cgroup v2 writes the literal "max", v1 writes ~2^63.
++        self.assertEqual(_FakeCgroup(900 * MIB, "max").read(), (None, None))
++        self.assertIsNone(_FakeCgroup(900 * MIB, "max").pct())
++        self.assertEqual(_FakeCgroup(900 * MIB, str(1 << 63)).read(), (None, None))
++
++    def test_missing_files_fail_open(self):
++        usage, limit = read_cgroup_memory("/nope/a", "/nope/b", "/nope/c", "/nope/d")
++        self.assertIsNone(usage)
++        self.assertIsNone(limit)
++        self.assertIsNone(pressure_percent("/nope/a", "/nope/b", "/nope/c", "/nope/d"))
++
++    def test_real_numbers_from_the_incident(self):
++        """The Sep-19 kill: anon-rss 1,547,600 kB + file-rss 35,116 kB against
++        a 1536 MiB cap — 100.6% of the limit.  That is what the guard must see."""
++        cg = _FakeCgroup((1547600 + 35116) * 1024, 1536 * MIB)
++        self.assertGreater(cg.pct(), 100.0)
++
++
++@unittest.skipIf(check_capacity is None,
++                 "services.capacity_planner is absent on this branch")
++class GuardDecisionTests(unittest.TestCase):
++    def test_refuses_above_threshold(self):
++        allowed, pct = guard_allows_new_order(max_percent=85.0)
++        # On a dev box without a capped cgroup this returns (True, None).
++        self.assertIsInstance(allowed, bool)
++        self.assertTrue(pct is None or isinstance(pct, float))
++
++    def test_capacity_planner_refuses_with_reason_memory(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=91.0, memory_max_percent=85.0,
++        )
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "memory")
++        self.assertEqual(v.memory_pressure_percent, 91.0)
++
++    def test_capacity_planner_allows_below_threshold(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=40.0, memory_max_percent=85.0,
++        )
++        self.assertTrue(v.allowed)
++        self.assertIsNone(v.reason)
++
++    def test_capacity_planner_fails_open_without_a_reading(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=None, memory_max_percent=85.0,
++        )
++        self.assertTrue(v.allowed)
++        self.assertIsNone(v.memory_pressure_percent)
++
++    def test_memory_reason_serialises(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        d = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30,
++            memory_pressure_percent=99.0, memory_max_percent=85.0,
++        ).to_dict()
++        self.assertEqual(d["reason"], "memory")
++        self.assertEqual(d["memory_pressure_percent"], 99.0)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_restart_recovery.py b/tests/test_restart_recovery.py
+new file mode 100644
+index 0000000..670b8ff
+--- /dev/null
++++ b/tests/test_restart_recovery.py
+@@ -0,0 +1,165 @@
++"""Orders interrupted by a process restart must be recovered, not cancelled.
++
++Incident 1405-07-04: ``DatabaseManager.reset_stuck_orders()`` flipped every
++``running`` order to ``stopped`` on startup.  After an OOM kill or a deploy, a
++paid, still-valid order therefore ended up listed under "cancelled" in the
++admin panel (whose filter is ``status IN ('stopped','failed')``) with no
++re-join, no message to the user and no refund.
++
++These tests pin the two halves of the fix:
++  1. ``reset_stuck_orders`` no longer touches orders at all;
++  2. ``main._recover_interrupted_orders`` resumes an order that still has paid
++     time left, and tells the user when it does not.
++
++Offline: no PostgreSQL, no Telegram.
++"""
++from __future__ import annotations
++
++import os
++import unittest
++from datetime import datetime, timedelta
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock, patch
++
++os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
++os.environ.setdefault('BOT_TOKEN', 'test-token')
++
++import database  # noqa: E402
++import main  # noqa: E402
++
++
++def _order(oid=859, minutes=60, started_minutes_ago=10):
++    started = datetime.utcnow() - timedelta(minutes=started_minutes_ago)
++    return {
++        'id': oid, 'bot_id': 1, 'user_id': 7, 'order_type': 'voice_chat',
++        'target_link': 'https://t.me/x/1', 'accounts_count': 42,
++        'duration_minutes': minutes, 'price_paid': 500_000,
++        'status': 'running', 'started_at': started, 'created_at': started,
++    }
++
++
++class ResetStuckOrdersNoLongerCancelsOrdersTests(unittest.TestCase):
++    """The destructive UPDATE was the root of the silent cancellation."""
++
++    def test_source_no_longer_flips_running_orders_to_stopped(self):
++        src = Path(database.__file__).read_text(encoding='utf-8')
++        self.assertNotIn(
++            "Order.status == 'running').values(status='stopped')", src,
++            "reset_stuck_orders must not silently cancel paid running orders")
++
++    def test_reset_stuck_orders_still_resets_voice_sessions(self):
++        """The part that was always correct must survive the change."""
++        src = Path(database.__file__).read_text(encoding='utf-8')
++        body = src.split('async def reset_stuck_orders', 1)[1]
++        body = body.split('async def ', 1)[0]
++        self.assertIn("VoiceCallSession.status == 'joined'", body)
++        self.assertNotIn('Order.status', body,
++                         'reset_stuck_orders must not touch the Order table')
++
++    def test_get_running_orders_exists_and_reads_the_running_set(self):
++        self.assertTrue(hasattr(database.DatabaseManager, 'get_running_orders'),
++                        'recovery needs a way to find interrupted orders')
++
++
++class RecoverInterruptedOrdersTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.sent = []
++        bot = SimpleNamespace(send_message=AsyncMock(
++            side_effect=lambda chat_id, text, **kw: self.sent.append((chat_id, text))))
++        self.app = SimpleNamespace(bot=bot)
++        self.bot_manager = SimpleNamespace(active_bots={1: self.app})
++        self.executor = SimpleNamespace(submit_order=AsyncMock(return_value=True))
++        self.patchers = [
++            patch.object(main, 'bot_manager', self.bot_manager),
++            patch.object(main, 'order_executor', self.executor),
++        ]
++        for p in self.patchers:
++            p.start()
++
++    def tearDown(self):
++        for p in self.patchers:
++            p.stop()
++
++    def _db(self, orders):
++        return SimpleNamespace(
++            get_running_orders=AsyncMock(return_value=orders),
++            get_user_by_id=AsyncMock(return_value={'telegram_id': 555}),
++            update_order_status=AsyncMock(),
++        )
++
++    async def test_order_with_paid_time_left_is_resumed_for_the_remainder(self):
++        order = _order(minutes=60, started_minutes_ago=10)   # 50 min left
++        db = self._db([order])
++        with patch.object(main, 'DatabaseManager', db):
++            await main._recover_interrupted_orders()
++
++        self.executor.submit_order.assert_awaited_once()
++        oid, resume = self.executor.submit_order.await_args.args
++        self.assertEqual(oid, 859)
++        self.assertLess(resume['duration_minutes'], 60,
++                        'must resume for the REMAINING time, not the full order')
++        self.assertGreaterEqual(resume['duration_minutes'], 49)
++        self.assertIsNone(db.update_order_status.await_args,
++                          'a resumable order must not be marked stopped')
++        self.assertTrue(any('بازیابی' in t for _, t in self.sent),
++                        'the user must be told the order is being recovered')
++
++    async def test_order_with_no_time_left_is_closed_and_the_user_is_told(self):
++        order = _order(minutes=60, started_minutes_ago=120)  # expired
++        db = self._db([order])
++        with patch.object(main, 'DatabaseManager', db):
++            await main._recover_interrupted_orders()
++
++        self.executor.submit_order.assert_not_awaited()
++        db.update_order_status.assert_awaited_once_with(859, 'stopped')
++        self.assertTrue(any('باقی نمانده بود' in t for _, t in self.sent),
++                        'closing an order silently is the bug being fixed')
++
++    async def test_a_durationless_order_does_not_crash_the_recovery_loop(self):
++        order = _order()
++        order['duration_minutes'] = None          # "join and leave" style order
++        db = self._db([order])
++        with patch.object(main, 'DatabaseManager', db):
++            await main._recover_interrupted_orders()
++        self.executor.submit_order.assert_not_awaited()
++        db.update_order_status.assert_awaited_once_with(859, 'stopped')
++
++    async def test_a_failed_resume_falls_back_to_stopped(self):
++        self.executor.submit_order = AsyncMock(side_effect=RuntimeError('boom'))
++        db = self._db([_order(minutes=60, started_minutes_ago=5)])
++        with patch.object(main, 'DatabaseManager', db):
++            await main._recover_interrupted_orders()
++        db.update_order_status.assert_awaited_once_with(859, 'stopped')
++
++    async def test_no_interrupted_orders_is_a_no_op(self):
++        db = self._db([])
++        with patch.object(main, 'DatabaseManager', db):
++            await main._recover_interrupted_orders()
++        self.executor.submit_order.assert_not_awaited()
++        self.assertEqual(self.sent, [])
++
++    async def test_the_kill_switch_disables_recovery(self):
++        db = self._db([_order(minutes=60, started_minutes_ago=5)])
++        with patch.object(main, 'DatabaseManager', db), \
++             patch.object(main.Config, 'ORDER_RECOVERY_ENABLED', False,
++                          create=True):
++            await main._recover_interrupted_orders()
++        db.get_running_orders.assert_not_awaited()
++        self.executor.submit_order.assert_not_awaited()
++
++
++class RecoveryIsWiredIntoStartupTests(unittest.TestCase):
++    """Defining the coroutine is not enough - it has to actually run."""
++
++    def test_main_calls_recovery_after_starting_the_bots(self):
++        src = Path(main.__file__).read_text(encoding='utf-8')
++        self.assertIn('await _recover_interrupted_orders()', src)
++        # It must come AFTER start_all_active_bots, otherwise active_bots is
++        # empty and no resume message can be delivered.
++        self.assertGreater(src.index('await _recover_interrupted_orders()'),
++                           src.index('await bot_manager.start_all_active_bots()'))
++
++
++if __name__ == '__main__':
++    unittest.main()
