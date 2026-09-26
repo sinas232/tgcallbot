@@ -134,7 +134,7 @@ index 18a3fd5..e33f272 100644
      async def get_gateway(slug: str, bot_id=1):
          async with AsyncSessionLocal() as db_session:
 diff --git a/docker-compose.yml b/docker-compose.yml
-index d95edf9..26582f4 100644
+index d95edf9..4103ec5 100644
 --- a/docker-compose.yml
 +++ b/docker-compose.yml
 @@ -134,10 +134,10 @@ services:
@@ -152,8 +152,66 @@ index d95edf9..26582f4 100644
      environment:
        # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
        - TZ=${TZ:-Asia/Tehran}
+@@ -172,6 +172,11 @@ services:
+     image: postgres:15-alpine
+     container_name: postgres_db_container
+     restart: always
++    # ── سقف منابع ────────────────────────────────────────────────────────
++    # بدون سقف، رشد postgres باعث می‌شود OOM-killer سراغ بزرگ‌ترین پروسه برود
++    # — که ربات است. با سقف دادن به هر سرویس، خطا در سرویس خودش می‌ماند.
++    mem_limit: ${DB_MEM_LIMIT:-2G}
++    cpus: ${DB_CPU_LIMIT:-1.0}
+     environment:
+       POSTGRES_USER: ${POSTGRES_USER:-postgres}
+       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+@@ -198,6 +203,9 @@ services:
+     image: redis:7-alpine
+     container_name: redis_container
+     restart: always
++    # سقف منابع — مثل db، تا رشد redis به OOM-kill ربات ختم نشود.
++    mem_limit: ${REDIS_MEM_LIMIT:-512M}
++    cpus: ${REDIS_CPU_LIMIT:-0.5}
+     command: ["redis-server", "--appendonly", "yes"]
+     volumes:
+       - redis_data:/data
+diff --git a/handlers/admin_handlers.py b/handlers/admin_handlers.py
+index 85eca61..789e2d8 100644
+--- a/handlers/admin_handlers.py
++++ b/handlers/admin_handlers.py
+@@ -2,6 +2,7 @@
+ handlers/admin_handlers.py
+ مدیریت ادمین، نمایندگی‌ها و گزارشات
+ """
++import functools
+ import asyncio
+ import logging
+ import hashlib
+@@ -61,6 +62,7 @@ def clean_chat_id(chat_id_str: str) -> str:
+ # ===================== DECORATORS =====================
+ 
+ def require_admin(func):
++    @functools.wraps(func)
+     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+         user_id = update.effective_user.id
+         bot_id = context.bot_data.get('bot_id', 1)
+@@ -73,6 +75,7 @@ def require_admin(func):
+     return wrapper
+ 
+ def require_super_admin(func):
++    @functools.wraps(func)
+     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+         user_id = update.effective_user.id
+         bot_id = context.bot_data.get('bot_id', 1)
+@@ -89,6 +92,7 @@ def require_super_admin(func):
+     return wrapper
+ 
+ def require_god_admin(func):
++    @functools.wraps(func)
+     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+         user_id = update.effective_user.id
+         if user_id in Config.ADMIN_IDS:
 diff --git a/main.py b/main.py
-index 25df9c1..c661875 100644
+index 25df9c1..9ba4aa0 100644
 --- a/main.py
 +++ b/main.py
 @@ -575,6 +575,98 @@ async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
@@ -255,7 +313,61 @@ index 25df9c1..c661875 100644
  async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
      try:
          due_orders = await DatabaseManager.get_due_scheduled_orders()
-@@ -1586,6 +1678,16 @@ async def main_loop():
+@@ -1071,31 +1163,36 @@ def register_handlers(application: Application) -> None:
+         MessageHandler(FILTER_BACK, admin_panel_start),
+     ]
+     admin_conv = ConversationHandler(
++        # ── هر entry_point باید گارد داشته باشد ────────────────────────────
++        # entry_pointها بدون ورود به مکالمه قابل رسیدن‌اند و callback_data
++        # سمت کلاینت ساخته می‌شود. بدون require_admin یک کاربر عادی می‌توانست
++        # با فرستادن callback_data="admincancel_refund_<id>" هر سفارشی را لغو
++        # و عودت بگیرد (بدون هیچ بررسی دسترسی در بدنهٔ هندلر).
+         entry_points=[
+             MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start),
+             # دکمه‌های شیشه‌ای کهنهٔ پنل (بعد از /start یا ری‌استارت) هم باید
+             # وارد مکالمه شوند؛ وگرنه هیچ handlerای آن‌ها را نمی‌گیرد.
+             CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+-            CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
+-            CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
+-            CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
+-            CallbackQueryHandler(admin_stop_order_start, pattern="^admin_stop_order_start$"),
+-            CallbackQueryHandler(admin_cancel_order_callback, pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
+-            CallbackQueryHandler(admin_cancel_pick_callback, pattern=r"^admincancel_pick_\d+$"),
+-            CallbackQueryHandler(admin_user_actions_handler, pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
+-            CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
+-            CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
+-            CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
+-            CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+-            CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
++            CallbackQueryHandler(require_admin(admin_ticket_actions), pattern="^adm_|^exit_ticket_list"),
++            CallbackQueryHandler(require_admin(admin_orders_list_handler), pattern="^admin_orders_|^admin_search_user_orders"),
++            CallbackQueryHandler(require_admin(admin_orders_back_callback), pattern="^back_to_admin_orders"),
++            CallbackQueryHandler(require_admin(admin_stop_order_start), pattern="^admin_stop_order_start$"),
++            CallbackQueryHandler(require_admin(admin_cancel_order_callback), pattern=r"^admincancel_(refund|norefund|abort)_\d+$"),
++            CallbackQueryHandler(require_admin(admin_cancel_pick_callback), pattern=r"^admincancel_pick_\d+$"),
++            CallbackQueryHandler(require_admin(admin_user_actions_handler), pattern="^admin_(incr|decr|ban_toggle|exempt_toggle|kyc_toggle|stop_user_orders|view_user_tickets)$|^view_orders_|^view_trans_|^back_to_profile$"),
++            CallbackQueryHandler(require_admin(handle_security_toggle), pattern="^sec_toggle_|^back_to_settings$"),
++            CallbackQueryHandler(require_admin(set_log_channel_start), pattern="^setlog_"),
++            CallbackQueryHandler(require_admin(service_toggle_callback), pattern="^toggle_srv_"),
++            CallbackQueryHandler(require_admin(spam_settings_callback), pattern="^toggle_spam_check$|^set_spam_interval$"),
++            CallbackQueryHandler(require_admin(backup_action_callback), pattern="^bkp_"),
+             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
+-            CallbackQueryHandler(anti_spam_callback, pattern="^antispam_"),
+-            CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
+-            CallbackQueryHandler(edit_account_from_list, pattern="^acc_edit_"),
++            CallbackQueryHandler(require_admin(anti_spam_callback), pattern="^antispam_"),
++            CallbackQueryHandler(require_admin(account_pagination_callback), pattern="^acc_page_"),
++            CallbackQueryHandler(require_admin(edit_account_from_list), pattern="^acc_edit_"),
+             CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes|acc_resync_all)$"),
+             CallbackQueryHandler(deleted_account_cleanup_handler, pattern=_DELETED_CLEANUP_CALLBACK_RE),
+-            CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
+-            CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
++            CallbackQueryHandler(require_admin(handle_dead_accounts_callback), pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
++            CallbackQueryHandler(require_admin(maintenance_toggle_callback), pattern="^maint_(on|off)$"),
+         ],
+         states={
+             AWAITING_SETTINGS_ACTION: [
+@@ -1586,6 +1683,16 @@ async def main_loop():
      # راه‌اندازی ربات‌های نمایندگی
      await bot_manager.start_all_active_bots()
      
@@ -1429,6 +1541,172 @@ index 0000000..e8c058b
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tests/test_admin_entry_point_auth.py b/tests/test_admin_entry_point_auth.py
+new file mode 100644
+index 0000000..43db8c4
+--- /dev/null
++++ b/tests/test_admin_entry_point_auth.py
+@@ -0,0 +1,160 @@
++"""Every admin_conv entry point must be authorization-gated.
++
++Incident found in review (1405-07-04): ``admin_conv`` is registered with
++``application.add_handler(...)`` and **no filter**, and PTB entry points are
++reachable without ever entering the conversation.  Seventeen of its entry
++points pointed at handlers with no authorization check in the body, and
++``callback_data`` is client-controlled.  A non-admin user could therefore send
++
++    callback_data = "admincancel_refund_859"
++
++and reach ``admin_cancel_order_callback``, which calls
++``order_executor.settle_and_refund_order(...)`` unconditionally - cancelling
++and refunding any order in the system.  Reproduced: a mocked non-admin update
++produced exactly one ``settle_and_refund_order`` call.
++
++The fix wraps every unguarded entry point in ``require_admin(...)`` at the
++registration site.  These tests pin it, so a future entry point added without
++the wrapper fails the build instead of silently opening the panel.
++"""
++from __future__ import annotations
++
++import asyncio
++import os
++import re
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
++os.environ.setdefault('BOT_TOKEN', 'test-token')
++
++import main  # noqa: E402
++from handlers import admin_handlers as ah  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++
++# Entry points whose target is ALREADY decorated inside its own module, so
++# wrapping again at the call site would be redundant. Verified by reading each
++# definition's preceding lines.
++ALREADY_DECORATED = {
++    'admin_panel_start',               # @require_admin
++    'handle_reseller_action',          # @require_god_admin
++    'premium_emoji_callback',          # @require_super_admin
++    'health_report_handler',           # @require_admin
++    'deleted_account_cleanup_handler',  # @require_super_admin
++}
++
++
++def _entry_point_block():
++    """Return the source lines of admin_conv's entry_points=[...] block."""
++    lines = (ROOT / 'main.py').read_text(encoding='utf-8').split('\n')
++    start = next(i for i, l in enumerate(lines)
++                 if 'admin_conv = ConversationHandler(' in l)
++    ep = next(i for i in range(start, start + 12) if 'entry_points=[' in lines[i])
++    depth = 0
++    for j in range(ep, start + 80):
++        depth += lines[j].count('[') - lines[j].count(']')
++        if depth == 0 and j > ep:
++            return ep, j, lines
++    raise AssertionError('could not find the end of entry_points')
++
++
++def _entry_point_targets():
++    """(handler_name, wrapped_in_require_admin) for every entry point."""
++    ep, end, lines = _entry_point_block()
++    out = []
++    for line in lines[ep:end + 1]:
++        m = re.search(r'(?:Callback|Message)QueryHandler\(\s*'
++                      r'(?:require_admin\(\s*)?(\w+)', line)
++        if m:
++            out.append((m.group(1), 'require_admin(' in line))
++    return out
++
++
++class AdminEntryPointAuthTests(unittest.TestCase):
++    def test_every_entry_point_is_gated(self):
++        targets = _entry_point_targets()
++        self.assertGreater(len(targets), 15,
++                           'parser found too few entry points - fix the test')
++        exposed = [n for n, wrapped in targets
++                   if not wrapped and n not in ALREADY_DECORATED]
++        self.assertEqual(
++            exposed, [],
++            'these admin_conv entry points have no authorization gate; a '
++            'non-admin can reach them with a crafted callback_data: %s' % exposed)
++
++    def test_the_allowlist_is_still_accurate(self):
++        """Guard the guard: an entry in ALREADY_DECORATED must really be
++        decorated, or the allowlist becomes a hole."""
++        for name in sorted(ALREADY_DECORATED):
++            found = False
++            for f in (ROOT / 'handlers').glob('*.py'):
++                src = f.read_text(encoding='utf-8').split('\n')
++                for i, l in enumerate(src):
++                    if re.match(r'^async def %s\b' % name, l):
++                        preceding = '\n'.join(src[max(0, i - 5):i])
++                        self.assertRegex(
++                            preceding, r'@require_\w+',
++                            '%s is allowlisted as decorated but is not '
++                            '(%s:%d)' % (name, f.name, i + 1))
++                        found = True
++                        break
++                if found:
++                    break
++            self.assertTrue(found, '%s no longer exists in handlers/' % name)
++
++    def test_admin_conv_is_registered_without_a_filter(self):
++        """Documents WHY the entry points must be gated individually."""
++        src = (ROOT / 'main.py').read_text(encoding='utf-8')
++        self.assertIn('add_handler(register_conversation(admin_conv))', src)
++        reg = (ROOT / 'handlers' / 'conversation_registry.py').read_text(encoding='utf-8')
++        # Only the function body matters - the module docstring legitimately
++        # mentions filters.ALL / filters.TEXT while explaining the menu router.
++        body = reg.split('def register_conversation', 1)[1]
++        body = body.split('\ndef ', 1)[0]
++        self.assertNotIn('filters.', body,
++                         'register_conversation gained a filter - reconsider '
++                         'whether per-entry-point gating is still needed')
++        self.assertIn('return handler', body,
++                      'register_conversation must stay a pass-through')
++
++
++class RequireAdminBlocksTheExploitTests(unittest.IsolatedAsyncioTestCase):
++    """The actual attack, replayed against the wrapped handler."""
++
++    ATTACKER = 999_000_111
++    ADMIN = 111
++
++    async def _try(self, uid):
++        query = SimpleNamespace(data="admincancel_refund_859",
++                                answer=AsyncMock(),
++                                edit_message_text=AsyncMock())
++        update = SimpleNamespace(
++            callback_query=query, message=None,
++            effective_user=SimpleNamespace(id=uid, first_name="X"))
++        settle = AsyncMock(return_value={
++            'total_cost': 1, 'used_cost': 0, 'refund_amount': 1,
++            'refund_tx_id': 'T', 'user_wallet_balance': 1})
++        wrapped = ah.require_admin(ah.admin_cancel_order_callback)
++        with patch.object(ah.Config, 'ADMIN_IDS', [self.ADMIN]), \
++             patch.object(ah.DatabaseManager, 'get_order',
++                          AsyncMock(return_value={'id': 859, 'status': 'running'})), \
++             patch.object(ah.DatabaseManager, 'get_user',
++                          AsyncMock(return_value={'is_admin': False})), \
++             patch.object(ah.order_executor, 'settle_and_refund_order', settle):
++            await wrapped(update, SimpleNamespace(bot_data={'bot_id': 1}))
++        return settle.await_count
++
++    async def test_a_non_admin_cannot_refund_an_order(self):
++        self.assertEqual(await self._try(self.ATTACKER), 0,
++                         'a non-admin reached settle_and_refund_order')
++
++    async def test_a_real_admin_still_can(self):
++        """The fix must not lock admins out of their own panel."""
++        self.assertEqual(await self._try(self.ADMIN), 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
 diff --git a/tests/test_cgroup_paths.py b/tests/test_cgroup_paths.py
 new file mode 100644
 index 0000000..308eb7d
@@ -1600,6 +1878,22 @@ index 0000000..308eb7d
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tests/test_deleted_account_cleanup.py b/tests/test_deleted_account_cleanup.py
+index d4d9f9f..2ff5061 100644
+--- a/tests/test_deleted_account_cleanup.py
++++ b/tests/test_deleted_account_cleanup.py
+@@ -1623,7 +1623,10 @@ class CleanupMenuTests(unittest.IsolatedAsyncioTestCase):
+                              'deleted_cleanup_confirm_0123456789abcdef'):
+                 self.assertTrue(any(h.pattern.fullmatch(callback) for h in callbacks), callback)
+             self.assertTrue(any(h.pattern.fullmatch('confirm_delete_dead') for h in handlers
+-                                if getattr(h, 'callback', None) is main.handle_dead_accounts_callback
++                                # entry point is wrapped in require_admin;
++                                # functools.wraps exposes the original.
++                                if getattr(getattr(h, 'callback', None), '__wrapped__',
++                                           getattr(h, 'callback', None)) is main.handle_dead_accounts_callback
+                                 and hasattr(h, 'pattern')))
+         self.assertTrue(any(getattr(h, 'callback', None) is main.deleted_account_cleanup_handler
+                             for h in state))
 diff --git a/tests/test_env_sanity.py b/tests/test_env_sanity.py
 new file mode 100644
 index 0000000..8ae4a91
