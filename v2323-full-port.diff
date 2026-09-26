@@ -1,5 +1,5 @@
 diff --git a/config.py b/config.py
-index a95d3c1..cd0237b 100644
+index a95d3c1..544a26d 100644
 --- a/config.py
 +++ b/config.py
 @@ -7,6 +7,32 @@ from dotenv import load_dotenv
@@ -90,7 +90,7 @@ index a95d3c1..cd0237b 100644
 +    # silently delivering a short order. The wait is bounded so a stalled
 +    # order can never hang forever, and an account is never stolen.
 +    VOICE_STARVED_WAIT_ROUNDS = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS', '6'))
-+    VOICE_STARVED_WAIT_SECONDS = int(os.getenv('VOICE_STARVED_WAIT_SECONDS', '20'))
++    VOICE_STARVED_WAIT_SECONDS = float(os.getenv('VOICE_STARVED_WAIT_SECONDS', '20'))
 +    # ── RESTART RECOVERY (incident 1405-07-04) ────────────────────────────
 +    # Re-submit orders that were `running` when the process died (OOM kill /
 +    # deploy) for whatever paid time is left, and tell the user. Turn off to
