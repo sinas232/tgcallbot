@@ -48,7 +48,6 @@ if os.name != "nt":
             "uvloop not available (falling back to default asyncio loop): %s", _uvloop_exc
         )
 
-import html
 import json
 from datetime import datetime, timedelta
 from telegram import Update
@@ -1539,9 +1538,9 @@ async def main_loop():
     stop_event = asyncio.Event()
     try:
         _loop = asyncio.get_running_loop()
-        for _sig in (signal.SIGTERM, signal.SIGINT):
+        for _signum in (signal.SIGTERM, signal.SIGINT):
             try:
-                _loop.add_signal_handler(_sig, stop_event.set)
+                _loop.add_signal_handler(_signum, stop_event.set)
             except (NotImplementedError, RuntimeError):
                 pass
     except Exception:

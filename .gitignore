@@ -15,3 +15,17 @@ diag_voice.py
 # Local server env drafts (contain secrets, never commit)
 .env.newserver
 backups/
+
+# Deploy artifacts — a patch/base64 dump of a release that is already in
+# git history.  v223.patch + v223.b64 (128 KB) sat at the repo root with
+# zero references from code, docs or Dockerfile; the v2.2.3 content they
+# carry is fully subsumed by the committed tree.
+*.patch
+*.b64
+
+# This is a pure-Python project (see Dockerfile: python:3.11-slim).
+# composer.json requiring danog/madelineproto (a PHP library) was committed
+# by mistake and no .php file exists in the repo.
+composer.json
+composer.lock
+vendor/

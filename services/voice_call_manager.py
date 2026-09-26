@@ -70,7 +70,10 @@ from services.session_ownership import session_ownership
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
-    TEMPORARILY_UNKNOWN,
+    # TEMPORARILY_UNKNOWN is deliberately NOT imported here: this module owns
+    # the account state vocabulary (see the constants block below) and defines
+    # the same literal.  Importing it too shadowed nothing but confused readers
+    # and pyflakes alike.
     SUSPECTED_DISCONNECT,
     CONFIRMED_ABSENT,
     RECOVERING,
