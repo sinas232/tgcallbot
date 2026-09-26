@@ -279,7 +279,14 @@ def snapshot(
                                if mem_limit else None)
         out["mem_used_mb"] = (round(mem_usage / 1048576.0)
                               if mem_usage else None)
-    except Exception:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
+    except Exception as exc:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
+        # Never swallow silently.  A bare `except Exception: pass` here is what
+        # hid a missing services/memory_guard.py in the first prod patch: the
+        # ImportError looked identical to "the host exposes no cgroup data",
+        # which sent us hunting the wrong cause for a whole round.
+        logger.warning("[HostResources] memory snapshot unavailable: %r", exc)
         out["mem_percent"] = None
         out["mem_limit_mb"] = None
+        out["mem_used_mb"] = None
+        out["mem_error"] = repr(exc)
     return out

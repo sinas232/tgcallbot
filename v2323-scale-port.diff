@@ -392,10 +392,10 @@ index 0000000..0765e15
 +        return {}
 diff --git a/services/host_resources.py b/services/host_resources.py
 new file mode 100644
-index 0000000..a883d5a
+index 0000000..98e9b00
 --- /dev/null
 +++ b/services/host_resources.py
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,292 @@
 +"""تشخیص منابع واقعی در دسترس ربات + مقیاس‌پذیری خودکار هم‌روندی.
 +
 +چرا این ماژول لازم است
@@ -677,9 +677,16 @@ index 0000000..a883d5a
 +                               if mem_limit else None)
 +        out["mem_used_mb"] = (round(mem_usage / 1048576.0)
 +                              if mem_usage else None)
-+    except Exception:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
++    except Exception as exc:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
++        # Never swallow silently.  A bare `except Exception: pass` here is what
++        # hid a missing services/memory_guard.py in the first prod patch: the
++        # ImportError looked identical to "the host exposes no cgroup data",
++        # which sent us hunting the wrong cause for a whole round.
++        logger.warning("[HostResources] memory snapshot unavailable: %r", exc)
 +        out["mem_percent"] = None
 +        out["mem_limit_mb"] = None
++        out["mem_used_mb"] = None
++        out["mem_error"] = repr(exc)
 +    return out
 diff --git a/services/memory_guard.py b/services/memory_guard.py
 new file mode 100644
@@ -1168,10 +1175,10 @@ index 0000000..8ae4a91
 +    unittest.main(verbosity=2)
 diff --git a/tests/test_host_resources.py b/tests/test_host_resources.py
 new file mode 100644
-index 0000000..b0d0f9b
+index 0000000..d155ce6
 --- /dev/null
 +++ b/tests/test_host_resources.py
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,364 @@
 +"""Offline tests for services/host_resources.py.
 +
 +چرا این تست‌ها لازم‌اند: `os.cpu_count()` داخل کانتینر تعداد هسته‌های **هاست**
@@ -1504,6 +1511,38 @@ index 0000000..b0d0f9b
 +    def test_all_concurrency_values_are_at_least_one(self):
 +        for value in self._values()[1:]:
 +            self.assertGreaterEqual(value, 1)
++
++
++class SnapshotErrorVisibilityTests(unittest.TestCase):
++    """A missing dependency must be REPORTED, not look like 'no cgroup data'.
++
++    This is the exact failure that shipped in the first v2.3.23 patch: it
++    contained host_resources.py but not memory_guard.py, so snapshot()'s
++    `from services.memory_guard import ...` raised ModuleNotFoundError, the
++    bare `except Exception` swallowed it, and mem_percent/mem_limit_mb came
++    back None - indistinguishable from a host that exposes no cgroup files.
++    """
++
++    def test_a_broken_memory_guard_surfaces_in_the_snapshot(self):
++        import sys as _sys
++        saved = _sys.modules.get("services.memory_guard")
++        _sys.modules["services.memory_guard"] = None   # makes import raise
++        try:
++            snap = snapshot()
++        finally:
++            if saved is None:
++                _sys.modules.pop("services.memory_guard", None)
++            else:
++                _sys.modules["services.memory_guard"] = saved
++        self.assertIsNone(snap["mem_percent"])
++        self.assertIn("mem_error", snap,
++                      "snapshot must expose the failure, not hide it")
++        # the repr names ModuleNotFoundError, which is an ImportError subclass
++        self.assertIn("ModuleNotFoundError", snap["mem_error"])
++
++    def test_a_healthy_import_leaves_no_error_key(self):
++        snap = snapshot()
++        self.assertNotIn("mem_error", snap)
 diff --git a/tests/test_memory_guard.py b/tests/test_memory_guard.py
 new file mode 100644
 index 0000000..8dd7517

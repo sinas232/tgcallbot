@@ -330,3 +330,35 @@ class ConfigWiringTests(unittest.TestCase):
     def test_all_concurrency_values_are_at_least_one(self):
         for value in self._values()[1:]:
             self.assertGreaterEqual(value, 1)
+
+
+class SnapshotErrorVisibilityTests(unittest.TestCase):
+    """A missing dependency must be REPORTED, not look like 'no cgroup data'.
+
+    This is the exact failure that shipped in the first v2.3.23 patch: it
+    contained host_resources.py but not memory_guard.py, so snapshot()'s
+    `from services.memory_guard import ...` raised ModuleNotFoundError, the
+    bare `except Exception` swallowed it, and mem_percent/mem_limit_mb came
+    back None - indistinguishable from a host that exposes no cgroup files.
+    """
+
+    def test_a_broken_memory_guard_surfaces_in_the_snapshot(self):
+        import sys as _sys
+        saved = _sys.modules.get("services.memory_guard")
+        _sys.modules["services.memory_guard"] = None   # makes import raise
+        try:
+            snap = snapshot()
+        finally:
+            if saved is None:
+                _sys.modules.pop("services.memory_guard", None)
+            else:
+                _sys.modules["services.memory_guard"] = saved
+        self.assertIsNone(snap["mem_percent"])
+        self.assertIn("mem_error", snap,
+                      "snapshot must expose the failure, not hide it")
+        # the repr names ModuleNotFoundError, which is an ImportError subclass
+        self.assertIn("ModuleNotFoundError", snap["mem_error"])
+
+    def test_a_healthy_import_leaves_no_error_key(self):
+        snap = snapshot()
+        self.assertNotIn("mem_error", snap)
