@@ -177,6 +177,14 @@ class Config:
     # After a crash / OOM-kill / deploy, orders that were `running` are
     # resumed for their REMAINING paid time instead of being dropped.
     ORDER_RECOVERY_ENABLED = os.getenv('ORDER_RECOVERY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── گارد حافظهٔ cgroup (جلوگیری از OOM-kill وسط تماس) ────────────
+    # کرنل کانتینر را با SIGKILL می‌کشد وقتی مصرف cgroup از سقف RAM رد شود؛
+    # آن وقت همهٔ تماس‌های فعال یک‌جا می‌میرند و سفارش نیمه‌کاره می‌ماند.
+    # اگر مصرف از این درصدِ سقف بیشتر باشد، سفارش جدید پذیرفته نمی‌شود.
+    # توجه: rss_mb پایتون این عدد نیست — ffmpeg هر اکانت و حافظهٔ
+    # کرنل/سوکتِ WebRTC هم در cgroup حساب می‌شوند.
+    MEMORY_GUARD_ENABLED = os.getenv('MEMORY_GUARD_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    MEMORY_GUARD_MAX_PERCENT = int(os.getenv('MEMORY_GUARD_MAX_PERCENT', '85'))
 
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))

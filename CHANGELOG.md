@@ -57,12 +57,24 @@
   رزروهای خودمان (`active_calls`) برای leave کردن استفاده می‌شود تا
   اتصال‌های WebRTC قدیمی نشت نکنند.
 
-### ۳) سقف حافظهٔ کانتینر (علت احتمالی کشته‌شدن پروسه)
+### ۳) سقف حافظهٔ کانتینر + گارد حافظه (علت کشته‌شدن پروسه — تأییدشده)
+- `dmesg` روی سرور **۱۳ بار** «Memory cgroup out of memory: Killed process
+  (python)» بین ۱۷ تا ۲۶ سپتامبر ثبت کرده بود؛ کشته‌شدن ۱۹ سپتامبر دقیقاً روی
+  **۱۰۰.۶٪** سقف ۱۵۳۶ MiB اتفاق افتاده. نکته: `docker inspect` بعد از
+  بازسازی کانتینر `OOMKilled=false` نشان می‌دهد، چون `docker compose up`
+  کانتینر را recreate می‌کند و `RestartCount` صفر می‌شود.
 - لاگ خودِ ربات: `rss_mb=895` با ۳۴ اکانت ⇒ ≈۲۰ مگابایت به ازای هر اکانت.
   اما این فقط RSS پایتون است و پروسهٔ ffmpeg هر اکانت در cgroup همان
   کانتینر حساب می‌شود؛ جمعِ این دو در ۴۲ اکانت به ≈۱.۶–۱.۹ گیگابایت
   می‌رسد.
 - `docker-compose.yml`: سقف حافظه از `1536M` به `3G` تغییر کرد.
+- **ماژول جدید `services/memory_guard.py`:** مستقیماً `memory.current` /
+  `memory.max` (cgroup v2 و v1) را می‌خواند و اگر مصرف بالای
+  `MEMORY_GUARD_MAX_PERCENT` (پیش‌فرض ۸۵٪) باشد، `capacity_planner` سفارش
+  جدید را با دلیل `memory` رد می‌کند. Fail-open: اگر عدد خوانده نشود، مسیر
+  خرید بسته نمی‌شود. دلیلش این است که `rss_mb` پایتون مصرف واقعی cgroup نیست
+  (ffmpeg هر اکانت + حافظهٔ کرنل/سوکت WebRTC هم حساب می‌شوند).
+- کلیدهای env جدید: `MEMORY_GUARD_ENABLED`، `MEMORY_GUARD_MAX_PERCENT`.
 
 ### ۴) `requirements.txt` — بیلد تازه کرش می‌کرد
 - `sqlalchemy` بدون پین و بدون extra نصب می‌شد؛ از SQLAlchemy 2.1 به بعد
@@ -74,7 +86,7 @@
   `python-telegram-bot[job-queue]>=22.0,<23`.
 
 ### ۵) تست‌ها
-- قبل: `5 failed, 113 passed, 1 skipped` — بعد: **`125 passed, 1 skipped`**.
+- قبل: `5 failed, 113 passed, 1 skipped` — بعد: **`135 passed, 1 skipped`**.
 - دو تست قدیمی با رفتارِ عمدیِ فعلی هم‌راستا شدند (استریم سکوت ۲۴kHz مونو و
   `-stream_loop 1000000`؛ حالا از روی `Config`/ثابت‌های ماژول خوانده می‌شوند
   تا دوباره کهنه نشوند) و تست چرخهٔ حیات انجین به قرارداد واقعیِ
@@ -87,7 +99,8 @@
   می‌شوند.
 - `SESSION_ENCRYPTION_KEY` تست‌ها یک کلید **معتبر Fernet** شد (مقدار قبلی
   معتبر نبود و همهٔ رمزگشایی‌ها در تست خطا می‌دادند).
-- فایل تست جدید: `tests/test_account_exclusion.py` (۷ تست).
+- فایل‌های تست جدید: `tests/test_account_exclusion.py` (۷ تست) و
+  `tests/test_memory_guard.py` (۱۰ تست).
 
 </div>
 

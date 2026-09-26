@@ -107,6 +107,8 @@ class CapacityVerdict:
     busy_until_utc: Optional[datetime] = None     # پایان آخرین رزروِ مزاحم
     suggested_start_utc: Optional[datetime] = None  # اولین شروعِ جادار (دقیق)
     degraded: bool = False                # True یعنی خطای داخلی → fail-open
+    memory_pressure_percent: Optional[float] = None  # مصرف cgroup نسبت به سقف
+    memory_max_percent: float = 0.0                  # آستانهٔ گارد حافظه
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -124,6 +126,8 @@ class CapacityVerdict:
             "busy_until_utc": self.busy_until_utc,
             "suggested_start_utc": self.suggested_start_utc,
             "degraded": self.degraded,
+            "memory_pressure_percent": self.memory_pressure_percent,
+            "memory_max_percent": self.memory_max_percent,
         }
 
 
@@ -296,6 +300,8 @@ def check_capacity(
     step_minutes: int = 5,
     horizon_minutes: int = 24 * 60,
     now_utc: Optional[datetime] = None,
+    memory_pressure_percent: Optional[float] = None,
+    memory_max_percent: float = 85.0,
 ) -> CapacityVerdict:
     """داوری نهایی ظرفیت برای یک درخواست سفارش (تابع خالص — بدون DB/تلگرام)."""
     now = now_utc or datetime.utcnow()
@@ -324,7 +330,23 @@ def check_capacity(
     verdict.peak_usage = peak
     verdict.peak_concurrent = concurrent
 
-    # ۲) جا شدن کامل بازه (اوج مصرف + درخواست ≤ ظرفیت مفید) و سقف همزمانی
+    # ۲) گارد حافظهٔ کانتینر — منبعی کاملاً مستقل از «تعداد اکانت».
+    #    ورود هر اکانت ≈ ۲۰ مگابایت RSS پایتون + یک پروسهٔ ffmpeg، و ده‌ها
+    #    اتصال WebRTC هم حافظهٔ کرنل/سوکت مصرف می‌کنند. اگر cgroup نزدیک سقف
+    #    باشد، پذیرش سفارش جدید یعنی OOM-kill وسط تماس (رویداد ۱۴۰۵/۰۷/۰۴:
+    #    ۱۳ بار در ۱۰ روز). None یعنی «نمی‌دانم» ⇒ fail-open.
+    if memory_pressure_percent is not None:
+        try:
+            _pct = float(memory_pressure_percent)
+            verdict.memory_pressure_percent = _pct
+            verdict.memory_max_percent = float(memory_max_percent)
+        except Exception:
+            _pct = None
+        if _pct is not None and _pct >= float(memory_max_percent):
+            verdict.reason = "memory"
+            return verdict
+
+    # ۳) جا شدن کامل بازه (اوج مصرف + درخواست ≤ ظرفیت مفید) و سقف همزمانی
     if accounts_needed <= eff_pool and (peak + accounts_needed) <= eff_pool and (concurrent + 1) <= max_conc:
         verdict.allowed = True
         return verdict
@@ -386,6 +408,23 @@ class CapacityPlanner:
             unknown_min = _cfg_int("CAPACITY_UNKNOWN_DURATION_MINUTES", "CAPACITY_UNKNOWN_DURATION_MINUTES", 60)
             reservations = _normalize_reservations(rows, now, unknown_min)
 
+            # ── گارد حافظهٔ cgroup (منبع مستقل از «تعداد اکانت») ──────────
+            # کرنل کانتینر را با SIGKILL می‌کشد وقتی از سقف RAM رد شود و آن
+            # وقت همهٔ تماس‌های فعال یک‌جا می‌میرند. None ⇒ fail-open.
+            mem_pct: Optional[float] = None
+            mem_max = 85.0
+            if _cfg_bool("MEMORY_GUARD_ENABLED", "MEMORY_GUARD_ENABLED", True):
+                try:
+                    from services.memory_guard import pressure_percent as _mem_pct
+                    mem_pct = _mem_pct()
+                except Exception as _exc:
+                    logger.warning("memory guard unavailable (%s) — skipping", _exc)
+                    mem_pct = None
+                try:
+                    mem_max = float(_cfg_int("MEMORY_GUARD_MAX_PERCENT", "MEMORY_GUARD_MAX_PERCENT", 85))
+                except Exception:
+                    mem_max = 85.0
+
             verdict = check_capacity(
                 reservations=reservations,
                 pool_size=pool_size,
@@ -395,6 +434,8 @@ class CapacityPlanner:
                 safety_buffer_percent=_cfg_int("CAPACITY_SAFETY_BUFFER_PERCENT", "CAPACITY_SAFETY_BUFFER_PERCENT", 10),
                 max_concurrent_orders=_cfg_int("MAX_CONCURRENT_ORDERS", "MAX_CONCURRENT_ORDERS", 10),
                 unknown_duration_min=unknown_min,
+                memory_pressure_percent=mem_pct,
+                memory_max_percent=mem_max,
                 step_minutes=_cfg_int("CAPACITY_STEP_MINUTES", "CAPACITY_STEP_MINUTES", 5),
                 horizon_minutes=_cfg_int("CAPACITY_HORIZON_HOURS", "CAPACITY_HORIZON_HOURS", 24) * 60,
                 now_utc=now,
