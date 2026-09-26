@@ -1255,6 +1255,35 @@ class VoiceCallManager:
                 reserved.update(account_ids)
         return reserved
 
+    def accounts_busy_in_other_orders(self, order_id: Optional[int]) -> Set[int]:
+        """Accounts this order must NOT pick: they belong to another live order.
+
+        ── Why this exists ──────────────────────────────────────────────
+        A Telegram account can sit in exactly ONE voice chat at a time, and
+        this manager keeps exactly ONE Pyrogram client and ONE PyTgCalls
+        engine per ``account_id`` (NOT per order).  So when two concurrent
+        orders are allocated the same account, the second order's join
+        physically drags the account out of the first order's call — with no
+        error anywhere — and the first order's teardown (``leave_call``)
+        kills the second one too.
+
+        Production incident 1405-07-04: orders 859 and 860 were both handed
+        the same 42-account pool and 860's first 10 accounts were 100%
+        already inside 859.
+
+        The result is derived from state that is ALREADY maintained and
+        cleaned up (``active_calls`` + ``_reservations``), so there is no
+        separate lifecycle to leak.
+        """
+        busy: Set[int] = set()
+        for (oid, aid) in self.active_calls.keys():
+            if order_id is None or oid != order_id:
+                busy.add(aid)
+        busy |= self.get_reserved_account_ids(exclude_order_id=order_id)
+        # Never report this order's own accounts as "busy elsewhere".
+        busy -= self.get_active_account_ids(order_id) if order_id is not None else set()
+        return busy
+
     def get_cached_session_account_ids(self) -> Set[int]:
         return set(self._session_cache.keys())
 
@@ -1917,14 +1946,28 @@ class VoiceCallManager:
                     # PyTgCalls 2.x has no stop(); leave each held call so the
                     # engine (and its WebRTC connections) is truly torn down
                     # before the fresh instance is built below.
+                    known_chats: Set[int] = set()
                     try:
-                        for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                            try:
-                                await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                            except Exception:
-                                pass
+                        _live = await asyncio.wait_for(pytg.group_calls, timeout=3)
+                        known_chats |= {int(c) for c in (_live or {})}
                     except Exception:
                         pass
+                    if not known_chats:
+                        # `group_calls` itself is broken — that is exactly WHY
+                        # the engine was judged unhealthy.  Fall back to the
+                        # chats WE booked for this account; without this the
+                        # old WebRTC bindings are simply dropped (leaked) and
+                        # the freshly built engine collides with them.
+                        known_chats |= {
+                            int((info or {}).get("chat_id") or 0)
+                            for (_oid, _aid), info in list(self.active_calls.items())
+                            if _aid == account_id and (info or {}).get("chat_id")
+                        }
+                    for _cid in known_chats:
+                        try:
+                            await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
+                        except Exception:
+                            pass
                     pytg = None
                     self.clients.pop(account_id, None)
 
@@ -3497,9 +3540,13 @@ class VoiceCallManager:
         """
         Track which accounts this order has *selected* so far.
 
-        The same account may legitimately participate in multiple orders and
-        multiple Voice Chats simultaneously. We only record the set for
-        bookkeeping / de-duplication WITHIN this order.
+        This is the cross-order lock: an account can be in ONE voice chat at
+        a time and this manager keeps ONE client/engine per ``account_id``,
+        so two concurrent orders must never be handed the same account.
+        ``accounts_busy_in_other_orders`` reads this set, which closes the
+        race between "candidate picked" and "join confirmed in
+        active_calls".  The set is replaced on every wave and dropped when
+        the order ends.
         """
         async with self._reservation_lock:
             self._reservations[order_id] = set(account_ids)

@@ -3,7 +3,15 @@
 numpy
 python-dotenv
 cryptography
-sqlalchemy
+# ⚠️ حتماً با extra «asyncio»: این پروژه sqlalchemy.ext.asyncio را import
+# می‌کند و از SQLAlchemy 2.1 به بعد، greenlet دیگر خودکار نصب نمی‌شود.
+# با «sqlalchemy» خالی، بیلدِ تازه روی سرور جدید در همان import اولِ
+# database.py با این خطا کرش می‌کند:
+#   ImportError: The SQLAlchemy asyncio module requires that the Python
+#   'greenlet' library is installed. ... use 'sqlalchemy[asyncio]'
+# (به‌صورت عملی روی SQLAlchemy 2.1.1 بازتولید شد.)
+sqlalchemy[asyncio]>=2.0,<2.2
+greenlet>=3.0
 asyncpg
 redis
 aiohttp
@@ -14,7 +22,10 @@ uvloop; sys_platform != "win32"
 
 #Bot
 
-python-telegram-bot[job-queue]
+# پینِ محدودهٔ نسخه: کد روی API نسخهٔ ۲۲ نوشته شده (Application/Persistence،
+# ایموجی پریمیوم Bot API 9.4). نصبِ بدون پین می‌تواند نسخهٔ ۲۳ را بیاورد و
+# استارت را بشکند.
+python-telegram-bot[job-queue]>=22.0,<23
 
 #Engine
 

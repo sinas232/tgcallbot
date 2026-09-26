@@ -1222,10 +1222,26 @@ finished_at=datetime.utcfromtimestamp(finished) if finished else None,
 
     @staticmethod
     async def reset_stuck_orders():
+        """Reset ONLY the voice-session rows left `joined` by a restart.
+
+        ⚠️ This used to flip every `running` order to `stopped` as well.
+        That silently destroyed paid, still-valid orders after an OOM
+        kill / deploy (incident 1405-07-04: orders 859 & 860 were paid,
+        the process restarted mid-build, and both ended up listed under
+        "cancelled" with no re-join, no message and no refund).
+        Order recovery now lives in `main._recover_interrupted_orders`.
+        """
         async with AsyncSessionLocal() as db_session:
-            await db_session.execute(update(Order).where(Order.status == 'running').values(status='stopped'))
             await db_session.execute(update(VoiceCallSession).where(VoiceCallSession.status == 'joined').values(status='reset'))
             await db_session.commit()
+
+    @staticmethod
+    async def get_running_orders():
+        """Orders still marked `running` — i.e. interrupted by a restart."""
+        async with AsyncSessionLocal() as db_session:
+            q = select(Order).filter(Order.status == 'running').order_by(Order.id)
+            res = await db_session.execute(q)
+            return [to_dict(o) for o in res.scalars().all()]
 
     @staticmethod
     async def get_gateway(slug: str, bot_id=1):

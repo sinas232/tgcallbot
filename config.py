@@ -167,6 +167,16 @@ class Config:
     # Extra human-like jitter on top of the base leave gap (seconds).
     VOICE_LEAVE_JITTER_MIN = float(os.getenv('VOICE_LEAVE_JITTER_MIN', '0.0'))
     VOICE_LEAVE_JITTER_MAX = float(os.getenv('VOICE_LEAVE_JITTER_MAX', '0.4'))
+    # ── STARVATION WAIT (cross-order account contention) ────────────
+    # When every remaining pool account is held by ANOTHER live order, wait
+    # this many rounds × seconds for a release instead of stealing the
+    # account or silently delivering a short order.
+    VOICE_STARVED_WAIT_ROUNDS = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS', '6'))
+    VOICE_STARVED_WAIT_SECONDS = float(os.getenv('VOICE_STARVED_WAIT_SECONDS', '20'))
+    # ── RESTART RECOVERY ────────────────────────────────────────────
+    # After a crash / OOM-kill / deploy, orders that were `running` are
+    # resumed for their REMAINING paid time instead of being dropped.
+    ORDER_RECOVERY_ENABLED = os.getenv('ORDER_RECOVERY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # Consecutive failure-free waves before the brain widens the window by 1.
     VOICE_JOIN_GROWTH_AFTER_WAVES = int(os.getenv('VOICE_JOIN_GROWTH_AFTER_WAVES', '2'))

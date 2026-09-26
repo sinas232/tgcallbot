@@ -581,6 +581,99 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Expired orders check error: {e}")
 
+async def _recover_interrupted_orders() -> None:
+    """بازیابی سفارش‌هایی که موقع ری‌استارت پروسه در حال اجرا بودند.
+
+    قبل از این، `reset_stuck_orders` همهٔ سفارش‌های `running` را بی‌صدا به
+    `stopped` تبدیل می‌کرد: بعد از OOM-kill / دیپلوی، سفارشِ پول‌داده‌شده نه
+    دوباره join می‌شد، نه پیامی می‌رفت و نه عودتی — و چون فیلتر `cancelled`
+    در دیتابیس `['stopped','failed']` است، در پنل ادمین زیر «لغو/ناموفق»
+    می‌افتاد. (رویداد ۱۴۰۵/۰۷/۰۴ — سفارش‌های ۸۵۹ و ۸۶۰)
+
+    حالا: اگر از زمان پرداخت‌شدهٔ سفارش چیزی باقی مانده باشد، سفارش برای همان
+    «مدت باقی‌مانده» دوباره submit می‌شود (زمان ورود مجدد رایگان است) و به
+    کاربر اطلاع داده می‌شود؛ اگر زمانی نمانده باشد، سفارش بسته می‌شود و کاربر
+    بی‌خبر نمی‌ماند.
+    """
+    if not bool(getattr(Config, "ORDER_RECOVERY_ENABLED", True)):
+        logger.info("♻️ Order recovery disabled (ORDER_RECOVERY_ENABLED=false)")
+        return
+    try:
+        orders = await DatabaseManager.get_running_orders()
+    except Exception as e:
+        logger.error(f"♻️ Order recovery: cannot read running orders ({e})")
+        return
+    if not orders:
+        return
+    logger.warning(
+        f"♻️ Found {len(orders)} order(s) still marked `running` at startup "
+        f"(process restarted mid-order) — attempting recovery"
+    )
+    now = datetime.utcnow()
+    for order in orders:
+        oid = order.get("id")
+        bot_id = order.get("bot_id", 1)
+        duration = int(order.get("duration_minutes") or 0)
+        start = order.get("started_at") or order.get("created_at")
+        app = bot_manager.active_bots.get(bot_id)
+        tg_id = None
+        try:
+            user = await DatabaseManager.get_user_by_id(order.get("user_id"))
+            tg_id = (user or {}).get("telegram_id")
+        except Exception:
+            tg_id = None
+
+        end = (start + timedelta(minutes=duration)) if (start and duration > 0) else None
+        remaining = int((end - now).total_seconds() // 60) if end else 0
+
+        if end is None or remaining <= 0:
+            # زمانی برای تحویل نمانده (یا سفارش «تکمیل و خروج» بدون مدت که
+            # اکانت‌هایش از بین رفته‌اند) — ببند و به کاربر بگو.
+            try:
+                await DatabaseManager.update_order_status(oid, "stopped")
+            except Exception:
+                pass
+            logger.warning(f"♻️ Order {oid}: interrupted by restart with no paid time left — closed")
+            if tg_id and app:
+                try:
+                    await app.bot.send_message(
+                        tg_id,
+                        "⚠️ **سرور در میانهٔ سفارش شما راه‌اندازی مجدد شد.**\n"
+                        f"🆔 کد سفارش: `{oid}`\n"
+                        "زمانی از سفارش باقی نمانده بود، بنابراین سفارش بسته شد. "
+                        "برای پیگیری/عودت با پشتیبانی تماس بگیرید."
+                    )
+                except Exception:
+                    pass
+            continue
+
+        keep = max(1, remaining)
+        resume = dict(order)
+        resume["duration_minutes"] = keep
+        logger.warning(f"♻️ Order {oid}: resuming with {keep} minute(s) left (originally {duration})")
+        try:
+            await order_executor.submit_order(oid, resume)
+        except Exception as e:
+            logger.error(f"♻️ Order {oid}: resume failed ({e}) — marking stopped")
+            try:
+                await DatabaseManager.update_order_status(oid, "stopped")
+            except Exception:
+                pass
+            continue
+        if tg_id and app:
+            try:
+                await app.bot.send_message(
+                    tg_id,
+                    "♻️ **سرور راه‌اندازی مجدد شد و سفارش شما در حال بازیابی است.**\n"
+                    f"🆔 کد سفارش: `{oid}`\n"
+                    f"⏳ مدت باقی‌مانده: `{keep}` دقیقه\n"
+                    "اکانت‌ها دوباره وارد ویس‌کال می‌شوند؛ زمان ورود مجدد رایگان "
+                    "است و از مدت سفارش کم نمی‌شود."
+                )
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------
 # راه‌اندازی و هندلرها
 # ---------------------------------------------------------
@@ -1416,6 +1509,14 @@ async def main_loop():
     
     # راه‌اندازی ربات‌های نمایندگی
     await bot_manager.start_all_active_bots()
+
+    # ── بازیابی سفارش‌هایی که ری‌استارتِ پروسه قطعشان کرده بود ──
+    # باید بعد از start_all_active_bots اجرا شود تا رباتِ هر سفارش برای
+    # ارسال پیام بازیابی در دسترس باشد.
+    try:
+        await _recover_interrupted_orders()
+    except Exception as e:
+        logger.error(f"♻️ Order recovery failed: {e}")
     
     # زمان‌بندی جاب‌ها
     if main_app.job_queue:

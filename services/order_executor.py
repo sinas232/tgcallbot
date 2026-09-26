@@ -164,8 +164,23 @@ class OrderExecutor:
 	        order_type = data["order_type"]
 
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
-	        exact = min(requested, eligible_count)
-	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
+	        # Accounts already committed to ANOTHER live order are not available to
+	        # this one (one client/engine + one voice chat per account), so counting
+	        # them here makes "Target=N" a promise the fill can never keep and ends
+	        # in the fill silently stealing them back.  Subtract them up front.
+	        held_elsewhere = 0
+	        try:
+	            _vcm0 = _get_voice_call_manager()
+	            if _vcm0 is not None:
+	                held_elsewhere = len(_vcm0.accounts_busy_in_other_orders(order_id))
+	        except Exception:
+	            held_elsewhere = 0
+	        free_count = max(0, eligible_count - held_elsewhere)
+	        exact = min(requested, free_count)
+	        logger.info(
+	            f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, "
+	            f"HeldByOtherOrders={held_elsewhere}, Target={exact}"
+	        )
 
 	        if exact <= 0:
 	            await self._fail_order(order_id, "No eligible active accounts available.")
@@ -457,6 +472,20 @@ class OrderExecutor:
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────
+	    # An account can sit in ONE voice chat at a time and this process
+	    # keeps ONE Pyrogram client + ONE PyTgCalls engine per account_id
+	    # (not per order).  Handing the same account to two concurrent
+	    # orders silently drags it out of the first order's call, so
+	    # accounts held by another LIVE order are not eligible here.
+	    # Fail-open: if the manager cannot answer, fall back to the old
+	    # behaviour instead of stalling the build.
+	    busy_elsewhere: Set[int] = set()
+	    if vcm is not None:
+	        try:
+	            busy_elsewhere = vcm.accounts_busy_in_other_orders(order_id)
+	        except Exception:
+	            busy_elsewhere = set()
 	    chosen: List[Dict] = []
 	    cursor = self._voice_cursor.get(order_id, 0)
 	    n = len(pool)
@@ -470,6 +499,8 @@ class OrderExecutor:
 	            continue
 	        if aid in banned or aid in joined_ids or aid in in_flight:
 	            continue
+	        if aid in busy_elsewhere:
+	            continue
 	        if attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        if retry_after.get(aid, 0) > now:
@@ -480,6 +511,11 @@ class OrderExecutor:
 	            continue
 	        chosen.append(acc)
 	    self._voice_cursor[order_id] = cursor % n if n else 0
+	    if not chosen and busy_elsewhere:
+	        logger.info(
+	            f"Order {order_id}: no candidate available — "
+	            f"{len(busy_elsewhere)} account(s) held by other live order(s)"
+	        )
 	    return chosen
 
 	def _voice_earliest_retry(self, order_id: int, joined_ids: Set[int]) -> Optional[float]:
@@ -491,10 +527,21 @@ class OrderExecutor:
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    # Accounts held by ANOTHER live order have no retry timer of their
+	    # own, so counting them here would return 0.0 and make the caller
+	    # give up instantly instead of waiting for the release.
+	    busy_elsewhere: Set[int] = set()
+	    if vcm is not None:
+	        try:
+	            busy_elsewhere = vcm.accounts_busy_in_other_orders(order_id)
+	        except Exception:
+	            busy_elsewhere = set()
 	    best: Optional[float] = None
 	    for acc in pool:
 	        aid = acc.get("id")
 	        if not aid or aid in banned or aid in joined_ids:
+	            continue
+	        if aid in busy_elsewhere:
 	            continue
 	        if attempts.get(aid, 0) >= attempt_budget:
 	            continue
@@ -550,6 +597,7 @@ class OrderExecutor:
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
+	    starved_rounds = 0
 	    live = int(vcm.get_active_count(order_id))
 
 	    while self._is_order_active(order_id) and live < target_count:
@@ -564,6 +612,8 @@ class OrderExecutor:
 	        joined_ids = set(vcm.get_active_account_ids(order_id))
 
 	        candidates = self._voice_candidates(order_id, window, joined_ids, set(), now)
+	        if candidates:
+	            starved_rounds = 0
 	        try:
 	            candidates = self_healing.rank(candidates)
 	        except Exception:
@@ -596,6 +646,41 @@ class OrderExecutor:
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # Pool exhausted *for this order*.  One more possibility:
+	                # every remaining account is held by ANOTHER live order and
+	                # will be released when that order ends.  Wait a bounded
+	                # number of rounds for that instead of silently delivering
+	                # a short order — and never steal the account.
+	                busy_now: Set[int] = set()
+	                if vcm is not None:
+	                    try:
+	                        busy_now = vcm.accounts_busy_in_other_orders(order_id)
+	                    except Exception:
+	                        busy_now = set()
+	                pool_left = len([
+	                    a for a in (self._voice_pool.get(order_id) or [])
+	                    if (a.get("id") or 0) not in joined_ids
+	                ])
+	                max_rounds = max(0, int(getattr(Config, "VOICE_STARVED_WAIT_ROUNDS", 6)))
+	                gap = max(5.0, float(getattr(Config, "VOICE_STARVED_WAIT_SECONDS", 20)))
+	                if busy_now and pool_left > 0 and starved_rounds < max_rounds:
+	                    starved_rounds += 1
+	                    logger.warning(
+	                        f"Order {order_id}: all {pool_left} remaining pool account(s)"
+	                        f" are held by other live order(s) — waiting {gap:.0f}s for a"
+	                        f" release ({starved_rounds}/{max_rounds})"
+	                    )
+	                    try:
+	                        await asyncio.sleep(gap)
+	                    except asyncio.CancelledError:
+	                        break
+	                    continue
+	                if busy_now and pool_left > 0:
+	                    logger.error(
+	                        f"Order {order_id}: giving up on {pool_left} account(s) still"
+	                        f" held by other order(s) after {starved_rounds} wait round(s)"
+	                        f" — delivering {live}/{target_count} rather than stealing them"
+	                    )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -630,6 +715,14 @@ class OrderExecutor:
 	            f"live={live}/{target_count})"
 	        )
 
+	        # Publish this order's selection BEFORE the joins start so a second
+	        # concurrent order cannot pick the same accounts during the ~3s join
+	        # window (active_calls only knows about accounts that already joined).
+	        try:
+	            _sel = set(joined_ids) | {c.get("id") for c in candidates if c.get("id")}
+	            await vcm.reserve_accounts(order_id, _sel)
+	        except Exception:
+	            pass
 	        wave_tasks: List[asyncio.Task] = []
 	        for _i, acc in enumerate(candidates):
 	            if _i > 0:

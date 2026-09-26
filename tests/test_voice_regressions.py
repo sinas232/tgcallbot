@@ -65,7 +65,11 @@ atexit.register(_close_stray_loops)
 # ── environment must exist BEFORE project imports ──────────────────────
 _TMP = tempfile.mkdtemp(prefix="voice-tests-")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
-os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef")
+# A REAL Fernet key (32 url-safe base64 bytes).  The previous literal was
+# NOT a valid Fernet key, so every session decrypt in the tests failed with
+# "Fernet key must be 32 url-safe base64-encoded bytes" and the voice tests
+# silently exercised the error path instead of the join path.
+os.environ.setdefault("SESSION_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cooldown.json"))
 os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "strategy.json"))
 os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
@@ -143,11 +147,17 @@ class SilenceStreamCommandTests(unittest.TestCase):
         # The single-dash fake flag must be gone.
         self.assertNotIn(" -audio ", f" {joined} ")
         self.assertIn("-stream_loop", cmd)
-        self.assertIn("-1", cmd)
         # -stream_loop is an INPUT option: it must appear before -i.
         self.assertLess(cmd.index("-stream_loop"), cmd.index("-i"), joined)
-        # The loop count sits right next to the flag.
-        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "-1", joined)
+        # ── py-tgcalls 2.3.x regression guard ────────────────────────────
+        # cleanup_commands() drops ANY token starting with "-", including the
+        # "-1" VALUE of -stream_loop → instant EOF + endless StreamEnded.
+        # The loop count must therefore be a large POSITIVE integer that
+        # survives the cleanup, and it must sit right next to the flag.
+        value = cmd[cmd.index("-stream_loop") + 1]
+        self.assertNotEqual(value, "-1", joined)
+        self.assertTrue(value.lstrip("+").isdigit(), f"loop value {value!r} in {joined}")
+        self.assertGreater(int(value), 1000, joined)
         # Output format is the ntgcalls wire format.
         self.assertIn("s16le", joined)
 
@@ -158,14 +168,28 @@ class SilenceStreamCommandTests(unittest.TestCase):
         self.assertIn("-audio", cmd)  # unrecognised ffmpeg flag -> instant exit
 
     def test_silence_file_format(self):
+        """The generated .wav must match what ntgcalls is told to expect.
+
+        The rate/channel count are NOT hardcoded here on purpose: they come
+        from ``VOICE_AUDIO_SAMPLE_RATE`` / ``VOICE_AUDIO_CHANNELS`` (default
+        24 kHz MONO — the cheapest Opus frame Telegram still accepts).  The
+        invariant that matters is that the file, the ffmpeg ``-ar/-ac`` and
+        ``AudioParameters`` all agree, so ffmpeg is a pure pass-through and
+        never resamples/downmixes mid-order.
+        """
         path = os.path.join(_TMP, "silence_check.wav")
         vcm_mod.SILENT_AUDIO_PATH = path
         vcm_mod._ensure_silence_file()
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), vcm_mod._SILENCE_RATE)
+            self.assertEqual(r.getnchannels(), vcm_mod._SILENCE_CHANNELS)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(
+                r.getnframes(), vcm_mod._SILENCE_RATE * vcm_mod._SILENCE_SECONDS
+            )
+        # …and the AudioParameters handed to ntgcalls describe the same stream.
+        self.assertEqual(vcm_mod._SILENCE_AUDIO_PARAMS.bitrate, vcm_mod._SILENCE_RATE)
+        self.assertEqual(vcm_mod._SILENCE_AUDIO_PARAMS.channels, vcm_mod._SILENCE_CHANNELS)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).
@@ -389,6 +413,7 @@ class FakePyTgCalls:
         self.stopped = 0
         self.active_chats = set()
         self.played = []
+        self.left = []
         FakePyTgCalls.instances.append(self)
 
     def on_update(self, flt):
@@ -409,6 +434,12 @@ class FakePyTgCalls:
 
     async def mute(self, chat_id):
         return True
+
+    async def leave_call(self, chat_id):
+        # py-tgcalls 2.x: leave_call() IS the engine teardown (there is no
+        # stop() on the real class any more).
+        self.left.append(int(chat_id))
+        self.active_chats.discard(int(chat_id))
 
     @property
     async def group_calls(self):
@@ -471,12 +502,23 @@ class EngineLifecycleTests(unittest.TestCase):
             engine = FakeUnhealthyPyTgCalls(app)
             self.mgr.pyrogram_clients[1] = app
             self.mgr.clients[1] = engine
-            got = await self.mgr._get_or_create_client(901, 1, "fake-session")
-            self.assertIsNot(got, engine)
-            self.assertEqual(engine.stopped, 1)
-            self.assertEqual(got.started, 1)
-            # stream-end + chat-update handlers attached on the fresh engine
-            self.assertEqual(len(got.handlers), 2)
+            # We had booked this account into a call.  `group_calls` on a
+            # broken engine raises (that is why it is "unhealthy"), so the
+            # teardown must fall back to OUR booking instead of leaking the
+            # old WebRTC bindings into the rebuilt engine.
+            self.mgr.active_calls[(901, 1)] = {"chat_id": -555}
+            try:
+                got = await self.mgr._get_or_create_client(901, 1, "fake-session")
+                self.assertIsNot(got, engine)
+                # py-tgcalls 2.3.x has NO stop() — verified against the
+                # installed wheel — so teardown is per-call leave_call().
+                self.assertEqual(engine.left, [-555])
+                self.assertIs(self.mgr.clients.get(1), got)
+                self.assertEqual(got.started, 1)
+                # stream-end + chat-update handlers attached on the fresh engine
+                self.assertEqual(len(got.handlers), 2)
+            finally:
+                self.mgr.active_calls.pop((901, 1), None)
         self.loop.run_until_complete(scenario())
 
     def test_stream_end_event_restarts_silence_once(self):

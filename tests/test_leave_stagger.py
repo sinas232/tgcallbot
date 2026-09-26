@@ -26,7 +26,11 @@ sys.path.insert(0, str(ROOT))
 
 # Minimal env so config / modules that touch dotenv don't explode.
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
-os.environ.setdefault("SESSION_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef")
+# A REAL Fernet key (32 url-safe base64 bytes).  The previous literal was
+# NOT a valid Fernet key, so every session decrypt in the tests failed with
+# "Fernet key must be 32 url-safe base64-encoded bytes" and the voice tests
+# silently exercised the error path instead of the join path.
+os.environ.setdefault("SESSION_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 _TMP = tempfile.mkdtemp(prefix="leave-stagger-")
 os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cd.json"))
 os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "st.json"))
@@ -111,7 +115,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.3"', src)
+        self.assertIn('BOT_VERSION = "2.2.4"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -121,8 +125,21 @@ class StopAllPacingLogicTests(unittest.TestCase):
     def setUpClass(cls):
         # Stub heavy third-party modules before importing voice_call_manager.
         stubs = {}
+        # ── isolation ────────────────────────────────────────────────────
+        # Every entry we overwrite is remembered so tearDownClass can put the
+        # ORIGINAL module object back.  Without this, the stubs leak into the
+        # next test module: order_executor._get_voice_call_manager() imports
+        # inside the function, so it would resolve the re-imported (second)
+        # voice_call_manager while earlier-collected modules still hold the
+        # first one — patches silently stop applying.
+        cls._saved_modules = {}
+
+        def _remember(name):
+            if name not in cls._saved_modules:
+                cls._saved_modules[name] = sys.modules.get(name, "_MISSING_")
 
         def _mod(name, **attrs):
+            _remember(name)
             m = types.ModuleType(name)
             for k, v in attrs.items():
                 setattr(m, k, v)
@@ -191,6 +208,7 @@ class StopAllPacingLogicTests(unittest.TestCase):
         )
         so.SessionInUseError = type("SessionInUseError", (Exception,), {})
         so.SessionOwnership = type("SessionOwnership", (), {})
+        _remember("services.session_ownership")
         sys.modules["services.session_ownership"] = so
 
         vc = types.ModuleType("services.voice_cooldown")
@@ -201,6 +219,7 @@ class StopAllPacingLogicTests(unittest.TestCase):
             sleep_remaining=lambda *a, **k: None,
         )
         vc.VoiceCooldown = type("VoiceCooldown", (), {})
+        _remember("services.voice_cooldown")
         sys.modules["services.voice_cooldown"] = vc
 
         pr = types.ModuleType("services.presence_reconciler")
@@ -213,10 +232,12 @@ class StopAllPacingLogicTests(unittest.TestCase):
             "LEAVE_ACCOUNT_UNRECOVERABLE", "LEAVE_UNKNOWN",
         ):
             setattr(pr, name, name if name != "PresenceReconciler" else type("PresenceReconciler", (), {"__init__": lambda s, **k: None}))
+        _remember("services.presence_reconciler")
         sys.modules["services.presence_reconciler"] = pr
 
         # Ensure services package pieces exist
         sys.path.insert(0, str(ROOT))
+        _remember("services")
         if "services" not in sys.modules:
             pkg = types.ModuleType("services")
             pkg.__path__ = [str(ROOT / "services")]
@@ -227,10 +248,21 @@ class StopAllPacingLogicTests(unittest.TestCase):
         cls.Config = Config
         import importlib
         # Drop a half-imported module if a previous attempt failed
+        _remember("services.voice_call_manager")
         sys.modules.pop("services.voice_call_manager", None)
         vcm_mod = importlib.import_module("services.voice_call_manager")
         cls.vcm_mod = vcm_mod
         cls.VoiceCallManager = vcm_mod.VoiceCallManager
+
+    @classmethod
+    def tearDownClass(cls):
+        """Put back every sys.modules entry this class replaced (see setUpClass)."""
+        for name, val in getattr(cls, "_saved_modules", {}).items():
+            if val == "_MISSING_":
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = val
+        cls._saved_modules = {}
 
     def setUp(self):
         self.mgr = self.VoiceCallManager()
