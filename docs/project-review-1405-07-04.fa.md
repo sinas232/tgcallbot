@@ -29,14 +29,9 @@
 
 **امنیت پایه درست است.** هیچ `eval`، هیچ `pickle.load`، هیچ `shell=True`. هر دو مورد `exec(` که پیدا شد خطای مثبت بودند: `manual_verify_user_exec` (نام تابع) و `create_subprocess_exec` (asyncio). صفر SQL رشته‌ای — همه از ORM با پارامتر بایند.
 
-**احراز هویت ادمین fail-closed است.** `@require_admin` و `@require_super_admin` در `admin_handlers.py:63` تعریف شده‌اند و در صورت عدم دسترسی **بدون صداکردن تابع** برمی‌گردند. من سه هندلر حساس را دستی چک کردم:
+**دکوراتورهای احراز هویت fail-closed هستند.** `@require_admin` / `@require_super_admin` / `@require_god_admin` در `admin_handlers.py:63` به بعد تعریف شده‌اند و در صورت عدم دسترسی **بدون صداکردن تابع** برمی‌گردند. خودِ دکوراتورها درست‌اند.
 
-```
-plan_management_menu              line 1330   @require_super_admin
-maintenance_menu                  line  297   @require_super_admin
-deleted_account_cleanup_handler   line  495   @require_super_admin
-stop_order_handler                line  106   @require_admin
-```
+> ⚠️ ولی پوشش‌شان ناقص بود — بخش ۳.۰ را ببینید. دکوراتورِ درست وقتی روی تابع ننشیند فایده‌ای ندارد.
 
 **پورت‌های میزبان محدود است.** در کل `docker-compose.yml` فقط دو پورت منتشر می‌شود:
 
@@ -52,6 +47,51 @@ stop_order_handler                line  106   @require_admin
 ---
 
 ## ۳. یافته‌ها بر اساس شدت
+
+### 🔴 بحرانی — دور زدن احراز هویت ادمین (اثبات و اصلاح شد)
+
+**این مهم‌ترین یافتهٔ بررسی است و با PoC اثباتش کردم.**
+
+`admin_conv` بدون هیچ فیلتری ثبت می‌شود:
+
+```
+main.py:1387   application.add_handler(register_conversation(admin_conv))
+```
+
+و `register_conversation` فقط هندلر را در یک رجیستری ثبت می‌کند و همان را برمی‌گرداند — فیلتری اضافه نمی‌کند. در PTB، **entry_pointها بدون ورود به مکالمه قابل رسیدن‌اند** و `callback_data` سمت کلاینت ساخته می‌شود.
+
+از ۲۲ entry_point، **۱۷ تا هیچ گاردی نداشتند** و بدنهٔ هندلرشان هم بررسی دسترسی نمی‌کرد. نتیجه:
+
+```python
+callback_data = "admincancel_refund_859"
+user_id       = 999000111          # در ADMIN_IDS نیست
+```
+
+خروجی PoC روی کد **قبل از فیکس**:
+
+```
+attacker id in ADMIN_IDS?      False
+settle_and_refund_order called? 1 time(s)
+  -> VULNERABLE: a non-admin refunded order 859
+     canceled_by_role: پشتیبانی/ادمین
+```
+
+یعنی **هر کاربر تلگرامی می‌توانست هر سفارشی را لغو کند و پولش را عودت بگیرد.** `admin_cancel_order_callback` (`admin_handlers.py:1806`) مستقیم از پارس‌کردن `callback_data` به `order_executor.settle_and_refund_order()` می‌رفت.
+
+۱۷ مسیر باز: `admin_cancel_order_callback`, `admin_cancel_pick_callback`, `admin_user_actions_handler`, `admin_stop_order_start`, `admin_orders_list_handler`, `admin_orders_back_callback`, `admin_ticket_actions`, `backup_action_callback`, `service_toggle_callback`, `spam_settings_callback`, `anti_spam_callback`, `handle_security_toggle`, `set_log_channel_start`, `maintenance_toggle_callback`, `account_pagination_callback`, `edit_account_from_list`, `handle_dead_accounts_callback`.
+
+**فیکس:** هر ۱۷ تا در نقطهٔ ثبت با `require_admin(...)` wrap شدند. یک فایل، بدون ریسک import چرخه‌ای.
+
+خروجی PoC **بعد از فیکس**:
+
+```
+non-admin -> settle called 0 time(s)  BLOCKED
+admin     -> settle called 1 time(s)  still works
+```
+
+`tests/test_admin_entry_point_auth.py` (۵ تست) حمله را بازپخش می‌کند و فهرست entry_pointها را pin می‌کند تا اضافه‌شدن یکی بدون گارد، بیلد را بشکند.
+
+---
 
 ### 🔴 بالا — ۷۸۱ بلوک `except`، ۱۶۸ تای آن‌ها `except Exception: pass`
 
