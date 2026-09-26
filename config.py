@@ -7,6 +7,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── مقیاس‌پذیری خودکار هم‌روندی از روی سخت‌افزار واقعی ──────────────────────
+# os.cpu_count() تعداد هسته‌های هاست را می‌دهد، نه سهمیه‌ای که cgroup به
+# کانتینر داده است. host_resources سهمیهٔ واقعی را می‌خواند.
+# قاعده: اگر متغیر env صریحاً تنظیم شده باشد همان عدد برنده است؛ اگر تنظیم
+# نشده باشد (صفر) مقدار از روی تعداد هسته محاسبه می‌شود.
+from services.host_resources import (  # noqa: E402 (بعد از load_dotenv)
+    recommended_client_create_concurrency as _rec_client_create,
+    recommended_global_join_concurrency as _rec_global_join,
+    recommended_join_max_concurrency as _rec_join_max,
+)
+
+
+def _env_int(key: str) -> int:
+    """عددِ صریحِ env یا صفر. صفر یعنی «تنظیم نشده» ⇒ محاسبهٔ خودکار."""
+    _raw = os.getenv(key)
+    if _raw is None or not str(_raw).strip():
+        return 0
+    try:
+        return int(str(_raw).strip())
+    except ValueError:
+        return 0
+
+
 
 def _safe_encode_db_url(raw: str) -> str:
     """
@@ -70,7 +93,9 @@ class Config:
     RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '30'))
 
     # Order Settings
-    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
+    # تنها سقف تجاریِ ربات: تعداد سفارش‌های همزمان. بقیهٔ کنترل‌ها (هم‌روندی
+    # join، ساخت کلاینت) از روی سخت‌افزار محاسبه می‌شوند نه به‌صورت سقف ثابت.
+    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '5'))
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)
@@ -85,8 +110,11 @@ class Config:
     # System-wide hard cap on simultaneous native join operations (across ALL
     # orders). Bumped up so several 100-500-account orders can build in
     # parallel without starving each other.
-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
+    # AUTO: ۸ به ازای هر هستهٔ در دسترس، کف ۸، سقف ۹۶. این کار عمدتاً انتظار
+    # I/O است نه CPU (پاسخ سرور تلگرام)، پس ضریب بالایی می‌گیرد. env برنده است.
+    GLOBAL_JOIN_CONCURRENCY = _env_int('GLOBAL_JOIN_CONCURRENCY') or _rec_global_join()
+    # AUTO: ۲ به ازای هر هسته، کف ۴، سقف ۱۶ (هر ساخت = یک handshake کامل MTProto).
+    CLIENT_CREATE_CONCURRENCY = _env_int('CLIENT_CREATE_CONCURRENCY') or _rec_client_create()
     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
@@ -111,11 +139,14 @@ class Config:
     # voice handshake. The Join Brain may still widen this (up to the max).
     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~2 concurrent media setups is where transports start dying AND
-    # where Telegram's per-IP burst budget starts answering with FloodWait.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # Per-order ceiling. Previously a hard-coded 2 (a 'small VPS' assumption):
+    # every simultaneous voice handshake consumes CPU/ffmpeg + a WebRTC stack,
+    # and Telegram's per-IP burst budget answers bursts with FloodWait.
+    # AUTO: ۲ به ازای هر هسته، کف ۲، سقف ۱۶. این فقط یک «سقف» است — Join Brain
+    # تعداد واقعی هر موج را تطبیقی و زیر این سقف انتخاب می‌کند و در صورت فشار
+    # تلگرام تا VOICE_JOIN_MIN_CONCURRENCY پایین می‌آید؛ پس سقف بالاتر به معنی
+    # «همیشه این‌قدر join بزن» نیست.
+    VOICE_JOIN_MAX_CONCURRENCY = _env_int('VOICE_JOIN_MAX_CONCURRENCY') or _rec_join_max()
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds

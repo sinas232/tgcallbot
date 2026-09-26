@@ -432,7 +432,7 @@ class CapacityPlanner:
                 start_utc=start_utc,
                 duration_minutes=duration_minutes,
                 safety_buffer_percent=_cfg_int("CAPACITY_SAFETY_BUFFER_PERCENT", "CAPACITY_SAFETY_BUFFER_PERCENT", 10),
-                max_concurrent_orders=_cfg_int("MAX_CONCURRENT_ORDERS", "MAX_CONCURRENT_ORDERS", 10),
+                max_concurrent_orders=_cfg_int("MAX_CONCURRENT_ORDERS", "MAX_CONCURRENT_ORDERS", 5),
                 unknown_duration_min=unknown_min,
                 memory_pressure_percent=mem_pct,
                 memory_max_percent=mem_max,

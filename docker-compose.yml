@@ -123,18 +123,21 @@ services:
     #
     # ── تنظیم‌پذیر از .env ────────────────────────────────────────────────
     #   BOT_MEM_LIMIT  پیش‌فرض 6G   ≈ ۱۳۵ اکانت همزمانِ داخل تماس (با ۱G سهم ثابت)
-    #   BOT_CPU_LIMIT  پیش‌فرض 6.0  هستهٔ اختصاصی برای ربات
+    #   BOT_CPU_LIMIT  پیش‌فرض 8.0  = همهٔ هسته‌ها (سقف را برمی‌دارد).
+    #     ⚠️ اگر warp/postgres هم روی همین هاست هستند، 6.0–7.0 امن‌تر است:
+    #     warp تمام مدیای WebRTC را تونل می‌زند و اگر ربات همهٔ هسته‌ها را
+    #     بردارد، خودِ warp گلوگاه می‌شود و صدا قطع‌قطع می‌شود.
     #   قاعدهٔ سرانگشتی:  RAM ≈ ۰.۰۳۲ گیگ × تعداد اکانت + ۱ گیگ ثابت
     #   اگر مجبور به محدود کردن RAM هستید، به‌جای کوچک کردن این عدد
     #   MAX_CONCURRENT_ORDERS را کم کنید.
     deploy:
       resources:
         limits:
-          cpus: "${BOT_CPU_LIMIT:-6.0}"
+          cpus: "${BOT_CPU_LIMIT:-8.0}"
           memory: ${BOT_MEM_LIMIT:-6G}
     # سازگاری با اجرای غیر-swarm قدیمی‌تر (docker-compose v1) در صورت وجود:
     mem_limit: ${BOT_MEM_LIMIT:-6G}
-    cpus: ${BOT_CPU_LIMIT:-6.0}
+    cpus: ${BOT_CPU_LIMIT:-8.0}
     environment:
       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
       - TZ=${TZ:-Asia/Tehran}
