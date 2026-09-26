@@ -1,0 +1,959 @@
+diff --git a/config.py b/config.py
+index a95d3c1..2f82187 100644
+--- a/config.py
++++ b/config.py
+@@ -7,6 +7,32 @@ from dotenv import load_dotenv
+ 
+ load_dotenv()
+ 
++# ── مقیاس‌پذیری خودکار هم‌روندی از روی سخت‌افزار واقعی ──────────────────────
++# os.cpu_count() تعداد هسته‌های هاست را می‌دهد، نه سهمیه‌ای که cgroup به
++# کانتینر داده است. host_resources سهمیهٔ واقعی را می‌خواند.
++# قاعده: اگر متغیر env صریحاً تنظیم شده باشد همان عدد برنده است؛ اگر تنظیم
++# نشده باشد (صفر) مقدار از روی تعداد هسته محاسبه می‌شود.
++from services.host_resources import (  # noqa: E402 (بعد از load_dotenv)
++    recommended_client_create_concurrency as _rec_client_create,
++    recommended_global_join_concurrency as _rec_global_join,
++    recommended_join_max_concurrency as _rec_join_max,
++)
++from services.env_sanity import check_and_warn as _check_env  # noqa: E402
++
++ENV_DUPLICATE_KEYS = _check_env()
++
++
++def _env_int(key: str) -> int:
++    """عددِ صریحِ env یا صفر. صفر یعنی «تنظیم نشده» ⇒ محاسبهٔ خودکار."""
++    _raw = os.getenv(key)
++    if _raw is None or not str(_raw).strip():
++        return 0
++    try:
++        return int(str(_raw).strip())
++    except ValueError:
++        return 0
++
++
+ 
+ def _safe_encode_db_url(raw: str) -> str:
+     """
+@@ -70,7 +96,9 @@ class Config:
+     RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '30'))
+ 
+     # Order Settings
+-    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
++    # تنها سقف تجاریِ ربات: تعداد سفارش‌های همزمان. بقیهٔ کنترل‌های هم‌روندی از
++    # روی سهمیهٔ واقعی CPU محاسبه می‌شوند نه به‌صورت عدد ثابت.
++    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '5'))
+     if MAX_CONCURRENT_ORDERS < 0:
+         raise ValueError('MAX_CONCURRENT_ORDERS must not be negative')
+     # Preserve the permissive default for existing installs; 'private' opts in.
+@@ -93,8 +121,11 @@ class Config:
+     # System-wide hard cap on simultaneous native join operations (across ALL
+     # orders). Bumped up so several 100-500-account orders can build in
+     # parallel without starving each other.
+-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
+-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
++    # AUTO: ۸ به ازای هر هستهٔ در دسترس، کف ۸، سقف ۹۶. عمدتاً انتظار I/O است
++    # نه CPU، پس ضریب بالایی می‌گیرد. مقدار صریحِ env همیشه برنده است.
++    GLOBAL_JOIN_CONCURRENCY = _env_int('GLOBAL_JOIN_CONCURRENCY') or _rec_global_join()
++    # AUTO: ۲ به ازای هر هسته، کف ۴، سقف ۱۶ (هر ساخت = یک handshake کامل MTProto).
++    CLIENT_CREATE_CONCURRENCY = _env_int('CLIENT_CREATE_CONCURRENCY') or _rec_client_create()
+     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
+     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
+     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
+@@ -150,11 +181,14 @@ class Config:
+     # voice handshake. The Join Brain may still widen this (up to the max).
+     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
+     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
+-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
+-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
+-    # than ~2 concurrent media setups is where transports start dying AND
+-    # where Telegram's per-IP burst budget starts answering with FloodWait.
+-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
++    # Per-order ceiling. Previously a hard-coded 2 (a 'small VPS' assumption):
++    # every simultaneous voice handshake consumes CPU/ffmpeg + a WebRTC stack,
++    # and Telegram's per-IP burst budget answers bursts with FloodWait.
++    # AUTO: ۲ به ازای هر هسته، کف ۲، سقف ۱۶. این فقط یک «سقف» است — Join Brain
++    # تعداد واقعی هر موج را تطبیقی و زیر این سقف انتخاب می‌کند و در صورت فشار
++    # تلگرام تا VOICE_JOIN_MIN_CONCURRENCY پایین می‌آید؛ پس سقف بالاتر به معنی
++    # «همیشه این‌قدر join بزن» نیست.
++    VOICE_JOIN_MAX_CONCURRENCY = _env_int('VOICE_JOIN_MAX_CONCURRENCY') or _rec_join_max()
+     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
+     # Accounts of one wave do NOT fire their joins in the same millisecond:
+     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
+diff --git a/docker-compose.yml b/docker-compose.yml
+index d95edf9..26582f4 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -134,10 +134,10 @@ services:
+     deploy:
+       resources:
+         limits:
+-          cpus: "${BOT_CPU_LIMIT:-2.0}"
+-          memory: ${BOT_MEM_LIMIT:-1536M}
+-    mem_limit: ${BOT_MEM_LIMIT:-1536M}
+-    cpus: ${BOT_CPU_LIMIT:-2.0}
++          cpus: "${BOT_CPU_LIMIT:-8.0}"
++          memory: ${BOT_MEM_LIMIT:-6G}
++    mem_limit: ${BOT_MEM_LIMIT:-6G}
++    cpus: ${BOT_CPU_LIMIT:-8.0}
+     environment:
+       # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
+       - TZ=${TZ:-Asia/Tehran}
+diff --git a/services/env_sanity.py b/services/env_sanity.py
+new file mode 100644
+index 0000000..0765e15
+--- /dev/null
++++ b/services/env_sanity.py
+@@ -0,0 +1,123 @@
++"""بررسی سلامت `.env` در استارتاپ — کلید تکراری یک باگِ بی‌صداست.
++
++چرا این ماژول وجود دارد
++-----------------------
++`python-dotenv` و `env_file` داکر هر دو برای کلید تکراری **آخرین مقدار** را
++نگه می‌دارند. پس اگر `.env` این‌طور باشد:
++
++    MAX_CONCURRENT_ORDERS=10      # خط ۴۹
++    ...
++    MAX_CONCURRENT_ORDERS=5       # خط ۱۸۰
++
++ربات ۵ را می‌خواند و همه‌چیز درست به نظر می‌رسد. اما این یک مین است: اگر کسی
++بلوک پایینی را پاک کند، یا یک `export` در شل باشد، یا ترتیب عوض شود، مقدار
++بی‌صدا به ۱۰ برمی‌گردد و هیچ خطایی ثبت نمی‌شود. این دقیقاً همان اتفاقی است که
++وقتی یک اسکریپت `sed` کلید را **جایگزین** نکرد و مقدار جدید را به انتهای فایل
++**اضافه** کرد رخ می‌دهد.
++
++این ماژول تکراری‌ها را در استارتاپ پیدا می‌کند و با صدای بلند هشدار می‌دهد.
++هیچ‌وقت استثنا نمی‌دهد و هیچ‌وقت جلوی بالا آمدن ربات را نمی‌گیرد.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import sys
++from typing import Dict, List, Optional, Tuple
++
++logger = logging.getLogger("env_sanity")
++
++# خطوطی که در .env تعریفِ کلید حساب نمی‌شوند
++_SKIP_PREFIXES = ("#", ";", "[")
++
++
++def find_duplicate_keys(
++    path: str = ".env",
++) -> Dict[str, List[Tuple[int, str]]]:
++    """کلیدهایی که بیش از یک بار تعریف شده‌اند.
++
++    خروجی: `{کلید: [(شمارهٔ خط, مقدار), ...]}` — فقط کلیدهای تکراری.
++    اگر فایل وجود نداشته باشد یا خوانده نشود، `{}` برمی‌گردد.
++    """
++    try:
++        with open(path, "r", encoding="utf-8", errors="replace") as fh:
++            raw_lines = fh.readlines()
++    except OSError:
++        return {}
++
++    seen: Dict[str, List[Tuple[int, str]]] = {}
++    for lineno, line in enumerate(raw_lines, start=1):
++        stripped = line.strip()
++        if not stripped or stripped.startswith(_SKIP_PREFIXES):
++            continue
++        # `export FOO=bar` هم یک تعریف است
++        if stripped.startswith("export "):
++            stripped = stripped[len("export "):].lstrip()
++        if "=" not in stripped:
++            continue
++        key, _, value = stripped.partition("=")
++        key = key.strip()
++        if not key:
++            continue
++        seen.setdefault(key, []).append((lineno, value.strip()))
++
++    return {k: v for k, v in seen.items() if len(v) > 1}
++
++
++def describe_duplicates(
++    duplicates: Dict[str, List[Tuple[int, str]]],
++) -> List[str]:
++    """یک خط توضیح فارسی برای هر کلید تکراری — آمادهٔ لاگ."""
++    out: List[str] = []
++    for key in sorted(duplicates):
++        hits = duplicates[key]
++        winner_line, winner_value = hits[-1]
++        detail = "، ".join(f"خط {n}={v or '(خالی)'}" for n, v in hits)
++        out.append(
++            f"{key} {len(hits)} بار تعریف شده ({detail}). "
++            f"مقدار برنده = «{winner_value or '(خالی)'}» از خط {winner_line} "
++            f"— چون dotenv آخرین مقدار را نگه می‌دارد."
++        )
++    return out
++
++
++def check_and_warn(
++    path: Optional[str] = None,
++    quiet: bool = False,
++) -> Dict[str, List[Tuple[int, str]]]:
++    """`.env` را بررسی و در صورت وجود کلید تکراری هشدار بده.
++
++    چون این تابع خیلی زودتر از تنظیم‌شدن handlerهای لاگ اجرا می‌شود، علاوه بر
++    `logger.warning` مستقیماً روی **stderr** هم می‌نویسد — stderr همیشه در
++    `docker logs` دیده می‌شود.
++
++    هیچ‌وقت استثنا نمی‌دهد.
++    """
++    if path is None:
++        path = os.getenv("ENV_FILE", ".env")
++    try:
++        duplicates = find_duplicate_keys(path)
++        if not duplicates:
++            return {}
++        lines = describe_duplicates(duplicates)
++        if not quiet:
++            banner = (
++                "\n" + "=" * 72 + "\n"
++                f"⚠️  {len(duplicates)} کلید تکراری در {path} پیدا شد:\n"
++                + "\n".join("   • " + ln for ln in lines)
++                + "\n   آخرین مقدار برنده است. خط‌های تکراری را پاک کنید تا\n"
++                "   تغییرات بعدی بی‌صدا خنثی نشوند.\n"
++                + "=" * 72 + "\n"
++            )
++            try:
++                sys.stderr.write(banner)
++                sys.stderr.flush()
++            except Exception:      # pragma: no cover - هرگز نباید استارت را ببندد
++                pass
++            for ln in lines:
++                logger.warning("[EnvSanity] %s", ln)
++        return duplicates
++    except Exception as exc:       # pragma: no cover - دفاعی
++        logger.debug("[EnvSanity] check failed: %r", exc)
++        return {}
+diff --git a/services/host_resources.py b/services/host_resources.py
+new file mode 100644
+index 0000000..4c249d6
+--- /dev/null
++++ b/services/host_resources.py
+@@ -0,0 +1,245 @@
++"""تشخیص منابع واقعی در دسترس ربات + مقیاس‌پذیری خودکار هم‌روندی.
++
++چرا این ماژول لازم است
++----------------------
++`os.cpu_count()` تعداد هسته‌های **هاست** را برمی‌گرداند، حتی وقتی کانتینر با
++`deploy.resources.limits.cpus` به ۲ هسته محدود شده باشد. یعنی کدی که با
++`os.cpu_count()` هم‌روندی‌اش را تنظیم کند، روی هاست ۸ هسته‌ای فکر می‌کند ۸ هسته
++دارد در حالی که cgroup فقط ۲ هسته به آن می‌دهد ⇒ صف‌های داخلی بزرگ می‌شوند،
++تأخیر بالا می‌رود و هیچ خطایی هم ثبت نمی‌شود.
++
++تنها عدد درست، **سهمیهٔ cgroup** است:
++  v2: /sys/fs/cgroup/cpu.max                → «<quota> <period>» یا «max <period>»
++  v1: /sys/fs/cgroup/cpu/cpu.cfs_quota_us   →  quota (−۱ یعنی نامحدود)
++      /sys/fs/cgroup/cpu/cpu.cfs_period_us  →  period
++
++این ماژول آن را می‌خواند و `min(cpu_count, سهمیه)` را برمی‌گرداند. مثل
++`services/memory_guard.py` **fail-open** است: اگر چیزی خوانده نشود به
++`os.cpu_count()` برمی‌گردد، چون کم‌گرفتنِ منابع هم خودش یک باگ است.
++
++همهٔ مسیرها پارامترِ تزریق‌پذیر دارند تا بدون cgroup واقعی تست شوند.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import time
++from typing import Any, Dict, Optional, Tuple
++
++logger = logging.getLogger("host_resources")
++
++# ─── مسیرهای پیش‌فرض (قابل override برای تست) ─────────────────────────────
++CPU_MAX_V2 = "/sys/fs/cgroup/cpu.max"
++CPU_QUOTA_V1 = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
++CPU_PERIOD_V1 = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
++CPU_STAT_V2 = "/sys/fs/cgroup/cpu.stat"
++CPUACCT_USAGE_V1 = "/sys/fs/cgroup/cpuacct/cpuacct.usage"
++
++
++def _read_text(path: str) -> Optional[str]:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.read().strip()
++    except (OSError, ValueError):
++        return None
++
++
++def _read_int(path: str) -> Optional[int]:
++    raw = _read_text(path)
++    if raw is None:
++        return None
++    try:
++        return int(raw)
++    except ValueError:
++        return None
++
++
++# ─── سهمیهٔ CPU ────────────────────────────────────────────────────────────
++def read_cgroup_cpu_quota(
++    max_v2: str = CPU_MAX_V2,
++    quota_v1: str = CPU_QUOTA_V1,
++    period_v1: str = CPU_PERIOD_V1,
++) -> Optional[float]:
++    """سهمیهٔ CPU را به «تعداد هسته» برمی‌گرداند؛ `None` یعنی نامحدود/نامعلوم.
++
++    >>> read_cgroup_cpu_quota(...)  # «200000 100000» → 2.0
++    >>> read_cgroup_cpu_quota(...)  # «max 100000»     → None (نامحدود)
++    """
++    raw = _read_text(max_v2)
++    if raw:
++        parts = raw.split()
++        if len(parts) >= 2:
++            quota_s, period_s = parts[0], parts[1]
++            if quota_s.lower() == "max":
++                return None
++            try:
++                quota = float(quota_s)
++                period = float(period_s)
++            except ValueError:
++                quota = period = 0.0
++            if period > 0 and quota > 0:
++                return quota / period
++
++    quota = _read_int(quota_v1)
++    period = _read_int(period_v1)
++    if quota is not None and period is not None:
++        if quota <= 0:          # −۱ = بدون محدودیت
++            return None
++        if period > 0:
++            return quota / period
++
++    return None
++
++
++def detect_cpu_cores(host_cpu_count: Optional[int] = None, **paths: Any) -> float:
++    """تعداد هستهٔ واقعاً در دسترس: `min(cpu_count, سهمیهٔ cgroup)`.
++
++    fail-open: اگر سهمیه خوانده نشود، `cpu_count` هاست برگردانده می‌شود.
++    همیشه ≥ ۱.۰ است.
++    """
++    host = int(host_cpu_count or os.cpu_count() or 1)
++    quota = read_cgroup_cpu_quota(**paths)
++    if quota is None or quota <= 0:
++        return float(max(1, host))
++    return float(max(1.0, min(float(host), quota)))
++
++
++# ─── هم‌روندیِ مشتق‌شده از سخت‌افزار ────────────────────────────────────────
++# هر سه تابع یک override صریح می‌پذیرند: اگر کاربر عدد را در .env گذاشته باشد
++# همان عدد برنده است و هیچ محاسبه‌ای انجام نمی‌شود. این یعنی رفتار قدیمی
++# (عدد ثابت) همیشه قابل بازیابی است.
++def _scaled(cores: float, per_core: float, floor: int, ceiling: int,
++            override: Optional[int]) -> int:
++    if override is not None and int(override) > 0:
++        return max(1, int(override))
++    value = int(round(float(cores) * per_core))
++    return max(floor, min(ceiling, value))
++
++
++def recommended_client_create_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """ساخت هم‌زمان کلاینت Pyrogram. هر ساخت = یک handshake کامل MTProto.
++
++    پیش‌فرض قدیمی: ۸ ثابت. حالا ۲ به ازای هر هسته، کف ۴، سقف ۱۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 2.0, 4, 16, override)
++
++
++def recommended_global_join_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """سقف سراسری join بومی PyTgCalls در یک لحظه.
++
++    این کار عمدتاً انتظار I/O است (پاسخ سرور تلگرام)، نه CPU؛ پس ضریب
++    بالاتری می‌گیرد. پیش‌فرض قدیمی: ۲۴ ثابت. حالا ۸ به ازای هر هسته،
++    کف ۸، سقف ۹۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 8.0, 8, 96, override)
++
++
++def recommended_join_max_concurrency(
++    cores: Optional[float] = None, override: Optional[int] = None
++) -> int:
++    """سقف سختِ join برای «یک» سفارش.
++
++    ⚠️ این سقف فقط CPU نیست — FloodWait تلگرام هم سقف است. Join Brain تعداد
++    موج‌ها را زیر این سقف به‌صورت تطبیقی انتخاب می‌کند، پس بالا بردن سقف به
++    معنی «همیشه این‌قدر join بزن» نیست. پیش‌فرض قدیمی: ۲ (بسیار محافظه‌کار).
++    حالا ۲ به ازای هر هسته، کف ۲، سقف ۱۶.
++    """
++    if cores is None:
++        cores = detect_cpu_cores()
++    return _scaled(cores, 2.0, 2, 16, override)
++
++
++# ─── مصرف CPU (برای تله‌متری) ──────────────────────────────────────────────
++def read_cpu_usage_usec(
++    stat_v2: str = CPU_STAT_V2,
++    cpuacct_v1: str = CPUACCT_USAGE_V1,
++) -> Optional[int]:
++    """مصرف تجمعی CPU این cgroup بر حسب میکروثانیه.
++
++    v2: در `cpu.stat` به شکل `usage_usec 123456`
++    v1: در `cpuacct/cpuacct.usage` بر حسب **نانو**ثانیه (تبدیل می‌شود)
++    """
++    raw = _read_text(stat_v2)
++    if raw:
++        for line in raw.splitlines():
++            parts = line.split()
++            if len(parts) == 2 and parts[0] == "usage_usec":
++                try:
++                    return int(parts[1])
++                except ValueError:
++                    break
++    ns = _read_int(cpuacct_v1)
++    if ns is not None and ns >= 0:
++        return ns // 1000
++    return None
++
++
++def cpu_percent(
++    prev_usec: Optional[int],
++    prev_mono: Optional[float],
++    cores: Optional[float] = None,
++    now_usec: Optional[int] = None,
++    now_mono: Optional[float] = None,
++) -> Optional[float]:
++    """درصد مصرف CPU نسبت به کل سهمیهٔ تخصیص‌یافته (۰ تا ~۱۰۰+).
++
++    باید با دو نمونه‌برداری در دو لحظه صدا زده شود؛ نمونهٔ اول `None`
++    برمی‌گرداند چون مبنایی برای تفاضل نیست.
++    """
++    if prev_usec is None or prev_mono is None:
++        return None
++    if now_usec is None:
++        now_usec = read_cpu_usage_usec()
++    if now_usec is None:
++        return None
++    if now_mono is None:
++        now_mono = time.monotonic()
++    elapsed = float(now_mono) - float(prev_mono)
++    if elapsed <= 0:
++        return None
++    if cores is None:
++        cores = detect_cpu_cores()
++    if not cores or cores <= 0:
++        return None
++    used_cores = ((now_usec - prev_usec) / 1_000_000.0) / elapsed
++    return round((used_cores / float(cores)) * 100.0, 1)
++
++
++def snapshot(
++    prev_usec: Optional[int] = None,
++    prev_mono: Optional[float] = None,
++) -> Dict[str, Any]:
++    """یک بستهٔ تله‌متری آمادهٔ لاگ. هرگز استثنا نمی‌دهد."""
++    cores = detect_cpu_cores()
++    usage = read_cpu_usage_usec()
++    try:
++        load1 = round(os.getloadavg()[0], 2)
++    except (OSError, AttributeError):
++        load1 = None
++    out: Dict[str, Any] = {
++        "cores_available": round(cores, 2),
++        "cores_host": os.cpu_count(),
++        "cpu_percent": cpu_percent(prev_usec, prev_mono, cores=cores,
++                                   now_usec=usage, now_mono=time.monotonic()),
++        "loadavg_1m": load1,
++        "cpu_usage_usec": usage,
++    }
++    try:
++        from services.memory_guard import pressure_percent, read_cgroup_memory
++        mem_usage, mem_limit = read_cgroup_memory()
++        out["mem_percent"] = pressure_percent(mem_usage, mem_limit)
++        out["mem_limit_mb"] = (round(mem_limit / 1048576.0)
++                               if mem_limit else None)
++    except Exception:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
++        out["mem_percent"] = None
++        out["mem_limit_mb"] = None
++    return out
+diff --git a/tests/test_env_sanity.py b/tests/test_env_sanity.py
+new file mode 100644
+index 0000000..8ae4a91
+--- /dev/null
++++ b/tests/test_env_sanity.py
+@@ -0,0 +1,134 @@
++"""Tests for services/env_sanity.py.
++
++باگِ واقعی که این ماژول برایش ساخته شد: روی سرور، `.env` هم
++`MAX_CONCURRENT_ORDERS=10` (خط ۴۹) را داشت و هم `MAX_CONCURRENT_ORDERS=5`
++(خط ۱۸۰)، چون یک اسکریپت `sed` مقدار تازه را به انتهای فایل «اضافه» کرد به‌جای
++اینکه خط قبلی را جایگزین کند. dotenv آخرین مقدار را نگه می‌دارد، پس ربات ۵ را
++خواند و همه‌چیز درست به نظر رسید — ولی مین سر جایش ماند.
++
++Run:
++    python -m pytest tests/test_env_sanity.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.env_sanity import (  # noqa: E402
++    check_and_warn,
++    describe_duplicates,
++    find_duplicate_keys,
++)
++
++
++def _write(text):
++    fd, path = tempfile.mkstemp(prefix="env-", suffix=".env")
++    with os.fdopen(fd, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++class FindDuplicateKeysTests(unittest.TestCase):
++    def test_the_exact_server_scenario(self):
++        p = _write("BOT_TOKEN=abc\nMAX_CONCURRENT_ORDERS=10\nFOO=1\n"
++                   "MAX_CONCURRENT_ORDERS=5\n")
++        d = find_duplicate_keys(p)
++        self.assertEqual(list(d), ["MAX_CONCURRENT_ORDERS"])
++        self.assertEqual(d["MAX_CONCURRENT_ORDERS"], [(2, "10"), (4, "5")])
++
++    def test_clean_file_reports_nothing(self):
++        p = _write("A=1\nB=2\nC=3\n")
++        self.assertEqual(find_duplicate_keys(p), {})
++
++    def test_comments_and_blank_lines_are_not_keys(self):
++        p = _write("# A=1\n\n;A=2\nA=3\n[section]\nA=4\n")
++        # only the two real definitions count, so this IS a duplicate pair
++        d = find_duplicate_keys(p)
++        self.assertEqual(list(d), ["A"])
++        self.assertEqual(d["A"], [(4, "3"), (6, "4")])
++
++    def test_export_prefix_counts_as_a_definition(self):
++        p = _write("A=1\nexport A=2\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2")])
++
++    def test_empty_value_is_still_a_definition(self):
++        p = _write("A=\nA=1\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, ""), (2, "1")])
++
++    def test_value_containing_equals_keeps_only_the_first_split(self):
++        p = _write("DATABASE_URL=postgres://u:p=x@h/db\nDATABASE_URL=y\n")
++        d = find_duplicate_keys(p)
++        self.assertEqual(d["DATABASE_URL"][0], (1, "postgres://u:p=x@h/db"))
++
++    def test_whitespace_around_key_and_value_is_stripped(self):
++        p = _write("  A  =  1  \nA=2\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2")])
++
++    def test_missing_file_returns_empty_and_does_not_raise(self):
++        self.assertEqual(find_duplicate_keys("/nonexistent/.env"), {})
++
++    def test_line_with_no_equals_is_ignored(self):
++        p = _write("JUST_A_WORD\nA=1\n")
++        self.assertEqual(find_duplicate_keys(p), {})
++
++    def test_three_occurrences_are_all_reported_in_order(self):
++        p = _write("A=1\nA=2\nA=3\n")
++        self.assertEqual(find_duplicate_keys(p)["A"], [(1, "1"), (2, "2"), (3, "3")])
++
++
++class DescribeDuplicatesTests(unittest.TestCase):
++    def test_names_the_winning_line_because_last_wins(self):
++        lines = describe_duplicates({"A": [(2, "10"), (4, "5")]})
++        self.assertEqual(len(lines), 1)
++        self.assertIn("خط 4", lines[0])
++        self.assertIn("5", lines[0])
++
++    def test_output_is_sorted_by_key(self):
++        lines = describe_duplicates({"Z": [(1, "1"), (2, "2")],
++                                     "A": [(1, "1"), (2, "2")]})
++        self.assertTrue(lines[0].startswith("A"))
++        self.assertTrue(lines[1].startswith("Z"))
++
++    def test_empty_input_gives_empty_output(self):
++        self.assertEqual(describe_duplicates({}), [])
++
++
++class CheckAndWarnTests(unittest.TestCase):
++    def test_quiet_mode_still_returns_the_findings(self):
++        p = _write("A=1\nA=2\n")
++        self.assertEqual(list(check_and_warn(p, quiet=True)), ["A"])
++
++    def test_clean_file_returns_empty(self):
++        self.assertEqual(check_and_warn(_write("A=1\n")), {})
++
++    def test_missing_file_returns_empty(self):
++        self.assertEqual(check_and_warn("/nonexistent/.env"), {})
++
++    def test_writes_the_banner_to_stderr_when_not_quiet(self):
++        import io
++        import contextlib
++        p = _write("MAX_CONCURRENT_ORDERS=10\nMAX_CONCURRENT_ORDERS=5\n")
++        buf = io.StringIO()
++        with contextlib.redirect_stderr(buf):
++            check_and_warn(p)
++        out = buf.getvalue()
++        self.assertIn("MAX_CONCURRENT_ORDERS", out)
++        self.assertIn("کلید تکراری", out)
++
++    def test_never_raises_on_binary_garbage(self):
++        fd, p = tempfile.mkstemp(prefix="env-bin-")
++        with os.fdopen(fd, "wb") as fh:
++            fh.write(b"\x00\x01\xff\xfeA=1\nA=2\n")
++        try:
++            check_and_warn(p, quiet=True)      # must not raise
++        finally:
++            os.unlink(p)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_host_resources.py b/tests/test_host_resources.py
+new file mode 100644
+index 0000000..b0d0f9b
+--- /dev/null
++++ b/tests/test_host_resources.py
+@@ -0,0 +1,332 @@
++"""Offline tests for services/host_resources.py.
++
++چرا این تست‌ها لازم‌اند: `os.cpu_count()` داخل کانتینر تعداد هسته‌های **هاست**
++را برمی‌گرداند. اگر هم‌روندی ربات با آن تنظیم شود، روی هاست ۸ هسته‌ای که
++کانتینرش به ۲ هسته محدود شده ربات فکر می‌کند ۸ هسته دارد. تنها عدد درست
++سهمیهٔ cgroup است و این تست‌ها همان خواندن را پوشش می‌دهند.
++
++Run:
++    python -m pytest tests/test_host_resources.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.host_resources import (  # noqa: E402
++    cpu_percent,
++    detect_cpu_cores,
++    read_cgroup_cpu_quota,
++    read_cpu_usage_usec,
++    recommended_client_create_concurrency,
++    recommended_global_join_concurrency,
++    recommended_join_max_concurrency,
++    snapshot,
++)
++
++
++def _w(d, name, text):
++    p = os.path.join(d, name)
++    with open(p, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return p
++
++
++class _Missing:
++    """Paths that do not exist -> the reader must fail open, never crash."""
++
++    def __init__(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-missing-")
++
++    def p(self, name):
++        return os.path.join(self.dir, name)
++
++
++class CgroupV2QuotaTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-v2-")
++        self.max = os.path.join(self.dir, "cpu.max")
++
++    def _q(self, content):
++        _w(self.dir, "cpu.max", content)
++        return read_cgroup_cpu_quota(
++            max_v2=self.max,
++            quota_v1=self.max + ".nope",
++            period_v1=self.max + ".nope",
++        )
++
++    def test_200000_over_100000_is_two_cores(self):
++        self.assertAlmostEqual(self._q("200000 100000"), 2.0)
++
++    def test_600000_over_100000_is_six_cores(self):
++        self.assertAlmostEqual(self._q("600000 100000"), 6.0)
++
++    def test_fractional_quota_below_one_core(self):
++        # 50000/100000 = half a core.  Must not round up to 1.
++        self.assertAlmostEqual(self._q("50000 100000"), 0.5)
++
++    def test_max_means_unlimited(self):
++        self.assertIsNone(self._q("max 100000"))
++
++    def test_garbage_content_is_ignored(self):
++        self.assertIsNone(self._q("nonsense"))
++
++    def test_trailing_newline_tolerated(self):
++        self.assertAlmostEqual(self._q("800000 100000\n"), 8.0)
++
++
++class CgroupV1QuotaTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-v1-")
++        self.quota = os.path.join(self.dir, "cpu.cfs_quota_us")
++        self.period = os.path.join(self.dir, "cpu.cfs_period_us")
++
++    def _q(self, quota, period):
++        _w(self.dir, "cpu.cfs_quota_us", str(quota))
++        _w(self.dir, "cpu.cfs_period_us", str(period))
++        return read_cgroup_cpu_quota(
++            max_v2=self.quota + ".nope",
++            quota_v1=self.quota,
++            period_v1=self.period,
++        )
++
++    def test_v1_quota_over_period(self):
++        self.assertAlmostEqual(self._q(400000, 100000), 4.0)
++
++    def test_v1_minus_one_means_unlimited(self):
++        self.assertIsNone(self._q(-1, 100000))
++
++    def test_v1_zero_period_does_not_divide_by_zero(self):
++        self.assertIsNone(self._q(200000, 0))
++
++
++class FailOpenTests(unittest.TestCase):
++    def test_no_cgroup_files_returns_none(self):
++        m = _Missing()
++        self.assertIsNone(read_cgroup_cpu_quota(
++            max_v2=m.p("cpu.max"),
++            quota_v1=m.p("cpu.cfs_quota_us"),
++            period_v1=m.p("cpu.cfs_period_us"),
++        ))
++
++    def test_detect_cores_falls_back_to_host_count(self):
++        m = _Missing()
++        got = detect_cpu_cores(host_cpu_count=8,
++                               max_v2=m.p("cpu.max"),
++                               quota_v1=m.p("cpu.cfs_quota_us"),
++                               period_v1=m.p("cpu.cfs_period_us"))
++        self.assertEqual(got, 8.0)
++
++    def test_detect_cores_never_below_one(self):
++        m = _Missing()
++        self.assertGreaterEqual(
++            detect_cpu_cores(host_cpu_count=0,
++                             max_v2=m.p("cpu.max"),
++                             quota_v1=m.p("cpu.cfs_quota_us"),
++                             period_v1=m.p("cpu.cfs_period_us")),
++            1.0)
++
++
++class DetectCoresTests(unittest.TestCase):
++    def setUp(self):
++        self.dir = tempfile.mkdtemp(prefix="cg-detect-")
++        self.max = os.path.join(self.dir, "cpu.max")
++        _w(self.dir, "cpu.max", "200000 100000")   # 2 cores
++        self.kw = dict(max_v2=self.max,
++                       quota_v1=self.max + ".nope",
++                       period_v1=self.max + ".nope")
++
++    def test_quota_caps_host_count(self):
++        # The regression this module exists for: os.cpu_count() says 8, the
++        # container is only allowed 2.  The quota must win.
++        self.assertEqual(detect_cpu_cores(host_cpu_count=8, **self.kw), 2.0)
++
++    def test_host_count_caps_a_generous_quota(self):
++        self.assertEqual(detect_cpu_cores(host_cpu_count=2, **self.kw), 2.0)
++
++    def test_unlimited_quota_uses_host_count(self):
++        _w(self.dir, "cpu.max", "max 100000")
++        self.assertEqual(detect_cpu_cores(host_cpu_count=8, **self.kw), 8.0)
++
++
++class RecommendedConcurrencyTests(unittest.TestCase):
++    def test_explicit_override_always_wins(self):
++        self.assertEqual(recommended_global_join_concurrency(8.0, override=3), 3)
++        self.assertEqual(recommended_join_max_concurrency(8.0, override=1), 1)
++        self.assertEqual(recommended_client_create_concurrency(8.0, override=2), 2)
++
++    def test_zero_or_negative_override_is_ignored(self):
++        # config._env_int returns 0 for "not set"; 0 must NOT become the value.
++        self.assertEqual(recommended_global_join_concurrency(8.0, override=0), 64)
++        self.assertEqual(recommended_join_max_concurrency(8.0, override=-5), 16)
++
++    def test_scaling_on_an_eight_core_host(self):
++        self.assertEqual(recommended_client_create_concurrency(8.0), 16)
++        self.assertEqual(recommended_global_join_concurrency(8.0), 64)
++        self.assertEqual(recommended_join_max_concurrency(8.0), 16)
++
++    def test_floors_protect_small_boxes(self):
++        self.assertEqual(recommended_client_create_concurrency(1.0), 4)
++        self.assertEqual(recommended_global_join_concurrency(1.0), 8)
++        self.assertEqual(recommended_join_max_concurrency(1.0), 2)
++
++    def test_ceilings_protect_telegram_from_bursts(self):
++        # 64 cores must not produce 512 concurrent joins: FloodWait is a
++        # Telegram-side limit that no amount of hardware lifts.
++        self.assertEqual(recommended_client_create_concurrency(64.0), 16)
++        self.assertEqual(recommended_global_join_concurrency(64.0), 96)
++        self.assertEqual(recommended_join_max_concurrency(64.0), 16)
++
++    def test_more_cores_never_reduces_concurrency(self):
++        for fn in (recommended_client_create_concurrency,
++                   recommended_global_join_concurrency,
++                   recommended_join_max_concurrency):
++            prev = 0
++            for cores in (1.0, 2.0, 4.0, 6.0, 8.0, 16.0, 64.0):
++                now = fn(cores)
++                self.assertGreaterEqual(now, prev, f"{fn.__name__} shrank at {cores}")
++                prev = now
++
++
++class CpuPercentTests(unittest.TestCase):
++    def test_first_sample_returns_none(self):
++        self.assertIsNone(cpu_percent(None, None))
++
++    def test_computes_percent_of_allocated_quota(self):
++        # 2 cores allocated; the cgroup burned 1 core-second in 1 wall second
++        # => 1 used core / 2 allocated = 50%.
++        got = cpu_percent(prev_usec=0, prev_mono=100.0,
++                          cores=2.0, now_usec=1_000_000, now_mono=101.0)
++        self.assertAlmostEqual(got, 50.0)
++
++    def test_can_exceed_one_hundred_when_over_quota(self):
++        got = cpu_percent(prev_usec=0, prev_mono=100.0,
++                          cores=2.0, now_usec=3_000_000, now_mono=101.0)
++        self.assertAlmostEqual(got, 150.0)
++
++    def test_zero_elapsed_is_not_a_division_error(self):
++        self.assertIsNone(cpu_percent(prev_usec=0, prev_mono=100.0,
++                                      cores=2.0, now_usec=1000, now_mono=100.0))
++
++    def test_zero_cores_is_not_a_division_error(self):
++        self.assertIsNone(cpu_percent(prev_usec=0, prev_mono=100.0,
++                                      cores=0.0, now_usec=1000, now_mono=101.0))
++
++
++class V1CpuacctTests(unittest.TestCase):
++    def test_nanoseconds_are_converted_to_microseconds(self):
++        d = tempfile.mkdtemp(prefix="cg-v1acct-")
++        p = _w(d, "cpuacct.usage", "1500000")   # 1.5 ms in nanoseconds
++        self.assertEqual(read_cpu_usage_usec(stat_v2=p + ".nope", cpuacct_v1=p), 1500)
++
++    def test_v2_cpu_stat_is_preferred(self):
++        d = tempfile.mkdtemp(prefix="cg-v2stat-")
++        stat = _w(d, "cpu.stat",
++                  "usage_usec 4242\nuser_usec 100\nsystem_usec 200\n")
++        self.assertEqual(read_cpu_usage_usec(stat_v2=stat,
++                                             cpuacct_v1=stat + ".nope"), 4242)
++
++    def test_missing_both_returns_none(self):
++        m = _Missing()
++        self.assertIsNone(read_cpu_usage_usec(stat_v2=m.p("cpu.stat"),
++                                              cpuacct_v1=m.p("cpuacct.usage")))
++
++
++class SnapshotTests(unittest.TestCase):
++    def test_snapshot_always_returns_the_expected_keys(self):
++        snap = snapshot()
++        for key in ("cores_available", "cores_host", "cpu_percent",
++                    "loadavg_1m", "cpu_usage_usec", "mem_percent",
++                    "mem_limit_mb"):
++            self.assertIn(key, snap)
++
++    def test_snapshot_first_call_has_no_cpu_percent_but_second_can(self):
++        first = snapshot()
++        self.assertIsNone(first["cpu_percent"])
++        usage = first["cpu_usage_usec"]
++        if usage is None:
++            self.skipTest("host exposes no cgroup cpu accounting")
++        second = snapshot(prev_usec=usage, prev_mono=0.0)
++        # prev_mono=0.0 makes the elapsed window enormous, so the percentage
++        # is tiny but MUST be a number rather than None.
++        self.assertIsNotNone(second["cpu_percent"])
++
++    def test_cores_available_never_exceeds_host_cores(self):
++        snap = snapshot()
++        if snap["cores_host"]:
++            self.assertLessEqual(snap["cores_available"], snap["cores_host"])
++
++
++class LiveCgroupSmokeTests(unittest.TestCase):
++    """Read the REAL cgroup of whatever box runs the suite."""
++
++    def test_real_reader_does_not_raise(self):
++        try:
++            quota = read_cgroup_cpu_quota()
++            cores = detect_cpu_cores()
++            usage = read_cpu_usage_usec()
++        except Exception as exc:            # pragma: no cover - would be a bug
++            self.fail(f"live cgroup read raised {exc!r}")
++        self.assertGreaterEqual(cores, 1.0)
++        self.assertTrue(quota is None or quota > 0)
++        self.assertTrue(usage is None or usage >= 0)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
++
++
++class ConfigWiringTests(unittest.TestCase):
++    """config.py must honour an explicit env value and otherwise auto-scale.
++
++    Runs in a subprocess because config.py reads os.getenv at class-body
++    evaluation time, i.e. once per interpreter.
++    """
++
++    def _values(self, env_extra=None):
++        import json
++        import subprocess
++        env = dict(os.environ)
++        for k in ("MAX_CONCURRENT_ORDERS", "GLOBAL_JOIN_CONCURRENCY",
++                  "CLIENT_CREATE_CONCURRENCY", "VOICE_JOIN_MAX_CONCURRENCY"):
++            env.pop(k, None)
++        env.update(env_extra or {})
++        code = (
++            "import json, config;"
++            "c = config.Config;"
++            "print(json.dumps(["
++            " c.MAX_CONCURRENT_ORDERS, c.GLOBAL_JOIN_CONCURRENCY,"
++            " c.CLIENT_CREATE_CONCURRENCY, c.VOICE_JOIN_MAX_CONCURRENCY]))"
++        )
++        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
++        out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
++                             capture_output=True, text=True, timeout=120)
++        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
++        return json.loads(out.stdout.strip().splitlines()[-1])
++
++    def test_defaults_come_from_the_cpu_quota_not_a_hard_coded_number(self):
++        orders, glob, create, join = self._values()
++        self.assertEqual(orders, 5)
++        from services.host_resources import detect_cpu_cores
++        cores = detect_cpu_cores()
++        self.assertEqual(glob, recommended_global_join_concurrency(cores))
++        self.assertEqual(create, recommended_client_create_concurrency(cores))
++        self.assertEqual(join, recommended_join_max_concurrency(cores))
++
++    def test_explicit_env_wins_over_the_auto_value(self):
++        got = self._values({
++            "MAX_CONCURRENT_ORDERS": "3",
++            "GLOBAL_JOIN_CONCURRENCY": "99",
++            "CLIENT_CREATE_CONCURRENCY": "7",
++            "VOICE_JOIN_MAX_CONCURRENCY": "6",
++        })
++        self.assertEqual(got, [3, 99, 7, 6])
++
++    def test_all_concurrency_values_are_at_least_one(self):
++        for value in self._values()[1:]:
++            self.assertGreaterEqual(value, 1)
