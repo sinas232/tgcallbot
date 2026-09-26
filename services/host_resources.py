@@ -27,6 +27,8 @@ import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from services import cgroup_paths
+
 logger = logging.getLogger("host_resources")
 
 # ─── مسیرهای پیش‌فرض (قابل override برای تست) ─────────────────────────────
@@ -56,34 +58,58 @@ def _read_int(path: str) -> Optional[int]:
 
 
 # ─── سهمیهٔ CPU ────────────────────────────────────────────────────────────
+def _parse_cpu_max(raw: Optional[str]) -> Optional[float]:
+    """محتوای `cpu.max` → تعداد هسته؛ `None` یعنی «max» یا محتوای نامعتبر."""
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return None
+    if parts[0].lower() == "max":
+        return None
+    try:
+        quota = float(parts[0])
+        period = float(parts[1])
+    except ValueError:
+        return None
+    if period <= 0 or quota <= 0:
+        return None
+    return quota / period
+
+
 def read_cgroup_cpu_quota(
-    max_v2: str = CPU_MAX_V2,
-    quota_v1: str = CPU_QUOTA_V1,
-    period_v1: str = CPU_PERIOD_V1,
+    max_v2: Optional[str] = None,
+    quota_v1: Optional[str] = None,
+    period_v1: Optional[str] = None,
 ) -> Optional[float]:
     """سهمیهٔ CPU را به «تعداد هسته» برمی‌گرداند؛ `None` یعنی نامحدود/نامعلوم.
 
-    >>> read_cgroup_cpu_quota(...)  # «200000 100000» → 2.0
-    >>> read_cgroup_cpu_quota(...)  # «max 100000»     → None (نامحدود)
-    """
-    raw = _read_text(max_v2)
-    if raw:
-        parts = raw.split()
-        if len(parts) >= 2:
-            quota_s, period_s = parts[0], parts[1]
-            if quota_s.lower() == "max":
-                return None
-            try:
-                quota = float(quota_s)
-                period = float(period_s)
-            except ValueError:
-                quota = period = 0.0
-            if period > 0 and quota > 0:
-                return quota / period
+    اگر مسیر داده نشود از روی `/proc/self/cgroup` کشف می‌شود (ببینید
+    `services/cgroup_paths.py`) — چون `/sys/fs/cgroup` همیشه ریشهٔ cgroupِ
+    خودِ پروسه نیست و خواندن از ریشه بی‌صدا `None` می‌دهد.
 
-    quota = _read_int(quota_v1)
-    period = _read_int(period_v1)
-    if quota is not None and period is not None:
+    >>> _parse_cpu_max("200000 100000")   -> 2.0
+    >>> _parse_cpu_max("max 100000")      -> None (نامحدود)
+    """
+    v2_paths = [max_v2] if max_v2 else cgroup_paths.candidate_file("cpu.max")
+    for path in v2_paths:
+        raw = _read_text(path)
+        if raw is not None:
+            # فایل خوانده شد ⇒ جواب قطعی است (حتی اگر «max» باشد)
+            return _parse_cpu_max(raw)
+
+    if quota_v1 and period_v1:
+        pairs = [(quota_v1, period_v1)]
+    else:
+        pairs = list(zip(
+            cgroup_paths.candidate_file_v1("cpu.cfs_quota_us", "cpu"),
+            cgroup_paths.candidate_file_v1("cpu.cfs_period_us", "cpu"),
+        ))
+    for qpath, ppath in pairs:
+        quota = _read_int(qpath)
+        period = _read_int(ppath)
+        if quota is None or period is None:
+            continue
         if quota <= 0:          # −۱ = بدون محدودیت
             return None
         if period > 0:
@@ -160,16 +186,21 @@ def recommended_join_max_concurrency(
 
 # ─── مصرف CPU (برای تله‌متری) ──────────────────────────────────────────────
 def read_cpu_usage_usec(
-    stat_v2: str = CPU_STAT_V2,
-    cpuacct_v1: str = CPUACCT_USAGE_V1,
+    stat_v2: Optional[str] = None,
+    cpuacct_v1: Optional[str] = None,
 ) -> Optional[int]:
     """مصرف تجمعی CPU این cgroup بر حسب میکروثانیه.
 
     v2: در `cpu.stat` به شکل `usage_usec 123456`
     v1: در `cpuacct/cpuacct.usage` بر حسب **نانو**ثانیه (تبدیل می‌شود)
+
+    مسیرها در صورت نبودنِ آرگومان از `/proc/self/cgroup` کشف می‌شوند.
     """
-    raw = _read_text(stat_v2)
-    if raw:
+    v2_paths = [stat_v2] if stat_v2 else cgroup_paths.candidate_file("cpu.stat")
+    for path in v2_paths:
+        raw = _read_text(path)
+        if raw is None:
+            continue
         for line in raw.splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] == "usage_usec":
@@ -177,9 +208,13 @@ def read_cpu_usage_usec(
                     return int(parts[1])
                 except ValueError:
                     break
-    ns = _read_int(cpuacct_v1)
-    if ns is not None and ns >= 0:
-        return ns // 1000
+
+    v1_paths = ([cpuacct_v1] if cpuacct_v1
+                else cgroup_paths.candidate_file_v1("cpuacct.usage", "cpuacct"))
+    for path in v1_paths:
+        ns = _read_int(path)
+        if ns is not None and ns >= 0:
+            return ns // 1000
     return None
 
 
@@ -234,11 +269,16 @@ def snapshot(
         "cpu_usage_usec": usage,
     }
     try:
-        from services.memory_guard import pressure_percent, read_cgroup_memory
+        # NOTE: pressure_percent() takes PATHS, not numbers — passing the
+        # (usage, limit) tuple we just read made it silently return None every
+        # single time.  usage_percent() is the numeric counterpart.
+        from services.memory_guard import read_cgroup_memory, usage_percent
         mem_usage, mem_limit = read_cgroup_memory()
-        out["mem_percent"] = pressure_percent(mem_usage, mem_limit)
+        out["mem_percent"] = usage_percent(mem_usage, mem_limit)
         out["mem_limit_mb"] = (round(mem_limit / 1048576.0)
                                if mem_limit else None)
+        out["mem_used_mb"] = (round(mem_usage / 1048576.0)
+                              if mem_usage else None)
     except Exception:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
         out["mem_percent"] = None
         out["mem_limit_mb"] = None

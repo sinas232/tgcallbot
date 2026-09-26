@@ -27,6 +27,8 @@ import logging
 import os
 from typing import Optional, Tuple
 
+from services import cgroup_paths
+
 logger = logging.getLogger(__name__)
 
 # cgroup v2 (docker با systemd/cgroup v2)
@@ -55,19 +57,45 @@ def _read_int(path: str) -> Optional[int]:
     return val if val >= 0 else None
 
 
+def _read_first(paths) -> Optional[int]:
+    """اولین مسیرِ خواندنیِ فهرست را بخوان."""
+    for p in paths:
+        val = _read_int(p)
+        if val is not None:
+            return val
+    return None
+
+
 def read_cgroup_memory(
-    usage_path_v2: str = _V2_USAGE,
-    limit_path_v2: str = _V2_LIMIT,
-    usage_path_v1: str = _V1_USAGE,
-    limit_path_v1: str = _V1_LIMIT,
+    usage_path_v2: Optional[str] = None,
+    limit_path_v2: Optional[str] = None,
+    usage_path_v1: Optional[str] = None,
+    limit_path_v1: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """(usage_bytes, limit_bytes) یا (None, None) اگر قابل تشخیص نبود."""
-    for usage_path, limit_path in (
-        (usage_path_v2, limit_path_v2),
-        (usage_path_v1, limit_path_v1),
-    ):
-        usage = _read_int(usage_path)
-        limit = _read_int(limit_path)
+    """(usage_bytes, limit_bytes) یا (None, None) اگر قابل تشخیص نبود.
+
+    اگر مسیرها صریحاً داده نشوند، از روی `/proc/self/cgroup` **کشف** می‌شوند
+    (ببینید `services/cgroup_paths.py`). این مهم است: `/sys/fs/cgroup` همیشه
+    ریشهٔ cgroupِ خودِ پروسه نیست — با cgroupns یا زیرگروه نام‌دار، فایل‌ها زیر
+    `/sys/fs/cgroup/<rel>/` هستند و خواندن از ریشه بی‌صدا `None` می‌دهد، یعنی
+    گارد حافظه fail-open می‌ماند.
+
+    مسیرهای صریح فقط برای تست‌اند؛ در آن حالت کشف انجام نمی‌شود.
+    """
+    if usage_path_v2 and limit_path_v2:
+        v2 = ([usage_path_v2], [limit_path_v2])
+    else:
+        v2 = (cgroup_paths.candidate_file("memory.current"),
+              cgroup_paths.candidate_file("memory.max"))
+    if usage_path_v1 and limit_path_v1:
+        v1 = ([usage_path_v1], [limit_path_v1])
+    else:
+        v1 = (cgroup_paths.candidate_file_v1("memory.usage_in_bytes", "memory"),
+              cgroup_paths.candidate_file_v1("memory.limit_in_bytes", "memory"))
+
+    for usage_paths, limit_paths in (v2, v1):
+        usage = _read_first(usage_paths)
+        limit = _read_first(limit_paths)
         if usage is None or limit is None:
             continue
         if limit >= _UNLIMITED_BYTES:      # بدون سقف → گارد بی‌معنی است
@@ -78,19 +106,35 @@ def read_cgroup_memory(
     return None, None
 
 
-def pressure_percent(
-    usage_path_v2: str = _V2_USAGE,
-    limit_path_v2: str = _V2_LIMIT,
-    usage_path_v1: str = _V1_USAGE,
-    limit_path_v1: str = _V1_LIMIT,
-) -> Optional[float]:
-    """درصدِ مصرفِ cgroup نسبت به سقفش؛ None یعنی «نمی‌دانم» (fail-open)."""
-    usage, limit = read_cgroup_memory(
-        usage_path_v2, limit_path_v2, usage_path_v1, limit_path_v1
-    )
+def usage_percent(usage: Optional[int], limit: Optional[int]) -> Optional[float]:
+    """درصدِ مصرف نسبت به سقف، از روی **اعداد**. None یعنی «نمی‌دانم».
+
+    این تابع جدا از `pressure_percent` است چون آن یکی مسیر می‌گیرد و این یکی
+    عدد؛ قاطی‌کردنشان باعث می‌شود بی‌صدا `None` برگردد (اتفاقی که در
+    `host_resources.snapshot()` افتاده بود).
+    """
     if not usage or not limit or limit <= 0:
         return None
     return 100.0 * float(usage) / float(limit)
+
+
+def pressure_percent(
+    usage_path_v2: Optional[str] = None,
+    limit_path_v2: Optional[str] = None,
+    usage_path_v1: Optional[str] = None,
+    limit_path_v1: Optional[str] = None,
+) -> Optional[float]:
+    """درصدِ مصرفِ cgroup نسبت به سقفش؛ None یعنی «نمی‌دانم» (fail-open).
+
+    ⚠️ پیش‌فرض همهٔ آرگومان‌ها `None` است تا `read_cgroup_memory` مسیرها را از
+    `/proc/self/cgroup` **کشف** کند. اگر مثل قبل مسیرهای ثابتِ ریشه را پاس
+    بدهیم، کشف انجام نمی‌شود و روی میزبان‌هایی که cgroup زیر یک زیرگروه
+    نام‌دار است گارد برای همیشه fail-open می‌ماند.
+    """
+    usage, limit = read_cgroup_memory(
+        usage_path_v2, limit_path_v2, usage_path_v1, limit_path_v1
+    )
+    return usage_percent(usage, limit)
 
 
 def _cfg(attr: str, env_key: str, default):

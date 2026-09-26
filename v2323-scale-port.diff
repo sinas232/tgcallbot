@@ -99,6 +99,168 @@ index d95edf9..26582f4 100644
      environment:
        # هماهنگ با TZ داخل Dockerfile؛ زمان تهران برای ربات
        - TZ=${TZ:-Asia/Tehran}
+diff --git a/services/cgroup_paths.py b/services/cgroup_paths.py
+new file mode 100644
+index 0000000..5c0ada8
+--- /dev/null
++++ b/services/cgroup_paths.py
+@@ -0,0 +1,156 @@
++"""کشف مسیر واقعی cgroup — چون `/sys/fs/cgroup` همیشه ریشهٔ cgroupِ خودِ پروسه نیست.
++
++باگِ واقعی که این ماژول رفع می‌کند
++----------------------------------
++`memory_guard` و `host_resources` فرض می‌کردند فایل‌های cgroup مستقیماً زیر
++`/sys/fs/cgroup` هستند. روی خیلی از میزبان‌ها (Docker با cgroupns، یا
++sandbox/systemd با زیرگروه نام‌دار) این غلط است: `/proc/self/cgroup` مسیر
++`0::/user` را می‌دهد و فایل‌ها زیر `/sys/fs/cgroup/user/` قرار دارند، در حالی که
++خودِ `/sys/fs/cgroup/` اصلاً `memory.max` ندارد.
++
++نتیجهٔ عملی‌اش روی سرور دیده شد:
++
++    snapshot = {... 'mem_percent': None, 'mem_limit_mb': None}
++
++یعنی گارد حافظه هیچ‌وقت عددی نمی‌دید و **fail-open** می‌ماند — دقیقاً وقتی که
++بیشترین نیاز به آن بود. بدتر: `detect_cpu_cores()` هم سهمیه را نمی‌دید و به
++`os.cpu_count()` برمی‌گشت؛ روی آن سرور تصادفاً درست بود (۸ = ۸) ولی در
++کانتینری که کمتر از هاست سهمیه دارد، عددِ غلطِ بزرگ‌تر برمی‌گرداند.
++
++راه‌حل: `/proc/self/cgroup` را بخوان و مسیر نسبی را به‌عنوان پیشوند امتحان کن،
++بعد مسیرهای قدیمی را به‌عنوان fallback.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Iterator, List, Optional
++
++PROC_SELF_CGROUP = "/proc/self/cgroup"
++CG_ROOT = "/sys/fs/cgroup"
++
++
++def _rel_parts(proc_path: str = PROC_SELF_CGROUP) -> List[str]:
++    """مسیرهای نسبیِ cgroupِ خودِ پروسه، از `/proc/self/cgroup`.
++
++    قالب cgroup v2 (یک خط):  `0::/user`          → «user»
++    قالب cgroup v1 (چند خط): `4:memory:/docker/abc` → «docker/abc»
++    ریشه:                     `0::/`               → «»
++    """
++    try:
++        with open(proc_path, "r", encoding="utf-8") as fh:
++            raw = fh.read()
++    except OSError:
++        return []
++
++    out: List[str] = []
++    for line in raw.splitlines():
++        parts = line.split(":", 2)
++        if len(parts) != 3:
++            continue
++        path = parts[2].strip()
++        if not path or path == "/":
++            rel = ""
++        else:
++            rel = path.lstrip("/")
++        if rel not in out:
++            out.append(rel)
++    return out
++
++
++def candidate_dirs(proc_path: str = PROC_SELF_CGROUP) -> Iterator[str]:
++    """دایرکتوری‌های cgroup v2 به ترتیب اولویت.
++
++    اول مسیر واقعیِ خودِ پروسه، بعد ریشهٔ mount (رفتار قدیمی).
++    """
++    for rel in _rel_parts(proc_path):
++        yield os.path.join(CG_ROOT, rel) if rel else CG_ROOT
++    if CG_ROOT not in _rel_parts(proc_path):
++        yield CG_ROOT
++
++
++def candidate_file(
++    name: str,
++    subdir: Optional[str] = None,
++    proc_path: str = PROC_SELF_CGROUP,
++) -> List[str]:
++    """همهٔ مسیرهای ممکن برای یک فایلِ cgroup v2.
++
++    >>> candidate_file("memory.max")
++    ['/sys/fs/cgroup/user/memory.max', '/sys/fs/cgroup/memory.max']
++    """
++    out: List[str] = []
++    for d in candidate_dirs(proc_path):
++        p = os.path.join(d, name) if not subdir else os.path.join(d, subdir, name)
++        if p not in out:
++            out.append(p)
++    return out
++
++
++def candidate_file_v1(
++    name: str,
++    controller: str,
++    proc_path: str = PROC_SELF_CGROUP,
++) -> List[str]:
++    """مسیرهای ممکن برای cgroup v1 (`/sys/fs/cgroup/<controller>/…`)."""
++    base = os.path.join(CG_ROOT, controller)
++    out: List[str] = []
++    for rel in _rel_parts(proc_path):
++        p = os.path.join(base, rel, name) if rel else os.path.join(base, name)
++        if p not in out:
++            out.append(p)
++    plain = os.path.join(base, name)
++    if plain not in out:
++        out.append(plain)
++    return out
++
++
++def first_readable(paths: List[str]) -> Optional[str]:
++    """اولین مسیرِ خواندنی، یا `None`."""
++    for p in paths:
++        if os.access(p, os.R_OK):
++            return p
++    return None
++
++
++def probe(proc_path: str = PROC_SELF_CGROUP) -> dict:
++    """گزارش تشخیصی: برای هر مسیرِ نامزد، مقدارش یا دلیلِ خوانده‌نشدن.
++
++    برای وقتی که `snapshot()` مقدار `None` برمی‌گرداند و باید فهمید چرا.
++    """
++    wanted = {
++        "v2": [("memory.max", None), ("memory.current", None),
++               ("cpu.max", None), ("cpu.stat", None)],
++        "v1": [("memory.limit_in_bytes", "memory"),
++               ("memory.usage_in_bytes", "memory"),
++               ("cpu.cfs_quota_us", "cpu"),
++               ("cpu.cfs_period_us", "cpu"),
++               ("cpuacct.usage", "cpuacct")],
++    }
++    out: dict = {"proc_self_cgroup": None, "rel_paths": _rel_parts(proc_path),
++                 "v2": {}, "v1": {}}
++    try:
++        with open(proc_path, "r", encoding="utf-8") as fh:
++            out["proc_self_cgroup"] = fh.read().strip()
++    except OSError as exc:
++        out["proc_self_cgroup"] = f"unreadable: {exc}"
++
++    for name, sub in wanted["v2"]:
++        for p in candidate_file(name, sub, proc_path):
++            out["v2"][p] = _describe(p)
++    for name, controller in wanted["v1"]:
++        for p in candidate_file_v1(name, controller, proc_path):
++            out["v1"][p] = _describe(p)
++    return out
++
++
++def _describe(path: str) -> str:
++    if not os.path.exists(path):
++        return "missing"
++    if not os.access(path, os.R_OK):
++        return "unreadable"
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.read().strip().replace("\n", " ")[:120]
++    except OSError as exc:
++        return f"error: {exc}"
 diff --git a/services/env_sanity.py b/services/env_sanity.py
 new file mode 100644
 index 0000000..0765e15
@@ -230,10 +392,10 @@ index 0000000..0765e15
 +        return {}
 diff --git a/services/host_resources.py b/services/host_resources.py
 new file mode 100644
-index 0000000..4c249d6
+index 0000000..a883d5a
 --- /dev/null
 +++ b/services/host_resources.py
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,285 @@
 +"""تشخیص منابع واقعی در دسترس ربات + مقیاس‌پذیری خودکار هم‌روندی.
 +
 +چرا این ماژول لازم است
@@ -262,6 +424,8 @@ index 0000000..4c249d6
 +import os
 +import time
 +from typing import Any, Dict, Optional, Tuple
++
++from services import cgroup_paths
 +
 +logger = logging.getLogger("host_resources")
 +
@@ -292,34 +456,58 @@ index 0000000..4c249d6
 +
 +
 +# ─── سهمیهٔ CPU ────────────────────────────────────────────────────────────
++def _parse_cpu_max(raw: Optional[str]) -> Optional[float]:
++    """محتوای `cpu.max` → تعداد هسته؛ `None` یعنی «max» یا محتوای نامعتبر."""
++    if not raw:
++        return None
++    parts = raw.split()
++    if len(parts) < 2:
++        return None
++    if parts[0].lower() == "max":
++        return None
++    try:
++        quota = float(parts[0])
++        period = float(parts[1])
++    except ValueError:
++        return None
++    if period <= 0 or quota <= 0:
++        return None
++    return quota / period
++
++
 +def read_cgroup_cpu_quota(
-+    max_v2: str = CPU_MAX_V2,
-+    quota_v1: str = CPU_QUOTA_V1,
-+    period_v1: str = CPU_PERIOD_V1,
++    max_v2: Optional[str] = None,
++    quota_v1: Optional[str] = None,
++    period_v1: Optional[str] = None,
 +) -> Optional[float]:
 +    """سهمیهٔ CPU را به «تعداد هسته» برمی‌گرداند؛ `None` یعنی نامحدود/نامعلوم.
 +
-+    >>> read_cgroup_cpu_quota(...)  # «200000 100000» → 2.0
-+    >>> read_cgroup_cpu_quota(...)  # «max 100000»     → None (نامحدود)
-+    """
-+    raw = _read_text(max_v2)
-+    if raw:
-+        parts = raw.split()
-+        if len(parts) >= 2:
-+            quota_s, period_s = parts[0], parts[1]
-+            if quota_s.lower() == "max":
-+                return None
-+            try:
-+                quota = float(quota_s)
-+                period = float(period_s)
-+            except ValueError:
-+                quota = period = 0.0
-+            if period > 0 and quota > 0:
-+                return quota / period
++    اگر مسیر داده نشود از روی `/proc/self/cgroup` کشف می‌شود (ببینید
++    `services/cgroup_paths.py`) — چون `/sys/fs/cgroup` همیشه ریشهٔ cgroupِ
++    خودِ پروسه نیست و خواندن از ریشه بی‌صدا `None` می‌دهد.
 +
-+    quota = _read_int(quota_v1)
-+    period = _read_int(period_v1)
-+    if quota is not None and period is not None:
++    >>> _parse_cpu_max("200000 100000")   -> 2.0
++    >>> _parse_cpu_max("max 100000")      -> None (نامحدود)
++    """
++    v2_paths = [max_v2] if max_v2 else cgroup_paths.candidate_file("cpu.max")
++    for path in v2_paths:
++        raw = _read_text(path)
++        if raw is not None:
++            # فایل خوانده شد ⇒ جواب قطعی است (حتی اگر «max» باشد)
++            return _parse_cpu_max(raw)
++
++    if quota_v1 and period_v1:
++        pairs = [(quota_v1, period_v1)]
++    else:
++        pairs = list(zip(
++            cgroup_paths.candidate_file_v1("cpu.cfs_quota_us", "cpu"),
++            cgroup_paths.candidate_file_v1("cpu.cfs_period_us", "cpu"),
++        ))
++    for qpath, ppath in pairs:
++        quota = _read_int(qpath)
++        period = _read_int(ppath)
++        if quota is None or period is None:
++            continue
 +        if quota <= 0:          # −۱ = بدون محدودیت
 +            return None
 +        if period > 0:
@@ -396,16 +584,21 @@ index 0000000..4c249d6
 +
 +# ─── مصرف CPU (برای تله‌متری) ──────────────────────────────────────────────
 +def read_cpu_usage_usec(
-+    stat_v2: str = CPU_STAT_V2,
-+    cpuacct_v1: str = CPUACCT_USAGE_V1,
++    stat_v2: Optional[str] = None,
++    cpuacct_v1: Optional[str] = None,
 +) -> Optional[int]:
 +    """مصرف تجمعی CPU این cgroup بر حسب میکروثانیه.
 +
 +    v2: در `cpu.stat` به شکل `usage_usec 123456`
 +    v1: در `cpuacct/cpuacct.usage` بر حسب **نانو**ثانیه (تبدیل می‌شود)
++
++    مسیرها در صورت نبودنِ آرگومان از `/proc/self/cgroup` کشف می‌شوند.
 +    """
-+    raw = _read_text(stat_v2)
-+    if raw:
++    v2_paths = [stat_v2] if stat_v2 else cgroup_paths.candidate_file("cpu.stat")
++    for path in v2_paths:
++        raw = _read_text(path)
++        if raw is None:
++            continue
 +        for line in raw.splitlines():
 +            parts = line.split()
 +            if len(parts) == 2 and parts[0] == "usage_usec":
@@ -413,9 +606,13 @@ index 0000000..4c249d6
 +                    return int(parts[1])
 +                except ValueError:
 +                    break
-+    ns = _read_int(cpuacct_v1)
-+    if ns is not None and ns >= 0:
-+        return ns // 1000
++
++    v1_paths = ([cpuacct_v1] if cpuacct_v1
++                else cgroup_paths.candidate_file_v1("cpuacct.usage", "cpuacct"))
++    for path in v1_paths:
++        ns = _read_int(path)
++        if ns is not None and ns >= 0:
++            return ns // 1000
 +    return None
 +
 +
@@ -470,15 +667,365 @@ index 0000000..4c249d6
 +        "cpu_usage_usec": usage,
 +    }
 +    try:
-+        from services.memory_guard import pressure_percent, read_cgroup_memory
++        # NOTE: pressure_percent() takes PATHS, not numbers — passing the
++        # (usage, limit) tuple we just read made it silently return None every
++        # single time.  usage_percent() is the numeric counterpart.
++        from services.memory_guard import read_cgroup_memory, usage_percent
 +        mem_usage, mem_limit = read_cgroup_memory()
-+        out["mem_percent"] = pressure_percent(mem_usage, mem_limit)
++        out["mem_percent"] = usage_percent(mem_usage, mem_limit)
 +        out["mem_limit_mb"] = (round(mem_limit / 1048576.0)
 +                               if mem_limit else None)
++        out["mem_used_mb"] = (round(mem_usage / 1048576.0)
++                              if mem_usage else None)
 +    except Exception:  # pragma: no cover - تله‌متری نباید هرگز کار را بخواباند
 +        out["mem_percent"] = None
 +        out["mem_limit_mb"] = None
 +    return out
+diff --git a/services/memory_guard.py b/services/memory_guard.py
+new file mode 100644
+index 0000000..6123593
+--- /dev/null
++++ b/services/memory_guard.py
+@@ -0,0 +1,168 @@
++"""
++services/memory_guard.py
++════════════════════════
++🛡 گارد حافظهٔ cgroup — جلوی پذیرش سفارش جدید وقتی کانتینر نزدیک سقف RAM است.
++
++چرا لازم است (رویداد ۱۴۰۵/۰۷/۰۴):
++    `docker inspect` بعد از بازسازی کانتینر چیزی نشان نمی‌دهد، ولی `dmesg`
++    ۱۳ بار «Memory cgroup out of memory: Killed process (python)» در ۱۰ روز
++    ثبت کرده بود. کانتینر ربات سقف حافظه دارد و وقتی از آن رد شود کرنل
++    پروسه را با SIGKILL می‌کشد — بدون هیچ لاگی. چون هیچ مسیر بازیابی هم
++    وجود نداشت، سفارش‌های پول‌داده‌شده در میانهٔ راه از بین می‌رفتند.
++
++نکتهٔ مهم: `[VoiceMemory] rss_mb` فقط RSS پروسهٔ پایتون است. مصرف واقعیِ
++cgroup شامل این‌ها هم می‌شود:
++    * یک پروسهٔ ffmpeg به ازای هر اکانتِ داخل تماس
++    * page cache و حافظهٔ کرنل/سوکت (ده‌ها اتصال WebRTC)
++پس «rss_mb زیر سقف است» به‌هیچ‌وجه یعنی «cgroup زیر سقف است». این ماژول
++مستقیماً همان عددی را می‌خواند که کرنل برای OOM-kill نگاه می‌کند.
++
++Fail-open: اگر عدد خوانده نشود (هاست بدون cgroup، مجوز نداشتن فایل‌ها، …)
++هیچ‌وقت مسیر خرید را نمی‌بندد؛ فقط None برمی‌گرداند.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import Optional, Tuple
++
++from services import cgroup_paths
++
++logger = logging.getLogger(__name__)
++
++# cgroup v2 (docker با systemd/cgroup v2)
++_V2_USAGE = "/sys/fs/cgroup/memory.current"
++_V2_LIMIT = "/sys/fs/cgroup/memory.max"
++# cgroup v1
++_V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
++_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
++
++# هر عدد بزرگ‌تر از این یعنی «بدون سقف» (cgroup v1 مقدار ~2^63 می‌نویسد).
++_UNLIMITED_BYTES = 1 << 62
++
++
++def _read_int(path: str) -> Optional[int]:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            raw = fh.read().strip()
++    except Exception:
++        return None
++    if not raw or raw == "max":
++        return None
++    try:
++        val = int(raw)
++    except ValueError:
++        return None
++    return val if val >= 0 else None
++
++
++def _read_first(paths) -> Optional[int]:
++    """اولین مسیرِ خواندنیِ فهرست را بخوان."""
++    for p in paths:
++        val = _read_int(p)
++        if val is not None:
++            return val
++    return None
++
++
++def read_cgroup_memory(
++    usage_path_v2: Optional[str] = None,
++    limit_path_v2: Optional[str] = None,
++    usage_path_v1: Optional[str] = None,
++    limit_path_v1: Optional[str] = None,
++) -> Tuple[Optional[int], Optional[int]]:
++    """(usage_bytes, limit_bytes) یا (None, None) اگر قابل تشخیص نبود.
++
++    اگر مسیرها صریحاً داده نشوند، از روی `/proc/self/cgroup` **کشف** می‌شوند
++    (ببینید `services/cgroup_paths.py`). این مهم است: `/sys/fs/cgroup` همیشه
++    ریشهٔ cgroupِ خودِ پروسه نیست — با cgroupns یا زیرگروه نام‌دار، فایل‌ها زیر
++    `/sys/fs/cgroup/<rel>/` هستند و خواندن از ریشه بی‌صدا `None` می‌دهد، یعنی
++    گارد حافظه fail-open می‌ماند.
++
++    مسیرهای صریح فقط برای تست‌اند؛ در آن حالت کشف انجام نمی‌شود.
++    """
++    if usage_path_v2 and limit_path_v2:
++        v2 = ([usage_path_v2], [limit_path_v2])
++    else:
++        v2 = (cgroup_paths.candidate_file("memory.current"),
++              cgroup_paths.candidate_file("memory.max"))
++    if usage_path_v1 and limit_path_v1:
++        v1 = ([usage_path_v1], [limit_path_v1])
++    else:
++        v1 = (cgroup_paths.candidate_file_v1("memory.usage_in_bytes", "memory"),
++              cgroup_paths.candidate_file_v1("memory.limit_in_bytes", "memory"))
++
++    for usage_paths, limit_paths in (v2, v1):
++        usage = _read_first(usage_paths)
++        limit = _read_first(limit_paths)
++        if usage is None or limit is None:
++            continue
++        if limit >= _UNLIMITED_BYTES:      # بدون سقف → گارد بی‌معنی است
++            return None, None
++        if limit <= 0:
++            continue
++        return usage, limit
++    return None, None
++
++
++def usage_percent(usage: Optional[int], limit: Optional[int]) -> Optional[float]:
++    """درصدِ مصرف نسبت به سقف، از روی **اعداد**. None یعنی «نمی‌دانم».
++
++    این تابع جدا از `pressure_percent` است چون آن یکی مسیر می‌گیرد و این یکی
++    عدد؛ قاطی‌کردنشان باعث می‌شود بی‌صدا `None` برگردد (اتفاقی که در
++    `host_resources.snapshot()` افتاده بود).
++    """
++    if not usage or not limit or limit <= 0:
++        return None
++    return 100.0 * float(usage) / float(limit)
++
++
++def pressure_percent(
++    usage_path_v2: Optional[str] = None,
++    limit_path_v2: Optional[str] = None,
++    usage_path_v1: Optional[str] = None,
++    limit_path_v1: Optional[str] = None,
++) -> Optional[float]:
++    """درصدِ مصرفِ cgroup نسبت به سقفش؛ None یعنی «نمی‌دانم» (fail-open).
++
++    ⚠️ پیش‌فرض همهٔ آرگومان‌ها `None` است تا `read_cgroup_memory` مسیرها را از
++    `/proc/self/cgroup` **کشف** کند. اگر مثل قبل مسیرهای ثابتِ ریشه را پاس
++    بدهیم، کشف انجام نمی‌شود و روی میزبان‌هایی که cgroup زیر یک زیرگروه
++    نام‌دار است گارد برای همیشه fail-open می‌ماند.
++    """
++    usage, limit = read_cgroup_memory(
++        usage_path_v2, limit_path_v2, usage_path_v1, limit_path_v1
++    )
++    return usage_percent(usage, limit)
++
++
++def _cfg(attr: str, env_key: str, default):
++    raw = os.getenv(env_key)
++    if raw is not None and raw != "":
++        return raw
++    try:
++        from config import Config  # noqa: WPS433
++        return getattr(Config, attr, default)
++    except Exception:
++        return default
++
++
++def guard_allows_new_order(max_percent: Optional[float] = None) -> Tuple[bool, Optional[float]]:
++    """(مجاز؟, درصد مصرف) — اگر درصد خوانده نشود، اجازه می‌دهد (fail-open)."""
++    try:
++        limit = float(max_percent if max_percent is not None else _cfg(
++            "MEMORY_GUARD_MAX_PERCENT", "MEMORY_GUARD_MAX_PERCENT", 85))
++    except Exception:
++        limit = 85.0
++    pct = pressure_percent()
++    if pct is None:
++        return True, None
++    if pct >= limit:
++        logger.error(
++            "[MemoryGuard] cgroup memory at %.1f%% of limit (threshold %.0f%%) — "
++            "refusing new order to avoid an OOM kill mid-call",
++            pct, limit,
++        )
++        return False, pct
++    return True, pct
+diff --git a/tests/test_cgroup_paths.py b/tests/test_cgroup_paths.py
+new file mode 100644
+index 0000000..308eb7d
+--- /dev/null
++++ b/tests/test_cgroup_paths.py
+@@ -0,0 +1,165 @@
++"""Tests for services/cgroup_paths.py + two regressions it fixes.
++
++دو باگ واقعی که این تست‌ها قفل می‌کنند:
++
++۱) `memory_guard` و `host_resources` فرض می‌کردند فایل‌های cgroup زیر
++   `/sys/fs/cgroup` هستند. روی میزبانی که `/proc/self/cgroup` می‌گوید `0::/user`
++   فایل‌ها زیر `/sys/fs/cgroup/user/` اند. نتیجه روی سرور:
++   `snapshot = {..., 'mem_percent': None, 'mem_limit_mb': None}` ⇒ گارد حافظه
++   برای همیشه fail-open.
++
++۲) `host_resources.snapshot()` نتیجهٔ `read_cgroup_memory()` را که **عدد** بود
++   به `pressure_percent()` می‌داد که **مسیر** می‌گیرد ⇒ `mem_percent` حتی وقتی
++   خواندن حافظه درست کار می‌کرد هم همیشه `None` بود.
++
++Run:
++    python -m pytest tests/test_cgroup_paths.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services import cgroup_paths  # noqa: E402
++from services.memory_guard import (  # noqa: E402
++    pressure_percent,
++    read_cgroup_memory,
++    usage_percent,
++)
++
++
++def _proc(text):
++    fd, path = tempfile.mkstemp(prefix="proc-cgroup-")
++    with os.fdopen(fd, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++class RelPartsTests(unittest.TestCase):
++    def test_v2_named_subgroup(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("0::/user\n")), ["user"])
++
++    def test_v2_root(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("0::/\n")), [""])
++
++    def test_v1_multiple_controllers(self):
++        raw = ("12:pids:/docker/abc123\n4:memory:/docker/abc123\n"
++               "1:name=systemd:/init.scope\n0::/init.scope\n")
++        got = cgroup_paths._rel_parts(_proc(raw))
++        self.assertIn("docker/abc123", got)
++        self.assertIn("init.scope", got)
++
++    def test_missing_file_gives_empty_list(self):
++        self.assertEqual(cgroup_paths._rel_parts("/nonexistent/cgroup"), [])
++
++    def test_malformed_lines_are_skipped(self):
++        self.assertEqual(cgroup_paths._rel_parts(_proc("garbage\n0::/ok\n")), ["ok"])
++
++    def test_duplicate_paths_are_deduplicated(self):
++        raw = "4:memory:/docker/x\n3:cpu:/docker/x\n"
++        self.assertEqual(cgroup_paths._rel_parts(_proc(raw)), ["docker/x"])
++
++
++class CandidateTests(unittest.TestCase):
++    def test_subgroup_is_tried_before_the_mount_root(self):
++        got = cgroup_paths.candidate_file("memory.max", proc_path=_proc("0::/user\n"))
++        self.assertEqual(got, ["/sys/fs/cgroup/user/memory.max",
++                               "/sys/fs/cgroup/memory.max"])
++
++    def test_root_cgroup_does_not_duplicate_the_path(self):
++        got = cgroup_paths.candidate_file("cpu.max", proc_path=_proc("0::/\n"))
++        self.assertEqual(got, ["/sys/fs/cgroup/cpu.max"])
++
++    def test_v1_paths_are_under_the_controller_directory(self):
++        got = cgroup_paths.candidate_file_v1("memory.limit_in_bytes", "memory",
++                                             proc_path=_proc("0::/docker/abc\n"))
++        self.assertEqual(got[0], "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes")
++        self.assertEqual(got[-1], "/sys/fs/cgroup/memory/memory.limit_in_bytes")
++
++    def test_first_readable_skips_missing_files(self):
++        d = tempfile.mkdtemp(prefix="cg-")
++        real = os.path.join(d, "real")
++        with open(real, "w", encoding="utf-8") as fh:
++            fh.write("42\n")
++        self.assertEqual(
++            cgroup_paths.first_readable([os.path.join(d, "nope"), real]), real)
++
++    def test_first_readable_returns_none_when_nothing_is_readable(self):
++        self.assertIsNone(cgroup_paths.first_readable(["/nope/a", "/nope/b"]))
++
++
++class ProbeTests(unittest.TestCase):
++    def test_probe_never_raises_and_reports_the_proc_line(self):
++        p = cgroup_paths.probe(proc_path=_proc("0::/user\n"))
++        self.assertEqual(p["rel_paths"], ["user"])
++        self.assertIn("v2", p)
++        self.assertIn("v1", p)
++
++    def test_probe_survives_an_unreadable_proc_file(self):
++        # With no rel_paths it falls back to probing /sys/fs/cgroup itself,
++        # which may or may not exist depending on the host - so assert only
++        # that every entry is a descriptive string and nothing raised.
++        p = cgroup_paths.probe(proc_path="/nonexistent/cgroup")
++        self.assertEqual(p["rel_paths"], [])
++        self.assertTrue(p["proc_self_cgroup"].startswith("unreadable"))
++        for entry in list(p["v2"].values()) + list(p["v1"].values()):
++            self.assertIsInstance(entry, str)
++            self.assertTrue(entry)
++
++    def test_probe_describes_a_missing_path_explicitly(self):
++        self.assertEqual(cgroup_paths._describe("/definitely/not/here"), "missing")
++
++
++class LiveDiscoveryTests(unittest.TestCase):
++    """Run against the real cgroup of whatever box executes the suite."""
++
++    def test_the_live_box_reports_consistent_numbers(self):
++        usage, limit = read_cgroup_memory()
++        if usage is None or limit is None:
++            self.skipTest("host exposes no readable cgroup memory files")
++        self.assertGreater(limit, 0)
++        self.assertGreaterEqual(usage, 0)
++        self.assertAlmostEqual(usage_percent(usage, limit),
++                               100.0 * usage / limit, places=6)
++
++
++class UsagePercentTests(unittest.TestCase):
++    def test_computes_from_numbers(self):
++        self.assertAlmostEqual(usage_percent(1, 4), 25.0)
++
++    def test_the_exact_regression_snapshot_hit(self):
++        """pressure_percent() used to receive these numbers as if they were
++        paths and returned None.  usage_percent() must not."""
++        # 705957888 / 3997061120 * 100 = 17.66192376863129
++        self.assertAlmostEqual(usage_percent(705957888, 3997061120),
++                               17.66192376863129, places=6)
++
++    def test_none_inputs(self):
++        self.assertIsNone(usage_percent(None, 100))
++        self.assertIsNone(usage_percent(100, None))
++        self.assertIsNone(usage_percent(100, 0))
++
++    def test_passing_numbers_to_pressure_percent_still_does_not_crash(self):
++        # Wrong use on purpose: it must fail open with None, never raise.
++        self.assertIsNone(pressure_percent(705957888, 3997061120))
++
++
++class PressurePercentDiscoveryTests(unittest.TestCase):
++    def test_no_arg_call_uses_discovery_not_hard_coded_root_paths(self):
++        """Regression 1: the old defaults were the root paths, which made
++        read_cgroup_memory skip discovery entirely."""
++        import inspect
++        sig = inspect.signature(pressure_percent)
++        for name in ("usage_path_v2", "limit_path_v2",
++                     "usage_path_v1", "limit_path_v1"):
++            self.assertIsNone(sig.parameters[name].default,
++                              f"{name} must default to None so discovery runs")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
 diff --git a/tests/test_env_sanity.py b/tests/test_env_sanity.py
 new file mode 100644
 index 0000000..8ae4a91
@@ -957,3 +1504,152 @@ index 0000000..b0d0f9b
 +    def test_all_concurrency_values_are_at_least_one(self):
 +        for value in self._values()[1:]:
 +            self.assertGreaterEqual(value, 1)
+diff --git a/tests/test_memory_guard.py b/tests/test_memory_guard.py
+new file mode 100644
+index 0000000..8dd7517
+--- /dev/null
++++ b/tests/test_memory_guard.py
+@@ -0,0 +1,143 @@
++"""Offline tests for the cgroup memory guard (services/memory_guard.py).
++
++ریشهٔ رویداد ۱۴۰۵/۰۷/۰۴: `dmesg` سیزده بار
++«Memory cgroup out of memory: Killed process (python)» در ده روز ثبت کرده بود.
++`docker inspect` بعد از بازسازی کانتینر چیزی نشان نمی‌دهد، پس تنها راهِ
++پیشگیری این است که خودِ ربات مصرف cgroup را بخواند و وقتی نزدیک سقف است
++سفارش جدید نپذیرد.
++
++Run:
++    python -m pytest tests/test_memory_guard.py -v
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import unittest
++from datetime import datetime
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services.memory_guard import (  # noqa: E402
++    guard_allows_new_order,
++    pressure_percent,
++    read_cgroup_memory,
++)
++# v2.3.x removed services/capacity_planner.py, so the four integration tests
++# below are skipped there while the cgroup-reading tests still run.
++try:  # noqa: E402
++    from services.capacity_planner import check_capacity
++except ImportError:  # pragma: no cover - depends on the branch under test
++    check_capacity = None
++
++MIB = 1024 * 1024
++
++
++class _FakeCgroup:
++    """Write cgroup-looking files into a temp dir and point the reader at them."""
++
++    def __init__(self, usage, limit, version=2):
++        self.dir = tempfile.mkdtemp(prefix="cg-")
++        if version == 2:
++            self.usage = os.path.join(self.dir, "memory.current")
++            self.limit = os.path.join(self.dir, "memory.max")
++        else:
++            self.usage = os.path.join(self.dir, "memory.usage_in_bytes")
++            self.limit = os.path.join(self.dir, "memory.limit_in_bytes")
++        with open(self.usage, "w", encoding="utf-8") as fh:
++            fh.write(str(usage))
++        with open(self.limit, "w", encoding="utf-8") as fh:
++            fh.write(str(limit))
++
++    def read(self):
++        return read_cgroup_memory(self.usage, self.limit, self.usage, self.limit)
++
++    def pct(self):
++        return pressure_percent(self.usage, self.limit, self.usage, self.limit)
++
++
++class ReadCgroupTests(unittest.TestCase):
++    def test_reads_v2_files(self):
++        cg = _FakeCgroup(800 * MIB, 1536 * MIB)
++        self.assertEqual(cg.read(), (800 * MIB, 1536 * MIB))
++        self.assertAlmostEqual(cg.pct(), 100.0 * 800 / 1536, places=6)
++
++    def test_reads_v1_files(self):
++        cg = _FakeCgroup(1400 * MIB, 1536 * MIB, version=1)
++        self.assertEqual(cg.read(), (1400 * MIB, 1536 * MIB))
++        self.assertGreater(cg.pct(), 90.0)
++
++    def test_unlimited_means_no_guard(self):
++        # cgroup v2 writes the literal "max", v1 writes ~2^63.
++        self.assertEqual(_FakeCgroup(900 * MIB, "max").read(), (None, None))
++        self.assertIsNone(_FakeCgroup(900 * MIB, "max").pct())
++        self.assertEqual(_FakeCgroup(900 * MIB, str(1 << 63)).read(), (None, None))
++
++    def test_missing_files_fail_open(self):
++        usage, limit = read_cgroup_memory("/nope/a", "/nope/b", "/nope/c", "/nope/d")
++        self.assertIsNone(usage)
++        self.assertIsNone(limit)
++        self.assertIsNone(pressure_percent("/nope/a", "/nope/b", "/nope/c", "/nope/d"))
++
++    def test_real_numbers_from_the_incident(self):
++        """The Sep-19 kill: anon-rss 1,547,600 kB + file-rss 35,116 kB against
++        a 1536 MiB cap — 100.6% of the limit.  That is what the guard must see."""
++        cg = _FakeCgroup((1547600 + 35116) * 1024, 1536 * MIB)
++        self.assertGreater(cg.pct(), 100.0)
++
++
++@unittest.skipIf(check_capacity is None,
++                 "services.capacity_planner is absent on this branch")
++class GuardDecisionTests(unittest.TestCase):
++    def test_refuses_above_threshold(self):
++        allowed, pct = guard_allows_new_order(max_percent=85.0)
++        # On a dev box without a capped cgroup this returns (True, None).
++        self.assertIsInstance(allowed, bool)
++        self.assertTrue(pct is None or isinstance(pct, float))
++
++    def test_capacity_planner_refuses_with_reason_memory(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=91.0, memory_max_percent=85.0,
++        )
++        self.assertFalse(v.allowed)
++        self.assertEqual(v.reason, "memory")
++        self.assertEqual(v.memory_pressure_percent, 91.0)
++
++    def test_capacity_planner_allows_below_threshold(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=40.0, memory_max_percent=85.0,
++        )
++        self.assertTrue(v.allowed)
++        self.assertIsNone(v.reason)
++
++    def test_capacity_planner_fails_open_without_a_reading(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        v = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30, safety_buffer_percent=10,
++            memory_pressure_percent=None, memory_max_percent=85.0,
++        )
++        self.assertTrue(v.allowed)
++        self.assertIsNone(v.memory_pressure_percent)
++
++    def test_memory_reason_serialises(self):
++        start = datetime(2026, 9, 26, 12, 0)
++        d = check_capacity(
++            reservations=[], pool_size=100, accounts_needed=10,
++            start_utc=start, duration_minutes=30,
++            memory_pressure_percent=99.0, memory_max_percent=85.0,
++        ).to_dict()
++        self.assertEqual(d["reason"], "memory")
++        self.assertEqual(d["memory_pressure_percent"], 99.0)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
