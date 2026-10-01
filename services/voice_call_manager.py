@@ -453,8 +453,11 @@ _VALID_TRANSITIONS = {
     RECONNECTING: {REJOINING, TEMPORARILY_UNKNOWN, FAILED},
     REJOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED},
     RATE_LIMITED: {RETRY_PENDING, FAILED, LEAVING},
-    RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING},
-    FAILED: {LEAVING, COMPLETED},
+    RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING, STARTING},
+    # A VoiceFill "second chance" round deliberately RE-ARMS a failed
+    # account, so FAILED -> STARTING is legal (it used to log
+    # "invalid transition" noise on every retry, e.g. order 940 acc 144).
+    FAILED: {LEAVING, COMPLETED, STARTING},
     LEAVING: {COMPLETED},
     COMPLETED: set(),
 }
@@ -696,6 +699,13 @@ class VoiceCallManager:
         # A disconnect that could not be confirmed is NOT permission to
         # reconnect. Keep its hold until shutdown (never burn the same key).
         self._quarantined_accounts: Set[int] = set()
+        # A quarantine is a LOCAL, recoverable hold: "the previous transport
+        # might still be open, so no second connection on this auth key" -
+        # not a verdict on the account. The maintenance sweep re-probes the
+        # holds (heal_quarantine_holds) instead of keeping healthy accounts
+        # dead until process exit. Incident 2026-10-02: a DC timeout storm
+        # parked 22 of 42 accounts here and starved every later build.
+        self._quarantine_heal_last: Dict[int, float] = {}
         self._shutting_down = False
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._reservation_lock = asyncio.Lock()
@@ -2270,6 +2280,77 @@ class VoiceCallManager:
             self._client_last_used.pop(account_id, None)
             return True
 
+    def is_locally_quarantined(self, account_id: int) -> bool:
+        """True while a LOCAL auth-key hold blocks new connections for the account.
+
+        The DB row is still healthy - only THIS process refuses to open a
+        second connection on a transport whose teardown was never confirmed.
+        The executor uses this to DEFER such an account until the heal sweep
+        releases it, instead of burning a wave slot on a guaranteed instant
+        fail (``SESSION_IN_USE`` in 0s).
+        """
+        return account_id in self._quarantined_accounts
+
+    async def heal_quarantine_holds(self) -> int:
+        """Re-probe quarantine holds and release the ones that are provably stale.
+
+        Why this exists (incident 2026-10-02, orders 940/941): a Telegram
+        timeout storm made dozens of engine ``start()`` calls and disconnects
+        unconfirmable, and every one of them parked the account in
+        ``_quarantined_accounts`` permanently - ``[VoiceMemory]`` showed
+        ``quarantined: 22`` of 42 accounts while a fresh order built 0/22
+        live. Nothing ever re-checked a hold, so a ten-minute DC blip cost
+        the whole night.
+
+        The hold itself stays correct - no second connection while the old
+        transport might be alive - but it must not outlive its reason:
+        ``_cleanup_client(force=True)`` re-issues the teardown and only
+        DROPS the quarantine when the disconnect is CONFIRMED, the exact
+        invariant the hold guards. Accounts any live order still needs are
+        never touched, and a failed probe backs off for
+        ``VOICE_QUARANTINE_HEAL_SECONDS * 3`` so a DC that is still down is
+        not hammered every sweep.
+        """
+        if not self._quarantined_accounts:
+            return 0
+        max_per_sweep = max(1, int(getattr(
+            Config, "VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP", 6)))
+        retry_gap = max(60.0, float(getattr(
+            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)) * 3.0)
+        now = time.time()
+        healed = 0
+        for aid in list(self._quarantined_accounts):
+            if healed >= max_per_sweep:
+                break
+            if now - self._quarantine_heal_last.get(aid, 0.0) < retry_gap:
+                continue
+            # A live reservation is exactly what the hold protects.
+            if (self._busy_accounts.get(aid)
+                    or self._account_in_any_order(aid)
+                    or aid in self.get_reserved_account_ids()
+                    or any(_k[0] == aid for _k in self._inflight_joins)):
+                continue
+            self._quarantine_heal_last[aid] = now
+            try:
+                await self._cleanup_client(aid, force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the hold, re-probe later
+                logger.warning(
+                    "[VoiceQuarantine] acc=%s heal probe failed: %r", aid, exc)
+                continue
+            if aid in self._quarantined_accounts:
+                logger.info(
+                    "[VoiceQuarantine] acc=%s: transport still unconfirmed - "
+                    "hold kept, next probe in %.0fs", aid, retry_gap)
+                continue
+            healed += 1
+            self._quarantine_heal_last.pop(aid, None)
+            logger.info(
+                "[VoiceQuarantine] acc=%s: stale transport confirmed gone - "
+                "quarantine lifted, the account is joinable again", aid)
+        return healed
+
     async def reap_idle_clients(self, *, force: bool = False) -> int:
         """Close unused MTProto clients after TTL (or immediately on pressure).
 
@@ -2330,6 +2411,14 @@ class VoiceCallManager:
                     closed = await self.reap_idle_clients(force=bool(soft and rss > soft))
                     if closed:
                         logger.info("[VoiceReaper] closed %s idle client(s)", closed)
+                    # Quarantine holds are recoverable - re-probe them on
+                    # every maintenance sweep (see heal_quarantine_holds).
+                    healed = await self.heal_quarantine_holds()
+                    if healed:
+                        logger.info(
+                            "[VoiceQuarantine] released %s stale hold(s); "
+                            "still held: %s", healed,
+                            len(self._quarantined_accounts))
                     if soft and rss > soft:
                         logger.warning("[VoiceMemory] RSS %s MB > soft %s MB; "
                                        "only unreferenced clients can be reaped", rss, soft)
@@ -4436,7 +4525,13 @@ class VoiceCallManager:
                 return False, f"SESSION_REVOKED: {e}", 0
             except SessionInUseError as e:
                 self._set_state(order_id, account_id, RETRY_PENDING, e.technical)
-                return False, f"SESSION_IN_USE: {e}", 0
+                # Carry the machine-readable reason into the message: the
+                # executor must tell a LOCAL recoverable hold ('uncertain',
+                # released by the quarantine heal) apart from a durable one
+                # (DB 'quarantined' row, 'stale', 'replaced', ...) before it
+                # decides defer-vs-terminal.
+                _reason = getattr(e, "reason", "voice") or "voice"
+                return False, f"SESSION_IN_USE[{_reason}]: {e}", 0
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 3) or 3)
                 voice_cooldown.record(account_id, wait_s,

@@ -110,8 +110,8 @@ docker compose up -d --force-recreate bot
   گاردها را خودش انجام می‌دهد).
 - بعد از apply باید ۱۷ فایل ` M` و ۲۲ فایل `??` تازه ببینید (۳۹ مسیر، پورت + فیکس‌ها).
 - تأیید سریع داخل کانتینر (بعد از بالا آمدن):
-  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow`
-  باید ۴۸ تست OK بدهد.
+  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow tests.test_report_dedupe tests.test_quarantine_heal`
+  باید ۸۴ تست OK بدهد.
 - `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
   تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
   `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
@@ -158,7 +158,7 @@ retries»). ولی یعنی استخر قابل‌استفاده ۴۰ تاست؛
 
 ## ۸) آزمون‌ها
 
-سوئیت کامل: **۶۶۱ تست، ۶۵۵ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ + ۱۴ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
+سوئیت کامل: **۶۸۳ تست، ۶۷۷ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ + ۱۴ + ۲۲ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
 و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
 کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
 `tests/test_chat_closed_ask_flow.py` هستند.
@@ -242,3 +242,54 @@ Order 933: duplicate 'completed' report suppressed (already sent)
 ```
 Order 933 (Bot 1): past its deadline for 42s but its session is still finishing (cleanup/paced leaves) - the executor owns the report.
 ```
+
+## ۱۱) قفلِ محلی اکانت‌ها خودبه‌خود باز می‌شود؛ بیلد ۰/N دیگر تحویل نمی‌شود (۱۴۰۵/۰۷/۱۱)
+
+**علامت (لاگ سرور، ۰۰:۲۷):** طوفان `Retrying "channels.GetMessages" due to: Request timed out` روی
+همه اکانت‌ها، `[VoiceMemory] ... 'quarantined': 22`، موج‌هایی که در ۰-۲ ثانیه با `fail`
+تمام می‌شدند، `[VoiceState] ... invalid transition FAILED -> STARTING` و `all 42 remaining pool
+account(s) are held by other live order(s)` — یعنی اکانت‌ها اصلاً وارد ویس‌کال نشدند.
+
+**علت:** هر «قطع‌اتصالِ تأییدنشده» (تایم‌اوتِ `pytg.start()` یا disconnect وسط قطعی تلگرام)
+اکانت را در `_quarantined_accounts` قفل می‌کند تا اتصال دومی روی همان auth-key باز نشود —
+قفل درست است، ولی **هیچ‌کس دوباره بررسیش نمی‌کرد**؛ عمراً تا پایان پروسه می‌ماند. executor هم
+با `SESSION_IN_USE` همان اسلات را برای سفارش terminal می‌کرد. ۲۲ قفل = استخر عملاً نصف؛
+سفارش تازه (۹۴۱) بعد از ۶×۲۰ ثانیه انتظار، ۰/۲۲ تحویل شد.
+
+**فیکس‌ها:**
+
+1. `heal_quarantine_holds()` در همان جارویِ نگهدار (`_idle_reaper_loop`): برای اکانت‌های
+   قفل‌شده‌ای که هیچ سفارش زنده‌ای لازمشان ندارد، teardown دوباره تلاش می‌شود و فقط اگر
+   قطع‌شدن **تأیید** شد، قفل برداشته می‌شود (همان invariant که قفل ازش محافظت می‌کرد).
+   حداکثر `VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP` (پیش‌فرض ۶) در هر جارو و backoff
+   `VOICE_QUARANTINE_HEAL_SECONDS×۳` برای قفل‌هایی که هنوز تأیید نمی‌شوند.
+2. برچسب دلیل در پیام: `SESSION_IN_USE[uncertain]: …`. دلیل `uncertain` = قفلِ محلیِ
+   قابل‌بازگشت → بودجه attempt حفظ می‌شود، اکانت terminal **نمی‌شود**، موج با تأخیرِ پنجرهٔ
+   heal ادامه می‌کند (`OUTCOME_SYSTEM`). دلایل ماندگار (`quarantined` دیتابیسی، `stale`،
+   `replaced`) مثل قبل رفتار می‌کنند.
+3. انتخاب کاندیدا (موج و second-chance) اکانتِ قفل‌شده را فعلاً برنمی‌دارد؛ به‌جای موجِ
+   فیل‌های صُفرثانیه‌ای، یک بار به اندازه پنجره heal صبر می‌کند.
+4. `VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE` (پیش‌فرض ۴۵ راند ×۲۰ ثانیه ≈ ۱۵ دقیقه): بیلدی که
+   هنوز **هیچ** اکانت زنده ندارد، به‌جای ۶ راند، برای آزادشدن استخر صبر می‌کند — چون زمان
+   پولی بعد از بیلد شروع می‌شود، صبر کردن رایگان است و تحویلِ صفر بدترین نتیجه.
+5. `FAILED -> STARTING` حالا ترنزیشن قانونی است (دورِ second-chance عمداً اکانت fail شده را
+   دوباره مسلح می‌کند؛ آن warning فقط نویز لاگ بود).
+
+در لاگ، بازگشت اکانت‌ها این‌طور دیده می‌شود:
+
+```
+[VoiceQuarantine] acc=137: stale transport confirmed gone - quarantine lifted, the account is joinable again
+[VoiceQuarantine] acc=144: transport still unconfirmed - hold kept, next probe in 540s
+Order 940: account 144 local session hold (previous disconnect unconfirmed) - retry deferred 180s for the quarantine heal, budget kept
+```
+
+**تست:** ۲۲ تست تازه در `tests/test_quarantine_heal.py` (برداشتن قفل با تأیید teardown،
+backoff، عدم دست‌زدن به اکانت درگیرِ سفارش زنده، سقف هر جارو، تأخیر زمان‌بندی موج،
+abstain/صبر second-chance، تگِ دلیل در start_call، کلاسیفیکاسیون uncertain و گاردهای سیم‌کشی).
+
+⚠️ **هشدار عملیاتی (همان حادثه، از جنس جدا):** در ترمینال سرور، `git pull origin arena/01a0f958-tgcallbot --rebase`
+اجرا شده — این برنچ مربوط به **یک نشست کاری دیگر** (دوره v2.3.1، حذف Capacity Guard) است و
+rebase روی آن، درخت `/opt/tgcallbot` را وسطِ کنفلکت رها می‌کند و بیلد ایمیج را از کدِ
+دارای marker خراب می‌سازد. مسیر مجاز فقط همان شش دستور بخش ۶ است (fetch همان برنچِ خودمان +
+`git apply` پورت کامل؛ بدون pull/rebase). اگر `git status` روی سرور کثیف بود:
+`git rebase --abort; git checkout -- .; git clean -fd -- services tests docs` و بعد مراحل عادی.

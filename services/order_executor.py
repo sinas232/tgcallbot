@@ -46,6 +46,23 @@ _PARSE_ERROR_MARKERS = ("can't parse", "can't find end", "unsupported start tag"
                         "parse entities", "parse_mode", "entity", "imbalanced")
 
 
+def _is_local_session_hold(msg: str) -> bool:
+    """True when a SESSION_IN_USE failure is only a LOCAL, healable hold.
+
+    ``voice_call_manager`` tags the reason into the failure text
+    (``SESSION_IN_USE[uncertain]: ...``). 'uncertain' means a previous
+    disconnect or engine stop could not be CONFIRMED - the typical fallout
+    of a Telegram timeout storm - while the account itself is healthy and
+    the quarantine heal sweep releases it shortly. Marking such an account
+    terminal for the order (the old behaviour) is what turned the
+    2026-10-02 blip into 22 dead slots and a build that ended 0/22 live.
+    Message shapes without a ``[reason]`` tag stay conservative: terminal,
+    exactly as before.
+    """
+    text = (msg or "").upper()
+    return "SESSION_IN_USE" in text and "[UNCERTAIN]" in text
+
+
 def _is_parse_error(exc) -> bool:
 	"""True only for a Telegram formatting failure (BadRequest about entities)."""
 	try:
@@ -752,6 +769,18 @@ class OrderExecutor:
 	            continue
 	        if retry_after.get(aid, 0) > now:
 	            continue
+	        # Skip accounts parked on a LOCAL auth-key hold: selecting one
+	        # would only produce an instant SESSION_IN_USE fail. The heal
+	        # sweep re-admits them once the stale transport is proven gone.
+	        if vcm is not None:
+	            try:
+	                _held = vcm.is_locally_quarantined(aid)
+	            except Exception as _probe_exc:
+	                logger.debug("Order %s: candidate quarantine probe failed "
+	                             "for %s: %r", order_id, aid, _probe_exc)
+	                _held = False
+	            if _held:
+	                continue
 	        # Persisted server-directed FloodWait (may survive wave
 	        # cancellation and restarts): never re-issue early.
 	        if vcm is not None and vcm.flood_wait_remaining(aid) > 0:
@@ -807,6 +836,18 @@ class OrderExecutor:
 	            flood_when = now + vcm.flood_wait_remaining(aid)
 	            if flood_when > when:
 	                when = flood_when
+	            # A LOCAL quarantine hold turns an instant attempt into an
+	            # instant SESSION_IN_USE fail that burns a wave slot; schedule
+	            # the account around the heal sweep instead.
+	            try:
+	                if vcm.is_locally_quarantined(aid):
+	                    heal_when = now + max(30.0, float(getattr(
+	                        Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
+	                    if heal_when > when:
+	                        when = heal_when
+	            except Exception as _probe_exc:
+	                logger.debug("Order %s: quarantine probe failed for %s: %r",
+	                             order_id, aid, _probe_exc)
 	        # 🛡 استراحت ضد اسپم هم در زمان‌بندی موج لحاظ می‌شود تا موتور موج
 	        # به‌جای «پول تمام شد»، تا اتمام نزدیک‌ترین استراحت صبر کند.
 	        try:
@@ -868,7 +909,40 @@ class OrderExecutor:
 	    if not self._is_order_active(order_id):
 	        return False
 	    await self._voice_load_pool(bot_id, order_id)
-	    retry_ids = eligible()
+
+	    def _on_local_hold(ids) -> set:
+	        _vcm = _get_voice_call_manager()
+	        if _vcm is None:
+	            return set()
+	        held = set()
+	        for _id in ids:
+	            try:
+	                if _vcm.is_locally_quarantined(_id):
+	                    held.add(_id)
+	            except Exception as _probe_exc:
+	                logger.debug("second-chance quarantine probe failed for %s: %r",
+	                    _id, _probe_exc)
+	        return held
+
+	    retry_ids = [i for i in eligible() if i not in _on_local_hold(eligible())]
+	    if not retry_ids and eligible():
+	        # Everything worth retrying sits on a LOCAL session hold;
+	        # starting them now fails in milliseconds. Spend this round
+	        # on ONE wait for the heal sweep instead of a wave of
+	        # instant SESSION_IN_USE fails.
+	        gap = max(30.0, float(getattr(
+	            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
+	        logger.info(
+	            "[VoiceFill] order=%s: %s second-chance candidate(s) sit on a "
+	            "local session hold - waiting %.0fs for the quarantine heal",
+	            order_id, len(eligible()), gap)
+	        try:
+	            await asyncio.sleep(gap)
+	        except asyncio.CancelledError:
+	            return False
+	        if not self._is_order_active(order_id):
+	            return False
+	        retry_ids = [i for i in eligible() if i not in _on_local_hold(eligible())]
 	    if not retry_ids:
 	        return False
 	    budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
@@ -1016,6 +1090,15 @@ class OrderExecutor:
 	                    if (a.get("id") or 0) not in joined_ids
 	                ])
 	                max_rounds = max(0, int(getattr(Config, "VOICE_STARVED_WAIT_ROUNDS", 6)))
+	                # A build must NEVER end at 0/N because of pool contention
+	                # while other orders are live: delivering nothing is strictly
+	                # worse than waiting (billing starts only AFTER the build, so
+	                # the wait itself is free). Orders that already have at least
+	                # one live account keep the short ceiling and deliver
+	                # best-effort.
+	                if live == 0:
+	                    max_rounds = max(max_rounds, int(getattr(
+	                        Config, "VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE", 45)))
 	                starve_gap = max(5.0, float(getattr(Config, "VOICE_STARVED_WAIT_SECONDS", 20)))
 	                if busy_now and pool_left > 0 and starved_rounds < max_rounds:
 	                    starved_rounds += 1
@@ -1233,7 +1316,26 @@ class OrderExecutor:
 	                        continue
 
 	                if "SESSION_IN_USE" in msg.upper():
-	                    # A local owner is serving this key; do not turn the
+	                    if _is_local_session_hold(msg):
+	                        # LOCAL auth-key hold only: the account is healthy
+	                        # and the heal sweep may release it within minutes.
+	                        # Keep the attempt budget, never terminalise the
+	                        # slot - defer past the next heal window instead.
+	                        hold = max(30.0, float(getattr(
+	                            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
+	                        self._voice_retry_after.setdefault(order_id, {})[aid] = \
+	                            time.time() + hold
+	                        logger.warning(
+	                            f"Order {order_id}: account {aid} local session hold "
+	                            f"(previous disconnect unconfirmed) - retry deferred "
+	                            f"{hold:.0f}s for the quarantine heal, budget kept"
+	                        )
+	                        join_brain.report_result(order_id, OUTCOME_SYSTEM, msg)
+	                        wave_fail += 1
+	                        wave_system += 1
+	                        continue
+	                    # A local owner is serving this key (or the DB row is
+	                    # quarantined for a typed 406); do not turn the
 	                    # second-chance loop into repeated connection probes.
 	                    self._voice_banned[order_id].add(aid)
 	                    self._voice_terminal[order_id].add(aid)
@@ -1839,7 +1941,10 @@ class OrderExecutor:
 		except SessionInUseError as e:
 			# Same session is held by the voice engine — opening a duplicate
 			# connection would revoke the auth key. Skip (never mark dead).
-			return {"success": False, "status": "failed", "msg": f"SESSION_IN_USE: {e}"}
+			# The [reason] tag lets the wave classifier tell a healable
+			# local hold apart from a durable one.
+			return {"success": False, "status": "failed",
+					"msg": f"SESSION_IN_USE[{getattr(e, 'reason', 'voice') or 'voice'}]: {e}"}
 		except Exception as e:
 			return {"success": False, "status": "error", "msg": str(e)}
 

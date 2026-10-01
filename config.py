@@ -163,6 +163,11 @@ class Config:
     VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
     VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
     VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    # 🩹 خودترمیم نگه‌داشتن‌های محلی (quarantine heal): اکانتی که قطعِ اتصالش تأیید نشده بوده موقتاً در همین پروسه قفل می‌شود؛ جاروی نگهدار دوباره بررسی می‌کند و قفل را برمی‌دارد. این فاصله (ثانیه) مبنای تلاشِ مجدد در manager و مهلت تأخیرِ executor است. حادثة ۱۴۰۵-۰۷-۱۱: طوفانِ تایم‌اوت ۲۲ از ۴۲ اکانتِ سالم را تا پایانِ پروسه میخکوب کرد و بیلدِ جدید ۰/۲۲ شد.
+    VOICE_QUARANTINE_HEAL_SECONDS = int(os.getenv('VOICE_QUARANTINE_HEAL_SECONDS', '180'))
+    VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP = int(os.getenv('VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP', '6'))
+    # سقف صبر برای آزادشدن استخر وقتی هنوز حتی یک اکانت زنده نداریم (هر راند = VOICE_STARVED_WAIT_SECONDS ثانیه).
+    VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE', '45'))
     VOICE_RAM_SOFT_LIMIT_MB = int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0'))
     # 'auto' tests one canary per chat; other accounts use media until a
     # participant-list AND native-binding observation proves its dwell time.
