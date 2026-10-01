@@ -1,8 +1,8 @@
 diff --git a/.env.example b/.env.example
-index cfd55d7..fc2c4f4 100644
+index cfd55d7..d9e7031 100644
 --- a/.env.example
 +++ b/.env.example
-@@ -133,6 +133,26 @@ VOICE_JOIN_SEQUENTIAL_PREWARM=false
+@@ -133,6 +133,34 @@ VOICE_JOIN_SEQUENTIAL_PREWARM=false
  VOICE_ACCOUNT_ATTEMPT_LIMIT=2
  VOICE_SECOND_CHANCE_ROUNDS=0
  VOICE_SECOND_CHANCE_COOLDOWN_SECONDS=60
@@ -26,14 +26,22 @@ index cfd55d7..fc2c4f4 100644
 +# اسنپ‌شات اشتراکیِ لیست شرکت‌کنندگان در ویس‌کال‌های بزرگ ناقص می‌شود؛ «غایب»
 +# فقط بعد از یک بررسیِ مستقیمِ همان اکانت به قطع‌شدن/ری‌جوین تبدیل می‌شود.
 +VOICE_PRESENCE_DIRECT_RECHECK=true
++# اگر خودِ ویس‌چت از سمت تلگرام بسته شود، همهٔ اکانت‌ها بیرون می‌افتند و هر
++# تلاش ری‌جوین/بازسازی مدیا فقط «Call ... already removed» تولید می‌کند. یک
++# آپدیت تنها کافی نیست: چت وقتی «بسته» علامت می‌خورد که این تعداد اکانتِ همان
++# سفارش در این بازهٔ ثانیه‌ای تأییدش کنند، و تا این مدت ثانیه‌ای تلاش بی‌فایده
++# متوقف می‌شود (یک join موفق فوراً پاکش می‌کند).
++VOICE_CHAT_CLOSED_MIN_ACCOUNTS=2
++VOICE_CHAT_CLOSED_WINDOW_SECONDS=60
++VOICE_CHAT_CLOSED_GRACE_SECONDS=300
  # media = استریم سکوت فعلی؛ auto = یک شنوندهٔ آزمایشی در هر چت تا تأیید
  # دوگانهٔ حضور و binding؛ خطا/قطع => بازگشت به استریم؛ listener = opt-in صریح.
  VOICE_SILENCE_MODE=media
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..d6569c8 100644
+index 5ed9f7c..6778120 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -9,6 +9,23 @@
+@@ -9,6 +9,25 @@
  
  ---
  
@@ -48,7 +56,9 @@ index 5ed9f7c..d6569c8 100644
 +- **تایم‌اوت بالاآمدن انجین دیگر اکانت را برای همیشه قرنطینه نمی‌کند.** `_start_engine_with_retries` همان هندل `PyTgCalls` را تا `VOICE_ENGINE_START_ATTEMPTS` بار (پیش‌فرض ۳) با `VOICE_ENGINE_START_TIMEOUT` دوباره `start()` می‌کند؛ انجین دوم روی همان کلید ساخته نمی‌شود. پیام `client init error: ` (خالی، از `TimeoutError` بی‌متن) هم دیگر خالی نیست و نوع/دلیل خطا را می‌برد. در سفارش ۹۳۰ همین یک تایم‌اوت ۱۵ ثانیه‌ای اکانت‌های ۱۵۶ و ۱۴۲ را سوزاند و بیلد روی ۳۸/۴۲ تمام شد.
 +- **«بی‌پیشرفت» در فاز ساخت سقف دارد و کسری همیشه گزارش می‌شود.** حلقهٔ ساخت هر دور انتظارِ بدون رشد live را می‌شمارد (`VOICE_BUILD_MAX_STALL_ROUNDS`) و هنگام پایان زیر هدف، یک هشدار صریح با تفکیک دلیل جاهای خالی می‌دهد: `terminal/unusable`، `out-of-budget`، `retryable-left`، `held-by-other-orders` (هم در لاگ، هم در `active_orders[order]["build_shortfall"]`). اکانت‌های `_voice_terminal` هم دیگر نه انتخاب می‌شوند و نه بیلد را بیدار نگه می‌دارند.
 +- **«غایب» اسنپ‌شات اشتراکی، تنها مدرک قطع‌شدن نیست.** اسنپ‌شات اشتراکی هر چت در هر سیکل یک پیمایش صفحه‌بندی‌شده است و در ویس‌کال‌های بزرگ می‌تواند ناقص باشد؛ در سفارش ۹۳۰ هشت اکانت پشت‌سرهم `media_transport_lost → confirmed_disconnect → recovered` می‌شدند و هر بار ری‌جوین تازه می‌زدند. اکنون قبل از اینکه «غایب» به شمارش قطع‌شدن (و ری‌جوین) برسد، یک بررسی مستقیمِ همان اکانت (`_is_in_voice_call(force_direct=True)`) انجام می‌شود: `True` ⇒ اسنپ‌شات ناقص بوده و اسلات می‌ماند، `None` ⇒ ناشناخته و شمارش نمی‌شود، `False` ⇒ قطع واقعی و مسیر بازگشت مثل قبل. با `VOICE_PRESENCE_DIRECT_RECHECK=false` می‌توان خاموشش کرد.
-+- **تست:** ۱۸ تست تازه (`tests/test_telegram_system_failures.py`، `tests/test_presence_direct_recheck.py` و دو تست چرخهٔ انجین) + به‌روزرسانی تست قبلی تایم‌اوت انجین. کل سوئیت: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip**. این‌ها آزمون آفلاین‌اند: رفتار زندهٔ تلگرام (InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند.
++- **آپدیتهای موتور برای چتهایی که سفارش در آنها نیست، دیگر به سفارش نسبت داده نمیشوند.** در لاگ سفارش ۹۳۲، آپدیتهای کهنهٔ چتِ سفارش ۹۳۰ (همان اکانتها، سفارش قبلی) با `order=932` لاگ میشد و ردیف drop جعلی مینوشت و حتی listener چت بیربط را خاموش میکرد. اکنون فقط binding فعالِ همان (اکانت، چت) میتواند رکورد سفارش بسازد؛ بقیه با `stale_chat_update` ثبت میشوند و به دفتر drop راه پیدا نمیکنند.
++- **«ویس‌چت از سمت مقابل بسته شد» تشخیص داده میشود و چرخهٔ بیهوده قطع میشود.** در سفارش ۹۳۲، مشتری ۵۰ ثانیه بعد از شروع بیلینگ کال را بست؛ همهٔ اکانتها `CLOSED_VOICE_CHAT` دادند ولی ربات همچنان `live=40/42` میشمرد و بازسازی مدیا را تکرار میکرد که فقط `ntgcalls: Call ... not found, already removed` تولید میکرد. اکنون چت با تأیید چند اکانتِ همان سفارش (`VOICE_CHAT_CLOSED_MIN_ACCOUNTS` در بازهٔ `VOICE_CHAT_CLOSED_WINDOW_SECONDS`) «بسته» علامت میخورد، تا `VOICE_CHAT_CLOSED_GRACE_SECONDS` هیچ ری‌جوین/بازسازی مدیایی انجام نمیشود، یک join موفق فوراً پاکش میکند (کال تازه در همان گروه سرو میشود)، و اجراکننده وضعیت را صریح نشان میدهد: `chat=CLOSED` در شمارش ثانیهها + یک هشدار خط + `active_orders[order]["chat_closed"]`.
++- **تست:** ۱۰ تست تازه در `tests/test_voice_chat_closed.py` (نسبتدهی درست، تأیید حداقلی، توقف بازسازی مدیا، انقضا، پاک‌شدن با join موفق، سیم‌کشی اجراکننده). کل سوئیت: **۶۱۶ تست، ۶۱۰ موفق، ۶ skip** (۱۰ تست تازه از آخرین استقرار). این‌ها آزمون آفلاین‌اند: رفتار زندهٔ تلگرام (InterDC، لیست شرکت‌کنندگان، باز/بسته شدن کال) را اثبات نمی‌کنند.
 +
 +</div>
 +
@@ -58,10 +68,10 @@ index 5ed9f7c..d6569c8 100644
  
  <div dir="rtl">
 diff --git a/config.py b/config.py
-index e33815d..3388376 100644
+index e33815d..e57d693 100644
 --- a/config.py
 +++ b/config.py
-@@ -249,6 +249,35 @@ class Config:
+@@ -249,6 +249,44 @@ class Config:
      # Telegram still answers with FloodWait (server-directed waits are always
      # respected first — this only paces NEW waves).
      VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
@@ -94,15 +104,24 @@ index e33815d..3388376 100644
 +    # a confirmed disconnect (and a rejoin), confirm it with a DIRECT
 +    # per-account presence check.
 +    VOICE_PRESENCE_DIRECT_RECHECK = os.getenv('VOICE_PRESENCE_DIRECT_RECHECK', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
++    # ── voice chat closed by the other side ─────────────────────────────────
++    # When Telegram reports the chat's call as CLOSED (the customer ended it),
++    # accounts cannot be present any more. A chat is only marked closed after
++    # this many distinct accounts of the same order report it inside the
++    # window below; the marker then suppresses futile rejoin/media-restore
++    # attempts for this long (a successful join clears it immediately).
++    VOICE_CHAT_CLOSED_MIN_ACCOUNTS = int(os.getenv('VOICE_CHAT_CLOSED_MIN_ACCOUNTS', '2'))
++    VOICE_CHAT_CLOSED_WINDOW_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_WINDOW_SECONDS', '60'))
++    VOICE_CHAT_CLOSED_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_GRACE_SECONDS', '300'))
      # Driver-level attempt budget per account (start_call itself already does
      # bounded retries + respects FloodWait internally).
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..d3ace80
+index 0000000..a213132
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,159 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -217,11 +236,49 @@ index 0000000..d3ace80
 +- فقط اگر درخت سرور دقیقاً هم‌سن `d08a4d8` باشد، `v2323-voice-join-fixes.diff` (۷۴KB) هم
 +  کافی است؛ روی پورت‌های قدیمی‌تر اعمال نمی‌شود چون خودِ پورت قدیمی‌تر است.
 +
-+## ۷) آزمون‌ها
++## ۷) بعد از استقرار — دو یافتهٔ نو (۱۴۰۵/۰۷/۰۹، سفارش ۹۳۲)
 +
-+سوئیت کامل: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip** (۱۸ تست تازه). این‌ها آفلاین‌اند و رفتار
-+زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند؛
-+تأیید نهایی همان لاگ پروداکشن است.
++### الف) مشتری خودش کال را بست
++
++در سفارش ۹۳۲، ۵۰ ثانیه بعد از شروع بیلینگ، چت از سمت تلگرام `CLOSED_VOICE_CHAT` شد و
++همهٔ ۴۰ اکانت بیرون افتادند، ولی ربات همچنان `live=40/42` می‌شمرد و برای هر اکانت
++بازسازی مدیا را تکرار می‌کرد؛ نتیجه فقط طوفان `ntgcalls: Call ... not found, already removed`
++بود. اکنون:
++
++- چت با تأیید حداقل `VOICE_CHAT_CLOSED_MIN_ACCOUNTS` اکانتِ همان سفارش در بازهٔ
++  `VOICE_CHAT_CLOSED_WINDOW_SECONDS` «بسته» علامت می‌خورد (یک آپدیت تنها کافی نیست؛
++  ممکن است آرتیفکت محلی باشد).
++- تا `VOICE_CHAT_CLOSED_GRACE_SECONDS` هیچ ری‌جوین/بازسازی مدیایی برای آن چت انجام
++  نمی‌شود؛ یک لاگ صریح `[VoiceChatClosed] …` می‌آید.
++- یک **join موفق فوراً علامت را پاک می‌کند**، پس اگر مشتری کال تازه‌ای در همان گروه
++  شروع کند، همان اکانت‌ها برمی‌گردند (مسیر monitor دست‌نخورده است).
++- در شمارش ثانیه‌ها وضعیت اضافه می‌شود: `Order 932: 41:20 | live=40/42 | chat=CLOSED`
++  به‌همراه یک هشدار خط و `active_orders[932]["chat_closed"] = True`.
++
++**این یک تصمیم محصولی است که عمداً تغییر نداده‌ام:** تایمر/بیلینگ همان‌طور ادامه
++می‌یابد. اگر می‌خواهید وقتی مشتری کال را می‌بندد سفارش «متوقف/تسویه» شود، بگویید؛
++یک خط تغییر است ولی روی پول و تسویه اثر دارد.
++
++### ب) آپدیت‌های کهنهٔ چت‌های سفارش‌های قبلی
++
++در همان لاگ، خطوطی مثل `order=932 acc=117 chat=-1001956513128` دیده می‌شد؛ آن chat
++متعلق به **سفارش ۹۳۰** است، نه ۹۳۲. اکانت‌ها آبونمان‌های کالِ سفارش‌های قبلی را نگه
++می‌دارند و کد قدیمی این آپدیت‌ها را به سفارش فعلی نسبت می‌داد: ردیف drop جعلی در
++`logs/voice_drops.log` و خاموش‌کردن listener یک چت بی‌ربط. اکنون فقط binding فعالِ
++همان (اکانت، چت) رکورد سفارش می‌سازد؛ بقیه `stale_chat_update` می‌خورند.
++
++### پ) اکانت‌های فریزشده
++
++در سفارش ۹۳۲ اکانت‌های **۱۳۹ و ۱۵۱** با `[420 FROZEN_METHOD_INVALID]` رد شدند و
++درست هم مدیریت شد (بعد از یک بار: «permanent failure — excluded from second-chance
++retries»). ولی یعنی استخر قابل‌استفاده ۴۰ تاست؛ برای ۴۲/۴۲ باید این دو اکانت
++جایگزین یا از استخر خارج شوند.
++
++## ۸) آزمون‌ها
++
++سوئیت کامل: **۶۱۶ تست، ۶۱۰ موفق، ۶ skip** (۱۸ + ۱۰ تست تازه). این‌ها آفلاین‌اند و
++رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
++کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است.
 +
 +</div>
 diff --git a/services/join_brain.py b/services/join_brain.py
@@ -365,7 +422,7 @@ index 52c1932..e707471 100644
              policy.retryable_fails += 1
  
 diff --git a/services/order_executor.py b/services/order_executor.py
-index dfbf816..b6b54de 100644
+index dfbf816..7ed8922 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
 @@ -19,6 +19,11 @@ from services.session_ownership import (SessionInUseError, is_auth_key_duplicate
@@ -380,7 +437,58 @@ index dfbf816..b6b54de 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -581,7 +586,10 @@ class OrderExecutor:
+@@ -383,6 +388,13 @@ class OrderExecutor:
+ 	                self.active_orders[order_id]["end_time"] = end_time
+ 	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
+ 
++	            # The customer (or an admin) can end the group call while the paid timer
++	            # still runs. Telegram then reports CLOSED_VOICE_CHAT for every account;
++	            # the VCM flags the chat and stops futile rejoin/media-restore attempts.
++	            # Surface that here instead of logging a healthy live=40/42 that is no
++	            # longer being served.
++	            _chat_closed_now = False
++	            _chat_closed_logged = False
+ 	            _tick = 0
+ 	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
+ 	            _log_interval = 10
+@@ -413,6 +425,7 @@ class OrderExecutor:
+ 	                    logger.info(
+ 	                        f"Order {order_id}: {_format_timer(remaining_now)} "
+ 	                        f"| live={live}/{exact}"
++	                        + (" | chat=CLOSED" if _chat_closed_now else "")
+ 	                    )
+ 
+ 	                if _tick % _check_interval == 0 and _tick > 0:
+@@ -455,6 +468,7 @@ class OrderExecutor:
+ 	                    if order_id in self.active_orders:
+ 	                        self.active_orders[order_id]["live_count"] = live
+ 	                        self.active_orders[order_id]["joined_accounts"] = joined_list
++	                        self.active_orders[order_id]["chat_closed"] = _chat_closed_now
+ 	                    # Durable live count is not continuous media presence.
+ 	                    # Surface the native binding signal separately (it too
+ 	                    # cannot guarantee end-to-end WebRTC packet delivery).
+@@ -463,6 +477,20 @@ class OrderExecutor:
+ 	                        _vcm = _get_voice_call_manager()
+ 	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
+ 	                            _binding = _vcm.get_binding_status_counts(order_id)
++	                        if _vcm is not None and hasattr(_vcm, "is_chat_closed"):
++	                            try:
++	                                _chat_closed_now = bool(_vcm.is_chat_closed(order_id))
++	                            except Exception:
++	                                _chat_closed_now = False
++	                            if _chat_closed_now and not _chat_closed_logged:
++	                                _chat_closed_logged = True
++	                                logger.error(
++	                                    "Order %s: the voice chat is CLOSED on Telegram's side "
++	                                    "(%s/%s counted). The call has ended - presence cannot be "
++	                                    "served into a closed call; the timer keeps running. Start "
++	                                    "a new voice chat in the group or cancel the order.",
++	                                    order_id, live, exact,
++	                                )
+ 	                    logger.info(
+ 	                        "Order %s: durable_live=%s/%s | native_binding=%s "
+ 	                        "(not proof of UDP packet delivery)",
+@@ -581,7 +609,10 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -392,7 +500,7 @@ index dfbf816..b6b54de 100644
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
  	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
-@@ -636,7 +644,10 @@ class OrderExecutor:
+@@ -636,7 +667,10 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -404,7 +512,7 @@ index dfbf816..b6b54de 100644
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
  	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
-@@ -796,6 +807,14 @@ class OrderExecutor:
+@@ -796,6 +830,14 @@ class OrderExecutor:
  	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
  	    wave_no = 0
  	    starved_rounds = 0
@@ -419,7 +527,7 @@ index dfbf816..b6b54de 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -803,6 +822,9 @@ class OrderExecutor:
+@@ -803,6 +845,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -429,7 +537,7 @@ index dfbf816..b6b54de 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -890,6 +912,14 @@ class OrderExecutor:
+@@ -890,6 +935,14 @@ class OrderExecutor:
  	                # Should not happen (a ready account would have been
  	                # selected); avoid any possibility of a hot spin.
  	                break
@@ -444,7 +552,7 @@ index dfbf816..b6b54de 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -975,6 +1005,15 @@ class OrderExecutor:
+@@ -975,6 +1028,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -460,7 +568,7 @@ index dfbf816..b6b54de 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -1018,6 +1057,7 @@ class OrderExecutor:
+@@ -1018,6 +1080,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -468,7 +576,7 @@ index dfbf816..b6b54de 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -1028,6 +1068,7 @@ class OrderExecutor:
+@@ -1028,6 +1091,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -476,7 +584,7 @@ index dfbf816..b6b54de 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -1049,6 +1090,7 @@ class OrderExecutor:
+@@ -1049,6 +1113,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -484,7 +592,7 @@ index dfbf816..b6b54de 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -1067,6 +1109,7 @@ class OrderExecutor:
+@@ -1067,6 +1132,7 @@ class OrderExecutor:
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -492,7 +600,7 @@ index dfbf816..b6b54de 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -1088,8 +1131,29 @@ class OrderExecutor:
+@@ -1088,8 +1154,29 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -522,7 +630,7 @@ index dfbf816..b6b54de 100644
  
  	                if outcome == OUTCOME_PERMANENT:
  	                    # A permanent failure produces the IDENTICAL error on every retry,
-@@ -1104,6 +1168,7 @@ class OrderExecutor:
+@@ -1104,6 +1191,7 @@ class OrderExecutor:
  	                    self._mark_voice_account_permanent(order_id, aid, msg, attempt_budget)
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -530,7 +638,7 @@ index dfbf816..b6b54de 100644
  	                    logger.warning(
  	                        f"Order {order_id}: account {aid} permanent failure "
  	                        f"({msg[:90]}) - excluded from second-chance retries"
-@@ -1158,11 +1223,16 @@ class OrderExecutor:
+@@ -1158,11 +1246,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -549,7 +657,7 @@ index dfbf816..b6b54de 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1196,6 +1266,44 @@ class OrderExecutor:
+@@ -1196,6 +1289,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
@@ -595,10 +703,39 @@ index dfbf816..b6b54de 100644
  	    # merging them into the order's running joined_accounts list (the
  	    # VoiceCallManager remains the authoritative source for counting).
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 51fde01..f2f67c8 100644
+index 51fde01..7786677 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
-@@ -2098,19 +2098,79 @@ class VoiceCallManager:
+@@ -713,6 +713,18 @@ class VoiceCallManager:
+         self._listener_drops = 0
+         self._listener_globally_disabled = False
+ 
++        # ── REMOTE-CLOSED VOICE CHATS (the customer ended the call) ─────────
++        # Telegram reports the chat's group call as CLOSED; the accounts cannot
++        # be present any more and every rejoin/media-restore attempt against a
++        # removed call only produced `ntgcalls: Call ... not found, already
++        # removed` noise for the rest of the paid hour (order 932, 2026-10-01).
++        # One update can be a local artefact, so a chat is marked closed only
++        # after several distinct accounts of the SAME order report it.
++        # _chat_closed_reports[(order_id, chat_id)] = {"accounts": set, "first_ts": float}
++        # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
++        self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
++        self._chat_closed_until: Dict[Tuple[int, int], float] = {}
++
+         # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
+         # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
+         # This is the AUTHORITATIVE count for an order. It is NEVER decremented
+@@ -1403,6 +1415,9 @@ class VoiceCallManager:
+ 
+         Returns True if newly registered, False if already registered.
+         """
++        # A successful join proves the chat is serviceable again (a new call may
++        # have been started in the same group) — drop any "closed" marker.
++        self._clear_chat_closed(order_id, chat_id)
+         if order_id not in self.joined_accounts_by_order:
+             self.joined_accounts_by_order[order_id] = {}
+         inner = self.joined_accounts_by_order[order_id]
+@@ -2098,19 +2113,79 @@ class VoiceCallManager:
                      # start() can time out AFTER native WebRTC initialized.
                      # Retain the original engine before awaiting it. A retry
                      # must never construct a second engine on a transport that
@@ -686,7 +823,166 @@ index 51fde01..f2f67c8 100644
      async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
          # IMPORTANT: use the SAME per-account lock as the warmup/create path.
          # Previously we popped the client (and even removed its lock) BEFORE
-@@ -2791,6 +2851,54 @@ class VoiceCallManager:
+@@ -2296,6 +2371,109 @@ class VoiceCallManager:
+                 return oid
+         return None
+ 
++    def _active_order_for_chat(self, account_id: int, chat_id: int) -> Optional[int]:
++        """Order this account is CURRENTLY serving in THIS exact chat.
++
++        Deliberately stricter than ``_order_id_for_account``: a durable join
++        record is not proof that a later engine update belongs to that order.
++        Accounts keep stale call subscriptions from earlier orders — the first
++        1405-07-09 log showed order-930 chat updates surfacing under a later
++        order, which disabled listeners and wrote bogus drop rows for chats the
++        order never used. Only an ACTIVE binding may produce order records.
++        """
++        for (oid, aid), info in self.active_calls.items():
++            if aid == account_id and int((info or {}).get("chat_id") or 0) == int(chat_id or 0):
++                return oid
++        return None
++
++    @staticmethod
++    def _is_closed_status(status: Any) -> bool:
++        """True when an engine chat update says the CALL itself is gone.
++
++        PyTgCalls distinguishes ``Status.CLOSED_VOICE_CHAT`` (the call ended)
++        from a plain ``LEFT_CALL`` (this client left). Only the former means
++        "this chat has no call any more", which is what suppresses rejoins.
++        """
++        try:
++            text = str(getattr(status, "name", status) or "")
++        except Exception:
++            text = ""
++        return "CLOSED" in text.upper()
++
++    def _note_chat_closed(self, order_id: int, account_id: int, chat_id: int,
++                          status: Any) -> None:
++        """Corroborated marker: the chat's voice call itself is CLOSED.
++
++        One engine update can be a local artefact, so the chat is only treated
++        as closed after ``VOICE_CHAT_CLOSED_MIN_ACCOUNTS`` distinct accounts of
++        the same order report it inside ``VOICE_CHAT_CLOSED_WINDOW_SECONDS``.
++        While the marker is active nothing rejoins or rebuilds media for that
++        chat (Telegram already removed the call). A successful join clears it,
++        so a NEW call started later in the same group is served again.
++        """
++        try:
++            key = (int(order_id), int(chat_id))
++            now = time.time()
++            min_accounts = max(1, int(getattr(Config, "VOICE_CHAT_CLOSED_MIN_ACCOUNTS", 2)))
++            window = max(1.0, float(getattr(Config, "VOICE_CHAT_CLOSED_WINDOW_SECONDS", 60)))
++            grace = max(0.0, float(getattr(Config, "VOICE_CHAT_CLOSED_GRACE_SECONDS", 300)))
++
++            rec = self._chat_closed_reports.get(key)
++            if rec is None or now - float(rec.get("first_ts") or 0.0) > window:
++                rec = {"accounts": set(), "first_ts": now}
++                self._chat_closed_reports[key] = rec
++            rec["accounts"].add(int(account_id))
++            seen = len(rec["accounts"])
++
++            if seen < min_accounts:
++                logger.info(
++                    "[VoiceChatClosed] order=%s chat=%s: account %s reports %s "
++                    "(confirmations %s/%s)",
++                    order_id, chat_id, account_id, status, seen, min_accounts,
++                )
++                return
++
++            if self._chat_closed_until.get(key, 0.0) > now:
++                return  # already marked and still active → log once
++            self._chat_closed_until[key] = now + grace
++            logger.warning(
++                "[VoiceChatClosed] order=%s chat=%s: Telegram reports the voice chat "
++                "as CLOSED (%s accounts in %.0fs) — suppressing rejoin/media-restore "
++                "for %.0fs. The call is over on Telegram's side; the order timer "
++                "keeps running.",
++                order_id, chat_id, seen, now - float(rec["first_ts"]), grace,
++            )
++            self._vc_event_log(order_id, account_id, "chat_closed_remote", {
++                "chat_id": int(chat_id), "accounts": seen, "grace_s": grace,
++            })
++        except Exception as exc:  # telemetry must never break the engine handler
++            logger.debug("chat_closed marking skipped: %s", exc)
++
++    def _clear_chat_closed(self, order_id: int, chat_id: int) -> None:
++        key = (int(order_id), int(chat_id))
++        if key in self._chat_closed_until or key in self._chat_closed_reports:
++            self._chat_closed_until.pop(key, None)
++            self._chat_closed_reports.pop(key, None)
++            logger.info("[VoiceChatClosed] order=%s chat=%s: reopened (join succeeded)",
++                        order_id, chat_id)
++
++    def _prune_chat_closed(self) -> None:
++        now = time.time()
++        for key, until in list(self._chat_closed_until.items()):
++            if float(until) <= now:
++                self._chat_closed_until.pop(key, None)
++                self._chat_closed_reports.pop(key, None)
++
++    def is_chat_closed(self, order_id: Optional[int] = None,
++                       chat_id: Optional[int] = None) -> bool:
++        """True while the chat's call is known to be closed (see _note_chat_closed)."""
++        self._prune_chat_closed()
++        if order_id is None:
++            return bool(self._chat_closed_until)
++        if chat_id is None:
++            return any(oid == int(order_id) for (oid, _cid) in self._chat_closed_until)
++        return (int(order_id), int(chat_id)) in self._chat_closed_until
++
+     def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
+         """Register stream-end / kick handlers on a freshly built engine.
+ 
+@@ -2325,8 +2503,22 @@ class VoiceCallManager:
+             @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
+             async def _on_left_call(_engine, update):  # type: ignore[misc]
+                 cid = int(getattr(update, "chat_id", 0) or 0)
+-                order_id = self._order_id_for_account(account_id, cid)
+                 status = getattr(update, "status", "?")
++                # STRICT attribution: only a chat this account CURRENTLY serves
++                # may produce an order drop record. An account keeps stale call
++                # subscriptions from earlier orders (order-930 chat updates were
++                # logged under a later order, disabling listeners and writing
++                # bogus drops for a chat that order never used).
++                order_id = self._active_order_for_chat(account_id, cid)
++                if order_id is None:
++                    logger.info(
++                        "[VoiceChatUpdate] acc=%s chat=%s status=%s — no active order "
++                        "for this chat (stale/foreign call; not recorded)",
++                        account_id, cid, status,
++                    )
++                    self._vc_event_log(None, account_id, "stale_chat_update",
++                                       {"chat_id": cid, "status": str(status)})
++                    return
+                 logger.warning(
+                     "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
+                     order_id, account_id, cid, status,
+@@ -2339,8 +2531,10 @@ class VoiceCallManager:
+                     order_id, account_id, cid, "chat_left_update",
+                     reason=f"engine chat update: {status}",
+                 )
+-                if order_id is not None and (account_id, cid) in self._listener_bindings:
++                if (account_id, cid) in self._listener_bindings:
+                     self._disable_listener_chat(cid, account_id, "left_call_update")
++                if self._is_closed_status(status):
++                    self._note_chat_closed(order_id, account_id, cid, status)
+         except Exception as exc:
+             logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
+ 
+@@ -2501,6 +2695,12 @@ class VoiceCallManager:
+         key = (order_id, account_id)
+         if not self._media_restore_due(key):
+             return
++        if self.is_chat_closed(order_id, chat_id):
++            # The call is gone on Telegram's side: play()/leave_call() can only
++            # fail and used to spam `Call ... not found, already removed`.
++            self._vc_event_log(order_id, account_id, "media_restore_skipped_chat_closed",
++                               {"chat_id": int(chat_id)})
++            return
+         pytg = self.clients.get(account_id)
+         if pytg is None:
+             return
+@@ -2791,6 +2991,54 @@ class VoiceCallManager:
          """
          return True if media_binding is True else participant_presence
  
@@ -741,7 +1037,7 @@ index 51fde01..f2f67c8 100644
      async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
          """Authoritative per-chat media transport liveness.
  
-@@ -3063,21 +3171,30 @@ class VoiceCallManager:
+@@ -3063,21 +3311,30 @@ class VoiceCallManager:
              return None
          return int(my_id) in present_ids
  
@@ -776,7 +1072,7 @@ index 51fde01..f2f67c8 100644
          my_id = None
          try:
              me = getattr(app, "me", None)
-@@ -3094,9 +3211,10 @@ class VoiceCallManager:
+@@ -3094,9 +3351,10 @@ class VoiceCallManager:
              return None
  
          # Fast path: use the shared snapshot taken during the monitor cycle.
@@ -790,7 +1086,7 @@ index 51fde01..f2f67c8 100644
  
          try:
              cached = self._active_call_cache.get(int(chat_id))
-@@ -3732,6 +3850,11 @@ class VoiceCallManager:
+@@ -3732,6 +3990,11 @@ class VoiceCallManager:
                          rec['media_binding_alive'] = media_alive
                          rec['media_binding_checked_at'] = time.time()
                          present = self._media_presence_verdict(present, media_alive)
@@ -802,7 +1098,21 @@ index 51fde01..f2f67c8 100644
                          if media_alive is False:
                              if present is True:
                                  # ── GHOST-MEDIA-ONLY (presence intact) ──────────
-@@ -4147,8 +4270,13 @@ class VoiceCallManager:
+@@ -3878,6 +4141,13 @@ class VoiceCallManager:
+                                           reason="presence absent %dx in a row" % int(fc),
+                                           extra={"fail_cycle": int(fc)})
+ 
++                        if self.is_chat_closed(order_id, cid):
++                            self._vc_event_log(order_id, acc_id, "rejoin_skipped_chat_closed",
++                                               {"chat_id": cid})
++                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = "CHAT_CLOSED"
++                            rec["status"] = "CHAT_CLOSED"
++                            continue
++
+                         rejoined = False
+                         try:
+                             rejoined = await self._recover_same_account(
+@@ -4147,8 +4417,13 @@ class VoiceCallManager:
                  self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                  return False, f"FloodWait:{wait_s}", 0
              except Exception as e:
@@ -1269,6 +1579,223 @@ index 0000000..f6e9403
 +        self.assertEqual(joined, [])
 +        self.assertLess(time.time() - started, 30,
 +                        "the build must give up after the bounded stall rounds")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_voice_chat_closed.py b/tests/test_voice_chat_closed.py
+new file mode 100644
+index 0000000..eedac75
+--- /dev/null
++++ b/tests/test_voice_chat_closed.py
+@@ -0,0 +1,211 @@
++"""A closed voice chat must be recognised — and must stop the futile churn.
++
++Two defects seen in the live log of order 932 (2026-10-01, v2.3.23 + fixes):
++
++1. MISATTRIBUTED ENGINE UPDATES.  ``_order_id_for_account`` fell back to "any
++   order this account is durably joined to", so an account that still held a
++   stale call subscription from an EARLIER order produced drop entries for the
++   current order and disabled its listener::
++
++       15:12:35 [VoiceChatUpdate] order=932 acc=117 chat=-1001956513128 ...
++       15:12:35 [VoiceDrop] order=932 acc=117 chat=-1001956513128
++                event=media_transport_lost ...
++
++   ``-1001956513128`` is order 930's chat (same account, previous order), never
++   order 932's.  Attribution is now strict: only an ACTIVE binding of the same
++   (account, chat) may create an order record; anything else is logged as a
++   stale/foreign call and is NOT written to the drop ledger.
++
++2. CLOSED CALL KEPT BEING "RECOVERED".  The customer ended the group call 50s
++   into the paid hour; every account reported ``Status.CLOSED_VOICE_CHAT``
++   while the bot kept counting live=40/42 and retried media restore, producing
++   the ``ntgcalls: Call ... not found, already removed`` storm.  A chat now gets
++   a corroborated "closed" marker (>= VOICE_CHAT_CLOSED_MIN_ACCOUNTS distinct
++   accounts of the same order within VOICE_CHAT_CLOSED_WINDOW_SECONDS) that
++   suppresses rejoin/media-restore for VOICE_CHAT_CLOSED_GRACE_SECONDS, and a
++   successful join clears it (a new call in the same group is served again).
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++import time
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="chat-closed-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++import services.voice_call_manager as vcm_mod  # noqa: E402
++from services.voice_call_manager import VoiceCallManager  # noqa: E402
++
++ORDER = 932
++CHAT = -1002210423832          # order 932's own chat
++FOREIGN_CHAT = -1001956513128  # order 930's chat — same accounts, older order
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class _FakeEngine:
++    """Captures the handlers ``_attach_engine_handlers`` registers."""
++
++    def __init__(self):
++        self.handlers = []  # [(filter_tag, callable)]
++
++    def on_update(self, update_filter):
++        def _decorator(fn):
++            self.handlers.append((update_filter, fn))
++            return fn
++        return _decorator
++
++    def chat_update_handler(self):
++        for tag, fn in self.handlers:
++            if tag == "CHAT_UPDATE":
++                return fn
++        raise AssertionError("no chat_update handler registered")
++
++
++class _Filters:
++    """Stand-in for ``pytgcalls.filters`` so handlers are identifiable."""
++
++    @staticmethod
++    def stream_end(_kind):
++        return "STREAM_END"
++
++    @staticmethod
++    def chat_update(_status):
++        return "CHAT_UPDATE"
++
++
++def _attach(mgr, account_id):
++    """Attach the real handlers to a fake engine and return the chat handler."""
++    engine = _FakeEngine()
++    with mock.patch.object(vcm_mod, "pytgcalls_filters", _Filters), \
++            mock.patch.object(vcm_mod, "StreamEnded",
++                              SimpleNamespace(Type=SimpleNamespace(AUDIO=1))), \
++            mock.patch.object(vcm_mod, "ChatUpdate",
++                              SimpleNamespace(Status=SimpleNamespace(LEFT_CALL=1))):
++        mgr._attach_engine_handlers(engine, account_id)
++    return engine, engine.chat_update_handler()
++
++
++def _closed_update(chat_id):
++    return SimpleNamespace(chat_id=chat_id, status="Status.CLOSED_VOICE_CHAT")
++
++
++class ChatUpdateAttributionTests(unittest.TestCase):
++    """Engine updates for chats the order doesn't use must not be recorded."""
++
++    def setUp(self):
++        self.mgr = VoiceCallManager()
++        self.mgr.active_calls[(ORDER, 117)] = {"chat_id": CHAT, "joined_at": time.time()}
++        self.mgr.joined_accounts_by_order[ORDER] = {117: {"chat_id": CHAT}}
++        self.engine, self.handler = _attach(self.mgr, 117)
++
++    def _fire(self, chat_id):
++        with mock.patch.object(self.mgr, "_record_drop") as drop, \
++                mock.patch.object(self.mgr, "_vc_event_log") as events, \
++                mock.patch.object(self.mgr, "_disable_listener_chat") as listener:
++            # the engine callback is async: run it for real
++            asyncio.run(self.handler(self.engine, _closed_update(chat_id)))
++        names = [c.args[2] for c in events.call_args_list]
++        return drop, names, listener
++
++    def test_an_update_for_a_chat_the_order_does_not_use_is_not_a_drop(self):
++        drop, names, listener = self._fire(FOREIGN_CHAT)
++        drop.assert_not_called()
++        listener.assert_not_called()
++        self.assertIn("stale_chat_update", names,
++                      "a foreign call must be on record as stale, not as a drop")
++
++    def test_an_update_for_the_orders_own_chat_is_still_recorded(self):
++        drop, names, _listener = self._fire(CHAT)
++        self.assertIn("chat_left_update", names)
++        drop.assert_called_once()
++        self.assertEqual(int(drop.call_args.args[2]), CHAT)
++
++
++class RemoteClosedChatTests(unittest.TestCase):
++    """Corroborated closure marker: no rejoin / media-restore churn."""
++
++    def setUp(self):
++        self.mgr = VoiceCallManager()
++        for acc in (120, 121):
++            self.mgr.active_calls[(ORDER, acc)] = {"chat_id": CHAT, "joined_at": time.time()}
++
++    def _close_from(self, *accounts):
++        for acc in accounts:
++            engine, handler = _attach(self.mgr, acc)
++            asyncio.run(handler(engine, _closed_update(CHAT)))
++
++    def test_a_single_report_does_not_close_the_chat(self):
++        self._close_from(120)
++        self.assertFalse(self.mgr.is_chat_closed(ORDER, CHAT),
++                         "one engine update can be a local artefact")
++
++    def test_two_accounts_reporting_closure_mark_the_chat_closed(self):
++        self._close_from(120, 121)
++        self.assertTrue(self.mgr.is_chat_closed(ORDER, CHAT))
++        self.assertTrue(self.mgr.is_chat_closed(ORDER), "order-level query used by the executor")
++
++    def test_media_restore_is_skipped_while_the_chat_is_closed(self):
++        self._close_from(120, 121)
++        with mock.patch.object(self.mgr, "_play_silence") as play, \
++                mock.patch.object(self.mgr, "_vc_event_log") as events:
++            asyncio.run(self.mgr._schedule_media_restore(ORDER, 120, CHAT))
++        play.assert_not_called()
++        names = [c.args[2] for c in events.call_args_list]
++        self.assertIn("media_restore_skipped_chat_closed", names)
++
++    def test_the_marker_expires(self):
++        self._close_from(120, 121)
++        self.assertTrue(self.mgr.is_chat_closed(ORDER, CHAT))
++        self.mgr._chat_closed_until[(ORDER, CHAT)] = time.time() - 1  # grace elapsed
++        self.assertFalse(self.mgr.is_chat_closed(ORDER, CHAT))
++
++    def test_a_successful_join_reopens_the_chat(self):
++        self._close_from(120, 121)
++        self.assertTrue(self.mgr.is_chat_closed(ORDER, CHAT))
++        self.mgr.register_join(ORDER, 120, CHAT, "h:abc")
++        self.assertFalse(self.mgr.is_chat_closed(ORDER, CHAT),
++                         "a new call in the same group must be served again")
++
++    def test_the_corroboration_window_and_grace_are_configurable(self):
++        with mock.patch.object(Config, "VOICE_CHAT_CLOSED_MIN_ACCOUNTS", 1), \
++                mock.patch.object(Config, "VOICE_CHAT_CLOSED_GRACE_SECONDS", 5.0):
++            self._close_from(120)
++            self.assertTrue(self.mgr.is_chat_closed(ORDER, CHAT))
++            self.assertLessEqual(self.mgr._chat_closed_until[(ORDER, CHAT)] - time.time(), 5.0)
++
++    def test_a_report_from_a_foreign_chat_is_ignored(self):
++        engine, handler = _attach(self.mgr, 120)
++        asyncio.run(handler(engine, _closed_update(FOREIGN_CHAT)))
++        self.assertFalse(self.mgr.is_chat_closed(ORDER, FOREIGN_CHAT),
++                         "a stale call must never mark the order's chat closed")
++
++
++class ExecutorWiringTests(unittest.TestCase):
++    """The order countdown must say the chat is closed instead of a fake 40/42."""
++
++    def test_the_countdown_consults_the_vcm_and_labels_the_state(self):
++        src = (ROOT / "services" / "order_executor.py").read_text(encoding="utf-8")
++        self.assertIn("is_chat_closed(order_id)", src)
++        self.assertIn('| chat=CLOSED', src)
++        self.assertIn('active_orders[order_id]["chat_closed"]', src)
++        self.assertIn("the voice chat is CLOSED on Telegram's side", src)
 +
 +
 +if __name__ == "__main__":
