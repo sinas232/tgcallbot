@@ -1,5 +1,5 @@
 diff --git a/.env.example b/.env.example
-index 82fa755..d9e7031 100644
+index 82fa755..8acfa8b 100644
 --- a/.env.example
 +++ b/.env.example
 @@ -85,9 +85,19 @@ ORDER_LINK_MODE=any
@@ -25,7 +25,7 @@ index 82fa755..d9e7031 100644
  HEALTH_CHECK_INTERVAL=3600
  LOG_LEVEL=INFO
  
-@@ -123,6 +133,34 @@ VOICE_JOIN_SEQUENTIAL_PREWARM=false
+@@ -123,6 +133,37 @@ VOICE_JOIN_SEQUENTIAL_PREWARM=false
  VOICE_ACCOUNT_ATTEMPT_LIMIT=2
  VOICE_SECOND_CHANCE_ROUNDS=0
  VOICE_SECOND_CHANCE_COOLDOWN_SECONDS=60
@@ -57,10 +57,13 @@ index 82fa755..d9e7031 100644
 +VOICE_CHAT_CLOSED_MIN_ACCOUNTS=2
 +VOICE_CHAT_CLOSED_WINDOW_SECONDS=60
 +VOICE_CHAT_CLOSED_GRACE_SECONDS=300
++# بعد از پاسخ «ادامه می‌دهم»، اگر کال تا این مدت تازه نشود، سفارش خودکار
++# تسویه می‌شود و مبلغ زمانِ سرویس‌نشده به کیف پول برمی‌گردد (۰ = خاموش).
++VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS=600
  # media = استریم سکوت فعلی؛ auto = یک شنوندهٔ آزمایشی در هر چت تا تأیید
  # دوگانهٔ حضور و binding؛ خطا/قطع => بازگشت به استریم؛ listener = opt-in صریح.
  VOICE_SILENCE_MODE=media
-@@ -232,8 +270,16 @@ ANTISPAM_JOIN_GAP_MIN=3.0
+@@ -232,8 +273,16 @@ ANTISPAM_JOIN_GAP_MIN=3.0
  ANTISPAM_JOIN_GAP_MAX=8.0
  # jitter انسانیِ اضافه روی فاصلهٔ join:
  ANTISPAM_JOIN_JITTER_MAX=2.5
@@ -78,7 +81,7 @@ index 82fa755..d9e7031 100644
  # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه):
  ANTISPAM_LEAVE_GAP_MIN=1.5
  ANTISPAM_LEAVE_GAP_MAX=4.0
-@@ -253,3 +299,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
+@@ -253,3 +302,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
  
  # ── ممنوعیت ثبت سفارش جدید پس از لغو (دقیقه) — 0 = خاموش
  CANCEL_COOLDOWN_MINUTES=20
@@ -113,13 +116,31 @@ index f21bf42..c51a865 100644
 +.env.bak.*
 +FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..6778120 100644
+index 5ed9f7c..71cda68 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -9,6 +9,25 @@
+@@ -9,6 +9,43 @@
  
  ---
  
++## سؤال از مشتری وقتی ویس‌چت بسته شد + عودت زمانِ سرویس‌نشده (۲.۳.۲۳)
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۷/۱۰ — روی همان درخت پروداکشن (`c8259a5` + `v2323-full-port.diff`). `BOT_VERSION` عمداً دست‌نخورده مانده؛ برای تأیید استقرار همان خط `🔖 running commit: <sha>` معتبر است.
++
++- **وقتی کالِ گروه از سمت تلگرام بسته می‌شود، از خودِ مشتری می‌پرسیم.** تا پیش از این، ویس‌چتِ بسته فقط «علامت» می‌خورد و تایمر و بیلینگ ادامه داشت (تصمیم قبلی). حالا لحظهٔ بسته‌شدن (`chat_closed_since`) ثبت می‌شود و یک‌بار برای **مالک سفارش** پیامی با دو دکمه می‌رود: «✅ ادامه می‌دهم» / «⛔️ نه، تسویه کن»، به‌همراه یک خطِ فالبک با دکمهٔ ریپلای و ذکر کلمهٔ «پایان». سؤال در هر بسته‌شدن فقط **یک‌بار** پرسیده می‌شود (`_chat_closed_ask_gate`) و با باز شدن کال تازه دوباره مسلح می‌شود.
++- **تا وقتی مشتری جواب نداده، بیلینگ ادامه دارد.** این عمدی و ضدسوءاستفاده است: با بستن کال نمی‌شود زمان مصرفی را مجانی گرفت. اگر مشتری هیچ جوابی ندهد، هیچ اتفاق خودکاری نمی‌افتد و سفارش مثل قبل تا پایان مهلت ادامه می‌یابد.
++- **«نه، تسویه کن» → فقط زمانِ استفاده‌شده تا لحظهٔ بسته‌شدن کال حساب می‌شود** و باقی مبلغ به **کیف پول** برمی‌گردد (`Transaction(type='order_refund')`)؛ نه عودت درگاه. برای این کار `compute_prorated_settlement`/`compute_order_settlement` پارامتر `bill_until` گرفتند (سقفِ بیلینگ؛ هرگز بیشتر از `now`) و `settle_and_refund_order` همان را به `settle_cancel_order` می‌دهد؛ یعنی همان مسیر اتمیکِ قفل‌دارِ لغو. فشردن دوبارهٔ دکمه یا دکمهٔ کهنه فقط پیام «قبلاً لغو شده» می‌گیرد و هیچ عودت دوباره‌ای انجام نمی‌شود (تست idempotency).
++- **«ادامه می‌دهم» یعنی انتظار محدود، نه انتظار بی‌پایان.** مارکر بسته‌بودن پاک می‌شود تا اگر در همان گروه «ویس‌چت تازه» شروع شد اکانت‌ها خودشان برگردند؛ ولی اگر کال تا `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` (پیش‌فرض ۶۰۰ ثانیه) تازه نشود، سفارش **خودکار** با `canceled_by_role='سیستم (کال باز نشد)'` تسویه می‌شود و مبلغ زمانِ سرویس‌نشده برمی‌گردد. اگر تسویه دستی زودتر انجام شده باشد، پیام تکراری/عودت تکراری ندارد.
++- **پیام‌ها به هویت مقیدند.** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام می‌شود؛ مشتری/ربات دیگر نمی‌تواند سفارش دیگری را تسویه کند. فالبک متنی «پایان» هم فقط سفارش‌های «همین کاربر» با `chat_closed` را می‌بندد و اگر چنین سفارشی نباشد، دست به هیچ پیامی نمی‌زند.
++- **هیچ رشتهٔ تازه‌ای در مسیر پرداخت/تماس عوض نشده و `BOT_VERSION` دست‌نخورده است.** کدهای `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` در `config.py`/`.env.example` قابل تنظیم است (۰ = خاموش‌کردن تسویهٔ خودکار پس از پاسخ «ادامه»).
++- **تست:** ۲۶ تست تازه در `tests/test_chat_closed_ask_flow.py` (سقف بیلینگ/`bill_until`، گیتِ یک‌بار‌پرسیدن، انتخاب cutoff از VCM و fallback، پاس‌شدن محاسبه‌گر به لایهٔ DB، متن سؤال و دکمه‌ها، هندلر keep/stop، مالک غیرمجاز، دکمهٔ کهنه، تسویهٔ خودکار پس از مهلت، فالبک متنی «پایان»). کل سوئیت: **۶۴۲ تست، ۶۳۶ موفق، ۶ skip**.
++
++</div>
++
++---
++
 +## بستهٔ اصلاحی روی ۲.۳.۲۳ — خطاهای سمت تلگرام، اسلات‌های سوخته، گزارش کسری، طوفان ghost
 +
 +<div dir="rtl">
@@ -143,7 +164,7 @@ index 5ed9f7c..6778120 100644
  
  <div dir="rtl">
 diff --git a/config.py b/config.py
-index a95d3c1..e57d693 100644
+index a95d3c1..1b1e23e 100644
 --- a/config.py
 +++ b/config.py
 @@ -7,6 +7,32 @@ from dotenv import load_dotenv
@@ -224,7 +245,7 @@ index a95d3c1..e57d693 100644
      # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
      # Accounts of one wave do NOT fire their joins in the same millisecond:
      # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
-@@ -215,6 +249,44 @@ class Config:
+@@ -215,6 +249,48 @@ class Config:
      # Telegram still answers with FloodWait (server-directed waits are always
      # respected first — this only paces NEW waves).
      VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
@@ -266,10 +287,14 @@ index a95d3c1..e57d693 100644
 +    VOICE_CHAT_CLOSED_MIN_ACCOUNTS = int(os.getenv('VOICE_CHAT_CLOSED_MIN_ACCOUNTS', '2'))
 +    VOICE_CHAT_CLOSED_WINDOW_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_WINDOW_SECONDS', '60'))
 +    VOICE_CHAT_CLOSED_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_GRACE_SECONDS', '300'))
++    # پس از پاسخ «ادامه می‌دهم»: اگر کال تا این مدت در همان گروه تازه نشود،
++    # سفارش خودکار تسویه می‌شود (فقط زمانِ تا لحظهٔ بسته‌شدن کال شارژ و
++    # باقی به کیف پول عودت می‌شود). صفر = خاموش.
++    VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS', '600'))
      # Driver-level attempt budget per account (start_call itself already does
      # bounded retries + respects FloodWait internally).
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
-@@ -323,6 +395,11 @@ class Config:
+@@ -323,6 +399,11 @@ class Config:
      ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
      # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
      ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
@@ -281,7 +306,7 @@ index a95d3c1..e57d693 100644
      # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
      ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
      ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
-@@ -362,6 +439,18 @@ class Config:
+@@ -362,6 +443,18 @@ class Config:
      # Hard deadline per adaptive wave: stragglers are cancelled and deferred
      # to the next wave so one slow/stuck account never freezes the build.
      VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
@@ -377,10 +402,10 @@ index d95edf9..4103ec5 100644
        - redis_data:/data
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..a213132
+index 0000000..de31f22
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,202 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -492,8 +517,11 @@ index 0000000..a213132
 +- اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
 +  گاردها را خودش انجام می‌دهد).
 +- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
-+- فقط اگر درخت سرور دقیقاً هم‌سن `d08a4d8` باشد، `v2323-voice-join-fixes.diff` (۷۴KB) هم
-+  کافی است؛ روی پورت‌های قدیمی‌تر اعمال نمی‌شود چون خودِ پورت قدیمی‌تر است.
++- `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
++  تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
++  `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
++  آن‌ها ساختار دیگری دارد. مسیر توصیه‌شده همان «پورت تازهٔ کامل» بالاست که روی درخت
++  تمیز v2.3.23 صددرصد اعمال می‌شود.
 +
 +## ۷) بعد از استقرار — دو یافتهٔ نو (۱۴۰۵/۰۷/۰۹، سفارش ۹۳۲)
 +
@@ -514,9 +542,9 @@ index 0000000..a213132
 +- در شمارش ثانیه‌ها وضعیت اضافه می‌شود: `Order 932: 41:20 | live=40/42 | chat=CLOSED`
 +  به‌همراه یک هشدار خط و `active_orders[932]["chat_closed"] = True`.
 +
-+**این یک تصمیم محصولی است که عمداً تغییر نداده‌ام:** تایمر/بیلینگ همان‌طور ادامه
-+می‌یابد. اگر می‌خواهید وقتی مشتری کال را می‌بندد سفارش «متوقف/تسویه» شود، بگویید؛
-+یک خط تغییر است ولی روی پول و تسویه اثر دارد.
++**تصمیم محصولی که جای این را گرفت:** از ۱۴۰۵/۰۷/۱۰ (بخش ۹) وقتی کال بسته می‌شود
++از خودِ مشتری می‌پرسیم «ادامه می‌دهید یا تسویه؟»؛ با پاسخ «نه»، فقط زمانِ
++استفاده‌شده تا لحظهٔ بسته‌شدن کال حساب می‌شود و باقی به کیف پول برمی‌گردد.
 +
 +### ب) آپدیت‌های کهنهٔ چت‌های سفارش‌های قبلی
 +
@@ -535,11 +563,51 @@ index 0000000..a213132
 +
 +## ۸) آزمون‌ها
 +
-+سوئیت کامل: **۶۱۶ تست، ۶۱۰ موفق، ۶ skip** (۱۸ + ۱۰ تست تازه). این‌ها آفلاین‌اند و
-+رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
-+کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است.
++سوئیت کامل: **۶۴۲ تست، ۶۳۶ موفق، ۶ skip** (۱۸ + ۱۰ + ۲۶ تست تازه). این‌ها آفلاین‌اند
++و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
++کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
++`tests/test_chat_closed_ask_flow.py` هستند.
 +
 +</div>
++
++## ۹) بسته‌شدن کال → سؤال از مشتری + عودت زمانِ سرویس‌نشده (۱۴۰۵/۰۷/۱۰)
++
++قاعدهٔ تازه (جای تصمیم قبلی «تایمر و بیلینگ دست‌نخورده»):
++
++1. **لحظهٔ بسته‌شدن ثبت می‌شود.** `VoiceCallManager` علاوه بر علامتِ بسته‌بودن،
++   لحظهٔ اولین تأیید (`chat_closed_since`) را هم نگه می‌دارد؛ اجراکننده در شمارش
++   ثانیه‌ها `chat=CLOSED` را نشان می‌دهد و این لحظه را در
++   `active_orders[<order>]["chat_closed_at"]` هم می‌گذارد.
++2. **یک‌بار از مالک سفارش پرسیده می‌شود** (گیتِ `_chat_closed_ask_gate`): پیام با دو
++   دکمهٔ `chatclosed_<order>_keep` / `chatclosed_<order>_stop` + یک خطِ فالبک با
++   دکمهٔ ریپلای «⛔️ پایان سفارش» و ذکر این‌که کلمهٔ «پایان» هم قبول است.
++3. **تا جواب دادن مشتری، بیلینگ ادامه دارد** (ضدسوءاستفاده). اگر جوابی نیاید هیچ
++   کار خودکاری انجام نمی‌شود؛ سفارش مثل قبل تا پایان مهلت می‌رود.
++4. **«⛔️ نه، تسویه کن»** → تسویه از همان مسیر اتمیکِ لغو
++   (`settle_cancel_order` با قفل ردیفِ سفارش/کاربر): فقط زمانِ تا
++   `bill_until = chat_closed_since` شارژ می‌شود و باقی به **کیف پول** برمی‌گردد
++   (`Transaction(type='order_refund')`). دکمهٔ کهنه یا فشردن دوباره فقط پیام
++   «قبلاً لغو/تسویه شده» می‌گیرد و عودت دوم انجام نمی‌شود.
++5. **«✅ ادامه می‌دهم»** → مارکر بسته‌بودن پاک می‌شود تا اگر در همان گروه «ویس‌چت
++   تازه» شروع شد اکانت‌ها خودشان برگردند. اگر کال تا
++   `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` (پیش‌فرض ۶۰۰ ثانیه) تازه نشود،
++   سفارش **خودکار** تسویه می‌شود (`canceled_by_role='سیستم (کال باز نشد)'`) و باقی
++   مبلغ برمی‌گردد؛ برای مشتری هم یک پیام خلاصهٔ عودت می‌رود.
++6. **مالکیت:** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام
++   می‌شود؛ نه کسی دیگر می‌تواند سفارش دیگری را ببندد و نه فالبک متنی «پایان» به
++   سفارش کاربر دیگری دست می‌زند (فقط سفارش‌های خودِ همان کاربر با `chat_closed`).
++
++تنظیم‌ها در `.env` (همه اختیاری):
++
++```
++VOICE_CHAT_CLOSED_MIN_ACCOUNTS=2       # چند اکانت باید بسته‌بودن را تأیید کنند
++VOICE_CHAT_CLOSED_WINDOW_SECONDS=60    # بازهٔ تأیید
++VOICE_CHAT_CLOSED_GRACE_SECONDS=300    # مدت بی‌اثر شدن ری‌جوین بعد از بسته‌شدن
++VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS=600   # بعد از «ادامه»، تا این مدت صبر؛ ۰ = خاموش
++```
++
++نکتهٔ عملیاتی: پیام‌ها به تلگرام خودِ کاربر می‌روند؛ اگر بات نمی‌تواند به کاربر پیام
++بدهد (بلاک شده) فقط لاگ هشدار می‌خورد و منطق بیلی/عودت دست‌نخورده است.
 diff --git a/handlers/admin_handlers.py b/handlers/admin_handlers.py
 index 85eca61..789e2d8 100644
 --- a/handlers/admin_handlers.py
@@ -576,8 +644,172 @@ index 85eca61..789e2d8 100644
      async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
          user_id = update.effective_user.id
          if user_id in Config.ADMIN_IDS:
+diff --git a/handlers/order_handlers.py b/handlers/order_handlers.py
+index 6df540e..19ebd5e 100644
+--- a/handlers/order_handlers.py
++++ b/handlers/order_handlers.py
+@@ -586,6 +586,159 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
+ 
+     return ConversationHandler.END
+ 
++# -------------------- بسته‌شدن ویس‌چت توسط مشتری --------------------
++
++def _closed_chat_order_ids(user, bot_id):
++    """سفارش‌های فعالِ همین کاربر که ویس‌چتشان بسته است (فالبک متنی)."""
++    ids = []
++    try:
++        for oid, info in list(order_executor.active_orders.items()):
++            if not isinstance(info, dict):
++                continue
++            if info.get('user_id') != user['id']:
++                continue
++            if int(info.get('bot_id') or 1) != int(bot_id):
++                continue
++            if info.get('chat_closed'):
++                ids.append(oid)
++    except Exception:
++        logger.debug("closed-chat order scan failed", exc_info=True)
++    return ids
++
++
++def _chat_closed_result_text(prefix, summary):
++    refund = summary.get('refund_amount') or 0
++    return (
++        f"{prefix}\n\n"
++        f"💰 مبلغ کل پلن: {format_price(summary['total_cost'])} تومان\n"
++        f"⏱ مصرف تا لحظهٔ بسته‌شدن کال: {format_price(summary['used_cost'])} تومان\n"
++        f"💵 عودت به کیف پول: {format_price(refund)} تومان\n"
++        f"🧾 کد پیگیری عودت: {summary.get('refund_tx_id') or '—'}\n"
++        f"👛 موجودی فعلی کیف‌پول: {format_price(summary['user_wallet_balance'])} تومان"
++    )
++
++
++async def chat_closed_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    """
++    پاسخ مشتری به پیام «ویس‌چت بسته شد» (chatclosed_<order>_keep | _stop).
++
++    keep → ادامه تا پایان مهلت (مارکر بسته‌بودن پاک می‌شود و به کال تازهٔ همان
++           گروه ملحق می‌شویم).
++    stop → تسویهٔ فوری: فقط زمان استفاده‌شده تا لحظهٔ بسته‌شدن کال حساب و
++           باقی مبلغ به کیف پول عودت می‌شود (همان مسیر اتمیک لغو).
++    """
++    query = update.callback_query
++    await safe_answer(query)
++
++    data = query.data or ""
++    m = re.match(r'^chatclosed_(\d+)_(keep|stop)$', data)
++    if not m:
++        return ConversationHandler.END
++    order_id, choice = int(m.group(1)), m.group(2)
++
++    bot_id = context.bot_data.get('bot_id', 1)
++    tg_user_id = update.effective_user.id
++    logger.info("chat_closed_decision_callback fired: user=%s order=%s choice=%s",
++                tg_user_id, order_id, choice)
++
++    try:
++        user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)
++        if not user:
++            await query.edit_message_text("❌ حساب شما در سیستم یافت نشد.")
++            return ConversationHandler.END
++
++        order = await DatabaseManager.get_order(order_id)
++        if not order or order.get('bot_id', 1) != bot_id or order['user_id'] != user['id']:
++            await query.edit_message_text("❌ این سفارش برای شما یا این ربات نیست.")
++            return ConversationHandler.END
++
++        if order['status'] not in ('running', 'scheduled', 'pending'):
++            await query.edit_message_text(
++                "ℹ️ این سفارش دیگر فعال نیست (قبلاً لغو/تکمیل شده است)."
++            )
++            return ConversationHandler.END
++
++        if choice == 'keep':
++            await order_executor.continue_after_chat_closed(order_id)
++            await query.edit_message_text(
++                "✅ باشه، سفارش تا پایان مهلت ادامه می‌دهد.\n\n"
++                "اگر در همان گروه یک «ویس‌چت تازه» شروع کنید، اکانت‌ها خودشان ملحق می‌شوند.\n"
++                "اگر تا پایان مهلتِ تنظیم‌شده کال تازه‌ای شروع نشود، سفارش خودکار بسته "
++                "می‌شود و مبلغ زمانِ استفاده‌نشده به کیف پول برمی‌گردد."
++            )
++            return ConversationHandler.END
++
++        try:
++            summary = await order_executor.settle_chat_closed_order(
++                order_id, bot_id=bot_id, expected_user_id=user['id'],
++            )
++        except ValueError:
++            await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تسویه شده است.")
++            return ConversationHandler.END
++
++        await query.edit_message_text(_chat_closed_result_text(
++            "✅ سفارش خاتمه یافت؛ فقط زمان استفاده‌شده تا لحظهٔ بسته‌شدن کال محاسبه شد.",
++            summary,
++        ))
++    except Exception:
++        logger.exception("chat_closed_decision failed: order=%s", order_id)
++        try:
++            await query.edit_message_text(
++                "❌ خطای غیرمنتظره هنگام پردازش درخواست. لطفاً دوباره تلاش کنید."
++            )
++        except Exception:
++            logger.exception("chat_closed_decision: could not edit the message")
++
++    return ConversationHandler.END
++
++
++async def chat_closed_text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
++    """فالبک متنی: مشتری به‌جای دکمه، «پایان» می‌فرستد تا سفارش تسویه شود."""
++    msg = update.effective_message
++    if not msg or not msg.text:
++        return
++    bot_id = context.bot_data.get('bot_id', 1)
++    try:
++        user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
++    except Exception:
++        user = None
++    if not user:
++        return
++
++    order_ids = _closed_chat_order_ids(user, bot_id)
++    if not order_ids:
++        # سفارشی با ویس‌چتِ بسته وجود ندارد؛ این پیام برای ما نیست.
++        return
++
++    results = []
++    for oid in order_ids:
++        try:
++            summary = await order_executor.settle_chat_closed_order(
++                oid, bot_id=bot_id, expected_user_id=user['id'],
++            )
++            results.append(_chat_closed_result_text(
++                f"✅ سفارش #{oid} خاتمه یافت.", summary))
++        except ValueError:
++            results.append(f"ℹ️ سفارش #{oid} قبلاً بسته شده است.")
++        except Exception:
++            logger.exception("chat_closed_text_fallback failed: order=%s", oid)
++
++    if results:
++        try:
++            await send_safe(
++                context.bot, msg.chat_id, "\n\n".join(results),
++                reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True),
++            )
++        except Exception:
++            try:
++                await msg.reply_text("\n\n".join(results))
++            except Exception:
++                logger.debug("chat closed text fallback reply failed", exc_info=True)
++        # فقط وقتی واقعاً کاری انجام دادیم، جلوی ادامهٔ فلو را می‌گیریم.
++        from telegram.ext import ApplicationHandlerStop
++        raise ApplicationHandlerStop
++
++
+ # -------------------- تاریخچه سفارشات --------------------
+ 
+ async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 diff --git a/main.py b/main.py
-index 25df9c1..57a23e1 100644
+index 25df9c1..ba8d781 100644
 --- a/main.py
 +++ b/main.py
 @@ -575,6 +575,98 @@ async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
@@ -679,7 +911,32 @@ index 25df9c1..57a23e1 100644
  async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
      try:
          due_orders = await DatabaseManager.get_due_scheduled_orders()
-@@ -1071,31 +1163,36 @@ def register_handlers(application: Application) -> None:
+@@ -741,6 +833,24 @@ def register_handlers(application: Application) -> None:
+         group=-4,
+     )
+ 
++    # پاسخ مشتری به «ویس‌چت بسته شد؛ ادامه می‌دهید؟» — همان گروهٔ 4- و همان
++    # دلیلِ امن: تسویهٔ سفارشِ خودِ کاربر اتمیک و idempotent است و باید حتی در
++    # حالت تعمیرات/میوت هم کار کند. الگو از cancel_order_ جدا است پس تداخل
++    # ندارند. فالبک متنی «پایان» هم با همین گروه ثبت می‌شود تا فقط وقتی که
++    # واقعاً سفارشی با ویس‌چتِ بسته وجود دارد، جلوی بقیهٔ فلوها را بگیرد.
++    application.add_handler(
++        CallbackQueryHandler(chat_closed_decision_callback,
++                            pattern=r"^chatclosed_\d+_(keep|stop)$"),
++        group=-4,
++    )
++    application.add_handler(
++        MessageHandler(
++            filters.Regex(r"^(⛔️\s*)?پایان(\s+سفارش)?$|^تسویه$") & ~filters.COMMAND,
++            chat_closed_text_fallback,
++        ),
++        group=-4,
++    )
++
+     # گارد ضداسپم در گروهٔ مستقل 3-: تنها هندلرِ همین گروه است پس بلعیدنِ
+     # آپدیت فقط به همین گروه ختم می‌شود و گروه‌های بعدی (نگهبان تعمیرات،
+     # پیش‌روتر، مکالمه‌ها) سالم می‌مانند. توقفِ میوت با raise
+@@ -1071,31 +1181,36 @@ def register_handlers(application: Application) -> None:
          MessageHandler(FILTER_BACK, admin_panel_start),
      ]
      admin_conv = ConversationHandler(
@@ -733,7 +990,7 @@ index 25df9c1..57a23e1 100644
          ],
          states={
              AWAITING_SETTINGS_ACTION: [
-@@ -1586,6 +1683,16 @@ async def main_loop():
+@@ -1586,6 +1701,16 @@ async def main_loop():
      # راه‌اندازی ربات‌های نمایندگی
      await bot_manager.start_all_active_bots()
      
@@ -750,7 +1007,7 @@ index 25df9c1..57a23e1 100644
      # زمان‌بندی جاب‌ها
      if main_app.job_queue:
          main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
-@@ -1609,9 +1716,12 @@ async def main_loop():
+@@ -1609,9 +1734,12 @@ async def main_loop():
      stop_event = asyncio.Event()
      try:
          _loop = asyncio.get_running_loop()
@@ -1812,10 +2069,10 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..7ed8922 100644
+index 0e19892..cc73063 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -12,12 +12,18 @@ from database import DatabaseManager
+@@ -12,12 +12,23 @@ from database import DatabaseManager
  from telegram_client import TelegramAccountClient
  from utils.helpers import format_jalali_datetime
  from config import Config
@@ -1827,15 +2084,20 @@ index 0e19892..7ed8922 100644
  from services import self_healing
  from services.anti_spam import anti_spam
  from services.voice_cooldown import voice_cooldown
-+# ── Telegram-side (infrastructure) failures ─────────────────────────────────
-+# OUTCOME_SYSTEM is imported on its own line so this fix applies cleanly on
-+# every v2.3.23 port revision of this file (older ports import the other
-+# outcomes through a different, multi-line statement).
-+from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
++# ── Telegram-side (infrastructure) failure bucket ───────────────────────────
++# Imported on its OWN statement (never merged into the big ``join_brain``
++# import above): that import is formatted differently across v2.3.23 port
++# revisions, so touching it would make this patch un-appliable on some
++# servers.  Older join_brain modules without OUTCOME_SYSTEM fall back to a
++# plain string, which still classifies correctly in ``_is_system_outcome``.
++try:  # pragma: no cover - depends on the deployed port revision
++	from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
++except ImportError:  # pragma: no cover
++	OUTCOME_SYSTEM = "system"
  
  logger = logging.getLogger(__name__)
  
-@@ -41,6 +47,48 @@ def _get_voice_call_manager():
+@@ -41,6 +52,48 @@ def _get_voice_call_manager():
  		return None
  
  
@@ -1884,7 +2146,42 @@ index 0e19892..7ed8922 100644
  class OrderExecutor:
  	"""
  	Core executor for Telegram orders (voice chat, group join, etc.).
-@@ -192,8 +240,23 @@ class OrderExecutor:
+@@ -71,6 +124,34 @@ class OrderExecutor:
+ 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
+ 		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
+ 		self._suppress_cancel_log: Set[int] = set()
++		# Order ids already asked "the call closed — continue?" for the CURRENT
++		# closure. Re-armed when the chat reopens, so a second closure asks again.
++		self._chat_closed_asked: Dict[int, bool] = {}
++		# Order id -> when the customer chose «ادامه می‌دهم». If the chat is still closed
++		# after VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS the order is settled
++		# automatically (only the served part is charged, the rest is refunded).
++		self._chat_closed_continue_since: Dict[int, float] = {}
++		# Strong refs to fire-and-forget tasks so they are not garbage-collected
++		# mid-flight (the customer question must not vanish silently).
++		self._background_tasks: Set[asyncio.Task] = set()
++
++	def _chat_closed_ask_gate(self, order_id: int, is_closed: bool) -> bool:
++		"""True exactly ONCE per closure: send the customer question here.
++
++		The countdown loop calls this every cycle. A closed chat must produce ONE
++		question (not one per second), and after the chat reopens (a new call was
++		started, or the customer chose to continue) the gate re-arms so the next
++		closure asks again.
++		"""
++		asked = bool(self._chat_closed_asked.get(order_id))
++		if not is_closed:
++			if asked:
++				self._chat_closed_asked[order_id] = False
++			return False
++		if asked:
++			return False
++		self._chat_closed_asked[order_id] = True
++		return True
+ 
+ 	def _consume_cancel_log_suppression(self, order_id: int) -> bool:
+ 		"""اگر گزارش لغو این سفارش سرکوب شده باشد True برمی‌گرداند و flag را مصرف می‌کند."""
+@@ -192,8 +273,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -1910,7 +2207,7 @@ index 0e19892..7ed8922 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -325,6 +388,13 @@ class OrderExecutor:
+@@ -325,6 +421,13 @@ class OrderExecutor:
  	                self.active_orders[order_id]["end_time"] = end_time
  	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
  
@@ -1924,7 +2221,7 @@ index 0e19892..7ed8922 100644
  	            _tick = 0
  	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
  	            _log_interval = 10
-@@ -355,6 +425,7 @@ class OrderExecutor:
+@@ -355,6 +458,7 @@ class OrderExecutor:
  	                    logger.info(
  	                        f"Order {order_id}: {_format_timer(remaining_now)} "
  	                        f"| live={live}/{exact}"
@@ -1932,7 +2229,7 @@ index 0e19892..7ed8922 100644
  	                    )
  
  	                if _tick % _check_interval == 0 and _tick > 0:
-@@ -397,6 +468,7 @@ class OrderExecutor:
+@@ -397,6 +501,7 @@ class OrderExecutor:
  	                    if order_id in self.active_orders:
  	                        self.active_orders[order_id]["live_count"] = live
  	                        self.active_orders[order_id]["joined_accounts"] = joined_list
@@ -1940,7 +2237,7 @@ index 0e19892..7ed8922 100644
  	                    # Durable live count is not continuous media presence.
  	                    # Surface the native binding signal separately (it too
  	                    # cannot guarantee end-to-end WebRTC packet delivery).
-@@ -405,6 +477,20 @@ class OrderExecutor:
+@@ -405,6 +510,65 @@ class OrderExecutor:
  	                        _vcm = _get_voice_call_manager()
  	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
  	                            _binding = _vcm.get_binding_status_counts(order_id)
@@ -1958,10 +2255,55 @@ index 0e19892..7ed8922 100644
 +	                                    "a new voice chat in the group or cancel the order.",
 +	                                    order_id, live, exact,
 +	                                )
++	                            if _chat_closed_now:
++	                                # Ask the CUSTOMER (once per closure) whether to keep
++	                                # the order alive or settle now with a refund for the
++	                                # unserved remainder. Billing keeps running until the
++	                                # customer answers, so asking cannot be used to get
++	                                # free presence time.
++	                                _closed_since = None
++	                                if _vcm is not None and hasattr(_vcm, "chat_closed_since"):
++	                                    try:
++	                                        _closed_since = _vcm.chat_closed_since(order_id)
++	                                    except Exception:
++	                                        _closed_since = None
++	                                if _closed_since is None:
++	                                    _closed_since = time.time()
++	                                if order_id in self.active_orders:
++	                                    self.active_orders[order_id].setdefault(
++	                                        "chat_closed_at", _closed_since)
++	                                if self._chat_closed_ask_gate(order_id, True):
++	                                    _ask_task = asyncio.create_task(
++	                                        self.ask_customer_chat_closed(
++	                                            order_id, dict(data), _closed_since)
++	                                    )
++	                                    self._background_tasks.add(_ask_task)
++	                                    _ask_task.add_done_callback(
++	                                        self._background_tasks.discard)
++	                                if _chat_closed_now and order_id in self._chat_closed_continue_since:
++	                                    # The customer chose «ادامه می‌دهم» but no new call was started in
++	                                    # this group: settle with a refund for the unserved remainder instead
++	                                    # of billing a service that cannot be delivered.
++	                                    _grace = float(getattr(
++	                                        Config, "VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS", 600) or 0)
++	                                    _waited = time.time() - self._chat_closed_continue_since[order_id]
++	                                    if _grace <= 0 or _waited >= _grace:
++	                                        self._chat_closed_continue_since.pop(order_id, None)
++	                                        logger.error(
++	                                            "Order %s: %.0fs after the customer chose to continue the "
++	                                            "voice chat is STILL closed - settling now.",
++	                                            order_id, _waited,
++	                                        )
++	                                        _settle_task = asyncio.create_task(
++	                                            self._auto_settle_after_closed_chat(order_id, dict(data))
++	                                        )
++	                                        self._background_tasks.add(_settle_task)
++	                                        _settle_task.add_done_callback(self._background_tasks.discard)
++	                                        return
  	                    logger.info(
  	                        "Order %s: durable_live=%s/%s | native_binding=%s "
  	                        "(not proof of UDP packet delivery)",
-@@ -523,9 +609,26 @@ class OrderExecutor:
+@@ -523,9 +687,26 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -1989,7 +2331,7 @@ index 0e19892..7ed8922 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +640,7 @@ class OrderExecutor:
+@@ -537,7 +718,7 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -1998,7 +2340,7 @@ index 0e19892..7ed8922 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -564,13 +667,30 @@ class OrderExecutor:
+@@ -564,13 +745,30 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -2031,7 +2373,7 @@ index 0e19892..7ed8922 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -594,6 +714,27 @@ class OrderExecutor:
+@@ -594,6 +792,27 @@ class OrderExecutor:
  	        best = when if best is None else min(best, when)
  	    return best
  
@@ -2059,7 +2401,7 @@ index 0e19892..7ed8922 100644
  	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
  	                                    joined_ids: Set[int]) -> bool:
  	    """Give transiently exhausted accounts ONE new attempt per bounded round.
-@@ -671,30 +812,32 @@ class OrderExecutor:
+@@ -671,30 +890,32 @@ class OrderExecutor:
  	        _as_profile = await anti_spam.get_profile(bot_id)
  	    except Exception:
  	        _as_profile = None
@@ -2111,7 +2453,7 @@ index 0e19892..7ed8922 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -702,6 +845,9 @@ class OrderExecutor:
+@@ -702,6 +923,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -2121,7 +2463,7 @@ index 0e19892..7ed8922 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -748,12 +894,55 @@ class OrderExecutor:
+@@ -748,12 +972,55 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -2177,7 +2519,7 @@ index 0e19892..7ed8922 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -784,6 +973,16 @@ class OrderExecutor:
+@@ -784,6 +1051,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -2194,7 +2536,7 @@ index 0e19892..7ed8922 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -829,6 +1028,15 @@ class OrderExecutor:
+@@ -829,6 +1106,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -2210,7 +2552,7 @@ index 0e19892..7ed8922 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -872,6 +1080,7 @@ class OrderExecutor:
+@@ -872,6 +1158,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -2218,7 +2560,7 @@ index 0e19892..7ed8922 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -882,6 +1091,7 @@ class OrderExecutor:
+@@ -882,6 +1169,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -2226,7 +2568,7 @@ index 0e19892..7ed8922 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -903,6 +1113,7 @@ class OrderExecutor:
+@@ -903,6 +1191,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -2234,7 +2576,7 @@ index 0e19892..7ed8922 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -921,6 +1132,7 @@ class OrderExecutor:
+@@ -921,6 +1210,7 @@ class OrderExecutor:
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -2242,13 +2584,13 @@ index 0e19892..7ed8922 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -942,8 +1154,49 @@ class OrderExecutor:
+@@ -942,8 +1232,49 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
 +	                    wave_system += 1
-+	                    continue
-+
+ 	                    continue
+ 
 +	                if outcome == OUTCOME_SYSTEM:
 +	                    # Telegram-side infrastructure failure (500 INTERDC,
 +	                    # internal server error, transport timeout, unresolved
@@ -2268,8 +2610,8 @@ index 0e19892..7ed8922 100644
 +	                    join_brain.report_result(order_id, outcome, msg)
 +	                    wave_fail += 1
 +	                    wave_system += 1
- 	                    continue
- 
++	                    continue
++
 +	                if outcome == OUTCOME_PERMANENT:
 +	                    # A permanent failure produces the IDENTICAL error on every retry,
 +	                    # so spending the attempt budget on it is pointless - and _voice_banned
@@ -2292,7 +2634,7 @@ index 0e19892..7ed8922 100644
  	                attempts = self._voice_attempts.setdefault(order_id, {})
  	                n_att = attempts.get(aid, 0) + 1
  	                attempts[aid] = n_att
-@@ -993,11 +1246,16 @@ class OrderExecutor:
+@@ -993,11 +1324,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -2311,7 +2653,7 @@ index 0e19892..7ed8922 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1031,6 +1289,44 @@ class OrderExecutor:
+@@ -1031,6 +1367,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
@@ -2356,7 +2698,7 @@ index 0e19892..7ed8922 100644
  	    # Return only the accounts this call newly joined; the CALLER owns
  	    # merging them into the order's running joined_accounts list (the
  	    # VoiceCallManager remains the authoritative source for counting).
-@@ -1493,6 +1789,15 @@ class OrderExecutor:
+@@ -1493,6 +1867,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
@@ -2372,6 +2714,241 @@ index 0e19892..7ed8922 100644
  		else:
  			try:
  				await self._eject_all_fast(order_id, joined_accounts, data)
+@@ -1516,6 +1899,9 @@ class OrderExecutor:
+ 
+ 	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
+ 	                            suppress_cancel_log: bool = False):
++		# حالت‌های پیگیری «کال بسته» سفارش‌های تمام‌شده را نگه نداریم.
++		self._chat_closed_asked.pop(order_id, None)
++		self._chat_closed_continue_since.pop(order_id, None)
+ 		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
+ 		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
+ 		if suppress_cancel_log:
+@@ -1706,7 +2092,7 @@ class OrderExecutor:
+ 		return name, user.get("telegram_id", "---")
+ 
+ 	@staticmethod
+-	def compute_order_settlement(order) -> Tuple[float, float, float]:
++	def compute_order_settlement(order, bill_until=None) -> Tuple[float, float, float]:
+ 		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
+ 
+ 		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
+@@ -1714,6 +2100,9 @@ class OrderExecutor:
+ 		- scheduled → هنوز مصرفی نشده: عودت کامل.
+ 		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
+ 		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
++			- ``bill_until`` (اختیاری): لحظه‌ای که سرویس واقعاً تمام شده
++			  (مثلاً بسته‌شدن ویس‌چت توسط مشتری)؛ مصرف فقط تا همان لحظه
++			  حساب می‌شود و باقی مبلغ برمی‌گردد (هرگز بیشتر از now).
+ 		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
+ 		"""
+ 		order = order or {}
+@@ -1732,10 +2121,12 @@ class OrderExecutor:
+ 				used = 0.0
+ 			return used, max(0.0, total_price - used), 0.0
+ 		# Never bill the build phase: created_at is NOT a service start.
+-		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
++		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at,
++		                                                  bill_until=bill_until)
+ 
+ 	@staticmethod
+-	def compute_prorated_settlement(total_price, duration_minutes, started_at):
++	def compute_prorated_settlement(total_price, duration_minutes, started_at,
++	                                bill_until=None):
+ 		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
+ 
+ 		خروجی: (used_cost, refund_amount, elapsed_seconds)
+@@ -1752,7 +2143,17 @@ class OrderExecutor:
+ 		duration_minutes = int(duration_minutes or 0)
+ 		if duration_minutes <= 0 or not started_at:
+ 			return 0.0, total_price, 0.0
+-		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
++		now = datetime.utcnow()
++		if bill_until is not None:
++			try:
++				# Billing stops at this instant (the customer closed the call): the
++				# unserved remainder must not be charged. Never bill past 'now'.
++				_cut = datetime.utcfromtimestamp(float(bill_until))
++				if _cut < now:
++					now = _cut
++			except (TypeError, ValueError, OSError, OverflowError):
++				pass
++		elapsed_seconds = max(0.0, (now - started_at).total_seconds())
+ 		total_seconds = duration_minutes * 60
+ 		if elapsed_seconds >= total_seconds:
+ 			used = total_price
+@@ -1762,10 +2163,153 @@ class OrderExecutor:
+ 		refund = max(0.0, total_price - used)
+ 		return used, refund, elapsed_seconds
+ 
++	async def ask_customer_chat_closed(self, order_id: int, data: dict,
++	                                  closed_at: float) -> bool:
++		"""Tell the order owner the call was closed and ask continue / settle.
++
++		The customer (or a group admin) can end the group call while the paid
++		timer still runs. The bot cannot serve presence into a closed call, so the
++		owner decides: continue until the deadline (a NEW call in the same group is
++		joined automatically), or stop now - only the time up to ``closed_at`` is
++		charged and the rest is refunded to the wallet.
++		"""
++		try:
++			from services.bot_manager import bot_manager
++			app = bot_manager.active_bots.get(int(data.get('bot_id') or 1))
++			if not app:
++				logger.warning(f"Order {order_id}: no bot app to ask the customer "
++				               f"about the closed voice chat")
++				return False
++			user = await DatabaseManager.get_user_by_id(data['user_id'])
++			if not user:
++				return False
++			from telegram import InlineKeyboardButton, InlineKeyboardMarkup
++			kb = InlineKeyboardMarkup([[
++				InlineKeyboardButton("\u2705 \u0627\u062f\u0627\u0645\u0647 \u0645\u06cc\u200c\u062f\u0647\u0645",
++				                     callback_data=f"chatclosed_{order_id}_keep"),
++				InlineKeyboardButton("\u26d4\ufe0f \u0646\u0647\u060c \u062a\u0633\u0648\u06cc\u0647 \u06a9\u0646",
++				                     callback_data=f"chatclosed_{order_id}_stop"),
++			]])
++			remaining = float((self.active_orders.get(order_id) or {}).get('remaining_seconds') or 0)
++			msg = (
++				f"\u26a0\ufe0f \u0648\u06cc\u0633\u200c\u0686\u062a \u0633\u0641\u0627\u0631\u0634 #{order_id} \u0627\u0632 \u0633\u0645\u062a \u062a\u0644\u06af\u0631\u0627\u0645 \u0628\u0633\u062a\u0647 \u0634\u062f (\u062a\u0648\u0633\u0637 \u062e\u0648\u062f\u062a\u0627\u0646 \u06cc\u0627 \u0627\u062f\u0645\u06cc\u0646 \u06af\u0631\u0648\u0647).\n\n"
++				f"\u23f3 \u0632\u0645\u0627\u0646 \u0628\u0627\u0642\u06cc\u200c\u0645\u0627\u0646\u062f\u0647\u0654 \u0633\u0641\u0627\u0631\u0634: {_format_timer(remaining)}\n"
++				"\u0627\u06a9\u0627\u0646\u062a\u200c\u0647\u0627 \u0628\u0647\u200c\u062e\u0627\u0637\u0631 \u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u06a9\u0627\u0644 \u0628\u06cc\u0631\u0648\u0646 \u0622\u0645\u062f\u0647\u200c\u0627\u0646\u062f \u0648 \u062a\u0627 \u0648\u0642\u062a\u06cc \u06a9\u0627\u0644 \u062a\u0627\u0632\u0647\u200c\u0627\u06cc \u062f\u0631 \u0647\u0645\u0627\u0646 "
++				"\u06af\u0631\u0648\u0647 \u0634\u0631\u0648\u0639 \u0646\u0634\u0648\u062f\u060c \u062d\u0636\u0648\u0631 \u0642\u0627\u0628\u0644 \u0627\u0631\u0627\u0626\u0647 \u0646\u06cc\u0633\u062a.\n\n"
++				"\u0627\u062f\u0627\u0645\u0647 \u0645\u06cc\u200c\u062f\u0647\u06cc\u062f (\u062a\u0627 \u067e\u0627\u06cc\u0627\u0646 \u0645\u0647\u0644\u062a\u060c \u0628\u0627 \u06a9\u0627\u0644 \u062a\u0627\u0632\u0647) \u06cc\u0627 \u0647\u0645\u06cc\u0646\u200c\u062c\u0627 \u062e\u0627\u062a\u0645\u0647 \u0648 \u062a\u0633\u0648\u06cc\u0647 \u0634\u0648\u062f\u061f\n"
++				"\u062f\u0631 \u0635\u0648\u0631\u062a \u062e\u0627\u062a\u0645\u0647\u060c \u0641\u0642\u0637 \u0632\u0645\u0627\u0646 \u0627\u0633\u062a\u0641\u0627\u062f\u0647\u200c\u0634\u062f\u0647 \u062a\u0627 \u0644\u062d\u0638\u0647\u0654 \u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u06a9\u0627\u0644 \u062d\u0633\u0627\u0628 \u0645\u06cc\u200c\u0634\u0648\u062f \u0648 "
++				"\u0628\u0627\u0642\u06cc \u0645\u0628\u0644\u063a \u0628\u0647 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0628\u0631\u0645\u06cc\u200c\u06af\u0631\u062f\u062f."
++			)
++			await app.bot.send_message(user['telegram_id'], msg, reply_markup=kb)
++			# Fallback line: the customer can also settle by TYPING «پایان» (the
++			# text handler picks it up) instead of pressing an inline button.
++			try:
++				from helpers.message_utils import send_safe as _send_safe
++				from telegram import ReplyKeyboardMarkup
++				await _send_safe(
++					app.bot, user['telegram_id'],
++					"⌛️ اگر نمی‌خواهید منتظر بمانید، دکمهٔ زیر را بزنید یا کلمهٔ «پایان» را بفرستید.",
++					reply_markup=ReplyKeyboardMarkup([["⛔️ پایان سفارش"]],
++					                                 resize_keyboard=True,
++					                                 one_time_keyboard=True),
++				)
++			except Exception as exc:
++				logger.debug(f"Order {order_id}: text fallback line failed: {exc}")
++			logger.warning(f"Order {order_id}: asked the customer about the closed "
++			               f"voice chat (closed_at={closed_at:.0f})")
++			return True
++		except Exception as exc:
++			logger.warning(f"Order {order_id}: could not ask the customer about the "
++			               f"closed voice chat: {type(exc).__name__}")
++			return False
++
++	async def continue_after_chat_closed(self, order_id: int) -> bool:
++		"""Customer chose "continue": drop the closed marker so a NEW call is joined."""
++		try:
++			vcm = _get_voice_call_manager()
++			if vcm and hasattr(vcm, "clear_chat_closed"):
++				vcm.clear_chat_closed(order_id)
++			self._chat_closed_asked[order_id] = False
++			self._chat_closed_continue_since[order_id] = time.time()
++			logger.info(f"Order {order_id}: customer chose to continue after the "
++			            f"voice chat closed; markers cleared")
++			return True
++		except Exception as exc:
++			logger.warning(f"Order {order_id}: continue-after-closed failed: {exc}")
++			return False
++
++	async def settle_chat_closed_order(self, order_id: int, *, bot_id: int = 1,
++	                                   expected_user_id=None,
++	                                   canceled_by_role=None,
++	                                   cancellation_reason=None) -> dict:
++		"""Customer chose to stop: bill only up to the closure, refund the rest.
++
++		The unserved period (from the moment the call was closed) must not be
++		charged - the same atomic claim/refund path as a normal cancellation is
++		used, with ``bill_until`` as the billing cutoff.
++		"""
++		closed_at = None
++		try:
++			vcm = _get_voice_call_manager()
++			if vcm and hasattr(vcm, "chat_closed_since"):
++				closed_at = vcm.chat_closed_since(order_id)
++		except Exception:
++			closed_at = None
++		if closed_at is None:
++			closed_at = (self.active_orders.get(order_id) or {}).get("chat_closed_at")
++		return await self.settle_and_refund_order(
++			order_id, do_refund=True,
++			canceled_by_role=canceled_by_role or "\u0645\u0634\u062a\u0631\u06cc (\u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u0648\u06cc\u0633\u200c\u0686\u062a)",
++			cancellation_reason=cancellation_reason or "\u0648\u06cc\u0633\u200c\u0686\u062a \u0628\u0633\u062a\u0647 \u0634\u062f \u0648 \u0645\u0634\u062a\u0631\u06cc \u0627\u062f\u0627\u0645\u0647 \u0646\u062f\u0627\u062f",
++			bot_id=bot_id, expected_user_id=expected_user_id,
++			bill_until=closed_at,
++		)
++
++	async def _auto_settle_after_closed_chat(self, order_id: int, data: dict):
++		"""مشتری «ادامه» را زد ولی کال باز نشد → تسویهٔ خودکار.
++
++		فقط زمانِ سرو‌شدهٔ تا لحظهٔ بسته‌شدن کال شارژ می‌شود؛ باقی به کیف پول
++		برمی‌گردد (همان مسیر اتمیک لغو با bill_until).
++		"""
++		try:
++			summary = await self.settle_chat_closed_order(
++				order_id, bot_id=int(data.get("bot_id") or 1),
++				expected_user_id=data.get("user_id"),
++				canceled_by_role="سیستم (کال باز نشد)",
++				cancellation_reason="ویس‌چت بسته ماند و کال تازه‌ای شروع نشد",
++			)
++		except ValueError:
++			logger.info(f"Order {order_id}: already settled before the closed-chat "
++			            f"grace expired")
++			return
++		except Exception as exc:
++			logger.error(f"Order {order_id}: auto-settlement after a closed chat "
++			             f"failed ({type(exc).__name__}); left for the operator")
++			return
++		self._chat_closed_asked.pop(order_id, None)
++		self._chat_closed_continue_since.pop(order_id, None)
++		logger.warning("Order %s: closed-chat grace expired - settled as system; "
++		               "used=%s refunded=%s",
++		               order_id, summary.get('used_cost'), summary.get('refund_amount'))
++		try:
++			from services.bot_manager import bot_manager
++			app = bot_manager.active_bots.get(int(data.get('bot_id') or 1))
++			user = await DatabaseManager.get_user_by_id(data.get('user_id'))
++			if app and user:
++				await app.bot.send_message(
++					user['telegram_id'],
++					f"⛔️ سفارش #{order_id} بسته شد: بعد از انتخاب «ادامه»، کال تازه‌ای در گروه شروع نشد.\n"
++					f"⏱ مصرف تا لحظهٔ بسته‌شدن کال: {float(summary.get('used_cost') or 0):,.0f} تومان\n"
++					f"💵 عودت به کیف پول: {float(summary.get('refund_amount') or 0):,.0f} تومان\n"
++					f"👛 موجودی: {float(summary.get('user_wallet_balance') or 0):,.0f} تومان",
++				)
++		except Exception as exc:
++			logger.debug(f"Order {order_id}: settle notice to the customer failed: {exc}")
++
+ 	async def settle_and_refund_order(
+ 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
+ 		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+-		expected_user_id=None,
++		expected_user_id=None, bill_until=None,
+ 	):
+ 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
+ 
+@@ -1778,9 +2322,15 @@ class OrderExecutor:
+ 		# Row-locked, atomic claim + settlement: a second callback must not
+ 		# credit the wallet twice or refund a completed/cancelled order. Price
+ 		# depends on elapsed time and the FULL plan, never the joined-account ratio.
++		# Billing cutoff: when the service actually ended before 'now' (the voice
++		# chat was closed by the customer), only the served part is charged.
++		calculator = self.compute_order_settlement
++		if bill_until is not None:
++			calculator = (lambda _order, _b=float(bill_until):
++			              self.compute_order_settlement(_order, bill_until=_b))
+ 		settled = await DatabaseManager.settle_cancel_order(
+ 			order_id, bot_id=bot_id, do_refund=do_refund,
+-			settlement_calculator=self.compute_order_settlement,
++			settlement_calculator=calculator,
+ 			expected_user_id=expected_user_id,
+ 		)
+ 		if settled is None:
 diff --git a/services/self_healing.py b/services/self_healing.py
 index 490a5b0..05bee81 100644
 --- a/services/self_healing.py
@@ -2386,7 +2963,7 @@ index 490a5b0..05bee81 100644
                        "call not found")),
      ("forbidden", ("forbidden", "403", "not enough rights")),
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 263629f..7786677 100644
+index 263629f..025008a 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
 @@ -75,7 +75,6 @@ from services.session_client import close_pyrogram_client
@@ -2418,7 +2995,7 @@ index 263629f..7786677 100644
          return FAILURE_RATE_LIMITED
      if isinstance(err, (AuthKeyInvalid, AuthKeyUnregistered, SessionRevoked)) or \
         is_fatal_auth_error(err) or is_fatal_auth_error(message) or \
-@@ -704,6 +713,18 @@ class VoiceCallManager:
+@@ -704,6 +713,19 @@ class VoiceCallManager:
          self._listener_drops = 0
          self._listener_globally_disabled = False
  
@@ -2433,11 +3010,12 @@ index 263629f..7786677 100644
 +        # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
 +        self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
 +        self._chat_closed_until: Dict[Tuple[int, int], float] = {}
++        self._chat_closed_since: Dict[Tuple[int, int], float] = {}
 +
          # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
          # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
          # This is the AUTHORITATIVE count for an order. It is NEVER decremented
-@@ -1329,6 +1350,36 @@ class VoiceCallManager:
+@@ -1329,6 +1351,36 @@ class VoiceCallManager:
                  reserved.update(account_ids)
          return reserved
  
@@ -2474,7 +3052,7 @@ index 263629f..7786677 100644
      def get_cached_session_account_ids(self) -> Set[int]:
          return set(self._session_cache.keys())
  
-@@ -1364,6 +1415,9 @@ class VoiceCallManager:
+@@ -1364,6 +1416,9 @@ class VoiceCallManager:
  
          Returns True if newly registered, False if already registered.
          """
@@ -2484,7 +3062,7 @@ index 263629f..7786677 100644
          if order_id not in self.joined_accounts_by_order:
              self.joined_accounts_by_order[order_id] = {}
          inner = self.joined_accounts_by_order[order_id]
-@@ -2059,19 +2113,79 @@ class VoiceCallManager:
+@@ -2059,19 +2114,79 @@ class VoiceCallManager:
                      # start() can time out AFTER native WebRTC initialized.
                      # Retain the original engine before awaiting it. A retry
                      # must never construct a second engine on a transport that
@@ -2572,7 +3150,7 @@ index 263629f..7786677 100644
      async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
          # IMPORTANT: use the SAME per-account lock as the warmup/create path.
          # Previously we popped the client (and even removed its lock) BEFORE
-@@ -2221,6 +2335,14 @@ class VoiceCallManager:
+@@ -2221,6 +2336,14 @@ class VoiceCallManager:
                      if now - self._last_memory_log >= log_interval:
                          self._last_memory_log = now
                          logger.info("[VoiceMemory] %s", self.memory_report())
@@ -2587,7 +3165,7 @@ index 263629f..7786677 100644
                  except asyncio.CancelledError:
                      raise
                  except Exception as exc:
-@@ -2249,6 +2371,109 @@ class VoiceCallManager:
+@@ -2249,6 +2372,134 @@ class VoiceCallManager:
                  return oid
          return None
  
@@ -2656,6 +3234,7 @@ index 263629f..7786677 100644
 +            if self._chat_closed_until.get(key, 0.0) > now:
 +                return  # already marked and still active → log once
 +            self._chat_closed_until[key] = now + grace
++            self._chat_closed_since[key] = now
 +            logger.warning(
 +                "[VoiceChatClosed] order=%s chat=%s: Telegram reports the voice chat "
 +                "as CLOSED (%s accounts in %.0fs) — suppressing rejoin/media-restore "
@@ -2674,8 +3253,31 @@ index 263629f..7786677 100644
 +        if key in self._chat_closed_until or key in self._chat_closed_reports:
 +            self._chat_closed_until.pop(key, None)
 +            self._chat_closed_reports.pop(key, None)
++            self._chat_closed_since.pop(key, None)
 +            logger.info("[VoiceChatClosed] order=%s chat=%s: reopened (join succeeded)",
 +                        order_id, chat_id)
++
++    def clear_chat_closed(self, order_id: int, chat_id: Optional[int] = None) -> None:
++        """Public: forget the closed marker for an order (chat_id=None → all chats).
++
++        Used when the customer answers "continue": the next monitor cycle may try
++        to rejoin immediately instead of waiting out the grace period.
++        """
++        if chat_id is None:
++            for (oid, cid) in [k for k in self._chat_closed_until if k[0] == int(order_id)]:
++                self._clear_chat_closed(oid, cid)
++        else:
++            self._clear_chat_closed(int(order_id), int(chat_id))
++
++    def chat_closed_since(self, order_id: int,
++                          chat_id: Optional[int] = None) -> Optional[float]:
++        """When the closure was corroborated (billing stops at this instant)."""
++        self._prune_chat_closed()
++        if chat_id is not None:
++            return self._chat_closed_since.get((int(order_id), int(chat_id)))
++        times = [ts for (oid, _cid), ts in self._chat_closed_since.items()
++                 if oid == int(order_id)]
++        return min(times) if times else None
 +
 +    def _prune_chat_closed(self) -> None:
 +        now = time.time()
@@ -2683,6 +3285,7 @@ index 263629f..7786677 100644
 +            if float(until) <= now:
 +                self._chat_closed_until.pop(key, None)
 +                self._chat_closed_reports.pop(key, None)
++                self._chat_closed_since.pop(key, None)
 +
 +    def is_chat_closed(self, order_id: Optional[int] = None,
 +                       chat_id: Optional[int] = None) -> bool:
@@ -2697,7 +3300,7 @@ index 263629f..7786677 100644
      def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
          """Register stream-end / kick handlers on a freshly built engine.
  
-@@ -2278,8 +2503,22 @@ class VoiceCallManager:
+@@ -2278,8 +2529,22 @@ class VoiceCallManager:
              @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
              async def _on_left_call(_engine, update):  # type: ignore[misc]
                  cid = int(getattr(update, "chat_id", 0) or 0)
@@ -2721,7 +3324,7 @@ index 263629f..7786677 100644
                  logger.warning(
                      "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                      order_id, account_id, cid, status,
-@@ -2292,8 +2531,10 @@ class VoiceCallManager:
+@@ -2292,8 +2557,10 @@ class VoiceCallManager:
                      order_id, account_id, cid, "chat_left_update",
                      reason=f"engine chat update: {status}",
                  )
@@ -2733,7 +3336,7 @@ index 263629f..7786677 100644
          except Exception as exc:
              logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
  
-@@ -2454,6 +2695,12 @@ class VoiceCallManager:
+@@ -2454,6 +2721,12 @@ class VoiceCallManager:
          key = (order_id, account_id)
          if not self._media_restore_due(key):
              return
@@ -2746,7 +3349,7 @@ index 263629f..7786677 100644
          pytg = self.clients.get(account_id)
          if pytg is None:
              return
-@@ -2744,6 +2991,54 @@ class VoiceCallManager:
+@@ -2744,6 +3017,54 @@ class VoiceCallManager:
          """
          return True if media_binding is True else participant_presence
  
@@ -2801,7 +3404,7 @@ index 263629f..7786677 100644
      async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
          """Authoritative per-chat media transport liveness.
  
-@@ -3016,21 +3311,30 @@ class VoiceCallManager:
+@@ -3016,21 +3337,30 @@ class VoiceCallManager:
              return None
          return int(my_id) in present_ids
  
@@ -2836,7 +3439,7 @@ index 263629f..7786677 100644
          my_id = None
          try:
              me = getattr(app, "me", None)
-@@ -3047,9 +3351,10 @@ class VoiceCallManager:
+@@ -3047,9 +3377,10 @@ class VoiceCallManager:
              return None
  
          # Fast path: use the shared snapshot taken during the monitor cycle.
@@ -2850,7 +3453,7 @@ index 263629f..7786677 100644
  
          try:
              cached = self._active_call_cache.get(int(chat_id))
-@@ -3685,6 +3990,11 @@ class VoiceCallManager:
+@@ -3685,6 +4016,11 @@ class VoiceCallManager:
                          rec['media_binding_alive'] = media_alive
                          rec['media_binding_checked_at'] = time.time()
                          present = self._media_presence_verdict(present, media_alive)
@@ -2862,7 +3465,7 @@ index 263629f..7786677 100644
                          if media_alive is False:
                              if present is True:
                                  # ── GHOST-MEDIA-ONLY (presence intact) ──────────
-@@ -3831,6 +4141,13 @@ class VoiceCallManager:
+@@ -3831,6 +4167,13 @@ class VoiceCallManager:
                                            reason="presence absent %dx in a row" % int(fc),
                                            extra={"fail_cycle": int(fc)})
  
@@ -2876,7 +3479,7 @@ index 263629f..7786677 100644
                          rejoined = False
                          try:
                              rejoined = await self._recover_same_account(
-@@ -3906,9 +4223,17 @@ class VoiceCallManager:
+@@ -3906,9 +4249,17 @@ class VoiceCallManager:
          """
          Track which accounts this order has *selected* so far.
  
@@ -2897,7 +3500,7 @@ index 263629f..7786677 100644
          """
          async with self._reservation_lock:
              self._reservations[order_id] = set(account_ids)
-@@ -4092,8 +4417,13 @@ class VoiceCallManager:
+@@ -4092,8 +4443,13 @@ class VoiceCallManager:
                  self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                  return False, f"FloodWait:{wait_s}", 0
              except Exception as e:
@@ -2913,7 +3516,7 @@ index 263629f..7786677 100644
  
              if not pytg:
                  self._set_state(order_id, account_id, FAILED, "client init failed")
-@@ -4407,6 +4737,21 @@ class VoiceCallManager:
+@@ -4407,6 +4763,21 @@ class VoiceCallManager:
              key_set.add((order_id, aid))
          keys = list(key_set)
  
@@ -3599,6 +4202,447 @@ index 0000000..308eb7d
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tests/test_chat_closed_ask_flow.py b/tests/test_chat_closed_ask_flow.py
+new file mode 100644
+index 0000000..45d25ca
+--- /dev/null
++++ b/tests/test_chat_closed_ask_flow.py
+@@ -0,0 +1,435 @@
++"""«ویس‌چت بسته شد» → پرسیدن از مشتری → ادامه یا تسویه با عودت باقی‌مانده.
++
++قاعدهٔ مالی (تصمیم کاربر، ۱۴۰۵-۰۷-۱۰):
++
++* تا وقتی مشتری جواب نداده، صورت‌حساب مثل قبل ادامه دارد (ضدسوءاستفاده).
++* «ادامه می‌دهم» → مارکر بسته‌بودن پاک می‌شود و به کال تازهٔ همان گروه ملحق
++  می‌شویم.
++* «نه، تسویه کن» → فقط زمانِ استفاده‌شده **تا لحظهٔ بسته‌شدن کال** حساب و
++  باقی مبلغ از کیف پول عودت می‌شود؛ مسیر اتمیک/قفل‌دارِ همان
++  ``settle_cancel_order`` استفاده می‌شود تا عودت دوباره ممکن نباشد.
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++import time
++import unittest
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++# ── محیط باید پیش از ایمپورت‌های پروژه آماده باشد ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="chat-closed-ask-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("BOT_TOKEN", "test-token")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "strategy.json"))
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++import database  # noqa: E402
++import services.order_executor as executor_mod  # noqa: E402
++from services.order_executor import OrderExecutor  # noqa: E402
++
++ORDER_ID = 932
++USER_ROW = {"id": 12, "telegram_id": 555001, "credit": 100_000}
++ORDER_ROW = {"id": ORDER_ID, "user_id": 12, "bot_id": 1, "status": "running",
++             "duration_minutes": 60, "price_paid": 600_000, "started_at": None}
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++class _FakeVCM:
++    def __init__(self, closed_since=None, is_closed=True):
++        self.closed_since = closed_since
++        self.is_closed = is_closed
++        self.cleared = []
++
++    def chat_closed_since(self, order_id, chat_id=None):
++        return self.closed_since
++
++    def is_chat_closed(self, order_id):
++        return self.is_closed
++
++    def clear_chat_closed(self, order_id, chat_id=None):
++        self.cleared.append((order_id, chat_id))
++        return True
++
++
++class _FakeQuery:
++    def __init__(self, data):
++        self.data = data
++        self.answer = AsyncMock()
++        self.edit_message_text = AsyncMock()
++
++
++class _FakeBot:
++    def __init__(self):
++        self.sent = []
++
++    async def send_message(self, chat_id, text, **kwargs):
++        self.sent.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
++        return SimpleNamespace(message_id=1)
++
++
++class BillingCutoffTests(unittest.TestCase):
++    """``bill_until`` = لحظهٔ بسته‌شدن کال؛ هرگز بیشتر از now صورت‌حساب نشود."""
++
++    def test_prorated_billing_stops_at_the_closure(self):
++        started = datetime.utcnow() - timedelta(minutes=30)
++        closed_at = (started + timedelta(minutes=10)).timestamp()
++        used, refund, elapsed = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started, bill_until=closed_at)
++        self.assertAlmostEqual(elapsed, 600, delta=5)
++        self.assertAlmostEqual(used, 100_000, delta=2_000)
++        self.assertAlmostEqual(refund, 500_000, delta=2_000)
++
++    def test_cutoff_in_the_future_never_bills_more_than_now(self):
++        started = datetime.utcnow() - timedelta(minutes=10)
++        used_future, refund_future, _ = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started, bill_until=(datetime.utcnow() + timedelta(hours=1)).timestamp())
++        used_now, refund_now, _ = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started)
++        self.assertEqual((used_future, refund_future), (used_now, refund_now))
++
++    def test_garbage_cutoff_is_ignored_instead_of_crashing_settlement(self):
++        started = datetime.utcnow() - timedelta(minutes=5)
++        for bad in ("nonsense", None if False else "nan-seconds", object()):
++            with self.subTest(bad=type(bad).__name__):
++                used, refund, _ = OrderExecutor.compute_prorated_settlement(
++                    600_000, 60, started, bill_until=bad)
++                self.assertGreaterEqual(used, 0)
++                self.assertAlmostEqual(used + refund, 600_000, delta=1)
++
++    def test_order_settlement_passes_the_cutoff_through(self):
++        started = datetime.utcnow() - timedelta(minutes=20)
++        closed_at = (started + timedelta(minutes=5)).timestamp()
++        order = dict(ORDER_ROW, started_at=started)
++        used_direct, _, _ = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started, bill_until=closed_at)
++        used_order, _, _ = OrderExecutor.compute_order_settlement(
++            order, bill_until=closed_at)
++        self.assertEqual(used_order, used_direct)
++        self.assertAlmostEqual(used_order, 50_000, delta=2_000)
++
++    def test_unstarted_order_still_refunds_everything_with_a_cutoff(self):
++        order = dict(ORDER_ROW, started_at=None)
++        self.assertEqual(
++            OrderExecutor.compute_order_settlement(order, bill_until=time.time()),
++            (0.0, 600_000.0, 0.0))
++
++
++class AskGateTests(unittest.TestCase):
++    """سؤال باید دقیقاً یک‌بار در هر بسته‌شدن پرسیده شود."""
++
++    def test_gate_opens_once_per_closure_and_rearms_after_reopen(self):
++        executor = OrderExecutor()
++        self.assertTrue(executor._chat_closed_ask_gate(ORDER_ID, True))
++        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, True))
++        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, True))
++        # کال تازه باز شد → دفعهٔ بعد دوباره می‌پرسیم.
++        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
++        self.assertTrue(executor._chat_closed_ask_gate(ORDER_ID, True))
++
++    def test_healthy_chat_never_asks(self):
++        executor = OrderExecutor()
++        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
++        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
++
++
++class ContinueGraceTests(unittest.IsolatedAsyncioTestCase):
++    """«ادامه» یعنی مهلت محدود: اگر کال باز نشد، خودکار با عودت تسویه شود."""
++
++    async def test_continue_arms_the_grace_timer(self):
++        executor = OrderExecutor()
++        fake = _FakeVCM()
++        with patch.object(executor_mod, "_get_voice_call_manager", return_value=fake):
++            await executor.continue_after_chat_closed(ORDER_ID)
++        self.assertIn(ORDER_ID, executor._chat_closed_continue_since)
++        self.assertLessEqual(executor._chat_closed_continue_since[ORDER_ID], time.time())
++
++    async def test_auto_settle_refunds_and_tells_the_customer(self):
++        executor = OrderExecutor()
++        executor._chat_closed_asked[ORDER_ID] = True
++        executor._chat_closed_continue_since[ORDER_ID] = time.time() - 3600
++        bot = _FakeBot()
++        app = SimpleNamespace(bot=bot)
++        summary = {"total_cost": 600_000, "used_cost": 150_000,
++                   "refund_amount": 450_000, "refund_tx_id": "TX-3",
++                   "user_wallet_balance": 550_000}
++        with patch.object(executor, "settle_chat_closed_order", new_callable=AsyncMock,
++                          return_value=summary) as settle, \
++             patch("services.bot_manager.bot_manager") as bm, \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=USER_ROW):
++            bm.active_bots = {1: app}
++            await executor._auto_settle_after_closed_chat(ORDER_ID, dict(ORDER_ROW))
++        kwargs = settle.await_args.kwargs
++        self.assertIn("سیستم", kwargs["canceled_by_role"])
++        self.assertEqual(kwargs["expected_user_id"], ORDER_ROW["user_id"])
++        self.assertNotIn(ORDER_ID, executor._chat_closed_asked)
++        self.assertNotIn(ORDER_ID, executor._chat_closed_continue_since)
++        self.assertEqual(bot.sent[0]["chat_id"], USER_ROW["telegram_id"])
++        self.assertIn("450,000", bot.sent[0]["text"])
++
++    async def test_auto_settle_on_an_already_claimed_order_is_silent(self):
++        executor = OrderExecutor()
++        with patch.object(executor, "settle_chat_closed_order", new_callable=AsyncMock,
++                          side_effect=ValueError("claimed")):
++            await executor._auto_settle_after_closed_chat(ORDER_ID, dict(ORDER_ROW))
++
++    async def test_stopping_an_order_drops_the_closed_chat_tracking(self):
++        executor = OrderExecutor()
++        executor._chat_closed_asked[ORDER_ID] = True
++        executor._chat_closed_continue_since[ORDER_ID] = time.time()
++        with patch.object(executor, "_cleanup_order", new_callable=AsyncMock), \
++             patch.object(database.DatabaseManager, "update_order_status",
++                          new_callable=AsyncMock):
++            await executor.stop_active_order(ORDER_ID)
++        self.assertNotIn(ORDER_ID, executor._chat_closed_asked)
++        self.assertNotIn(ORDER_ID, executor._chat_closed_continue_since)
++
++    def test_grace_default_is_ten_minutes(self):
++        from config import Config
++        self.assertEqual(Config.VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS, 600.0)
++
++
++class SettleChatClosedOrderTests(unittest.IsolatedAsyncioTestCase):
++    """``settle_chat_closed_order`` باید cutoff را از VCM بردارد و پاس بدهد."""
++
++    async def test_cutoff_comes_from_the_vcm_and_is_forwarded(self):
++        executor = OrderExecutor()
++        closed_since = time.time() - 120
++        fake = _FakeVCM(closed_since=closed_since)
++        with patch.object(executor_mod, "_get_voice_call_manager", return_value=fake), \
++             patch.object(executor, "settle_and_refund_order", new_callable=AsyncMock,
++                          return_value={"refund_amount": 1}) as settle:
++            await executor.settle_chat_closed_order(ORDER_ID, bot_id=1,
++                                                    expected_user_id=12)
++        kwargs = settle.await_args.kwargs
++        self.assertEqual(kwargs["bill_until"], closed_since)
++        self.assertTrue(kwargs["do_refund"])
++        self.assertEqual(kwargs["expected_user_id"], 12)
++        self.assertEqual(kwargs["bot_id"], 1)
++        self.assertIn("ویس", kwargs["cancellation_reason"])
++        self.assertIn("مشتری", kwargs["canceled_by_role"])
++
++    async def test_active_orders_timestamp_is_the_fallback(self):
++        executor = OrderExecutor()
++        fallback = time.time() - 300
++        executor.active_orders[ORDER_ID] = {"chat_closed_at": fallback}
++        with patch.object(executor_mod, "_get_voice_call_manager", return_value=None), \
++             patch.object(executor, "settle_and_refund_order", new_callable=AsyncMock,
++                          return_value={}) as settle:
++            await executor.settle_chat_closed_order(ORDER_ID, bot_id=1)
++        self.assertEqual(settle.await_args.kwargs["bill_until"], fallback)
++
++    async def test_continue_clears_the_marker_and_rearms_the_question(self):
++        executor = OrderExecutor()
++        fake = _FakeVCM()
++        executor._chat_closed_asked[ORDER_ID] = True
++        with patch.object(executor_mod, "_get_voice_call_manager", return_value=fake):
++            self.assertTrue(await executor.continue_after_chat_closed(ORDER_ID))
++        self.assertEqual(fake.cleared, [(ORDER_ID, None)])
++        self.assertFalse(executor._chat_closed_asked[ORDER_ID])
++        self.assertTrue(executor._chat_closed_ask_gate(ORDER_ID, True))
++
++
++class SettleAndRefundCutoffTests(unittest.IsolatedAsyncioTestCase):
++    """محاسبه‌گرِ پاس‌شده به لایهٔ DB باید ``bill_until`` را اعمال کند."""
++
++    async def test_calculator_given_to_db_applies_the_cutoff(self):
++        executor = OrderExecutor()
++        started = datetime.utcnow() - timedelta(minutes=30)
++        closed_at = (started + timedelta(minutes=10)).timestamp()
++        settlement = {"order": dict(ORDER_ROW, started_at=started),
++                      "total_cost": 600_000, "used_cost": 100_000,
++                      "refund_amount": 500_000, "refund_tx_id": "TX-1",
++                      "user_wallet_balance": 600_000}
++        with patch.object(database.DatabaseManager, "settle_cancel_order",
++                          new_callable=AsyncMock, return_value=settlement) as claim, \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=USER_ROW), \
++             patch.object(executor, "stop_active_order", new_callable=AsyncMock), \
++             patch.object(executor, "_log_to_channel", new_callable=AsyncMock):
++            await executor.settle_and_refund_order(
++                ORDER_ID, bot_id=1, expected_user_id=12, bill_until=closed_at)
++        calculator = claim.await_args.kwargs["settlement_calculator"]
++        used, refund, _ = calculator(dict(ORDER_ROW, started_at=started))
++        self.assertAlmostEqual(used, 100_000, delta=2_000)
++        self.assertAlmostEqual(refund, 500_000, delta=2_000)
++
++    async def test_without_a_cutoff_the_plain_calculator_is_used(self):
++        executor = OrderExecutor()
++        settlement = {"order": dict(ORDER_ROW), "total_cost": 600_000,
++                      "used_cost": 0, "refund_amount": 600_000,
++                      "refund_tx_id": None, "user_wallet_balance": 600_000}
++        with patch.object(database.DatabaseManager, "settle_cancel_order",
++                          new_callable=AsyncMock, return_value=settlement) as claim, \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=USER_ROW), \
++             patch.object(executor, "stop_active_order", new_callable=AsyncMock), \
++             patch.object(executor, "_log_to_channel", new_callable=AsyncMock):
++            await executor.settle_and_refund_order(ORDER_ID, bot_id=1)
++        self.assertIs(claim.await_args.kwargs["settlement_calculator"],
++                      OrderExecutor.compute_order_settlement)
++
++
++class AskCustomerTests(unittest.IsolatedAsyncioTestCase):
++    """پیام سؤال: دکمه‌های inline + خطِ فالبک متنی."""
++
++    async def test_question_is_sent_to_the_order_owner_with_both_choices(self):
++        executor = OrderExecutor()
++        executor.active_orders[ORDER_ID] = {"remaining_seconds": 1234}
++        bot = _FakeBot()
++        app = SimpleNamespace(bot=bot)
++        with patch("services.bot_manager.bot_manager") as bm, \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=USER_ROW), \
++             patch.object(executor_mod, "_get_voice_call_manager", return_value=None):
++            bm.active_bots = {1: app}
++            sent = await executor.ask_customer_chat_closed(
++                ORDER_ID, dict(ORDER_ROW), time.time())
++        self.assertTrue(sent)
++        self.assertEqual(bot.sent[0]["chat_id"], USER_ROW["telegram_id"])
++        callbacks = [b.callback_data
++                     for row in bot.sent[0]["kwargs"]["reply_markup"].inline_keyboard
++                     for b in row]
++        self.assertIn(f"chatclosed_{ORDER_ID}_keep", callbacks)
++        self.assertIn(f"chatclosed_{ORDER_ID}_stop", callbacks)
++        # خط دوم (فالبک) با کیبورد ریپلای قدیمی می‌آید.
++        self.assertIn("پایان", bot.sent[1]["text"])
++        self.assertIsNotNone(bot.sent[1]["kwargs"].get("reply_markup"))
++
++    async def test_missing_bot_app_is_not_an_exception(self):
++        executor = OrderExecutor()
++        with patch("services.bot_manager.bot_manager") as bm:
++            bm.active_bots = {}
++            self.assertFalse(await executor.ask_customer_chat_closed(
++                ORDER_ID, dict(ORDER_ROW), time.time()))
++
++
++class ChatClosedDecisionHandlerTests(unittest.IsolatedAsyncioTestCase):
++    """هندلر دکمه‌های مشتری (keep/stop)."""
++
++    def _update(self, data, user_id=555001):
++        query = _FakeQuery(data)
++        update = SimpleNamespace(callback_query=query,
++                                 effective_user=SimpleNamespace(id=user_id),
++                                 effective_message=None)
++        return update, query
++
++    async def _call(self, data, *, user=USER_ROW, order=ORDER_ROW, user_id=555001,
++                    settle=None, cont=None):
++        from handlers.order_handlers import chat_closed_decision_callback
++        update, query = self._update(data, user_id=user_id)
++        context = SimpleNamespace(bot_data={"bot_id": 1})
++        with patch.object(database.DatabaseManager, "get_user",
++                          new_callable=AsyncMock, return_value=user), \
++             patch.object(database.DatabaseManager, "get_order",
++                          new_callable=AsyncMock, return_value=order), \
++             patch.object(executor_mod.order_executor, "settle_chat_closed_order",
++                          new_callable=AsyncMock,
++                          return_value=settle or {"total_cost": 600_000,
++                                                  "used_cost": 100_000,
++                                                  "refund_amount": 500_000,
++                                                  "refund_tx_id": "TX-9",
++                                                  "user_wallet_balance": 600_000}) as settle_mock, \
++             patch.object(executor_mod.order_executor, "continue_after_chat_closed",
++                          new_callable=AsyncMock, return_value=True) as cont_mock:
++            await chat_closed_decision_callback(update, context)
++        return query, settle_mock, cont_mock
++
++    async def test_stop_settles_with_the_customer_identity(self):
++        query, settle_mock, cont_mock = await self._call(f"chatclosed_{ORDER_ID}_stop")
++        settle_mock.assert_awaited_once()
++        kwargs = settle_mock.await_args.kwargs
++        self.assertEqual(kwargs["expected_user_id"], USER_ROW["id"])
++        self.assertEqual(kwargs["bot_id"], 1)
++        cont_mock.assert_not_awaited()
++        text = query.edit_message_text.await_args.args[0]
++        self.assertIn("عودت", text)
++        self.assertIn("500,000", text)
++
++    async def test_keep_clears_the_closed_marker(self):
++        query, settle_mock, cont_mock = await self._call(f"chatclosed_{ORDER_ID}_keep")
++        cont_mock.assert_awaited_once_with(ORDER_ID)
++        settle_mock.assert_not_awaited()
++        self.assertIn("ادامه", query.edit_message_text.await_args.args[0])
++
++    async def test_foreign_customer_cannot_touch_the_order(self):
++        query, settle_mock, cont_mock = await self._call(
++            f"chatclosed_{ORDER_ID}_stop", order=dict(ORDER_ROW, user_id=99))
++        settle_mock.assert_not_awaited()
++        cont_mock.assert_not_awaited()
++        self.assertIn("نیست", query.edit_message_text.await_args.args[0])
++
++    async def test_stale_press_on_a_finished_order_does_not_double_refund(self):
++        query, settle_mock, cont_mock = await self._call(
++            f"chatclosed_{ORDER_ID}_stop", order=dict(ORDER_ROW, status="stopped"))
++        settle_mock.assert_not_awaited()
++        self.assertIn("دیگر فعال نیست", query.edit_message_text.await_args.args[0])
++
++    async def test_already_settled_claim_is_reported_not_crashed(self):
++        from handlers.order_handlers import chat_closed_decision_callback
++        update, query = self._update(f"chatclosed_{ORDER_ID}_stop")
++        context = SimpleNamespace(bot_data={"bot_id": 1})
++        with patch.object(database.DatabaseManager, "get_user",
++                          new_callable=AsyncMock, return_value=USER_ROW), \
++             patch.object(database.DatabaseManager, "get_order",
++                          new_callable=AsyncMock, return_value=ORDER_ROW), \
++             patch.object(executor_mod.order_executor, "settle_chat_closed_order",
++                          new_callable=AsyncMock, side_effect=ValueError("claimed")):
++            await chat_closed_decision_callback(update, context)
++        self.assertIn("قبلاً لغو", query.edit_message_text.await_args.args[0])
++
++
++class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
++    """فالبک متنی «پایان» برای مشتری‌ای که دکمه را نمی‌زند."""
++
++    def _update(self, text, user_id=555001):
++        msg = SimpleNamespace(text=text, chat_id=555001, reply_text=AsyncMock())
++        return SimpleNamespace(effective_message=msg,
++                               effective_user=SimpleNamespace(id=user_id)), msg
++
++    async def test_end_word_settles_only_closed_chat_orders_of_this_user(self):
++        from handlers.order_handlers import chat_closed_text_fallback
++        from telegram.ext import ApplicationHandlerStop
++        update, msg = self._update("پایان")
++        context = SimpleNamespace(bot_data={"bot_id": 1}, bot=_FakeBot())
++        settlement = {"total_cost": 600_000, "used_cost": 100_000,
++                      "refund_amount": 500_000, "refund_tx_id": "TX-9",
++                      "user_wallet_balance": 600_000}
++        executor = executor_mod.order_executor
++        executor.active_orders[ORDER_ID] = {"user_id": USER_ROW["id"], "bot_id": 1,
++                                            "chat_closed": True}
++        try:
++            with patch.object(database.DatabaseManager, "get_user",
++                              new_callable=AsyncMock, return_value=USER_ROW), \
++                 patch.object(executor, "settle_chat_closed_order",
++                              new_callable=AsyncMock, return_value=settlement) as settle:
++                with self.assertRaises(ApplicationHandlerStop):
++                    await chat_closed_text_fallback(update, context)
++            settle.assert_awaited_once()
++            self.assertEqual(settle.await_args.kwargs["expected_user_id"],
++                             USER_ROW["id"])
++        finally:
++            executor.active_orders.pop(ORDER_ID, None)
++
++    async def test_other_text_is_left_alone_when_no_closed_chat_exists(self):
++        from handlers.order_handlers import chat_closed_text_fallback
++        update, msg = self._update("پایان")
++        context = SimpleNamespace(bot_data={"bot_id": 1}, bot=_FakeBot())
++        with patch.object(database.DatabaseManager, "get_user",
++                          new_callable=AsyncMock, return_value=USER_ROW):
++            await chat_closed_text_fallback(update, context)  # باید بی‌صدا رد شود
++        msg.reply_text.assert_not_awaited()
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tests/test_debt_ratchets.py b/tests/test_debt_ratchets.py
 new file mode 100644
 index 0000000..b7fa7fb

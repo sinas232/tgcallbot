@@ -108,7 +108,10 @@ docker compose up -d --force-recreate bot
   پایانش استقرار را انجام دهید.
 - اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
   گاردها را خودش انجام می‌دهد).
-- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
+- بعد از apply باید ۱۷ فایل ` M` و ۲۲ فایل `??` تازه ببینید (۳۹ مسیر، پورت + فیکس‌ها).
+- تأیید سریع داخل کانتینر (بعد از بالا آمدن):
+  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow`
+  باید ۴۳ تست OK بدهد.
 - `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
   تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
   `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
