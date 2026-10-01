@@ -37,6 +37,20 @@ index cfd55d7..d9e7031 100644
  # media = استریم سکوت فعلی؛ auto = یک شنوندهٔ آزمایشی در هر چت تا تأیید
  # دوگانهٔ حضور و binding؛ خطا/قطع => بازگشت به استریم؛ listener = opt-in صریح.
  VOICE_SILENCE_MODE=media
+diff --git a/.gitignore b/.gitignore
+index f21bf42..c51a865 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,3 +16,9 @@ diag_voice.py
+ .env.newserver
+ backups/
+ .test-*.log
++
++# Server-side leftovers that must never block the deploy guard
++# (`git status --porcelain` non-empty aborts deploy-warp.sh): .env backups
++# written by an operator and a stray FETCH_HEAD left by a manual fetch.
++.env.bak.*
++FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 index 5ed9f7c..6778120 100644
 --- a/CHANGELOG.md
