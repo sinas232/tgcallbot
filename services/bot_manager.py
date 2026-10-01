@@ -20,8 +20,43 @@ logger = logging.getLogger(__name__)
 
 class BotManager:
     def __init__(self):
-        self.active_bots: Dict[int, Application] = {} 
-        self.register_handlers_func = None 
+        self.active_bots: Dict[int, Application] = {}
+        self._starting_bots: set[int] = set()
+        self._starting_tasks: Dict[int, asyncio.Task] = {}
+        # Synchronize publish of a newly initialized bot with the superadmin
+        # maintenance toggle. A startup DB read must not overwrite a toggle
+        # that happened while this reseller was starting/polling.
+        self.maintenance_lock = asyncio.Lock()
+        self.register_handlers_func = None
+
+    async def _publish_initialized_bot(self, bot_id: int, app: Application) -> None:
+        """Load global maintenance and publish the app in one critical section."""
+        async with self.maintenance_lock:
+            try:
+                app.bot_data['maintenance_mode'] = await asyncio.wait_for(
+                    DatabaseManager.global_maintenance_enabled_strict(), timeout=10)
+            except Exception as exc:
+                logger.error("Bot %s: maintenance flag load failed (%s) — fail CLOSED (ON)",
+                             bot_id, type(exc).__name__)
+                app.bot_data['maintenance_mode'] = True
+            # Publish BEFORE polling so any concurrent toggle can update its
+            # cache, even if Telegram startup takes several seconds.
+            self.active_bots[bot_id] = app
+
+    async def _discard_partial_bot(self, bot_id: int, app: Application | None) -> None:
+        """Undo a failed/cancelled launch before permitting another login."""
+        if app is None:
+            return
+        if self.active_bots.get(bot_id) is app:
+            self.active_bots.pop(bot_id, None)
+        try:
+            if app.updater and app.updater.running:
+                await app.updater.stop()
+            if app.running:
+                await app.stop()
+            await app.shutdown()
+        except Exception:
+            logger.exception("Bot %s: failed to clean up partial startup", bot_id)
 
     def set_handler_registrar(self, func):
         self.register_handlers_func = func
@@ -48,10 +83,14 @@ class BotManager:
         bot_id = bot_data['id']
         token = bot_data['token']
         
-        # اگر قبلاً روشن است، کاری نکن
+        # Prevent two concurrent launches of the same token in this process.
+        if bot_id in self._starting_bots:
+            return False
         if bot_id in self.active_bots:
             return True
-
+        self._starting_bots.add(bot_id)
+        self._starting_tasks[bot_id] = asyncio.current_task()
+        app = None
         try:
             # ایجاد پوشه دیتا اگر نباشد
             os.makedirs("data", exist_ok=True)
@@ -114,22 +153,16 @@ class BotManager:
             # 🔥 ذخیره API ID و Hash اختصاصی ربات نمایندگی
             app.bot_data['api_id'] = bot_data.get('api_id')
             app.bot_data['api_hash'] = bot_data.get('api_hash')
-            # پرچم حالت تعمیرات — «سراسری»: مرجع، تنظیم ربات اصلی (bot_id=1)
-            # است تا تاگلِ سوپرادمین روی همهٔ ربات‌های نمایندگی هم اثر بگذارد
-            # (با سقف زمانی؛ خطا → پیش‌فرض خاموش).
-            try:
-                app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-                    DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
-            except Exception as e:
-                logger.warning(f"Bot {bot_id}: maintenance flag load failed ({e}) — default OFF")
-                app.bot_data['maintenance_mode'] = False
-            
+            # Initialize restores stale PTB persistence. Set identity above,
+            # then read the canonical bot_id=1 flag and publish atomically
+            # with respect to the superadmin toggle (fail CLOSED on DB error).
+            await self._publish_initialized_bot(bot_id, app)
+
             # استارت ربات
             await app.start()
-            
+
             if not app.updater:
-                 logger.error(f"❌ Updater not found for bot {bot_id}")
-                 return False
+                raise RuntimeError(f"Updater not found for bot {bot_id}")
 
             # شروع دریافت پیام‌ها
             await app.updater.start_polling(
@@ -139,20 +172,39 @@ class BotManager:
                 drop_pending_updates=True,
             )
             
-            self.active_bots[bot_id] = app
             logger.info(f"✅ Reseller Bot {bot_id} (Admin: {bot_data['owner_id']}) started successfully.")
-            
             return True
-            
+
+        except asyncio.CancelledError:
+            await self._discard_partial_bot(bot_id, app)
+            raise
         except Exception as e:
             logger.error(f"❌ Failed to start bot {bot_id}: {e}")
+            await self._discard_partial_bot(bot_id, app)
             return False
+        finally:
+            self._starting_bots.discard(bot_id)
+            self._starting_tasks.pop(bot_id, None)
 
     async def stop_bot(self, bot_id: int):
         """توقف کامل یک ربات"""
-        if bot_id == 1: 
+        if bot_id == 1:
             logger.warning("⚠️ Cannot stop Main Bot (ID 1) via BotManager.")
             return
+
+        starting = self._starting_tasks.get(bot_id)
+        if starting and starting is not asyncio.current_task():
+            # The app is published before Telegram polling starts so the
+            # maintenance toggle can see it. A concurrent stop must cancel
+            # that in-flight launch, not remove the published app and let it
+            # finish starting as an untracked second bot client.
+            starting.cancel()
+            try:
+                await starting
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Bot %s: partial startup stop failed", bot_id)
 
         if bot_id in self.active_bots:
             app = self.active_bots[bot_id]

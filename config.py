@@ -7,6 +7,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── مقیاس‌پذیری خودکار هم‌روندی از روی سخت‌افزار واقعی ──────────────────────
+# os.cpu_count() تعداد هسته‌های هاست را می‌دهد، نه سهمیه‌ای که cgroup به
+# کانتینر داده است. host_resources سهمیهٔ واقعی را می‌خواند.
+# قاعده: اگر متغیر env صریحاً تنظیم شده باشد همان عدد برنده است؛ اگر تنظیم
+# نشده باشد (صفر) مقدار از روی تعداد هسته محاسبه می‌شود.
+from services.host_resources import (  # noqa: E402 (بعد از load_dotenv)
+    recommended_client_create_concurrency as _rec_client_create,
+    recommended_global_join_concurrency as _rec_global_join,
+    recommended_join_max_concurrency as _rec_join_max,
+)
+from services.env_sanity import check_and_warn as _check_env  # noqa: E402
+
+ENV_DUPLICATE_KEYS = _check_env()
+
+
+def _env_int(key: str) -> int:
+    """عددِ صریحِ env یا صفر. صفر یعنی «تنظیم نشده» ⇒ محاسبهٔ خودکار."""
+    _raw = os.getenv(key)
+    if _raw is None or not str(_raw).strip():
+        return 0
+    try:
+        return int(str(_raw).strip())
+    except ValueError:
+        return 0
+
+
 
 def _safe_encode_db_url(raw: str) -> str:
     """
@@ -70,7 +96,17 @@ class Config:
     RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '30'))
 
     # Order Settings
-    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '10'))
+    # تنها سقف تجاریِ ربات: تعداد سفارش‌های همزمان. بقیهٔ کنترل‌های هم‌روندی از
+    # روی سهمیهٔ واقعی CPU محاسبه می‌شوند نه به‌صورت عدد ثابت.
+    MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '5'))
+    if MAX_CONCURRENT_ORDERS < 0:
+        raise ValueError('MAX_CONCURRENT_ORDERS must not be negative')
+    # Preserve the permissive default for existing installs; 'private' opts in.
+    ORDER_LINK_MODE = os.getenv('ORDER_LINK_MODE', 'any').strip().lower()
+    if ORDER_LINK_MODE not in ('any', 'private'):
+        raise ValueError('ORDER_LINK_MODE must be any or private')
+    ORDER_LINK_REGEX = os.getenv('ORDER_LINK_REGEX', '').strip()
+    ORDER_LINK_EXAMPLE = os.getenv('ORDER_LINK_EXAMPLE', '').strip()
     DEFAULT_DELAY_BETWEEN_ACTIONS = {
         'min': int(os.getenv('DELAY_MIN', '5') or 5),
         'max': int(os.getenv('MAX_DELAY', '15') or 15)
@@ -85,8 +121,11 @@ class Config:
     # System-wide hard cap on simultaneous native join operations (across ALL
     # orders). Bumped up so several 100-500-account orders can build in
     # parallel without starving each other.
-    GLOBAL_JOIN_CONCURRENCY = int(os.getenv('GLOBAL_JOIN_CONCURRENCY', '24'))
-    CLIENT_CREATE_CONCURRENCY = int(os.getenv('CLIENT_CREATE_CONCURRENCY', '8'))  # parallel Pyrogram client creations
+    # AUTO: ۸ به ازای هر هستهٔ در دسترس، کف ۸، سقف ۹۶. عمدتاً انتظار I/O است
+    # نه CPU، پس ضریب بالایی می‌گیرد. مقدار صریحِ env همیشه برنده است.
+    GLOBAL_JOIN_CONCURRENCY = _env_int('GLOBAL_JOIN_CONCURRENCY') or _rec_global_join()
+    # AUTO: ۲ به ازای هر هسته، کف ۴، سقف ۱۶ (هر ساخت = یک handshake کامل MTProto).
+    CLIENT_CREATE_CONCURRENCY = _env_int('CLIENT_CREATE_CONCURRENCY') or _rec_client_create()
     BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
     RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
@@ -104,6 +143,37 @@ class Config:
     # (success speed vs. FloodWait / transient failures). Designed for
     # orders of 100-500 accounts.
     VOICE_JOIN_ADAPTIVE = os.getenv('VOICE_JOIN_ADAPTIVE', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Historical sequential mode is opt-in so existing wave installations do
+    # not change cadence unexpectedly. In this mode the per-order wave stays
+    # at 1 until the preceding account finishes group+voice verification.
+    VOICE_JOIN_SEQUENTIAL = os.getenv('VOICE_JOIN_SEQUENTIAL', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    # Both legacy gap spellings are accepted; the account-gap names win when
+    # explicitly supplied. Never treat INITIAL_CONCURRENCY=1 as sequential:
+    # adaptive mode can widen later.
+    VOICE_JOIN_ACCOUNT_GAP_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MIN', os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MIN', '1.0')))
+    VOICE_JOIN_ACCOUNT_GAP_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_MAX', os.getenv('VOICE_JOIN_SEQUENTIAL_GAP_MAX', '2.0')))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MIN', '0.0'))
+    VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX = float(os.getenv('VOICE_JOIN_ACCOUNT_GAP_JITTER_MAX', '0.5'))
+    # A prewarm opens the *next* client's MTProto transport before its join.
+    # Off by default to avoid extra simultaneous auth-key connections.
+    VOICE_JOIN_SEQUENTIAL_PREWARM = os.getenv('VOICE_JOIN_SEQUENTIAL_PREWARM', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_SECOND_CHANCE_ROUNDS = int(os.getenv('VOICE_SECOND_CHANCE_ROUNDS', '0'))
+    VOICE_SECOND_CHANCE_COOLDOWN_SECONDS = float(os.getenv('VOICE_SECOND_CHANCE_COOLDOWN_SECONDS', '60'))
+    VOICE_IDLE_REAPER = os.getenv('VOICE_IDLE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+    VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+    VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
+    VOICE_RAM_SOFT_LIMIT_MB = int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0'))
+    # 'auto' tests one canary per chat; other accounts use media until a
+    # participant-list AND native-binding observation proves its dwell time.
+    # 'media' keeps the existing behaviour; 'listener' opts in explicitly.
+    VOICE_SILENCE_MODE = os.getenv('VOICE_SILENCE_MODE', 'media').strip().lower()
+    VOICE_LISTENER_PROBE_SECONDS = int(os.getenv('VOICE_LISTENER_PROBE_SECONDS', '60'))
+    VOICE_LISTENER_MAX_FAILURES = int(os.getenv('VOICE_LISTENER_MAX_FAILURES', '2'))
+    VOICE_LISTENER_MAX_DROPS = int(os.getenv('VOICE_LISTENER_MAX_DROPS', '3'))
+    # Legacy name: minimum delay before an OPERATOR-initiated in-bot,
+    # single-account conflict check. No automatic 406 retry is safe.
+    VOICE_SESSION_CONFLICT_RETRY_SECONDS = int(os.getenv('VOICE_SESSION_CONFLICT_RETRY_SECONDS', '60'))
     # First wave size. 2 is the safe default: combined with the staggered
     # starts below (VOICE_JOIN_START_STAGGER_*) the JoinGroupCall RPCs and the
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
@@ -111,11 +181,14 @@ class Config:
     # voice handshake. The Join Brain may still widen this (up to the max).
     VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
     VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~2 concurrent media setups is where transports start dying AND
-    # where Telegram's per-IP burst budget starts answering with FloodWait.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    # Per-order ceiling. Previously a hard-coded 2 (a 'small VPS' assumption):
+    # every simultaneous voice handshake consumes CPU/ffmpeg + a WebRTC stack,
+    # and Telegram's per-IP burst budget answers bursts with FloodWait.
+    # AUTO: ۲ به ازای هر هسته، کف ۲، سقف ۱۶. این فقط یک «سقف» است — Join Brain
+    # تعداد واقعی هر موج را تطبیقی و زیر این سقف انتخاب می‌کند و در صورت فشار
+    # تلگرام تا VOICE_JOIN_MIN_CONCURRENCY پایین می‌آید؛ پس سقف بالاتر به معنی
+    # «همیشه این‌قدر join بزن» نیست.
+    VOICE_JOIN_MAX_CONCURRENCY = _env_int('VOICE_JOIN_MAX_CONCURRENCY') or _rec_join_max()
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -267,6 +340,55 @@ class Config:
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
+    # ═══════════════════════════════════════════════════════════════════
+    # 🛡 حالت ضد اسپم (Anti-Spam Protection) — services/anti_spam.py
+    # ═══════════════════════════════════════════════════════════════════
+    # این مقادیر «پیش‌فرضِ fallback» هستند؛ مقدارِ نهاییِ زنده از دیتابیس
+    # (پنل سوپرادمین → «🛡 ضد اسپم و محافظت») خوانده می‌شود و تغییر آن‌ها در
+    # پنل بدون ری‌استارت اعمال می‌شود. env فقط وقتی استفاده می‌شود که کلید
+    # متناظر در دیتابیس هنوز ست نشده باشد.
+    #
+    # سوییچ کلی حالت ضد اسپم (join آهسته‌تر + خروج انسانی‌تر + استراحت اکانت).
+    ANTISPAM_ENABLED = os.getenv('ANTISPAM_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # فاصلهٔ شروع join دو اکانت متوالی در حالت ضد اسپم (ثانیه) — پراکندگی RPC.
+    ANTISPAM_JOIN_GAP_MIN = float(os.getenv('ANTISPAM_JOIN_GAP_MIN', '3.0'))
+    ANTISPAM_JOIN_GAP_MAX = float(os.getenv('ANTISPAM_JOIN_GAP_MAX', '8.0'))
+    # jitter انسانیِ اضافه روی فاصلهٔ join (ضد fingerprint پریودیک).
+    ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
+    # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
+    ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
+    # کفِ پنجرهٔ join وقتی ضدِ‌اسپم فعال است.
+    # نرخِ JoinGroupCall را start-gap مهار می‌کند نه پنجره؛ پنجره فقط
+    # اجازهٔ هم‌پوشانی می‌دهد. مقدار ۱ رفتارِ قبلی را بازمی‌گرداند
+    # (joinها کاملاً سریال). سقفِ نهایی همچنان VOICE_JOIN_MAX_CONCURRENCY است.
+    ANTISPAM_JOIN_WINDOW_FLOOR = int(os.getenv('ANTISPAM_JOIN_WINDOW_FLOOR', '4'))
+    # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
+    ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
+    ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
+    ANTISPAM_LEAVE_JITTER_MAX = float(os.getenv('ANTISPAM_LEAVE_JITTER_MAX', '1.2'))
+    ANTISPAM_LEAVE_MAX_CONCURRENCY = int(os.getenv('ANTISPAM_LEAVE_MAX_CONCURRENCY', '2'))
+    # استراحت هر اکانت بین دو سفارش (دقیقه). 0 = خاموش. با مقدار >0 اکانتی که
+    # تازه کارش تمام شده تا پایان استراحت برای سفارش جدید انتخاب نمی‌شود.
+    ANTISPAM_ACCOUNT_REST_MINUTES = float(os.getenv('ANTISPAM_ACCOUNT_REST_MINUTES', '0'))
+
+    # ── خروج به‌تأخیرافتاده از گروه (services/group_leave_scheduler.py) ──
+    # پس از پایان/لغو سفارش، اکانت‌ها از «ویس‌کال» بلافاصله خارج می‌شوند ولی
+    # خروج از خودِ گروه/کانال زمان‌بندی می‌شود؛ اگر کاربر برای همان مقصد دوباره
+    # سفارش بزند خروج‌ها لغو می‌شوند (بدون چرخهٔ leave/rejoin مضر).
+    GROUP_LEAVE_ENABLED = os.getenv('GROUP_LEAVE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # تأخیر خروج از گروه بعد از پایان سفارش (ساعت). پیش‌فرض ۱۶۸ = یک هفته.
+    GROUP_LEAVE_DELAY_HOURS = float(os.getenv('GROUP_LEAVE_DELAY_HOURS', '168'))
+    # فاصلهٔ زمانی بین خروج دو اکانتِ متوالی از یک گروه (ثانیه) — دونه‌به‌دونه و
+    # به‌ترتیب، نه یک‌جا (مشهورترین الگوی ربات برای آنتی‌اسپم).
+    GROUP_LEAVE_INTERVAL_SEC = float(os.getenv('GROUP_LEAVE_INTERVAL_SEC', '60'))
+    # حداکثر تعداد خروج پردازش‌شده در هر اجرای زمان‌بند (job هر ۶۰ ثانیه).
+    GROUP_LEAVE_SWEEP_BATCH = int(os.getenv('GROUP_LEAVE_SWEEP_BATCH', '25'))
+
+    # ── ممنوعیت ثبت سفارش جدید پس از لغو (Cancel Cooldown) ──
+    # کاربری که سفارشش را لغو می‌کند تا این مدت (دقیقه) نمی‌تواند سفارش جدید
+    # ثبت کند. 0 = خاموش. از پنل سوپرادمین قابل تنظیم است.
+    CANCEL_COOLDOWN_MINUTES = int(os.getenv('CANCEL_COOLDOWN_MINUTES', '20'))
+
 # ─── Voice-chat join scheduling ─────────────────────────────────────────
     # JOIN ARCHITECTURE: ADAPTIVE BATCH (see VOICE_JOIN_* knobs above).
     # Accounts of one order join in waves of N (initial 5-10) concurrent
@@ -279,6 +401,18 @@ class Config:
     # Hard deadline per adaptive wave: stragglers are cancelled and deferred
     # to the next wave so one slow/stuck account never freezes the build.
     VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
+    # ── CROSS-ORDER STARVATION WAIT (incident 1405-07-04) ─────────────────
+    # If every remaining pool account is held by ANOTHER live order, wait a
+    # bounded number of rounds for that order to release them instead of
+    # silently delivering a short order. The wait is bounded so a stalled
+    # order can never hang forever, and an account is never stolen.
+    VOICE_STARVED_WAIT_ROUNDS = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS', '6'))
+    VOICE_STARVED_WAIT_SECONDS = float(os.getenv('VOICE_STARVED_WAIT_SECONDS', '20'))
+    # ── RESTART RECOVERY (incident 1405-07-04) ────────────────────────────
+    # Re-submit orders that were `running` when the process died (OOM kill /
+    # deploy) for whatever paid time is left, and tell the user. Turn off to
+    # get the old behaviour, where such orders stayed `running` forever.
+    ORDER_RECOVERY_ENABLED = os.getenv('ORDER_RECOVERY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # Telegram JoinGroupCall supports joining muted; keep the account muted by
     # default while the silent stream maintains the media transport.
     VOICE_JOIN_MUTED = os.getenv('VOICE_JOIN_MUTED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')

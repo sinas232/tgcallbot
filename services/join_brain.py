@@ -31,8 +31,8 @@ Design goals (100-500 accounts per order):
     VoiceCallManager); the Brain only paces NEW waves and never bypasses a
     server wait.
 
-The module is intentionally dependency-free (stdlib + config) so it can be
-unit-tested without Telegram/DB infrastructure.
+The module only imports stdlib, config and the pure session classifier; it
+can be unit-tested without Telegram/DB infrastructure.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ import time
 from typing import Dict, List, Optional
 
 from config import Config
+from services.session_ownership import is_auth_key_duplicated, is_fatal_auth_error
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +63,39 @@ def classify_message(msg: str) -> str:
     so it mirrors the important buckets without importing heavy modules.
     """
     text = (msg or "").upper()
+    if is_auth_key_duplicated(text):
+        return OUTCOME_DEAD  # skip this order slot; text alone cannot authorize DB deletion
+
+    # ── Permanent ACCOUNT conditions, checked BEFORE the flood bucket ──────
+    # FROZEN_METHOD_INVALID is returned by Telegram with error code 420 - the
+    # same code as FloodWait - so the loose "420" substring test that used to
+    # sit here swallowed it as throttling.  It is not throttling: a frozen
+    # account is unusable until its owner talks to @SpamBot.  Mis-bucketing it
+    # as FLOOD kept the attempt budget ("budget kept, retry deferred"), so the
+    # same frozen account was retried forever while every retry paused the
+    # WHOLE order for VOICE_JOIN_FLOOD_PAUSE_SECONDS.  Order 929 stalled at
+    # live=40/42 for exactly this reason.  PERMANENT replaces it from the pool.
+    #
+    # PEER_FLOOD is grouped with it because voice_call_manager already maps
+    # both to "Account Restricted"; USER_DEACTIVATED is dead, not throttled.
     if any(k in text for k in (
-        "SESSION_REVOKED", "AUTH_KEY_INVALID", "AUTH_KEY_UNREGISTERED",
-        "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401", "DEAD",
+        "FROZEN_METHOD_INVALID", "ACCOUNT FROZEN", "PEER_FLOOD",
+        "USER_DEACTIVATED",
     )):
-        return OUTCOME_DEAD
+        return OUTCOME_PERMANENT
+
+    # ── Real server-directed throttling ────────────────────────────────────
+    # The bare "420" substring is deliberately gone.  See the docstring of
+    # session_ownership.is_fatal_auth_error for why a numeric substring is not
+    # evidence of an RPC code: a chat ID, a trace number, an elapsed-ms figure
+    # or a "FLOOD_WAIT:420" duration can all contain it.  Only match 420 where
+    # Telegram actually puts the code, i.e. immediately before the error name.
     if any(k in text for k in (
-        "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
-    )):
+        "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "SLOW_MODE",
+    )) or "420 FLOOD" in text or "(420)" in text:
         return OUTCOME_FLOOD
+    if is_fatal_auth_error(text):
+        return OUTCOME_DEAD
     if any(k in text for k in (
         "INVALID LINK", "USERNAME_INVALID", "ACCOUNT RESTRICTED", "PEER_ID_INVALID",
         "COULD NOT RESOLVE", "CANNOT FIND", "MEMBERSHIP", "VOICE CHAT NOT ACTIVE",

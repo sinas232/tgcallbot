@@ -16,15 +16,21 @@ from constants import *
 from helpers.message_utils import send_safe
 from handlers.admin_handlers import admin_panel_start
 from telegram_client import TelegramAccountClient
+from services.session_client import close_pyrogram_client
+from services.session_ownership import session_ownership
 
 logger = logging.getLogger(__name__)
 
 async def _cleanup_client(context):
-    c = context.user_data.get('temp_client')
-    if c:
-        try: await c.stop()
-        except: pass
-    context.user_data.pop('temp_client', None)
+    client = context.user_data.get('temp_client')
+    if client is None:
+        return True
+    closed = await close_pyrogram_client(client)
+    if closed:
+        context.user_data.pop('temp_client', None)
+    else:
+        logger.error("Phone-login MTProto client did not disconnect; session not safe to save")
+    return closed
 
 # --- دریافت کد ورود ---
 async def get_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -142,8 +148,13 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def finalize_session(update, context, client):
     try:
         sess = await client.export_session_string()
-        enc_sess = SecurityManager.encrypt_session(sess)
         me = await client.get_me()
+        if not await _cleanup_client(context):
+            raise RuntimeError("اتصال قبلی قطع نشد؛ سشن ذخیره نشد.")
+        session_ownership.note_login_disconnect(sess)
+        enc_sess = SecurityManager.encrypt_session(sess)
+        if not enc_sess:
+            raise ValueError("رمزنگاری سشن ناموفق بود")
 
         # 🔥 استفاده از bot_id صحیح برای ثبت اکانت
         bot_id = context.bot_data.get('bot_id', 1)

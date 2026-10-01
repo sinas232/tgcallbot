@@ -180,7 +180,7 @@ _RULES = (
     ("import_error", ("cannot import name", "no module named", "importerror")),
     ("session_dead", ("session_revoked", "auth_key_invalid", "auth_key_unregistered",
                       "user_deactivated", "active user required")),
-    ("flood_wait", ("floodwait", "flood_wait", "retry after", "420")),
+    ("flood_wait", ("floodwait", "flood_wait", "retry after", "420 flood")),
     ("call_invalid", ("groupcallinvalid", "group call invalid", "gcall_invalid",
                       "call not found")),
     ("forbidden", ("forbidden", "403", "not enough rights")),
