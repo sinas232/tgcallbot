@@ -2098,18 +2098,78 @@ class VoiceCallManager:
                     # start() can time out AFTER native WebRTC initialized.
                     # Retain the original engine before awaiting it. A retry
                     # must never construct a second engine on a transport that
-                    # may still be using the same Telegram authorization key.
+                    # may still be using the same Telegram authorization key —
+                    # _start_engine_with_retries reuses THIS handle and only
+                    # quarantines the account when every attempt fails.
                     self.clients[account_id] = pytg
-                    try:
-                        await asyncio.wait_for(pytg.start(), timeout=15)
-                    except BaseException:
-                        self._quarantined_accounts.add(account_id)
-                        logger.error("acc=%s engine startup unconfirmed; existing client "
-                                     "quarantined (no second engine)", account_id)
-                        raise
+                    await self._start_engine_with_retries(pytg, account_id)
 
             self._client_last_used[account_id] = time.time()
             return pytg
+
+    async def _start_engine_with_retries(self, pytg: PyTgCalls, account_id: int) -> None:
+        """Start a freshly constructed PyTgCalls engine, retrying the SAME handle.
+
+        Why this exists (incident 2026-10-01, order 930): a single
+        ``pytg.start()`` timeout quarantined the account for the lifetime of
+        the process —
+
+            acc=156 engine startup unconfirmed; existing client quarantined
+            (no second engine)
+            reason: "client init error: "        ← empty: a bare TimeoutError
+
+        — so a 15-second hiccup cost the order two perfectly healthy accounts
+        (156, 142) and the build finished at 38/42.  Retrying the SAME engine
+        object is safe: no second PyTgCalls instance is ever constructed on the
+        same auth key, which is the invariant the quarantine protects.  Only
+        after every attempt fails do we keep the conservative quarantine.
+
+        Raises the original exception (wrapped with a non-empty message) so
+        callers can still classify it.
+        """
+        attempts = max(1, int(getattr(Config, "VOICE_ENGINE_START_ATTEMPTS", 3)))
+        timeout = max(5, int(getattr(Config, "VOICE_ENGINE_START_TIMEOUT", 15)))
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.wait_for(pytg.start(), timeout=timeout)
+                if attempt > 1:
+                    logger.info(
+                        "acc=%s engine start recovered on attempt %d/%d",
+                        account_id, attempt, attempts,
+                    )
+                return
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                last_exc = exc
+                msg = str(exc) or type(exc).__name__
+                if attempt < attempts:
+                    logger.warning(
+                        "acc=%s engine start attempt %d/%d failed (%s); "
+                        "retrying the same engine",
+                        account_id, attempt, attempts, msg[:120],
+                    )
+                    await asyncio.sleep(min(2.0 * attempt, 5.0))
+                else:
+                    logger.error(
+                        "acc=%s engine start failed after %d attempt(s) (%s)",
+                        account_id, attempts, msg[:120],
+                    )
+        self._quarantined_accounts.add(account_id)
+        assert last_exc is not None
+        if is_fatal_auth_error(str(last_exc)) or is_auth_key_duplicated(str(last_exc)):
+            raise last_exc
+        # A bare asyncio.TimeoutError stringifies to "" — that is how the
+        # production log ended up with `reason: "client init error: "`.
+        detail = str(last_exc).strip()
+        if isinstance(last_exc, (asyncio.TimeoutError, TimeoutError)) and not detail:
+            detail = f"start() not confirmed within {timeout}s"
+        detail = (f"{type(last_exc).__name__}: {detail[:120]}" if detail
+                  else f"{type(last_exc).__name__} (no message)")
+        raise RuntimeError(
+            f"engine startup failed after {attempts} attempt(s): {detail}"
+        ) from last_exc
 
     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
         # IMPORTANT: use the SAME per-account lock as the warmup/create path.
@@ -2791,6 +2851,54 @@ class VoiceCallManager:
         """
         return True if media_binding is True else participant_presence
 
+    async def _presence_after_direct_recheck(self, order_id: int, account_id: int,
+                                             app: Client, chat_id: int,
+                                             present: Optional[bool],
+                                             media_alive: Optional[bool]) -> Optional[bool]:
+        """Verify a shared-snapshot "absent" answer before acting on it.
+
+        The monitor takes ONE paginated participant sweep per chat per cycle
+        and shares it between every account of the order.  That snapshot is
+        authoritative when complete, but a truncated/partial sweep makes
+        healthy accounts look absent — and an account that is "absent" while
+        its media binding is also gone used to be escalated to
+        ``confirmed_disconnect`` + ``rejoin`` after CONFIRMED_DISCONNECT_THRESHOLD
+        cycles.  Order 930 showed the result: eight accounts at a time bounced
+        through ``media_transport_lost → confirmed_disconnect → recovered``
+        every few cycles, each bounce issuing fresh JoinGroupCall traffic.
+
+        A direct per-account answer (``force_direct``) is the tie-breaker:
+          * True  → the shared snapshot was incomplete; presence is intact
+          * None  → unknown; do NOT count towards a disconnect
+          * False → the account really is out of the call
+        Runs at most once per cycle, and only for accounts the snapshot called
+        absent (so it cannot become a new RPC source in the common case).
+        """
+        if present is not False or media_alive is True:
+            return present
+        if not bool(getattr(Config, "VOICE_PRESENCE_DIRECT_RECHECK", True)):
+            return present
+        try:
+            direct = await self._is_in_voice_call(app, int(chat_id), force_direct=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            direct = None
+        if direct is present:
+            return present
+        self._vc_event_log(order_id, account_id, "presence_recheck", {
+            "chat_id": int(chat_id),
+            "snapshot_present": bool(present),
+            "direct_present": direct,
+        })
+        if direct is True:
+            logger.warning(
+                "[VoicePresence] acc=%s chat=%s: shared snapshot said ABSENT but a "
+                "direct check says PRESENT — keeping the slot (incomplete snapshot, "
+                "no rejoin issued)", account_id, chat_id,
+            )
+        return direct
+
     async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
         """Authoritative per-chat media transport liveness.
 
@@ -3063,21 +3171,30 @@ class VoiceCallManager:
             return None
         return int(my_id) in present_ids
 
-    async def _is_in_voice_call(self, app: Client, chat_id: int) -> Optional[bool]:
+    async def _is_in_voice_call(self, app: Client, chat_id: int,
+                                force_direct: bool = False) -> Optional[bool]:
         """Check if account is actually in the voice call via Telegram API.
 
         Returns:
           True  - account confirmed present in the call.
           False - account confirmed NOT present (full participant list checked).
           None  - presence could not be determined (API error / pagination failure).
+
+        ``force_direct=True`` skips the shared per-cycle participant snapshot
+        and asks Telegram for THIS account directly.  Use it before an
+        "absent" answer is allowed to trigger a rejoin: the shared snapshot is
+        one paginated sweep for the whole chat and can be incomplete in huge
+        calls, while a direct answer cannot be confused by another account's
+        pagination state (see _presence_after_direct_recheck).
         """
         # One failed SHARED snapshot should never trigger a second, per-account
         # pagination sweep for every member of a large order. An unknown
         # response stays unknown; otherwise RPC floods can create the very
         # timeouts and apparent absences the monitor is trying to fix.
-        snapshot = self._participant_snapshot.get(int(chat_id))
-        if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
-            return None
+        if not force_direct:
+            snapshot = self._participant_snapshot.get(int(chat_id))
+            if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
+                return None
         my_id = None
         try:
             me = getattr(app, "me", None)
@@ -3094,9 +3211,10 @@ class VoiceCallManager:
             return None
 
         # Fast path: use the shared snapshot taken during the monitor cycle.
-        snap_result = self._snapshot_contains(int(chat_id), int(my_id))
-        if snap_result is not None:
-            return snap_result
+        if not force_direct:
+            snap_result = self._snapshot_contains(int(chat_id), int(my_id))
+            if snap_result is not None:
+                return snap_result
 
         try:
             cached = self._active_call_cache.get(int(chat_id))
@@ -3732,6 +3850,11 @@ class VoiceCallManager:
                         rec['media_binding_alive'] = media_alive
                         rec['media_binding_checked_at'] = time.time()
                         present = self._media_presence_verdict(present, media_alive)
+                        # A snapshot "absent" is not proof on its own: confirm it
+                        # against THIS account before it can count towards a
+                        # confirmed disconnect (and a rejoin storm).
+                        present = await self._presence_after_direct_recheck(
+                            order_id, acc_id, app, cid, present, media_alive)
                         if media_alive is False:
                             if present is True:
                                 # ── GHOST-MEDIA-ONLY (presence intact) ──────────
@@ -4147,8 +4270,13 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
             except Exception as e:
-                self._set_state(order_id, account_id, FAILED, f"client init error: {e}")
-                return False, f"Client Init Error: {e}", 0
+                # An empty str(e) (asyncio.TimeoutError from an engine-start
+                # timeout was the production case: "Client Init Error: " with
+                # nothing after it) hides WHICH failure happened and makes the
+                # log useless for diagnosis. Always carry the type name.
+                err = str(e) or type(e).__name__
+                self._set_state(order_id, account_id, FAILED, f"client init error: {err}")
+                return False, f"Client Init Error: {err}", 0
 
             if not pytg:
                 self._set_state(order_id, account_id, FAILED, "client init failed")

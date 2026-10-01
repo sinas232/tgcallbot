@@ -13,7 +13,8 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
-                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
+                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
+                                 OUTCOME_SYSTEM)
 from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
                                         is_fatal_auth_error, fatal_auth_category)
 from services import self_healing
@@ -581,7 +582,10 @@ class OrderExecutor:
 	        return []
 	    vcm = _get_voice_call_manager()
 	    attempts = self._voice_attempts.get(order_id, {})
-	    banned = self._voice_banned.get(order_id, set())
+	    # ``_voice_terminal`` (revoked key / 406 conflict / frozen account) is
+	    # NEVER eligible again in this order: it must not be re-selected and it
+	    # must not keep the build awake either.
+	    banned = self._voice_banned.get(order_id, set()) | self._voice_terminal.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
@@ -636,7 +640,10 @@ class OrderExecutor:
 	    vcm = _get_voice_call_manager()
 	    now = time.time()
 	    attempts = self._voice_attempts.get(order_id, {})
-	    banned = self._voice_banned.get(order_id, set())
+	    # ``_voice_terminal`` (revoked key / 406 conflict / frozen account) is
+	    # NEVER eligible again in this order: it must not be re-selected and it
+	    # must not keep the build awake either.
+	    banned = self._voice_banned.get(order_id, set()) | self._voice_terminal.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
 	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
@@ -796,6 +803,14 @@ class OrderExecutor:
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
 	    starved_rounds = 0
+	    # Progress watchdog: a build must not wait forever for Telegram to
+	    # recover from a system-side outage.  Every "no ready candidates, waiting
+	    # for a backoff" round that does NOT increase the live count is counted;
+	    # after VOICE_BUILD_MAX_STALL_ROUNDS of them the build ends and the
+	    # shortfall report explains exactly which slots are missing and why.
+	    max_stall_rounds = max(1, int(getattr(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 20)))
+	    stall_rounds = 0
+	    last_live_seen = -1
 	    # A run of 406 errors suggests a systemic auth-key collision (including
 	    # same-process reseller copies), not proof of another server or a usable
 	    # key. Abort the wave to avoid hammering possibly invalidated keys.
@@ -803,6 +818,9 @@ class OrderExecutor:
 	    live = int(vcm.get_active_count(order_id))
 
 	    while self._is_order_active(order_id) and live < target_count:
+	        if live > last_live_seen:
+	            last_live_seen = live
+	            stall_rounds = 0
 	        await join_brain.wait_if_paused(order_id)
 	        if not self._is_order_active(order_id):
 	            break
@@ -890,6 +908,14 @@ class OrderExecutor:
 	                # Should not happen (a ready account would have been
 	                # selected); avoid any possibility of a hot spin.
 	                break
+	            stall_rounds += 1
+	            if stall_rounds > max_stall_rounds:
+	                logger.error(
+	                    f"Order {order_id}: build made NO progress for {stall_rounds} "
+	                    f"wait round(s) (live={live}/{target_count}); ending the build "
+	                    f"instead of waiting forever for retryable accounts"
+	                )
+	                break
 	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
 	            await asyncio.sleep(wait)
 	            continue
@@ -975,6 +1001,15 @@ class OrderExecutor:
 	        wave_ok = 0
 	        wave_fail = 0
 	        wave_dead = 0
+	        # Telegram-side infrastructure failures (500 INTERDC, transport
+	        # timeout, unresolved join, wave-deadline deferral): the accounts are
+	        # healthy, so the wave must not narrow the Join-Brain window for
+	        # them - it pauses new waves instead.
+	        wave_system = 0
+	        # Account-specific failures (permanent/dead/session-in-use) are
+	        # excluded from the wave error-rate for the same reason: two frozen
+	        # accounts must not serialise a 42-account build.
+	        wave_account_specific = 0
 	        for acc, _t in zip(candidates, wave_tasks):
 	            res = results.get(_t)
 	            if res is None:
@@ -1018,6 +1053,7 @@ class OrderExecutor:
 	                        f"retrying in 5s (budget kept)"
 	                    )
 	                    wave_fail += 1
+	                    wave_system += 1
 	                    continue
 
 	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
@@ -1028,6 +1064,7 @@ class OrderExecutor:
 	                    dead_count += 1  # order statistics, not a DB auto-disable
 	                    wave_dead += 1
 	                    wave_fail += 1
+	                    wave_account_specific += 1
 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
 	                    self._voice_terminal[order_id].add(aid)
@@ -1049,6 +1086,7 @@ class OrderExecutor:
 	                        # Account itself is dead — mark inactive & replace.
 	                        dead_count += 1
 	                        wave_dead += 1
+	                        wave_account_specific += 1
 	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
 	                        self._voice_banned.setdefault(order_id, set()).add(aid)
 	                        self._voice_terminal[order_id].add(aid)
@@ -1067,6 +1105,7 @@ class OrderExecutor:
 	                    self._voice_banned[order_id].add(aid)
 	                    self._voice_terminal[order_id].add(aid)
 	                    wave_fail += 1
+	                    wave_account_specific += 1
 	                    continue
 
 	                outcome = join_brain.classify_message(msg)
@@ -1088,8 +1127,29 @@ class OrderExecutor:
 	                    )
 	                    join_brain.report_result(order_id, outcome, msg)
 	                    wave_fail += 1
+	                    wave_system += 1
 	                    continue
 
+	                if outcome == OUTCOME_SYSTEM:
+	                    # Telegram-side infrastructure failure (500 INTERDC,
+	                    # internal server error, transport timeout, unresolved
+	                    # join request).  This is NOT the account's fault:
+	                    #   * keep its attempt budget (no "gave up ... replaced
+	                    #     from pool" for a Telegram outage),
+	                    #   * never ban it,
+	                    #   * retry the SAME account after a short pause.
+	                    pause = max(1.0, float(getattr(
+	                        Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 15)))
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = \
+	                        time.time() + pause
+	                    logger.warning(
+	                        f"Order {order_id}: account {aid} Telegram-side failure "
+	                        f"({msg[:80]}) — budget kept, retry deferred {pause:.0f}s"
+	                    )
+	                    join_brain.report_result(order_id, outcome, msg)
+	                    wave_fail += 1
+	                    wave_system += 1
+	                    continue
 
 	                if outcome == OUTCOME_PERMANENT:
 	                    # A permanent failure produces the IDENTICAL error on every retry,
@@ -1104,6 +1164,7 @@ class OrderExecutor:
 	                    self._mark_voice_account_permanent(order_id, aid, msg, attempt_budget)
 	                    join_brain.report_result(order_id, outcome, msg)
 	                    wave_fail += 1
+	                    wave_account_specific += 1
 	                    logger.warning(
 	                        f"Order {order_id}: account {aid} permanent failure "
 	                        f"({msg[:90]}) - excluded from second-chance retries"
@@ -1158,11 +1219,16 @@ class OrderExecutor:
 	        # Wave fully resolved → recompute authoritative live count, adapt.
 	        live = int(vcm.get_active_count(order_id))
 	        wave_duration = time.monotonic() - wave_started
-	        wave_total = wave_ok + wave_fail
-	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0
+	        # The wave error-rate drives the adaptive window.  Account-specific
+	        # failures (frozen/dead/replaced key) say nothing about the pace, so
+	        # they are excluded; Telegram-side failures are reported separately
+	        # so the brain pauses instead of narrowing.
+	        wave_effective = max(0, wave_ok + wave_fail - wave_account_specific)
+	        ok_rate = (wave_ok / wave_effective) if wave_effective else 1.0
 	        join_brain.finish_wave(
 	            order_id, joined=wave_ok, failed=wave_fail,
 	            ok_rate=ok_rate, duration_s=wave_duration,
+	            infra_failures=wave_system,
 	        )
 
 	        if order_id in self.active_orders:
@@ -1195,6 +1261,44 @@ class OrderExecutor:
 	                jit_lo = max(jit_lo, jitter_min)
 	                jit_hi = max(jit_lo, jit_hi, jitter_max)
 	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
+
+	    # ── SHORTFALL REPORT ───────────────────────────────────────────────
+	    # Ending a build below the target is a business event: it must never be
+	    # silent (order 930 reached live=38/42 and started the billable hour
+	    # without a single line explaining WHY four slots were missing).
+	    if live < target_count and self._is_order_active(order_id):
+	        pool_ids = {a.get("id") for a in (self._voice_pool.get(order_id) or []) if a.get("id")}
+	        terminal = sorted(self._voice_terminal.get(order_id, set()) & pool_ids)
+	        banned = sorted((self._voice_banned.get(order_id, set()) & pool_ids) - set(terminal))
+	        pending = sorted(
+	            aid for aid in pool_ids
+	            if aid not in joined_ids and aid not in terminal
+	            and aid not in self._voice_banned.get(order_id, set())
+	            and self._voice_attempts.get(order_id, {}).get(aid, 0) < attempt_budget
+	        )
+	        busy: Set[int] = set()
+	        try:
+	            busy = set(vcm.accounts_busy_in_other_orders(order_id)) & pool_ids
+	        except Exception:
+	            busy = set()
+	        logger.warning(
+	            "Order %s: build ended %s/%s BELOW TARGET - terminal/unusable=%s %s, "
+	            "out-of-budget=%s %s, retryable-left=%s %s, held-by-other-orders=%s %s",
+	            order_id, live, target_count,
+	            len(terminal), terminal[:12],
+	            len(banned), banned[:12],
+	            len(pending), pending[:12],
+	            len(busy), sorted(busy)[:12],
+	        )
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["build_shortfall"] = {
+	                "live": int(live),
+	                "target": int(target_count),
+	                "terminal": terminal[:50],
+	                "out_of_budget": banned[:50],
+	                "retryable_left": pending[:50],
+	                "held_by_other_orders": sorted(busy)[:50],
+	            }
 
 	    # Return only the accounts this call newly joined; the CALLER owns
 	    # merging them into the order's running joined_accounts list (the

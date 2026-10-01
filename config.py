@@ -249,6 +249,35 @@ class Config:
     # Telegram still answers with FloodWait (server-directed waits are always
     # respected first — this only paces NEW waves).
     VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
+    # ── Telegram-side (infrastructure) failures ─────────────────────────────
+    # A 500 from Telegram (INTERDC_X_CALL_ERROR / INTERNAL_SERVER_ERROR), a
+    # transport timeout or an unresolved join request is NOT the account's
+    # fault: the account keeps its attempt budget and is retried after this
+    # short pause instead of being replaced from the pool.
+    VOICE_SYSTEM_FAILURE_PAUSE_SECONDS = int(os.getenv('VOICE_SYSTEM_FAILURE_PAUSE_SECONDS', '15'))
+    # When a whole wave fails on Telegram-side errors, pause NEW waves for this
+    # long instead of narrowing the window (the accounts themselves are fine).
+    VOICE_SYSTEM_PAUSE_SECONDS = int(os.getenv('VOICE_SYSTEM_PAUSE_SECONDS', '20'))
+    # Hard bound on a build that keeps making no progress while slots are still
+    # unfilled but retryable (e.g. Telegram is failing inter-DC for minutes).
+    # Counted in "waiting for a retry backoff" rounds with no growth in the
+    # live count; the build then ends with a loud shortfall report instead of
+    # waiting forever for the DC to recover.
+    VOICE_BUILD_MAX_STALL_ROUNDS = int(os.getenv('VOICE_BUILD_MAX_STALL_ROUNDS', '20'))
+    # ── engine startup (PyTgCalls.start) ────────────────────────────────────
+    # A single start() timeout used to quarantine the account for the rest of
+    # the process ("engine startup unconfirmed; existing client quarantined");
+    # order 930 lost accounts 156/142 to one 15s hiccup and finished at 38/42.
+    # Retrying the SAME engine handle is safe: no second engine is ever built
+    # on the same auth key.
+    VOICE_ENGINE_START_ATTEMPTS = int(os.getenv('VOICE_ENGINE_START_ATTEMPTS', '3'))
+    VOICE_ENGINE_START_TIMEOUT = int(os.getenv('VOICE_ENGINE_START_TIMEOUT', '15'))
+    # ── presence confirmation ───────────────────────────────────────────────
+    # The shared participant snapshot can be incomplete (pagination limits in
+    # huge voice chats).  Before an "absent" answer is allowed to count towards
+    # a confirmed disconnect (and a rejoin), confirm it with a DIRECT
+    # per-account presence check.
+    VOICE_PRESENCE_DIRECT_RECHECK = os.getenv('VOICE_PRESENCE_DIRECT_RECHECK', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # Driver-level attempt budget per account (start_call itself already does
     # bounded retries + respects FloodWait internally).
     VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))

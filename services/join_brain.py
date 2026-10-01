@@ -53,6 +53,7 @@ OUTCOME_DEAD = "DEAD"                  # session revoked / auth invalid → repl
 OUTCOME_FLOOD = "FLOOD"                # FloodWait even after internal retries → system pressure
 OUTCOME_FAIL = "FAIL"                  # transient/retryable (network, group-call state...)
 OUTCOME_PERMANENT = "PERMANENT"        # invalid link, restricted... → replace account
+OUTCOME_SYSTEM = "SYSTEM"              # Telegram-side infra failure (500/INTERDC/timeout)
 
 
 def classify_message(msg: str) -> str:
@@ -102,6 +103,27 @@ def classify_message(msg: str) -> str:
         "GROUP_CALL_FORBIDDEN", "VOICE_CHAT_FORBIDDEN", "RESTRICTED",
     )):
         return OUTCOME_PERMANENT
+
+    # ── Telegram-SIDE infrastructure failures ──────────────────────────────
+    # Checked AFTER the account-specific buckets above, because those carry
+    # the same words ("...Group join failed: Telegram says: [420 ...]").
+    #
+    # Incident (2026-10-01, order 931 after the v2.3.23 port): Telegram
+    # answered `phone.JoinGroupCall` with ``[500 INTERDC_X_CALL_ERROR]``
+    # ("An error occurred while Telegram was intercommunicating with DC4") and
+    # the join never completed.  Nothing about that error is account-specific:
+    # the SAME error comes back for every healthy account while Telegram's
+    # inter-DC link is broken.  Treated as a generic FAIL it spent the
+    # account's attempt budget, got the account banned and "replaced from the
+    # pool" - so a Telegram outage burned the whole pool and the build ended
+    # short (order 930: live=38/42).  The executor now parks the account with
+    # a short retry_after instead ("budget kept, retry deferred").
+    if any(k in text for k in (
+        "INTERDC", "CALL_ERROR", "INTERNAL SERVER", "INTERNAL PROBLEMS",
+        "SERVER IS HAVING", "RETRIES EXHAUSTED", "RETRY DEFERRED",
+        "JOIN REQUEST UNRESOLVED", "WALL-CLOCK TIMEOUT", "TIMED OUT", "TIMEOUT",
+    )):
+        return OUTCOME_SYSTEM
     return OUTCOME_FAIL
 
 
@@ -113,6 +135,7 @@ class _OrderPolicy:
         "growth_after_waves", "clean_waves", "flood_waves", "error_rate_shrink",
         "paused_until", "flood_pause_seconds",
         "successes", "dead", "flooded", "retryable_fails", "permanent_fails",
+        "system_fails",
         "wave_count", "wave_duration_ewma", "wave_duration_samples",
         "last_wave_at", "wave_sizes", "joined_per_wave",
     )
@@ -136,6 +159,9 @@ class _OrderPolicy:
         self.flooded = 0
         self.retryable_fails = 0
         self.permanent_fails = 0
+        # Telegram-side infrastructure failures (500/INTERDC/timeout): counted
+        # separately because they are NOT the accounts' fault.
+        self.system_fails = 0
         # ETA bookkeeping
         self.wave_count = 0
         self.wave_duration_ewma: Optional[float] = None
@@ -164,6 +190,7 @@ class _OrderPolicy:
             "flooded": self.flooded,
             "retryable_fails": self.retryable_fails,
             "permanent_fails": self.permanent_fails,
+            "system_fails": self.system_fails,
             "wave_duration_ewma": self.wave_duration_ewma,
             "eta_seconds": eta_s,
             "avg_join_rate": avg_join_rate,
@@ -244,7 +271,7 @@ class AdaptiveJoinBrain:
         pause = self.pause_seconds(order_id)
         if pause > 0:
             logger.warning(
-                "[JoinBrain] order=%s wave-pause %.0fs (flood burst at min window)",
+                "[JoinBrain] order=%s wave-pause %.0fs (pacing: flood/system pressure)",
                 order_id, pause,
             )
             await asyncio.sleep(pause)
@@ -257,12 +284,15 @@ class AdaptiveJoinBrain:
         policy.last_wave_at = time.time()
 
     def finish_wave(self, order_id: int, *, joined: int, failed: int,
-                    ok_rate: float, duration_s: float) -> None:
+                    ok_rate: float, duration_s: float,
+                    infra_failures: int = 0) -> None:
         """Called when a whole wave resolved.
 
         Updates the ETA model and — most importantly — the adaptive window:
           * if the wave was (almost) clean → count towards widening
-          * if the wave had many retryable/flood failures → narrow
+          * if the wave had many retryable failures → narrow
+          * a wave that failed ONLY on Telegram-side infra errors does NOT
+            narrow the window (the accounts are healthy) — it pauses instead.
         """
         policy = self._orders.get(order_id)
         if policy is None:
@@ -277,6 +307,22 @@ class AdaptiveJoinBrain:
                 policy.wave_duration_ewma = (1 - alpha) * policy.wave_duration_ewma + alpha * duration_s
 
         error_rate = 1.0 - ok_rate if ok_rate is not None else 0.0
+        if infra_failures and joined == 0 and infra_failures >= max(1, failed):
+            # Infra-only wave (every failure was a Telegram-side error).
+            # Narrowing here would punish healthy accounts and serialise the
+            # build (see the order-928 window=1 incident); pause instead.
+            policy.clean_waves = 0
+            policy.flood_waves = 0
+            pause = max(0, int(getattr(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20)))
+            until = time.time() + pause
+            if pause > 0 and until > policy.paused_until:
+                policy.paused_until = until
+                logger.warning(
+                    "[JoinBrain] order=%s wave failed on Telegram-side errors "
+                    "(infra=%s) → pause new waves %.0fs",
+                    order_id, infra_failures, pause,
+                )
+            return
         if error_rate <= 0.05:
             # Clean wave → remember and maybe widen.
             policy.clean_waves += 1
@@ -307,6 +353,10 @@ class AdaptiveJoinBrain:
         * FLOOD → system pressure: if we are already at the floor, pause new
           waves for a bounded cooldown (the actual server wait was already
           respected inside VoiceCallManager).
+        * SYSTEM → Telegram-side infra failure (500/INTERDC/timeout): the
+          accounts are healthy, so it only counts (the per-account retry pause
+          and the wave-level pause in :meth:`finish_wave` pace the build) and
+          it never narrows the window.
         * FAIL (retryable) → mild pressure signal.
         """
         policy = self.register_order(order_id)
@@ -328,6 +378,12 @@ class AdaptiveJoinBrain:
                         "[JoinBrain] order=%s flood burst at floor window → pause new waves %.0fs",
                         order_id, policy.flood_pause_seconds,
                     )
+        elif outcome == OUTCOME_SYSTEM:
+            # Telegram-side infra failure: the account is healthy and keeps its
+            # budget.  Pacing is handled once per wave (finish_wave) instead of
+            # once per account, so a 4-account infra wave cannot pause the
+            # order four times in a row.
+            policy.system_fails += 1
         else:
             policy.retryable_fails += 1
 

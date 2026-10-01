@@ -505,15 +505,57 @@ class EngineLifecycleTests(unittest.TestCase):
         async def scenario():
             app = FakeApp()
             self.mgr.pyrogram_clients[1] = app
-            with patch.object(vcm_mod, 'PyTgCalls', SlowStartPyTgCalls):
-                with self.assertRaises(asyncio.TimeoutError):
+            with patch.object(vcm_mod, 'PyTgCalls', SlowStartPyTgCalls), \
+                    patch.object(vcm_mod.Config, "VOICE_ENGINE_START_ATTEMPTS", 1):
+                with self.assertRaises(Exception) as ctx:
                     await self.mgr._get_or_create_client(901, 1, 'fake-session')
+            # The failure reason must never be empty again: the production log
+            # showed `reason: "client init error: "` for exactly this timeout.
+            self.assertIn("engine startup failed", str(ctx.exception))
+            self.assertFalse(str(ctx.exception).rstrip().endswith(":"),
+                             "the engine-start failure must carry a reason")
             original = self.mgr.clients[1]
             self.assertIn(1, self.mgr._quarantined_accounts)
             with self.assertRaises(SessionInUseError):
                 await self.mgr._get_or_create_client(901, 1, 'fake-session')
             self.assertIs(self.mgr.clients[1], original)
             self.assertEqual(len(FakePyTgCalls.instances), 1)
+        self.loop.run_until_complete(scenario())
+
+    def test_one_transient_engine_start_timeout_does_not_burn_the_account(self):
+        """Order 930 lost accounts 156/142 to a SINGLE 15s start() timeout.
+
+        The old code quarantined the account for the rest of the process
+        ("engine startup unconfirmed; existing client quarantined (no second
+        engine)"), the executor read SESSION_IN_USE on the next wave and marked
+        the slot terminal, and the build finished at live=38/42.  The retry
+        reuses the SAME engine handle - never a second engine on one auth key.
+        """
+
+        class FlakyStartPyTgCalls(FakePyTgCalls):
+            async def start(self):
+                self.start_attempts = getattr(self, "start_attempts", 0) + 1
+                if self.start_attempts == 1:
+                    raise asyncio.TimeoutError()
+                self.started += 1
+
+        async def _no_sleep(_delay, *a, **kw):
+            return None
+
+        async def scenario():
+            app = FakeApp()
+            self.mgr.pyrogram_clients[1] = app
+            with patch.object(vcm_mod, 'PyTgCalls', FlakyStartPyTgCalls), \
+                    patch.object(vcm_mod.Config, "VOICE_ENGINE_START_ATTEMPTS", 2), \
+                    patch.object(vcm_mod.asyncio, "sleep", new=_no_sleep):
+                got = await self.mgr._get_or_create_client(902, 1, 'fake-session')
+            self.assertIsNotNone(got, "a single start() timeout must not lose the engine")
+            self.assertNotIn(1, self.mgr._quarantined_accounts,
+                             "a transient timeout must not quarantine the key")
+            self.assertIs(self.mgr.clients[1], got)
+            self.assertEqual(len(FakePyTgCalls.instances), 1,
+                             "the retry must reuse the SAME engine handle")
+            self.assertEqual(got.start_attempts, 2)
         self.loop.run_until_complete(scenario())
 
     def test_stream_end_event_restarts_silence_once(self):
