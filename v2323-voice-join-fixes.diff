@@ -1,0 +1,1306 @@
+diff --git a/.env.example b/.env.example
+index cfd55d7..fc2c4f4 100644
+--- a/.env.example
++++ b/.env.example
+@@ -133,6 +133,26 @@ VOICE_JOIN_SEQUENTIAL_PREWARM=false
+ VOICE_ACCOUNT_ATTEMPT_LIMIT=2
+ VOICE_SECOND_CHANCE_ROUNDS=0
+ VOICE_SECOND_CHANCE_COOLDOWN_SECONDS=60
++# ── خطاهای سمت تلگرام (زیرساخت) ──
++# خطای ۵۰۰ تلگرام (INTERDC_X_CALL_ERROR / INTERNAL_SERVER_ERROR)، تایم‌اوت
++# ترابری یا «join بدون پاسخ» تقصیر اکانت نیست: بودجهٔ تلاش اکانت خورده نمی‌شود،
++# بن نمی‌شود و فقط بعد از این مکث کوتاه دوباره امتحان می‌شود.
++VOICE_SYSTEM_FAILURE_PAUSE_SECONDS=15
++# اگر یک موج کامل به‌خاطر خطای سمت تلگرام شکست بخورد، موج‌های بعدی این‌قدر
++# مکث می‌کنند (به‌جای باریک‌کردن پنجره؛ چون اکانت‌ها سالم‌اند).
++VOICE_SYSTEM_PAUSE_SECONDS=20
++# سقف دورهای انتظارِ بی‌پیشرفت در فاز ساخت؛ بعد از آن ساخت با گزارش صریح
++# کسری جاها تمام می‌شود تا سفارش بی‌نهایت معطل نماند.
++VOICE_BUILD_MAX_STALL_ROUNDS=20
++# ── بالاآمدن انجین (PyTgCalls.start) ──
++# یک تایم‌اوت ۱۵ ثانیه‌ای دیگر اکانت را برای همیشهٔ پروسه قرنطینه نمی‌کند؛
++# همان هندل انجین دوباره تلاش می‌شود (انجین دوم ساخته نمی‌شود).
++VOICE_ENGINE_START_ATTEMPTS=3
++VOICE_ENGINE_START_TIMEOUT=15
++# ── تأیید حضور ──
++# اسنپ‌شات اشتراکیِ لیست شرکت‌کنندگان در ویس‌کال‌های بزرگ ناقص می‌شود؛ «غایب»
++# فقط بعد از یک بررسیِ مستقیمِ همان اکانت به قطع‌شدن/ری‌جوین تبدیل می‌شود.
++VOICE_PRESENCE_DIRECT_RECHECK=true
+ # media = استریم سکوت فعلی؛ auto = یک شنوندهٔ آزمایشی در هر چت تا تأیید
+ # دوگانهٔ حضور و binding؛ خطا/قطع => بازگشت به استریم؛ listener = opt-in صریح.
+ VOICE_SILENCE_MODE=media
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5ed9f7c..d6569c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,23 @@
+ 
+ ---
+ 
++## بستهٔ اصلاحی روی ۲.۳.۲۳ — خطاهای سمت تلگرام، اسلات‌های سوخته، گزارش کسری، طوفان ghost
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۷/۰۹ — بر مبنای لاگ سفارش‌های ۹۳۰ و ۹۳۱ روی همان درخت پروداکشن (`c8259a5` + `v2323-full-port.diff`). `BOT_VERSION` عمداً روی `2.3.23` مانده تا گارد استقرار/پیش‌پرواز نسخه دست‌نخورده کار کند؛ برای تأیید استقرار از خط `🔖 running commit: <sha>` در بوت استفاده کنید.
++
++- **خطای سمت تلگرام دیگر اکانت را نمی‌سوزاند.** `[500 INTERDC_X_CALL_ERROR]`، خطای داخلی ۵۰۰، تایم‌اوت ترابری و «join بدون پاسخ» مقصر اکانت نیستند؛ در `join_brain` باکت تازهٔ `OUTCOME_SYSTEM` اضافه شد و اجراکننده این اکانت را بن نمی‌کند، بودجهٔ تلاشش را خرج نمی‌کند و بعد از مکث کوتاه (`VOICE_SYSTEM_FAILURE_PAUSE_SECONDS`) همان اکانت را دوباره امتحان می‌کند. پیش‌تر این خطا در مسیر عمومی می‌افتاد و پیام «gave up … replaced from pool» می‌داد؛ یعنی یک قطعی تلگرام کل استخر را می‌سوزاند.
++- **موجِ خطای زیرساختی پنجرهٔ Join Brain را باریک نمی‌کند.** یک موج که فقط به‌خاطر خطای سمت تلگرام شکست خورده، فقط موج‌های بعدی را مکث می‌کند (`VOICE_SYSTEM_PAUSE_SECONDS`)؛ خطاهای اکانت‌محور (frozen/dead/406/SESSION_IN_USE) هم از نرخ خطای موج کنار گذاشته شدند تا دو اکانت فریز‌شده کل ساخت ۴۲ اکانتی را سریالی (window=1) نکنند. حسابداری هر موج شامل `wave_system`/`wave_account_specific` و شمارندهٔ `system_fails` در Brain است.
++- **تایم‌اوت بالاآمدن انجین دیگر اکانت را برای همیشه قرنطینه نمی‌کند.** `_start_engine_with_retries` همان هندل `PyTgCalls` را تا `VOICE_ENGINE_START_ATTEMPTS` بار (پیش‌فرض ۳) با `VOICE_ENGINE_START_TIMEOUT` دوباره `start()` می‌کند؛ انجین دوم روی همان کلید ساخته نمی‌شود. پیام `client init error: ` (خالی، از `TimeoutError` بی‌متن) هم دیگر خالی نیست و نوع/دلیل خطا را می‌برد. در سفارش ۹۳۰ همین یک تایم‌اوت ۱۵ ثانیه‌ای اکانت‌های ۱۵۶ و ۱۴۲ را سوزاند و بیلد روی ۳۸/۴۲ تمام شد.
++- **«بی‌پیشرفت» در فاز ساخت سقف دارد و کسری همیشه گزارش می‌شود.** حلقهٔ ساخت هر دور انتظارِ بدون رشد live را می‌شمارد (`VOICE_BUILD_MAX_STALL_ROUNDS`) و هنگام پایان زیر هدف، یک هشدار صریح با تفکیک دلیل جاهای خالی می‌دهد: `terminal/unusable`، `out-of-budget`، `retryable-left`، `held-by-other-orders` (هم در لاگ، هم در `active_orders[order]["build_shortfall"]`). اکانت‌های `_voice_terminal` هم دیگر نه انتخاب می‌شوند و نه بیلد را بیدار نگه می‌دارند.
++- **«غایب» اسنپ‌شات اشتراکی، تنها مدرک قطع‌شدن نیست.** اسنپ‌شات اشتراکی هر چت در هر سیکل یک پیمایش صفحه‌بندی‌شده است و در ویس‌کال‌های بزرگ می‌تواند ناقص باشد؛ در سفارش ۹۳۰ هشت اکانت پشت‌سرهم `media_transport_lost → confirmed_disconnect → recovered` می‌شدند و هر بار ری‌جوین تازه می‌زدند. اکنون قبل از اینکه «غایب» به شمارش قطع‌شدن (و ری‌جوین) برسد، یک بررسی مستقیمِ همان اکانت (`_is_in_voice_call(force_direct=True)`) انجام می‌شود: `True` ⇒ اسنپ‌شات ناقص بوده و اسلات می‌ماند، `None` ⇒ ناشناخته و شمارش نمی‌شود، `False` ⇒ قطع واقعی و مسیر بازگشت مثل قبل. با `VOICE_PRESENCE_DIRECT_RECHECK=false` می‌توان خاموشش کرد.
++- **تست:** ۱۸ تست تازه (`tests/test_telegram_system_failures.py`، `tests/test_presence_direct_recheck.py` و دو تست چرخهٔ انجین) + به‌روزرسانی تست قبلی تایم‌اوت انجین. کل سوئیت: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip**. این‌ها آزمون آفلاین‌اند: رفتار زندهٔ تلگرام (InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند.
++
++</div>
++
++---
++
+ ## نسخهٔ ۲.۳.۲۳ — صرف‌نظر آگاهانه از دقیقاً ۲۲ سشن inactive نامعلوم
+ 
+ <div dir="rtl">
+diff --git a/config.py b/config.py
+index e33815d..3388376 100644
+--- a/config.py
++++ b/config.py
+@@ -249,6 +249,35 @@ class Config:
+     # Telegram still answers with FloodWait (server-directed waits are always
+     # respected first — this only paces NEW waves).
+     VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
++    # ── Telegram-side (infrastructure) failures ─────────────────────────────
++    # A 500 from Telegram (INTERDC_X_CALL_ERROR / INTERNAL_SERVER_ERROR), a
++    # transport timeout or an unresolved join request is NOT the account's
++    # fault: the account keeps its attempt budget and is retried after this
++    # short pause instead of being replaced from the pool.
++    VOICE_SYSTEM_FAILURE_PAUSE_SECONDS = int(os.getenv('VOICE_SYSTEM_FAILURE_PAUSE_SECONDS', '15'))
++    # When a whole wave fails on Telegram-side errors, pause NEW waves for this
++    # long instead of narrowing the window (the accounts themselves are fine).
++    VOICE_SYSTEM_PAUSE_SECONDS = int(os.getenv('VOICE_SYSTEM_PAUSE_SECONDS', '20'))
++    # Hard bound on a build that keeps making no progress while slots are still
++    # unfilled but retryable (e.g. Telegram is failing inter-DC for minutes).
++    # Counted in "waiting for a retry backoff" rounds with no growth in the
++    # live count; the build then ends with a loud shortfall report instead of
++    # waiting forever for the DC to recover.
++    VOICE_BUILD_MAX_STALL_ROUNDS = int(os.getenv('VOICE_BUILD_MAX_STALL_ROUNDS', '20'))
++    # ── engine startup (PyTgCalls.start) ────────────────────────────────────
++    # A single start() timeout used to quarantine the account for the rest of
++    # the process ("engine startup unconfirmed; existing client quarantined");
++    # order 930 lost accounts 156/142 to one 15s hiccup and finished at 38/42.
++    # Retrying the SAME engine handle is safe: no second engine is ever built
++    # on the same auth key.
++    VOICE_ENGINE_START_ATTEMPTS = int(os.getenv('VOICE_ENGINE_START_ATTEMPTS', '3'))
++    VOICE_ENGINE_START_TIMEOUT = int(os.getenv('VOICE_ENGINE_START_TIMEOUT', '15'))
++    # ── presence confirmation ───────────────────────────────────────────────
++    # The shared participant snapshot can be incomplete (pagination limits in
++    # huge voice chats).  Before an "absent" answer is allowed to count towards
++    # a confirmed disconnect (and a rejoin), confirm it with a DIRECT
++    # per-account presence check.
++    VOICE_PRESENCE_DIRECT_RECHECK = os.getenv('VOICE_PRESENCE_DIRECT_RECHECK', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+     # Driver-level attempt budget per account (start_call itself already does
+     # bounded retries + respects FloodWait internally).
+     VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
+diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
+new file mode 100644
+index 0000000..1890aa7
+--- /dev/null
++++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
+@@ -0,0 +1,89 @@
++<div dir="rtl">
++
++# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
++
++**تاریخ:** ۱۴۰۵/۰۷/۰۹
++**مبنای شواهد:** لاگ پروداکشن سفارش ۹۳۰ (قبل از پورت) و سفارش ۹۳۱ (اولین اجرا بعد از `v2323-full-port.diff`)
++**درخت مرجع:** پروداکشن `c8259a5` (v2.3.23) + `v2323-full-port.diff` — دقیقاً همان چیزی که روی سرور اجرا می‌شود.
++
++---
++
++## ۰) خلاصهٔ یک‌خطی
++
++هر چهار نشانهٔ لاگ یک ریشهٔ مشترک دارند: **خطاهای گذرا (سمت تلگرام، موتور، یا اسنپ‌شات ناقص)
++به حساب اکانت نوشته می‌شدند** — اکانت سالم بن/قرنطینه می‌شد، اسلات سوخته و بیلد زیر هدف تمام می‌شد.
++
++| نشانه در لاگ | ریشه | فیکس |
++|---|---|---|
++| `[500 INTERDC_X_CALL_ERROR]` روی `phone.JoinGroupCall` (۱۳:۵۹ به بعد، سفارش ۹۳۱) | خطای گذرای DC تلگرام در مسیر عمومی می‌افتاد: خرج‌شدن بودجهٔ تلاش + بن + «replaced from pool» | باکت `OUTCOME_SYSTEM` + پارک اکانت با مکث کوتاه (`VOICE_SYSTEM_FAILURE_PAUSE_SECONDS`) |
++| `BUILD completed … live=38/42` و شروع بیلینگ | حلقهٔ ساخت با اکانت‌های *قابل‌تلاش* تمام می‌شد و کسری را کسی گزارش نمی‌کرد | سقف دورِ بی‌پیشرفت (`VOICE_BUILD_MAX_STALL_ROUNDS`) + گزارش صریح `BELOW TARGET` با تفکیک دلیل |
++| `acc=156 engine startup unconfirmed; … quarantined` و `client init error: ` خالی | یک تایم‌اوت ۱۵ ثانیه‌ای، اکانت را تا پایان پروسه قرنطینه می‌کرد و پیام خطا هم خالی بود | `_start_engine_with_retries` روی همان هندل (بدون انجین دوم) + پیام خطای همیشه‌پرمحتوا |
++| طوفان `media_transport_lost → confirmed_disconnect → recovered` (هشت اکانت، هر ~۱۲ ثانیه) | اسنپ‌شات ناقص «غایب» می‌گفت و با نبود binding، قطع‌شدن تأیید می‌شد ⇒ ری‌جوین‌های تکراری | بررسی مستقیم همان اکانت قبل از شمارش قطع‌شدن (`VOICE_PRESENCE_DIRECT_RECHECK`) |
++
++---
++
++## ۱) خطاهای سمت تلگرام — `OUTCOME_SYSTEM`
++
++`join_brain.classify_message` باکت تازهٔ `SYSTEM` گرفت: `INTERDC`، `CALL_ERROR`،
++`INTERNAL SERVER`، `RETRIES EXHAUSTED`، `RETRY DEFERRED`، `JOIN REQUEST UNRESOLVED`،
++`TIMED OUT/TIMEOUT`. ترتیب بررسی مهم است و حساب‌محورها اول می‌آیند، پس
++`FROZEN_METHOD_INVALID` همچنان `PERMANENT` و `FLOOD_WAIT` همچنان `FLOOD` است.
++
++در اجراکننده، این باکت:
++
++- بودجهٔ تلاش اکانت را **خرج نمی‌کند**،
++- اکانت را بن/ترمینال **نمی‌کند**،
++- `retry_after` کوتاه می‌گذارد و **همان اکانت** را دوباره امتحان می‌کند،
++- و در Join Brain فقط شمرده می‌شود (`system_fails`); مکث موج یک‌بار در
++  `finish_wave` انجام می‌شود تا یک موج چهار اکانتی، سفارش را چهار بار مکث ندهد.
++
++## ۲) زیر هدف تمام نشدن ساخت
++
++- شمارندهٔ دورهای بی‌پیشرفت: اگر live رشد نکند و فقط انتظار backoff باشد، بعد از
++  `VOICE_BUILD_MAX_STALL_ROUNDS` (پیش‌فرض ۲۰) ساخت با پیام خطا بسته می‌شود، نه بی‌نهایت انتظار.
++- گزارش کسری: `Order N: build ended X/Y BELOW TARGET - terminal/unusable=… out-of-budget=…
++  retryable-left=… held-by-other-orders=…` و همان تفکیک در `active_orders[N]["build_shortfall"]`.
++- اکانت‌های `_voice_terminal` دیگر در `_voice_candidates` و `_voice_earliest_retry` هم انتخاب/منتظر نمی‌شوند.
++- **صادقانه:** اگر استخر واقعاً ۴۰ اکانت قابل‌استفاده داشته باشد و ۲ تای دیگر فریز باشند، ۴۲/۴۲
++  از نظر فیزیکی ممکن نیست؛ کاری که این بسته می‌کند این است که اول آن ۴۰ تا *سوخته نشوند* و بعد
++  کسری با دلیلش اعلام شود. تغییر «زیر هدف بیلینگ شروع نشود» یک تصمیم محصولی است و عمداً انجام نشد.
++
++## ۳) تایم‌اوت بالاآمدن انجین
++
++- `_start_engine_with_retries`: تا `VOICE_ENGINE_START_ATTEMPTS` بار (۳) روی **همان**
++  هندل `PyTgCalls`، هر بار `VOICE_ENGINE_START_TIMEOUT` (۱۵s) — انجین دومی روی همان
++  auth key ساخته نمی‌شود، پس قرنطینه فقط بعد از شکست همهٔ تلاش‌ها اعمال می‌شود.
++- پیام خطا همیشه پرمحتواست: `Client Init Error: TimeoutError: start() not confirmed within 15s`
++  (قبلاً `Client Init Error: ` خالی بود).
++
++## ۴) حضور: بررسی مستقیم قبل از قطع‌شدن
++
++`_presence_after_direct_recheck` فقط وقتی صدا زده می‌شود که اسنپ‌شات «غایب» بگوید:
++
++| اسنپ‌شات | بررسی مستقیم | نتیجه |
++|---|---|---|
++| غایب | حاضر | اسلات می‌ماند، `presence_recheck` ثبت می‌شود، ری‌جوینی صادر نمی‌شود |
++| غایب | ناشناخته | `TEMPORARILY_UNKNOWN` — به قطع‌شدن شمارش نمی‌شود |
++| غایب | غایب | مسیر قطع‌شدن واقعی مثل قبل (۵ سیکل + بازیابی همان اکانت) |
++
++---
++
++## ۵) بعد از استقرار چه چیزی را در لاگ ببینید
++
++```bash
++docker logs -f --tail 100 telegram_bot_container | grep --line-buffered -E \
++  "Telegram-side failure|BELOW TARGET|engine start|presence_recheck|build_shortfall|wave failed on Telegram-side"
++```
++
++- خطای InterDC ⇒ باید `Telegram-side failure … budget kept, retry deferred` ببینید، **نه**
++  `gave up … replaced from pool`.
++- پیک سلول‌های بالا یعنی بسته واقعاً فعال است (`🔖 running commit: <sha>` را هم چک کنید).
++- اگر همچنان `BELOW TARGET` دیدید، همان خط دقیقاً می‌گوید کدام اسلات‌ها و به چه دلیلی خالی مانده‌اند.
++
++## ۶) آزمون‌ها
++
++سوئیت کامل: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip** (۱۸ تست تازه). این‌ها آفلاین‌اند و رفتار
++زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند؛
++تأیید نهایی همان لاگ پروداکشن است.
++
++</div>
+diff --git a/services/join_brain.py b/services/join_brain.py
+index 52c1932..e707471 100644
+--- a/services/join_brain.py
++++ b/services/join_brain.py
+@@ -53,6 +53,7 @@ OUTCOME_DEAD = "DEAD"                  # session revoked / auth invalid → repl
+ OUTCOME_FLOOD = "FLOOD"                # FloodWait even after internal retries → system pressure
+ OUTCOME_FAIL = "FAIL"                  # transient/retryable (network, group-call state...)
+ OUTCOME_PERMANENT = "PERMANENT"        # invalid link, restricted... → replace account
++OUTCOME_SYSTEM = "SYSTEM"              # Telegram-side infra failure (500/INTERDC/timeout)
+ 
+ 
+ def classify_message(msg: str) -> str:
+@@ -102,6 +103,27 @@ def classify_message(msg: str) -> str:
+         "GROUP_CALL_FORBIDDEN", "VOICE_CHAT_FORBIDDEN", "RESTRICTED",
+     )):
+         return OUTCOME_PERMANENT
++
++    # ── Telegram-SIDE infrastructure failures ──────────────────────────────
++    # Checked AFTER the account-specific buckets above, because those carry
++    # the same words ("...Group join failed: Telegram says: [420 ...]").
++    #
++    # Incident (2026-10-01, order 931 after the v2.3.23 port): Telegram
++    # answered `phone.JoinGroupCall` with ``[500 INTERDC_X_CALL_ERROR]``
++    # ("An error occurred while Telegram was intercommunicating with DC4") and
++    # the join never completed.  Nothing about that error is account-specific:
++    # the SAME error comes back for every healthy account while Telegram's
++    # inter-DC link is broken.  Treated as a generic FAIL it spent the
++    # account's attempt budget, got the account banned and "replaced from the
++    # pool" - so a Telegram outage burned the whole pool and the build ended
++    # short (order 930: live=38/42).  The executor now parks the account with
++    # a short retry_after instead ("budget kept, retry deferred").
++    if any(k in text for k in (
++        "INTERDC", "CALL_ERROR", "INTERNAL SERVER", "INTERNAL PROBLEMS",
++        "SERVER IS HAVING", "RETRIES EXHAUSTED", "RETRY DEFERRED",
++        "JOIN REQUEST UNRESOLVED", "WALL-CLOCK TIMEOUT", "TIMED OUT", "TIMEOUT",
++    )):
++        return OUTCOME_SYSTEM
+     return OUTCOME_FAIL
+ 
+ 
+@@ -113,6 +135,7 @@ class _OrderPolicy:
+         "growth_after_waves", "clean_waves", "flood_waves", "error_rate_shrink",
+         "paused_until", "flood_pause_seconds",
+         "successes", "dead", "flooded", "retryable_fails", "permanent_fails",
++        "system_fails",
+         "wave_count", "wave_duration_ewma", "wave_duration_samples",
+         "last_wave_at", "wave_sizes", "joined_per_wave",
+     )
+@@ -136,6 +159,9 @@ class _OrderPolicy:
+         self.flooded = 0
+         self.retryable_fails = 0
+         self.permanent_fails = 0
++        # Telegram-side infrastructure failures (500/INTERDC/timeout): counted
++        # separately because they are NOT the accounts' fault.
++        self.system_fails = 0
+         # ETA bookkeeping
+         self.wave_count = 0
+         self.wave_duration_ewma: Optional[float] = None
+@@ -164,6 +190,7 @@ class _OrderPolicy:
+             "flooded": self.flooded,
+             "retryable_fails": self.retryable_fails,
+             "permanent_fails": self.permanent_fails,
++            "system_fails": self.system_fails,
+             "wave_duration_ewma": self.wave_duration_ewma,
+             "eta_seconds": eta_s,
+             "avg_join_rate": avg_join_rate,
+@@ -244,7 +271,7 @@ class AdaptiveJoinBrain:
+         pause = self.pause_seconds(order_id)
+         if pause > 0:
+             logger.warning(
+-                "[JoinBrain] order=%s wave-pause %.0fs (flood burst at min window)",
++                "[JoinBrain] order=%s wave-pause %.0fs (pacing: flood/system pressure)",
+                 order_id, pause,
+             )
+             await asyncio.sleep(pause)
+@@ -257,12 +284,15 @@ class AdaptiveJoinBrain:
+         policy.last_wave_at = time.time()
+ 
+     def finish_wave(self, order_id: int, *, joined: int, failed: int,
+-                    ok_rate: float, duration_s: float) -> None:
++                    ok_rate: float, duration_s: float,
++                    infra_failures: int = 0) -> None:
+         """Called when a whole wave resolved.
+ 
+         Updates the ETA model and — most importantly — the adaptive window:
+           * if the wave was (almost) clean → count towards widening
+-          * if the wave had many retryable/flood failures → narrow
++          * if the wave had many retryable failures → narrow
++          * a wave that failed ONLY on Telegram-side infra errors does NOT
++            narrow the window (the accounts are healthy) — it pauses instead.
+         """
+         policy = self._orders.get(order_id)
+         if policy is None:
+@@ -277,6 +307,22 @@ class AdaptiveJoinBrain:
+                 policy.wave_duration_ewma = (1 - alpha) * policy.wave_duration_ewma + alpha * duration_s
+ 
+         error_rate = 1.0 - ok_rate if ok_rate is not None else 0.0
++        if infra_failures and joined == 0 and infra_failures >= max(1, failed):
++            # Infra-only wave (every failure was a Telegram-side error).
++            # Narrowing here would punish healthy accounts and serialise the
++            # build (see the order-928 window=1 incident); pause instead.
++            policy.clean_waves = 0
++            policy.flood_waves = 0
++            pause = max(0, int(getattr(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20)))
++            until = time.time() + pause
++            if pause > 0 and until > policy.paused_until:
++                policy.paused_until = until
++                logger.warning(
++                    "[JoinBrain] order=%s wave failed on Telegram-side errors "
++                    "(infra=%s) → pause new waves %.0fs",
++                    order_id, infra_failures, pause,
++                )
++            return
+         if error_rate <= 0.05:
+             # Clean wave → remember and maybe widen.
+             policy.clean_waves += 1
+@@ -307,6 +353,10 @@ class AdaptiveJoinBrain:
+         * FLOOD → system pressure: if we are already at the floor, pause new
+           waves for a bounded cooldown (the actual server wait was already
+           respected inside VoiceCallManager).
++        * SYSTEM → Telegram-side infra failure (500/INTERDC/timeout): the
++          accounts are healthy, so it only counts (the per-account retry pause
++          and the wave-level pause in :meth:`finish_wave` pace the build) and
++          it never narrows the window.
+         * FAIL (retryable) → mild pressure signal.
+         """
+         policy = self.register_order(order_id)
+@@ -328,6 +378,12 @@ class AdaptiveJoinBrain:
+                         "[JoinBrain] order=%s flood burst at floor window → pause new waves %.0fs",
+                         order_id, policy.flood_pause_seconds,
+                     )
++        elif outcome == OUTCOME_SYSTEM:
++            # Telegram-side infra failure: the account is healthy and keeps its
++            # budget.  Pacing is handled once per wave (finish_wave) instead of
++            # once per account, so a 4-account infra wave cannot pause the
++            # order four times in a row.
++            policy.system_fails += 1
+         else:
+             policy.retryable_fails += 1
+ 
+diff --git a/services/order_executor.py b/services/order_executor.py
+index dfbf816..ed8634b 100644
+--- a/services/order_executor.py
++++ b/services/order_executor.py
+@@ -13,7 +13,8 @@ from telegram_client import TelegramAccountClient
+ from utils.helpers import format_jalali_datetime
+ from config import Config
+ from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
+-                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
++                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
++                                 OUTCOME_SYSTEM)
+ from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
+                                         is_fatal_auth_error, fatal_auth_category)
+ from services import self_healing
+@@ -581,7 +582,10 @@ class OrderExecutor:
+ 	        return []
+ 	    vcm = _get_voice_call_manager()
+ 	    attempts = self._voice_attempts.get(order_id, {})
+-	    banned = self._voice_banned.get(order_id, set())
++	    # ``_voice_terminal`` (revoked key / 406 conflict / frozen account) is
++	    # NEVER eligible again in this order: it must not be re-selected and it
++	    # must not keep the build awake either.
++	    banned = self._voice_banned.get(order_id, set()) | self._voice_terminal.get(order_id, set())
+ 	    retry_after = self._voice_retry_after.get(order_id, {})
+ 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+ 	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
+@@ -636,7 +640,10 @@ class OrderExecutor:
+ 	    vcm = _get_voice_call_manager()
+ 	    now = time.time()
+ 	    attempts = self._voice_attempts.get(order_id, {})
+-	    banned = self._voice_banned.get(order_id, set())
++	    # ``_voice_terminal`` (revoked key / 406 conflict / frozen account) is
++	    # NEVER eligible again in this order: it must not be re-selected and it
++	    # must not keep the build awake either.
++	    banned = self._voice_banned.get(order_id, set()) | self._voice_terminal.get(order_id, set())
+ 	    retry_after = self._voice_retry_after.get(order_id, {})
+ 	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+ 	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
+@@ -796,6 +803,14 @@ class OrderExecutor:
+ 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
+ 	    wave_no = 0
+ 	    starved_rounds = 0
++	    # Progress watchdog: a build must not wait forever for Telegram to
++	    # recover from a system-side outage.  Every "no ready candidates, waiting
++	    # for a backoff" round that does NOT increase the live count is counted;
++	    # after VOICE_BUILD_MAX_STALL_ROUNDS of them the build ends and the
++	    # shortfall report explains exactly which slots are missing and why.
++	    max_stall_rounds = max(1, int(getattr(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 20)))
++	    stall_rounds = 0
++	    last_live_seen = -1
+ 	    # A run of 406 errors suggests a systemic auth-key collision (including
+ 	    # same-process reseller copies), not proof of another server or a usable
+ 	    # key. Abort the wave to avoid hammering possibly invalidated keys.
+@@ -803,6 +818,9 @@ class OrderExecutor:
+ 	    live = int(vcm.get_active_count(order_id))
+ 
+ 	    while self._is_order_active(order_id) and live < target_count:
++	        if live > last_live_seen:
++	            last_live_seen = live
++	            stall_rounds = 0
+ 	        await join_brain.wait_if_paused(order_id)
+ 	        if not self._is_order_active(order_id):
+ 	            break
+@@ -890,6 +908,14 @@ class OrderExecutor:
+ 	                # Should not happen (a ready account would have been
+ 	                # selected); avoid any possibility of a hot spin.
+ 	                break
++	            stall_rounds += 1
++	            if stall_rounds > max_stall_rounds:
++	                logger.error(
++	                    f"Order {order_id}: build made NO progress for {stall_rounds} "
++	                    f"wait round(s) (live={live}/{target_count}); ending the build "
++	                    f"instead of waiting forever for retryable accounts"
++	                )
++	                break
+ 	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
+ 	            await asyncio.sleep(wait)
+ 	            continue
+@@ -975,6 +1001,15 @@ class OrderExecutor:
+ 	        wave_ok = 0
+ 	        wave_fail = 0
+ 	        wave_dead = 0
++	        # Telegram-side infrastructure failures (500 INTERDC, transport
++	        # timeout, unresolved join, wave-deadline deferral): the accounts are
++	        # healthy, so the wave must not narrow the Join-Brain window for
++	        # them - it pauses new waves instead.
++	        wave_system = 0
++	        # Account-specific failures (permanent/dead/session-in-use) are
++	        # excluded from the wave error-rate for the same reason: two frozen
++	        # accounts must not serialise a 42-account build.
++	        wave_account_specific = 0
+ 	        for acc, _t in zip(candidates, wave_tasks):
+ 	            res = results.get(_t)
+ 	            if res is None:
+@@ -1018,6 +1053,7 @@ class OrderExecutor:
+ 	                        f"retrying in 5s (budget kept)"
+ 	                    )
+ 	                    wave_fail += 1
++	                    wave_system += 1
+ 	                    continue
+ 
+ 	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
+@@ -1028,6 +1064,7 @@ class OrderExecutor:
+ 	                    dead_count += 1  # order statistics, not a DB auto-disable
+ 	                    wave_dead += 1
+ 	                    wave_fail += 1
++	                    wave_account_specific += 1
+ 	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+ 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+ 	                    self._voice_terminal[order_id].add(aid)
+@@ -1049,6 +1086,7 @@ class OrderExecutor:
+ 	                        # Account itself is dead — mark inactive & replace.
+ 	                        dead_count += 1
+ 	                        wave_dead += 1
++	                        wave_account_specific += 1
+ 	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+ 	                        self._voice_banned.setdefault(order_id, set()).add(aid)
+ 	                        self._voice_terminal[order_id].add(aid)
+@@ -1067,6 +1105,7 @@ class OrderExecutor:
+ 	                    self._voice_banned[order_id].add(aid)
+ 	                    self._voice_terminal[order_id].add(aid)
+ 	                    wave_fail += 1
++	                    wave_account_specific += 1
+ 	                    continue
+ 
+ 	                outcome = join_brain.classify_message(msg)
+@@ -1088,8 +1127,29 @@ class OrderExecutor:
+ 	                    )
+ 	                    join_brain.report_result(order_id, outcome, msg)
+ 	                    wave_fail += 1
++	                    wave_system += 1
+ 	                    continue
+ 
++	                if outcome == OUTCOME_SYSTEM:
++	                    # Telegram-side infrastructure failure (500 INTERDC,
++	                    # internal server error, transport timeout, unresolved
++	                    # join request).  This is NOT the account's fault:
++	                    #   * keep its attempt budget (no "gave up ... replaced
++	                    #     from pool" for a Telegram outage),
++	                    #   * never ban it,
++	                    #   * retry the SAME account after a short pause.
++	                    pause = max(1.0, float(getattr(
++	                        Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 15)))
++	                    self._voice_retry_after.setdefault(order_id, {})[aid] = \
++	                        time.time() + pause
++	                    logger.warning(
++	                        f"Order {order_id}: account {aid} Telegram-side failure "
++	                        f"({msg[:80]}) — budget kept, retry deferred {pause:.0f}s"
++	                    )
++	                    join_brain.report_result(order_id, outcome, msg)
++	                    wave_fail += 1
++	                    wave_system += 1
++	                    continue
+ 
+ 	                if outcome == OUTCOME_PERMANENT:
+ 	                    # A permanent failure produces the IDENTICAL error on every retry,
+@@ -1104,6 +1164,7 @@ class OrderExecutor:
+ 	                    self._mark_voice_account_permanent(order_id, aid, msg, attempt_budget)
+ 	                    join_brain.report_result(order_id, outcome, msg)
+ 	                    wave_fail += 1
++	                    wave_account_specific += 1
+ 	                    logger.warning(
+ 	                        f"Order {order_id}: account {aid} permanent failure "
+ 	                        f"({msg[:90]}) - excluded from second-chance retries"
+@@ -1158,11 +1219,16 @@ class OrderExecutor:
+ 	        # Wave fully resolved → recompute authoritative live count, adapt.
+ 	        live = int(vcm.get_active_count(order_id))
+ 	        wave_duration = time.monotonic() - wave_started
+-	        wave_total = wave_ok + wave_fail
+-	        ok_rate = (wave_ok / wave_total) if wave_total else 1.0
++	        # The wave error-rate drives the adaptive window.  Account-specific
++	        # failures (frozen/dead/replaced key) say nothing about the pace, so
++	        # they are excluded; Telegram-side failures are reported separately
++	        # so the brain pauses instead of narrowing.
++	        wave_effective = max(0, wave_ok + wave_fail - wave_account_specific)
++	        ok_rate = (wave_ok / wave_effective) if wave_effective else 1.0
+ 	        join_brain.finish_wave(
+ 	            order_id, joined=wave_ok, failed=wave_fail,
+ 	            ok_rate=ok_rate, duration_s=wave_duration,
++	            infra_failures=wave_system,
+ 	        )
+ 
+ 	        if order_id in self.active_orders:
+@@ -1196,6 +1262,44 @@ class OrderExecutor:
+ 	                jit_hi = max(jit_lo, jit_hi, jitter_max)
+ 	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
+ 
++	    # ── SHORTFALL REPORT ───────────────────────────────────────────────
++	    # Ending a build below the target is a business event: it must never be
++	    # silent (order 930 reached live=38/42 and started the billable hour
++	    # without a single line explaining WHY four slots were missing).
++	    if live < target_count and self._is_order_active(order_id):
++	        pool_ids = {a.get("id") for a in (self._voice_pool.get(order_id) or []) if a.get("id")}
++	        terminal = sorted(self._voice_terminal.get(order_id, set()) & pool_ids)
++	        banned = sorted((self._voice_banned.get(order_id, set()) & pool_ids) - set(terminal))
++	        pending = sorted(
++	            aid for aid in pool_ids
++	            if aid not in joined_ids and aid not in terminal
++	            and aid not in self._voice_banned.get(order_id, set())
++	            and self._voice_attempts.get(order_id, {}).get(aid, 0) < attempt_budget
++	        )
++	        busy: Set[int] = set()
++	        try:
++	            busy = set(vcm.accounts_busy_in_other_orders(order_id)) & pool_ids
++	        except Exception:
++	            busy = set()
++	        logger.warning(
++	            "Order %s: build ended %s/%s BELOW TARGET - terminal/unusable=%s %s, "
++	            "out-of-budget=%s %s, retryable-left=%s %s, held-by-other-orders=%s %s",
++	            order_id, live, target_count,
++	            len(terminal), terminal[:12],
++	            len(banned), banned[:12],
++	            len(pending), pending[:12],
++	            len(busy), sorted(busy)[:12],
++	        )
++	        if order_id in self.active_orders:
++	            self.active_orders[order_id]["build_shortfall"] = {
++	                "live": int(live),
++	                "target": int(target_count),
++	                "terminal": terminal[:50],
++	                "out_of_budget": banned[:50],
++	                "retryable_left": pending[:50],
++	                "held_by_other_orders": sorted(busy)[:50],
++	            }
++
+ 	    # Return only the accounts this call newly joined; the CALLER owns
+ 	    # merging them into the order's running joined_accounts list (the
+ 	    # VoiceCallManager remains the authoritative source for counting).
+diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
+index 51fde01..f2f67c8 100644
+--- a/services/voice_call_manager.py
++++ b/services/voice_call_manager.py
+@@ -2098,19 +2098,79 @@ class VoiceCallManager:
+                     # start() can time out AFTER native WebRTC initialized.
+                     # Retain the original engine before awaiting it. A retry
+                     # must never construct a second engine on a transport that
+-                    # may still be using the same Telegram authorization key.
++                    # may still be using the same Telegram authorization key —
++                    # _start_engine_with_retries reuses THIS handle and only
++                    # quarantines the account when every attempt fails.
+                     self.clients[account_id] = pytg
+-                    try:
+-                        await asyncio.wait_for(pytg.start(), timeout=15)
+-                    except BaseException:
+-                        self._quarantined_accounts.add(account_id)
+-                        logger.error("acc=%s engine startup unconfirmed; existing client "
+-                                     "quarantined (no second engine)", account_id)
+-                        raise
++                    await self._start_engine_with_retries(pytg, account_id)
+ 
+             self._client_last_used[account_id] = time.time()
+             return pytg
+ 
++    async def _start_engine_with_retries(self, pytg: PyTgCalls, account_id: int) -> None:
++        """Start a freshly constructed PyTgCalls engine, retrying the SAME handle.
++
++        Why this exists (incident 2026-10-01, order 930): a single
++        ``pytg.start()`` timeout quarantined the account for the lifetime of
++        the process —
++
++            acc=156 engine startup unconfirmed; existing client quarantined
++            (no second engine)
++            reason: "client init error: "        ← empty: a bare TimeoutError
++
++        — so a 15-second hiccup cost the order two perfectly healthy accounts
++        (156, 142) and the build finished at 38/42.  Retrying the SAME engine
++        object is safe: no second PyTgCalls instance is ever constructed on the
++        same auth key, which is the invariant the quarantine protects.  Only
++        after every attempt fails do we keep the conservative quarantine.
++
++        Raises the original exception (wrapped with a non-empty message) so
++        callers can still classify it.
++        """
++        attempts = max(1, int(getattr(Config, "VOICE_ENGINE_START_ATTEMPTS", 3)))
++        timeout = max(5, int(getattr(Config, "VOICE_ENGINE_START_TIMEOUT", 15)))
++        last_exc: Optional[BaseException] = None
++        for attempt in range(1, attempts + 1):
++            try:
++                await asyncio.wait_for(pytg.start(), timeout=timeout)
++                if attempt > 1:
++                    logger.info(
++                        "acc=%s engine start recovered on attempt %d/%d",
++                        account_id, attempt, attempts,
++                    )
++                return
++            except asyncio.CancelledError:
++                raise
++            except BaseException as exc:  # noqa: BLE001 - re-raised below
++                last_exc = exc
++                msg = str(exc) or type(exc).__name__
++                if attempt < attempts:
++                    logger.warning(
++                        "acc=%s engine start attempt %d/%d failed (%s); "
++                        "retrying the same engine",
++                        account_id, attempt, attempts, msg[:120],
++                    )
++                    await asyncio.sleep(min(2.0 * attempt, 5.0))
++                else:
++                    logger.error(
++                        "acc=%s engine start failed after %d attempt(s) (%s)",
++                        account_id, attempts, msg[:120],
++                    )
++        self._quarantined_accounts.add(account_id)
++        assert last_exc is not None
++        if is_fatal_auth_error(str(last_exc)) or is_auth_key_duplicated(str(last_exc)):
++            raise last_exc
++        # A bare asyncio.TimeoutError stringifies to "" — that is how the
++        # production log ended up with `reason: "client init error: "`.
++        detail = str(last_exc).strip()
++        if isinstance(last_exc, (asyncio.TimeoutError, TimeoutError)) and not detail:
++            detail = f"start() not confirmed within {timeout}s"
++        detail = (f"{type(last_exc).__name__}: {detail[:120]}" if detail
++                  else f"{type(last_exc).__name__} (no message)")
++        raise RuntimeError(
++            f"engine startup failed after {attempts} attempt(s): {detail}"
++        ) from last_exc
++
+     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
+         # IMPORTANT: use the SAME per-account lock as the warmup/create path.
+         # Previously we popped the client (and even removed its lock) BEFORE
+@@ -2791,6 +2851,54 @@ class VoiceCallManager:
+         """
+         return True if media_binding is True else participant_presence
+ 
++    async def _presence_after_direct_recheck(self, order_id: int, account_id: int,
++                                             app: Client, chat_id: int,
++                                             present: Optional[bool],
++                                             media_alive: Optional[bool]) -> Optional[bool]:
++        """Verify a shared-snapshot "absent" answer before acting on it.
++
++        The monitor takes ONE paginated participant sweep per chat per cycle
++        and shares it between every account of the order.  That snapshot is
++        authoritative when complete, but a truncated/partial sweep makes
++        healthy accounts look absent — and an account that is "absent" while
++        its media binding is also gone used to be escalated to
++        ``confirmed_disconnect`` + ``rejoin`` after CONFIRMED_DISCONNECT_THRESHOLD
++        cycles.  Order 930 showed the result: eight accounts at a time bounced
++        through ``media_transport_lost → confirmed_disconnect → recovered``
++        every few cycles, each bounce issuing fresh JoinGroupCall traffic.
++
++        A direct per-account answer (``force_direct``) is the tie-breaker:
++          * True  → the shared snapshot was incomplete; presence is intact
++          * None  → unknown; do NOT count towards a disconnect
++          * False → the account really is out of the call
++        Runs at most once per cycle, and only for accounts the snapshot called
++        absent (so it cannot become a new RPC source in the common case).
++        """
++        if present is not False or media_alive is True:
++            return present
++        if not bool(getattr(Config, "VOICE_PRESENCE_DIRECT_RECHECK", True)):
++            return present
++        try:
++            direct = await self._is_in_voice_call(app, int(chat_id), force_direct=True)
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            direct = None
++        if direct is present:
++            return present
++        self._vc_event_log(order_id, account_id, "presence_recheck", {
++            "chat_id": int(chat_id),
++            "snapshot_present": bool(present),
++            "direct_present": direct,
++        })
++        if direct is True:
++            logger.warning(
++                "[VoicePresence] acc=%s chat=%s: shared snapshot said ABSENT but a "
++                "direct check says PRESENT — keeping the slot (incomplete snapshot, "
++                "no rejoin issued)", account_id, chat_id,
++            )
++        return direct
++
+     async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
+         """Authoritative per-chat media transport liveness.
+ 
+@@ -3063,21 +3171,30 @@ class VoiceCallManager:
+             return None
+         return int(my_id) in present_ids
+ 
+-    async def _is_in_voice_call(self, app: Client, chat_id: int) -> Optional[bool]:
++    async def _is_in_voice_call(self, app: Client, chat_id: int,
++                                force_direct: bool = False) -> Optional[bool]:
+         """Check if account is actually in the voice call via Telegram API.
+ 
+         Returns:
+           True  - account confirmed present in the call.
+           False - account confirmed NOT present (full participant list checked).
+           None  - presence could not be determined (API error / pagination failure).
++
++        ``force_direct=True`` skips the shared per-cycle participant snapshot
++        and asks Telegram for THIS account directly.  Use it before an
++        "absent" answer is allowed to trigger a rejoin: the shared snapshot is
++        one paginated sweep for the whole chat and can be incomplete in huge
++        calls, while a direct answer cannot be confused by another account's
++        pagination state (see _presence_after_direct_recheck).
+         """
+         # One failed SHARED snapshot should never trigger a second, per-account
+         # pagination sweep for every member of a large order. An unknown
+         # response stays unknown; otherwise RPC floods can create the very
+         # timeouts and apparent absences the monitor is trying to fix.
+-        snapshot = self._participant_snapshot.get(int(chat_id))
+-        if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
+-            return None
++        if not force_direct:
++            snapshot = self._participant_snapshot.get(int(chat_id))
++            if snapshot and snapshot[0] == self._monitor_cycle_ts and snapshot[1] is None:
++                return None
+         my_id = None
+         try:
+             me = getattr(app, "me", None)
+@@ -3094,9 +3211,10 @@ class VoiceCallManager:
+             return None
+ 
+         # Fast path: use the shared snapshot taken during the monitor cycle.
+-        snap_result = self._snapshot_contains(int(chat_id), int(my_id))
+-        if snap_result is not None:
+-            return snap_result
++        if not force_direct:
++            snap_result = self._snapshot_contains(int(chat_id), int(my_id))
++            if snap_result is not None:
++                return snap_result
+ 
+         try:
+             cached = self._active_call_cache.get(int(chat_id))
+@@ -3732,6 +3850,11 @@ class VoiceCallManager:
+                         rec['media_binding_alive'] = media_alive
+                         rec['media_binding_checked_at'] = time.time()
+                         present = self._media_presence_verdict(present, media_alive)
++                        # A snapshot "absent" is not proof on its own: confirm it
++                        # against THIS account before it can count towards a
++                        # confirmed disconnect (and a rejoin storm).
++                        present = await self._presence_after_direct_recheck(
++                            order_id, acc_id, app, cid, present, media_alive)
+                         if media_alive is False:
+                             if present is True:
+                                 # ── GHOST-MEDIA-ONLY (presence intact) ──────────
+@@ -4147,8 +4270,13 @@ class VoiceCallManager:
+                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
+                 return False, f"FloodWait:{wait_s}", 0
+             except Exception as e:
+-                self._set_state(order_id, account_id, FAILED, f"client init error: {e}")
+-                return False, f"Client Init Error: {e}", 0
++                # An empty str(e) (asyncio.TimeoutError from an engine-start
++                # timeout was the production case: "Client Init Error: " with
++                # nothing after it) hides WHICH failure happened and makes the
++                # log useless for diagnosis. Always carry the type name.
++                err = str(e) or type(e).__name__
++                self._set_state(order_id, account_id, FAILED, f"client init error: {err}")
++                return False, f"Client Init Error: {err}", 0
+ 
+             if not pytg:
+                 self._set_state(order_id, account_id, FAILED, "client init failed")
+diff --git a/tests/test_presence_direct_recheck.py b/tests/test_presence_direct_recheck.py
+new file mode 100644
+index 0000000..0b97f40
+--- /dev/null
++++ b/tests/test_presence_direct_recheck.py
+@@ -0,0 +1,153 @@
++"""An "absent" snapshot must be confirmed before it triggers a rejoin.
++
++Incident (2026-10-01, order 930 — the pre-port log the user pasted).  Eight
++accounts at a time were flagged every few cycles and then "recovered" seconds
++later::
++
++    13:49:16 [VoiceDrop] order=930 acc=116 chat=-1001956513128
++             event=media_transport_lost dwell=77.7s
++             reason=engine media connection missing (ghost)
++    13:52:36 [VoiceDrop] order=930 acc=116 event=confirmed_disconnect dwell=277.9s
++             reason=presence absent 5x in a row
++    13:52:38 [VoiceDrop] order=930 acc=116 event=recovered dwell=279.7s
++             reason=same-account rejoin ok
++
++Each "recovered" line followed a rejoin that took ~2 seconds — far too fast for
++a real JoinGroupCall, i.e. the account had never left the call.  The shared
++participant snapshot (ONE paginated sweep per chat per monitor cycle, shared by
++every account) said "absent", the media binding was also gone, and the monitor
++treated the two negatives as a genuine disconnect.
++
++The snapshot is a single paginated sweep and can be truncated in huge voice
++chats.  A direct per-account answer is the tie-breaker, so:
++
++  * snapshot=True  → unchanged,
++  * snapshot=False + direct=True  → presence kept (no fail cycle, no rejoin),
++  * snapshot=False + direct=None  → unknown (not counted towards a disconnect),
++  * snapshot=False + direct=False → a real absence (the rejoin path is right).
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++import time
++import unittest
++from types import SimpleNamespace
++from unittest import mock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="presence-recheck-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++from services.voice_call_manager import VoiceCallManager  # noqa: E402
++
++ORDER = 930
++CHAT = -1001956513128
++ACC = 116
++
++
++class _FakeApp:
++    """Minimal pyrogram Client stand-in: only ``me`` and ``invoke``."""
++
++    def __init__(self, me_id=ACC, present=True):
++        self.me = SimpleNamespace(id=me_id)
++        self.present = present
++        self.invokes = 0
++
++    async def invoke(self, query):
++        self.invokes += 1
++        if not self.present:
++            return SimpleNamespace(participants=[])
++        peer = SimpleNamespace(user_id=self.me.id)
++        return SimpleNamespace(participants=[SimpleNamespace(peer=peer, left=False)])
++
++
++class DirectRecheckTests(unittest.TestCase):
++    def setUp(self):
++        self.mgr = VoiceCallManager()
++
++    def _recheck(self, present, media_alive, direct):
++        calls = []
++        app = _FakeApp()
++
++        async def fake_direct(_app, _chat_id, force_direct=False):
++            calls.append(force_direct)
++            return direct
++
++        with mock.patch.object(self.mgr, "_is_in_voice_call", new=fake_direct), \
++                mock.patch.object(self.mgr, "_vc_event_log") as events:
++            got = asyncio.run(self.mgr._presence_after_direct_recheck(
++                ORDER, ACC, app, CHAT, present, media_alive))
++        return got, calls, events
++
++    def test_a_wrong_absent_snapshot_does_not_trigger_a_rejoin(self):
++        got, calls, events = self._recheck(False, False, True)
++        self.assertIs(got, True,
++                      "a direct check that says PRESENT must veto the snapshot")
++        self.assertEqual(calls, [True], "the direct path must be used")
++        names = [c.args[2] for c in events.call_args_list]
++        self.assertIn("presence_recheck", names,
++                      "the veto must be on record for diagnosis")
++
++    def test_unknown_direct_answer_is_not_a_disconnect(self):
++        got, _calls, _events = self._recheck(False, False, None)
++        self.assertIsNone(got, "unknown must not count towards confirmed_disconnect")
++
++    def test_direct_absence_is_still_a_disconnect(self):
++        got, _calls, _events = self._recheck(False, False, False)
++        self.assertIs(got, False, "a genuinely absent account must still recover")
++
++    def test_media_alive_presence_is_never_rechecked(self):
++        got, calls, _events = self._recheck(True, True, None)
++        self.assertIs(got, True)
++        self.assertEqual(calls, [], "no RPC when presence is already confirmed")
++
++    def test_the_recheck_can_be_disabled(self):
++        with mock.patch.object(Config, "VOICE_PRESENCE_DIRECT_RECHECK", False):
++            got, calls, _events = self._recheck(False, False, True)
++        self.assertIs(got, False)
++        self.assertEqual(calls, [], "the kill switch must skip the extra RPC")
++
++
++class ForceDirectPresenceTests(unittest.TestCase):
++    """``force_direct`` must bypass the incomplete shared snapshot."""
++
++    def setUp(self):
++        self.mgr = VoiceCallManager()
++        self.mgr._monitor_cycle_ts = time.time()
++        # An "authoritative" snapshot that does NOT contain this account —
++        # exactly the state that produced the false disconnect storm.
++        self.mgr._participant_snapshot[CHAT] = (self.mgr._monitor_cycle_ts, set())
++        self.mgr._active_call_cache[CHAT] = (time.time(), object())
++
++    def test_shared_snapshot_still_answers_the_fast_path(self):
++        app = _FakeApp()
++        with mock.patch.object(self.mgr, "_snapshot_contains", return_value=False) as snap:
++            got = asyncio.run(self.mgr._is_in_voice_call(app, CHAT))
++        self.assertIs(got, False)
++        snap.assert_called_once()
++
++    def test_force_direct_ignores_the_snapshot_and_asks_telegram(self):
++        app = _FakeApp()
++        with mock.patch.object(self.mgr, "_snapshot_contains",
++                               side_effect=AssertionError("must not consult the snapshot")):
++            got = asyncio.run(self.mgr._is_in_voice_call(app, CHAT, force_direct=True))
++        self.assertIs(got, True,
++                      "the direct answer must come from Telegram, not the snapshot")
++        self.assertGreaterEqual(app.invokes, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_telegram_system_failures.py b/tests/test_telegram_system_failures.py
+new file mode 100644
+index 0000000..f6e9403
+--- /dev/null
++++ b/tests/test_telegram_system_failures.py
+@@ -0,0 +1,290 @@
++"""Telegram-side infrastructure failures must not be charged to the account.
++
++Incident (2026-10-01, order 931 — the first run after the v2.3.23 full port).
++The build had just started when Telegram answered ``phone.JoinGroupCall`` with
++a server-side 500::
++
++    14:09:02 pyrogram.session.session WARNING [1] Retrying "phone.JoinGroupCall"
++             due to: Telegram says: [500 INTERDC_X_CALL_ERROR] - An error
++             occurred while Telegram was intercommunicating with DC4.
++    14:09:06 ... [2] same
++
++Nothing about that error is account-specific: every healthy account gets the
++identical answer while Telegram's inter-DC link is broken.  But the executor
++had no bucket for it, so it fell through to the generic retryable path, spent
++the account's attempt budget, banned the account and logged
++
++    Order N: account X gave up after 1 attempt(s) (Join transport failed: ...)
++        — replaced from pool
++
++i.e. a Telegram outage burned the account pool, and the build finished short
++(order 930: live=38/42) with no explanation.
++
++These tests drive the REAL ``OrderExecutor._voice_batched_fill`` loop and the
++REAL ``join_brain`` singleton:
++
++  * a system-side (INTERDC / 500 / timeout / retry-deferred) failure keeps the
++    account's attempt budget, does not ban it, and retries the SAME account,
++  * a genuinely account-specific failure still spends the budget,
++  * a wave that failed only on system-side errors does NOT narrow the
++    Join-Brain window (two frozen accounts used to serialise a 42-account
++    build at window=1),
++  * a build that ends below target logs a loud shortfall report instead of
++    silently starting the billable hour.
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++import time
++import unittest
++from unittest import mock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="telegram-system-failure-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++from services import join_brain  # noqa: E402
++from services.join_brain import AdaptiveJoinBrain, OUTCOME_SYSTEM  # noqa: E402
++from services.order_executor import OrderExecutor  # noqa: E402
++
++ORDER = 931
++# Verbatim from the order-931 log the user pasted.
++INTERDC_MSG = (
++    'Join transport failed: Telegram says: [500 INTERDC_X_CALL_ERROR] - An '
++    'error occurred while Telegram was intercommunicating with DC4. Please try '
++    'again later. (retry deferred)'
++)
++UNRESOLVED_MSG = "Join request unresolved after 30s (retry deferred)"
++TIMEOUT_MSG = "Join transport failed: TimeoutError (retry deferred)"
++FROZEN_MSG = ("membership failed: Group join failed: Telegram says: "
++              "[420 FROZEN_METHOD_INVALID] - The method can't be used by "
++              "frozen account.")
++FLOOD_MSG = "Telegram says: [420 FLOOD_WAIT_37] - A wait of 37 seconds is required"
++
++
++class ClassificationTests(unittest.TestCase):
++    """The second signal the Brain sees must have a system bucket."""
++
++    def test_interdc_500_is_a_system_failure(self):
++        self.assertEqual(join_brain.classify_message(INTERDC_MSG), OUTCOME_SYSTEM,
++                         "a Telegram inter-DC 500 is not the account's fault")
++
++    def test_unresolved_join_and_transport_timeout_are_system_failures(self):
++        for msg in (UNRESOLVED_MSG, TIMEOUT_MSG):
++            with self.subTest(msg=msg):
++                self.assertEqual(join_brain.classify_message(msg), OUTCOME_SYSTEM)
++
++    def test_account_specific_buckets_still_win(self):
++        self.assertEqual(join_brain.classify_message(FROZEN_MSG),
++                         join_brain.OUTCOME_PERMANENT)
++        self.assertEqual(join_brain.classify_message(FLOOD_MSG),
++                         join_brain.OUTCOME_FLOOD)
++        self.assertEqual(
++            join_brain.classify_message("Could not resolve chat: invalid link"),
++            join_brain.OUTCOME_PERMANENT)
++
++    def test_the_singleton_exposes_the_same_bucket(self):
++        brain = AdaptiveJoinBrain()
++        self.assertEqual(brain.classify_message(INTERDC_MSG), OUTCOME_SYSTEM)
++
++
++class InfraWaveDoesNotNarrowTheWindowTests(unittest.TestCase):
++    """Two frozen accounts used to pin a 42-account build at window=1."""
++
++    def test_infra_only_wave_pauses_instead_of_narrowing(self):
++        brain = AdaptiveJoinBrain()
++        brain.register_order(ORDER, initial=4, min_window=1, max_window=4)
++        with mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20):
++            brain.finish_wave(ORDER, joined=0, failed=4, ok_rate=0.0,
++                              duration_s=3.0, infra_failures=4)
++        policy = brain._orders[ORDER]
++        self.assertEqual(policy.window, 4,
++                         "a Telegram-side outage must not narrow the window")
++        self.assertGreater(policy.paused_until, time.time() - 1,
++                           "the wave rate is paused instead")
++
++    def test_a_plain_failure_wave_still_narrows(self):
++        brain = AdaptiveJoinBrain()
++        brain.register_order(ORDER, initial=4, min_window=1, max_window=4)
++        brain.finish_wave(ORDER, joined=0, failed=4, ok_rate=0.0, duration_s=3.0)
++        self.assertEqual(brain._orders[ORDER].window, 2,
++                         "retryable account failures keep the old behaviour")
++
++
++class _FakeVCM:
++    """Minimal VoiceCallManager stand-in for the fill loop."""
++
++    def __init__(self):
++        self.live = set()
++        self.busy = set()
++        self.reserved = []
++
++    def get_active_count(self, order_id):
++        return len(self.live)
++
++    def get_active_account_ids(self, order_id):
++        return set(self.live)
++
++    def accounts_busy_in_other_orders(self, order_id):
++        return set(self.busy)
++
++    def flood_wait_remaining(self, account_id):
++        return 0.0
++
++    async def reserve_accounts(self, order_id, account_ids):
++        self.reserved.append(set(account_ids))
++
++    async def warmup_clients(self, accounts, limit=0):
++        return 0
++
++
++class FillLoopSystemFailureTests(unittest.TestCase):
++    """Drive the real _voice_batched_fill loop with a fake join transport."""
++
++    POOL = [{"id": 132, "session_string": "s132"}]
++
++    def setUp(self):
++        self.ex = OrderExecutor()
++        self.ex.active_orders[ORDER] = {
++            "status": "running", "data": {}, "joined_accounts": [],
++            "cancel_requested": False, "target_count": 1, "live_count": 0,
++            "dead_accounts_count": 0, "pool_ids": set(), "swapped_accounts": 0,
++        }
++        self.ex._voice_pool[ORDER] = [dict(a) for a in self.POOL]
++        self.ex._voice_attempts[ORDER] = {}
++        self.ex._voice_banned[ORDER] = set()
++        self.ex._voice_terminal[ORDER] = set()
++        self.ex._voice_second_chance[ORDER] = 0
++        self.ex._voice_retry_after[ORDER] = {}
++        self.vcm = _FakeVCM()
++        join_brain.join_brain.forget_order(ORDER)
++
++    def tearDown(self):
++        join_brain.join_brain.forget_order(ORDER)
++
++    def _run_fill(self, results, *, target=1, patches=(), pool=None):
++        """Run the real fill loop. ``results`` is the join-result queue."""
++        if pool is not None:
++            self.ex._voice_pool[ORDER] = [dict(a) for a in pool]
++        queue = list(results)
++
++        async def fake_join(order_id, acc, order_type, target_link, duration_minutes=0):
++            res = queue.pop(0) if queue else {"success": False, "status": "failed",
++                                              "msg": "no more results"}
++            if res.get("success"):
++                self.vcm.live.add(acc["id"])
++            return res
++
++        with mock.patch("services.order_executor._get_voice_call_manager",
++                        return_value=self.vcm), \
++                mock.patch.object(self.ex, "_voice_load_pool",
++                                  new=mock.AsyncMock(return_value=None)), \
++                mock.patch.object(self.ex, "_join_single_account",
++                                  new=mock.AsyncMock(side_effect=fake_join)), \
++                mock.patch("services.order_executor.anti_spam") as as_mod, \
++                mock.patch("services.order_executor.voice_cooldown") as vc:
++            as_mod.get_profile = mock.AsyncMock(return_value=None)
++            as_mod.rest_remaining.return_value = 0.0
++            vc.remaining.return_value = 0.0
++            for p in patches:
++                p.start()
++            try:
++                joined, dead = asyncio.run(self.ex._voice_batched_fill(
++                    order_id=ORDER, target="https://t.me/+abc",
++                    bot_id=1, target_count=target, requested=target))
++            finally:
++                for p in reversed(patches):
++                    p.stop()
++        return joined, dead
++
++    def test_interdc_failure_keeps_budget_and_is_not_banned(self):
++        """The regression: a 500 used to burn the slot ('gave up ... replaced')."""
++        self.ex._voice_attempts[ORDER][132] = 0
++        patches = [
++            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 1),
++            mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
++            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 5),
++            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 1),
++        ]
++        with self.assertLogs("services.order_executor", level="WARNING") as logs:
++            joined, dead = self._run_fill(
++                [{"success": False, "status": "failed", "msg": INTERDC_MSG},
++                 {"success": True, "acc": {"id": 132}, "chat_id": -1001}],
++                patches=patches)
++
++        self.assertEqual(self.ex._voice_attempts[ORDER].get(132, 0), 0,
++                         "a Telegram-side failure must not spend the budget")
++        self.assertNotIn(132, self.ex._voice_banned[ORDER],
++                         "the account must not be banned for a Telegram outage")
++        self.assertNotIn(132, self.ex._voice_terminal[ORDER])
++        self.assertIn(132, [e["acc"]["id"] for e in joined],
++                      "the retry of the SAME account must be allowed to succeed")
++        self.assertTrue(any("Telegram-side failure" in line for line in logs.output),
++                        "the deferred retry must be visible in the log")
++
++    def test_genuine_account_failure_still_spends_the_budget(self):
++        """The system bucket must not turn into a no-op for real failures."""
++        patches = [
++            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 1),
++            mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
++            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 2),
++            mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0),
++            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 1),
++        ]
++        self._run_fill(
++            [{"success": False, "status": "failed", "msg": "Join error: weird"}],
++            patches=patches)
++
++        self.assertEqual(self.ex._voice_attempts[ORDER].get(132), 1)
++        self.assertIn(132, self.ex._voice_banned[ORDER])
++
++    def test_build_below_target_reports_the_shortfall(self):
++        """Order 930 started billing at 38/42 with no explanation."""
++        self.ex._voice_terminal[ORDER].add(700)  # a frozen/unusable account
++        with self.assertLogs("services.order_executor", level="WARNING") as logs:
++            joined, _dead = self._run_fill(
++                [{"success": True, "acc": {"id": 132}, "chat_id": -1001}],
++                target=2, pool=[{"id": 132, "session_string": "s"},
++                                {"id": 700, "session_string": "s"}],
++                patches=[mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0)])
++
++        self.assertEqual(len(joined), 1)
++        shortfalls = [l for l in logs.output if "BELOW TARGET" in l]
++        self.assertTrue(shortfalls, "an under-target build must be loud")
++        self.assertIn("terminal", shortfalls[0])
++        self.assertIn("700", shortfalls[0])
++        self.assertEqual(
++            self.ex.active_orders[ORDER]["build_shortfall"]["terminal"], [700])
++
++    def test_a_permanent_stack_does_not_hang_the_build(self):
++        """A system outage with no progress must end the build, not wait forever."""
++        patches = [
++            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 1),
++            mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
++            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 2),
++            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 1),
++        ]
++        started = time.time()
++        joined, _dead = self._run_fill(
++            [{"success": False, "status": "failed", "msg": INTERDC_MSG}] * 6,
++            patches=patches)
++        self.assertEqual(joined, [])
++        self.assertLess(time.time() - started, 30,
++                        "the build must give up after the bounded stall rounds")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_voice_regressions.py b/tests/test_voice_regressions.py
+index d6c2e5d..5577c28 100644
+--- a/tests/test_voice_regressions.py
++++ b/tests/test_voice_regressions.py
+@@ -505,9 +505,15 @@ class EngineLifecycleTests(unittest.TestCase):
+         async def scenario():
+             app = FakeApp()
+             self.mgr.pyrogram_clients[1] = app
+-            with patch.object(vcm_mod, 'PyTgCalls', SlowStartPyTgCalls):
+-                with self.assertRaises(asyncio.TimeoutError):
++            with patch.object(vcm_mod, 'PyTgCalls', SlowStartPyTgCalls), \
++                    patch.object(vcm_mod.Config, "VOICE_ENGINE_START_ATTEMPTS", 1):
++                with self.assertRaises(Exception) as ctx:
+                     await self.mgr._get_or_create_client(901, 1, 'fake-session')
++            # The failure reason must never be empty again: the production log
++            # showed `reason: "client init error: "` for exactly this timeout.
++            self.assertIn("engine startup failed", str(ctx.exception))
++            self.assertFalse(str(ctx.exception).rstrip().endswith(":"),
++                             "the engine-start failure must carry a reason")
+             original = self.mgr.clients[1]
+             self.assertIn(1, self.mgr._quarantined_accounts)
+             with self.assertRaises(SessionInUseError):
+@@ -516,6 +522,42 @@ class EngineLifecycleTests(unittest.TestCase):
+             self.assertEqual(len(FakePyTgCalls.instances), 1)
+         self.loop.run_until_complete(scenario())
+ 
++    def test_one_transient_engine_start_timeout_does_not_burn_the_account(self):
++        """Order 930 lost accounts 156/142 to a SINGLE 15s start() timeout.
++
++        The old code quarantined the account for the rest of the process
++        ("engine startup unconfirmed; existing client quarantined (no second
++        engine)"), the executor read SESSION_IN_USE on the next wave and marked
++        the slot terminal, and the build finished at live=38/42.  The retry
++        reuses the SAME engine handle - never a second engine on one auth key.
++        """
++
++        class FlakyStartPyTgCalls(FakePyTgCalls):
++            async def start(self):
++                self.start_attempts = getattr(self, "start_attempts", 0) + 1
++                if self.start_attempts == 1:
++                    raise asyncio.TimeoutError()
++                self.started += 1
++
++        async def _no_sleep(_delay, *a, **kw):
++            return None
++
++        async def scenario():
++            app = FakeApp()
++            self.mgr.pyrogram_clients[1] = app
++            with patch.object(vcm_mod, 'PyTgCalls', FlakyStartPyTgCalls), \
++                    patch.object(vcm_mod.Config, "VOICE_ENGINE_START_ATTEMPTS", 2), \
++                    patch.object(vcm_mod.asyncio, "sleep", new=_no_sleep):
++                got = await self.mgr._get_or_create_client(902, 1, 'fake-session')
++            self.assertIsNotNone(got, "a single start() timeout must not lose the engine")
++            self.assertNotIn(1, self.mgr._quarantined_accounts,
++                             "a transient timeout must not quarantine the key")
++            self.assertIs(self.mgr.clients[1], got)
++            self.assertEqual(len(FakePyTgCalls.instances), 1,
++                             "the retry must reuse the SAME engine handle")
++            self.assertEqual(got.start_attempts, 2)
++        self.loop.run_until_complete(scenario())
++
+     def test_stream_end_event_restarts_silence_once(self):
+         async def scenario():
+             app = FakeApp()
