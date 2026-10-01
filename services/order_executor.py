@@ -556,7 +556,7 @@ class OrderExecutor:
 	                                    _grace = float(getattr(
 	                                        Config, "VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS", 600) or 0)
 	                                    _waited = time.time() - self._chat_closed_continue_since[order_id]
-	                                    if _grace <= 0 or _waited >= _grace:
+	                                    if _grace > 0 and _waited >= _grace:
 	                                        self._chat_closed_continue_since.pop(order_id, None)
 	                                        logger.error(
 	                                            "Order %s: %.0fs after the customer chose to continue the "

@@ -198,6 +198,15 @@ class ContinueGraceTests(unittest.IsolatedAsyncioTestCase):
         from config import Config
         self.assertEqual(Config.VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS, 600.0)
 
+    def test_zero_grace_disables_the_automatic_settlement(self):
+        """۰ = خاموش؛ یعنی «ادامه» بدون سقف زمانی معتبر است، نه تسویهٔ فوری."""
+        import inspect
+        from config import Config
+        src = inspect.getsource(OrderExecutor)
+        self.assertIn("if _grace > 0 and _waited >= _grace:", src)
+        self.assertNotIn("if _grace <= 0 or _waited >= _grace:", src)
+        self.assertGreaterEqual(Config.VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS, 0)
+
 
 class SettleChatClosedOrderTests(unittest.IsolatedAsyncioTestCase):
     """``settle_chat_closed_order`` باید cutoff را از VCM بردارد و پاس بدهد."""
