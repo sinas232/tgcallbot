@@ -13,13 +13,17 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
-                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
-                                 OUTCOME_SYSTEM)
+                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
 from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
                                         is_fatal_auth_error, fatal_auth_category)
 from services import self_healing
 from services.anti_spam import anti_spam
 from services.voice_cooldown import voice_cooldown
+# ── Telegram-side (infrastructure) failures ─────────────────────────────────
+# OUTCOME_SYSTEM is imported on its own line so this fix applies cleanly on
+# every v2.3.23 port revision of this file (older ports import the other
+# outcomes through a different, multi-line statement).
+from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
