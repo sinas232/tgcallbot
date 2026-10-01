@@ -109,13 +109,9 @@ class Config:
     # WebRTC handshakes land several seconds apart, which keeps Telegram's
     # per-IP rate budget clean AND gives CPU/ffmpeg breathing room for each
     # voice handshake. The Join Brain may still widen this (up to the max).
-    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
-    VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
-    # Per-order ceiling kept LOW on purpose: every simultaneous voice
-    # handshake consumes CPU/ffmpeg + a WebRTC stack; on a small VPS more
-    # than ~2 concurrent media setups is where transports start dying AND
-    # where Telegram's per-IP burst budget starts answering with FloodWait.
-    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '2'))         # per-order hard ceiling
+    VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '4'))   # first wave size
+    VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '2'))          # floor when Telegram is stressed
+    VOICE_JOIN_MAX_CONCURRENCY = int(os.getenv('VOICE_JOIN_MAX_CONCURRENCY', '10'))         # per-order hard ceiling
     # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
     # Accounts of one wave do NOT fire their joins in the same millisecond:
     # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
@@ -244,6 +240,14 @@ class Config:
     # objects instead of each issuing resolve_peer/GetFullChannel from the same
     # IP (the #1 cause of PEER_FLOOD / FLOOD_WAIT when 40+ accounts share an IP).
     VOICE_CHAT_INFO_CACHE_TTL = int(os.getenv('VOICE_CHAT_INFO_CACHE_TTL', '120'))
+    # Stale-while-revalidate TTL for chat info cache when API times out
+    VOICE_CHAT_INFO_STALE_TTL = int(os.getenv('VOICE_CHAT_INFO_STALE_TTL', '600'))
+    # Stale-while-revalidate TTL for active call cache when API times out
+    VOICE_CALL_CACHE_STALE_TTL = int(os.getenv('VOICE_CALL_CACHE_STALE_TTL', '120'))
+    # Timeout per page of participant list fetching (seconds)
+    VOICE_PARTICIPANT_PAGE_TIMEOUT = int(os.getenv('VOICE_PARTICIPANT_PAGE_TIMEOUT', '15'))
+    # Max pages to fetch from participant list
+    VOICE_PARTICIPANT_MAX_PAGES = int(os.getenv('VOICE_PARTICIPANT_MAX_PAGES', '10'))
     # Android-like device fingerprint (anti-detection): instead of broadcasting
     # "CPython / Pyrogram" (an instant bot tell), accounts report a plausible
     # phone model + Telegram app version + Android SDK, deterministic per account.

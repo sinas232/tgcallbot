@@ -386,7 +386,7 @@ _VALID_TRANSITIONS = {
     REJOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED},
     RATE_LIMITED: {RETRY_PENDING, FAILED, LEAVING},
     RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING},
-    FAILED: {LEAVING, COMPLETED},
+    FAILED: {LEAVING, COMPLETED, STARTING, QUEUED},
     LEAVING: {COMPLETED},
     COMPLETED: set(),
 }
@@ -977,17 +977,51 @@ class VoiceCallManager:
         Returns the raw InputGroupCall, or None when there is no active call.
         با force_refresh=True کش نادیده گرفته می‌شود و مرجعِ تازهٔ تماس از سرور
         گرفته می‌شود (برای رفع خطای GROUPCALL_INVALID که به‌خاطر مرجع کهنه رخ می‌دهد).
+
+        STALE-WHILE-REVALIDATE: وقتی تماس API به‌خاطر timeout شکست می‌خورد،
+        مقدار کش‌شدهٔ قبلی برگردانده می‌شود (تا وقتی که کلاً منقضی نشده).
+        این جلوی «voice-call state temporarily unavailable» را می‌گیرد
+        وقتی تلگرام API overload است ولی ویس‌کال هنوز فعال است.
         """
         chat_id = int(chat_id)
+        # Save stale reference before attempting refresh
+        stale = self._chat_info_get(chat_id)
         if not force_refresh:
-            cached = self._chat_info_get(chat_id)
-            if cached and cached[1] is not None:
-                return cached[1]
-        peer = await self._resolve_cached_peer(app, chat_id)
-        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-        call = getattr(full.full_chat, "call", None)
-        self._chat_info_put(chat_id, peer, call)
-        return call
+            if stale and stale[1] is not None:
+                return stale[1]
+        try:
+            peer = await self._resolve_cached_peer(app, chat_id)
+            full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+            call = getattr(full.full_chat, "call", None)
+            self._chat_info_put(chat_id, peer, call)
+            return call
+        except Exception as exc:
+            # STALE-WHILE-REVALIDATE: API timeout doesn't mean the call ended.
+            # Return the last known good value if available (within extended TTL).
+            stale_ttl = max(
+                CHAT_INFO_CACHE_TTL * 3,
+                int(getattr(Config, "VOICE_CHAT_INFO_STALE_TTL", 600)),
+            )
+            if stale and stale[1] is not None:
+                age = time.time() - stale[0]
+                if age < stale_ttl:
+                    logger.debug(
+                        "[VoiceCache] chat=%s API failed (%s); returning stale "
+                        "cached call (age=%.0fs, stale_ttl=%ds)",
+                        chat_id, str(exc)[:80], age, stale_ttl,
+                    )
+                    return stale[1]
+                logger.warning(
+                    "[VoiceCache] chat=%s API failed AND stale cache expired "
+                    "(age=%.0fs > %ds) — returning None",
+                    chat_id, age, stale_ttl,
+                )
+            else:
+                logger.warning(
+                    "[VoiceCache] chat=%s API failed with no cached value: %s",
+                    chat_id, str(exc)[:80],
+                )
+            return None
 
     def _clear_chat_cache(self, chat_id: int) -> None:
         self._chat_refresh_cache.pop(chat_id, None)
@@ -2551,6 +2585,10 @@ class VoiceCallManager:
           None     - could not retrieve (API error / timeout). Callers must
                      treat None as "unknown → assume present" to avoid rejoin
                      storms and to avoid dropping healthy accounts.
+
+        TIMEOUT-RESILIENT: هر صفحه timeout جداگانه دارد. اگر API overload
+        باشد، نتایج partial برمی‌گرداند (بهتر از هیچی) و pagination را زودتر
+        متوقف می‌کند.
         """
         try:
             cached = self._active_call_cache.get(int(chat_id))
@@ -2569,15 +2607,24 @@ class VoiceCallManager:
                 return set()  # no active call → nobody present
 
             present_ids: Set[int] = set()
+            # Timeout per pagination page — prevents one hung invoke from
+            # blocking the monitor cycle for the whole KEEPALIVE_INTERVAL.
+            page_timeout = max(5, int(getattr(Config, "VOICE_PARTICIPANT_PAGE_TIMEOUT", 15)))
 
             # 1) First page via GetGroupCall (cheap)
             try:
-                participants = await app.invoke(functions.phone.GetGroupCall(call=call, limit=200))
+                participants = await asyncio.wait_for(
+                    app.invoke(functions.phone.GetGroupCall(call=call, limit=200)),
+                    timeout=page_timeout,
+                )
                 for p in (participants.participants or []):
                     ppeer = getattr(p, "peer", None)
                     uid = getattr(ppeer, "user_id", None)
                     if uid is not None and not getattr(p, "left", False):
                         present_ids.add(int(uid))
+            except asyncio.TimeoutError:
+                logger.debug("[VoiceMonitor] chat=%s GetGroupCall timeout", chat_id)
+                return None  # unknown → assume present
             except Exception:
                 pass
 
@@ -2587,17 +2634,42 @@ class VoiceCallManager:
             # on every cycle, so the shared snapshot always collapsed to
             # "unknown" and presence verification silently never worked.
             try:
+                consecutive_timeouts = 0
                 offset = ""
-                for _page in range(50):  # 50 * 500 = 25 000 participants max
-                    res = await app.invoke(
-                        functions.phone.GetGroupParticipants(
-                            call=call,
-                            ids=[],
-                            sources=[],
-                            offset=offset,
-                            limit=500,
+                max_pages = min(50, max(5, int(getattr(Config, "VOICE_PARTICIPANT_MAX_PAGES", 10))))
+                for _page in range(max_pages):
+                    try:
+                        res = await asyncio.wait_for(
+                            app.invoke(
+                                functions.phone.GetGroupParticipants(
+                                    call=call,
+                                    ids=[],
+                                    sources=[],
+                                    offset=offset,
+                                    limit=500,
+                                )
+                            ),
+                            timeout=page_timeout,
                         )
-                    )
+                    except asyncio.TimeoutError:
+                        consecutive_timeouts += 1
+                        logger.debug(
+                            "[VoiceMonitor] chat=%s GetGroupParticipants timeout (page %d, timeouts=%d)",
+                            chat_id, _page, consecutive_timeouts,
+                        )
+                        if consecutive_timeouts >= 2:
+                            # API clearly degraded — return partial results
+                            # instead of continuing to waste time.
+                            if present_ids:
+                                logger.warning(
+                                    "[VoiceMonitor] chat=%s returning partial "
+                                    "participant set (%d ids) after %d consecutive timeouts",
+                                    chat_id, len(present_ids), consecutive_timeouts,
+                                )
+                                return present_ids
+                            return None  # unknown → assume present
+                        continue
+                    consecutive_timeouts = 0  # reset on success
                     for p in (res.participants or []):
                         ppeer = getattr(p, "peer", None)
                         uid = getattr(ppeer, "user_id", None)
@@ -2641,6 +2713,9 @@ class VoiceCallManager:
           True  - account confirmed present in the call.
           False - account confirmed NOT present (full participant list checked).
           None  - presence could not be determined (API error / pagination failure).
+
+        TIMEOUT-RESILIENT: هر صفحه timeout جداگانه دارد. اگر API overload
+        باشد، partial result برمی‌گرداند یا None (assume present).
         """
         my_id = None
         try:
@@ -2675,29 +2750,48 @@ class VoiceCallManager:
             if not call:
                 return False
 
+            page_timeout = max(5, int(getattr(Config, "VOICE_PARTICIPANT_PAGE_TIMEOUT", 15)))
+
             # 1) First page via GetGroupCall (cheap)
             try:
-                participants = await app.invoke(functions.phone.GetGroupCall(call=call, limit=200))
+                participants = await asyncio.wait_for(
+                    app.invoke(functions.phone.GetGroupCall(call=call, limit=200)),
+                    timeout=page_timeout,
+                )
                 for p in (participants.participants or []):
                     ppeer = getattr(p, "peer", None)
                     if ppeer and getattr(ppeer, "user_id", None) == my_id:
                         return not getattr(p, "left", False)
+            except asyncio.TimeoutError:
+                return None  # can't tell — assume present to avoid false drop
             except Exception:
                 pass
 
             # 2) Paginate through the remainder (phone.getGroupParticipants).
             try:
+                consecutive_timeouts = 0
                 offset = ""
-                for _page in range(50):  # 50 * 500 = 25 000 participants max
-                    res = await app.invoke(
-                        functions.phone.GetGroupParticipants(
-                            call=call,
-                            ids=[],
-                            sources=[],
-                            offset=offset,
-                            limit=500,
+                max_pages = min(50, max(5, int(getattr(Config, "VOICE_PARTICIPANT_MAX_PAGES", 10))))
+                for _page in range(max_pages):
+                    try:
+                        res = await asyncio.wait_for(
+                            app.invoke(
+                                functions.phone.GetGroupParticipants(
+                                    call=call,
+                                    ids=[],
+                                    sources=[],
+                                    offset=offset,
+                                    limit=500,
+                                )
+                            ),
+                            timeout=page_timeout,
                         )
-                    )
+                    except asyncio.TimeoutError:
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts >= 2:
+                            return None  # API degraded — assume present
+                        continue
+                    consecutive_timeouts = 0
                     for p in (res.participants or []):
                         ppeer = getattr(p, "peer", None)
                         if ppeer and getattr(ppeer, "user_id", None) == my_id:
@@ -2720,20 +2814,41 @@ class VoiceCallManager:
         ``None`` means Telegram could not answer reliably.  It must not be
         collapsed into ``False`` because that turns a temporary API failure
         into a permanent order failure.
+
+        RESILIENT FALLBACK: هنگام overload بودن API تلگرام، اگر کش فعال
+        (active_call_cache) مقدار تازه‌ای دارد، از آن استفاده می‌کنیم.
+        این جلوی رد شدن join به‌خاطر timeout موقتی را می‌گیرد.
         """
+        cid = int(chat_id)
         # Shared chat-info cache: if another account already confirmed the call
         # is active (cached InputGroupCall), answer instantly — no API call.
-        cached_info = self._chat_info_get(int(chat_id))
+        cached_info = self._chat_info_get(cid)
         if cached_info and cached_info[1] is not None:
             return True
         try:
-            call = await self._get_cached_group_call(app, int(chat_id))
+            call = await self._get_cached_group_call(app, cid)
             if call is not None:
-                self._active_call_cache[int(chat_id)] = (time.time(), call)
+                self._active_call_cache[cid] = (time.time(), call)
                 return True
             return False
         except Exception as exc:
             logger.warning(f"voice-call state check failed chat={chat_id}: {exc}")
+            # FALLBACK: check if the active_call_cache has a RECENT positive
+            # result.  During API overload this prevents rejecting a valid join.
+            ac = self._active_call_cache.get(cid)
+            if ac:
+                ac_age = time.time() - ac[0]
+                stale_call_ttl = max(
+                    ACTIVE_CALL_CACHE_TTL * 3,
+                    int(getattr(Config, "VOICE_CALL_CACHE_STALE_TTL", 120)),
+                )
+                if ac_age < stale_call_ttl and ac[1] is not None:
+                    logger.debug(
+                        "[VoiceCache] chat=%s voice-call check failed but "
+                        "active_call_cache is fresh (age=%.0fs) — trusting it",
+                        chat_id, ac_age,
+                    )
+                    return True
             return None
 
     async def _verify_and_register_join(self, app: Client, chat_id: int, account_id: int, order_id: int, target: str, presence: Optional[bool] = None) -> bool:
@@ -3713,32 +3828,45 @@ class VoiceCallManager:
 
                 # STEP 4: Check Telegram's chat state.  A transient Telegram
                 # API failure is unknown, not proof that the call ended.
+                # RESILIENT: تلگرام API ممکن است overload باشد ولی ویس‌کال
+                # فعال باشد.  در این حالت به‌جای رد کردن، اجازه می‌دهیم
+                # join انجام شود — اگر واقعاً تماس نباشد، play() سریعاً
+                # خطا برمی‌گرداند و handle می‌شود.
                 call_state = await self._has_active_voice_call(app, int(chat_id))
                 if call_state is None:
-                    for _ in range(2):
-                        await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
-                        await self._force_refresh_call(app, chat_id)
+                    for _retry in range(3):
+                        await asyncio.sleep(
+                            VOICE_VERIFICATION_GRACE_INTERVAL * (1.5 ** _retry)
+                        )
+                        # DON'T force-refresh: let stale cache work
                         call_state = await self._has_active_voice_call(app, int(chat_id))
                         if call_state is not None:
                             break
                     if call_state is None:
-                        self._set_state(
-                            order_id, account_id, RETRY_PENDING,
-                            "Telegram voice-call state temporarily unavailable",
+                        # PROCEED ANYWAY: API degraded but call may be active.
+                        # The play() join will fail quickly if call truly ended.
+                        logger.warning(
+                            "[VoiceScheduler] Order %s acc %s: voice-call state "
+                            "unknown after retries (API degraded) — attempting join anyway",
+                            order_id, account_id,
                         )
-                        return False, "Telegram voice-call state temporarily unavailable", int(chat_id)
+                        self._vc_event_log(order_id, account_id, "call_state_unknown_proceeding", {
+                            "chat_id": int(chat_id),
+                            "reason": "API degraded, proceeding with join attempt",
+                        })
                 if call_state is False:
-                    await self._force_refresh_call(app, chat_id)
+                    # Don't force-refresh — let stale cache help
                     call_state = await self._has_active_voice_call(app, int(chat_id))
                     if call_state is False:
                         self._set_state(order_id, account_id, FAILED, "voice call not active")
                         return False, "Voice call not active", int(chat_id)
                     if call_state is None:
-                        self._set_state(
-                            order_id, account_id, RETRY_PENDING,
-                            "Telegram voice-call state temporarily unavailable",
+                        # PROCEED ANYWAY when we can't confirm either way
+                        logger.warning(
+                            "[VoiceScheduler] Order %s acc %s: voice-call check "
+                            "returned unknown on re-check — attempting join anyway",
+                            order_id, account_id,
                         )
-                        return False, "Telegram voice-call state temporarily unavailable", int(chat_id)
 
                 # STEP 5: JOIN (single account, verified before returning)
                 self._set_state(order_id, account_id, JOINING, "issuing native play")

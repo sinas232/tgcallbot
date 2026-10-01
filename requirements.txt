@@ -3,7 +3,8 @@
 numpy
 python-dotenv
 cryptography
-sqlalchemy
+sqlalchemy[asyncio]
+greenlet
 asyncpg
 redis
 aiohttp

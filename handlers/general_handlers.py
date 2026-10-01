@@ -88,20 +88,49 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # جایگذاری متغیرها در متن
     credit_val = int(db_user.get("credit", 0) or 0)
     credit_fmt = f"{credit_val:,}"
+
+    # خواندن تنظیمات قالب از دیتابیس (brand, tagline, intro, services, ...)
+    tpl_vars = {}
+    for key in ("brand", "tagline", "intro", "services", "benefits",
+                "guide", "support", "support_hours", "cta"):
+        tpl_vars[key] = await DatabaseManager.get_setting(
+            f"start_{key}", "", bot_id=bot_id
+        )
+
+    # متغیرهای پیش‌فرض اگر خالی باشند
+    defaults = {
+        "brand": "💎 ربات خدمات مجازی",
+        "tagline": "بهترین خدمات با کیفیت عالی",
+        "intro": "به ربات خدمات مجازی خوش آمدید.",
+        "services": "✨ ویس‌کال · عضویت · شارژ",
+        "benefits": "🌟 کیفیت بالا · پشتیبانی ۲۴ ساعته",
+        "guide": "۱. سرویس خود را انتخاب کنید\n۲. تعداد و مدت را مشخص کنید\n۳. پرداخت و تمام!",
+        "support": "📞 پشتیبانی: @support",
+        "support_hours": "۲۴ ساعته",
+        "cta": "از منوی زیر انتخاب کنید",
+    }
+    for k, v in defaults.items():
+        if not tpl_vars.get(k):
+            tpl_vars[k] = v
+
+    # ساخت dict نهایی برای format
+    fmt_dict = {
+        "name": safe_name,
+        "id": user.id,
+        "username": user.username or "None",
+        "credit": credit_fmt,
+        "user_id": user.id,
+        "first_name": safe_name,
+        **tpl_vars,
+    }
+
     try:
-        final_text = start_text.format(
-            name=safe_name,
-            id=user.id,
-            username=user.username or "None",
-            credit=credit_fmt,
-        )
-    except Exception:
-        final_text = (
-            start_text.replace("{name}", safe_name)
-            .replace("{credit}", credit_fmt)
-            .replace("{id}", str(user.id))
-            .replace("{username}", user.username or "None")
-        )
+        final_text = start_text.format(**fmt_dict)
+    except (KeyError, ValueError, IndexError):
+        # اگر format با خطا مواجه شد، فقط متغیرهای شناخته‌شده رو جایگزین کن
+        final_text = start_text
+        for k, v in fmt_dict.items():
+            final_text = final_text.replace("{" + k + "}", str(v))
 
     # اگر متن سفارشی ادمین Markdown قدیمی باشد، لایهٔ پریمیوم تبدیلش می‌کند؛
     # برای قالب پیش‌فرض HTML می‌فرستیم تا ظاهر رنگی/تمیز بماند.

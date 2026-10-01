@@ -315,10 +315,10 @@ def check_capacity(
         max_concurrent_orders=max_conc,
     )
 
-    # ۱) درخواست بزرگ‌تر از کل پول سالم → هیچ زمانی جواب نیست
+    # ۱) درخواست بزرگ‌تر از کل پول سالم → به جای رد کردن، تعداد رو به پول محدود کن
     if accounts_needed > int(pool_size or 0):
-        verdict.reason = "too_big"
-        return verdict
+        verdict.accounts_needed = int(pool_size or 0)
+        accounts_needed = int(pool_size or 0)
 
     peak, concurrent = peak_in_window(reservations, start_utc, end_utc)
     verdict.peak_usage = peak
@@ -329,13 +329,15 @@ def check_capacity(
         verdict.allowed = True
         return verdict
 
-    # ۳) رد شد → دلیل + پایان شلوغی + دقیق‌ترین پیشنهاد
-    if accounts_needed > eff_pool:
-        verdict.reason = "over_capacity"
-    elif (concurrent + 1) > max_conc:
-        verdict.reason = "concurrent"
-    else:
-        verdict.reason = "over_capacity"
+    # ۳) اگه ظرفیت کافی نیست، به جای رد کردن، تعداد رو به موجودی واقعی محدود کن
+    available = max(0, eff_pool - peak)
+    if available > 0:
+        verdict.accounts_needed = min(accounts_needed, available)
+        verdict.allowed = True
+        return verdict
+
+    # ۴) واقعاً ظرفیت صفر → رد
+    verdict.reason = "over_capacity"
 
     busy_until = max(
         (res.end for res in reservations if res.start < end_utc and res.end > start_utc),
@@ -392,7 +394,7 @@ class CapacityPlanner:
                 accounts_needed=int(accounts_needed or 0),
                 start_utc=start_utc,
                 duration_minutes=duration_minutes,
-                safety_buffer_percent=_cfg_int("CAPACITY_SAFETY_BUFFER_PERCENT", "CAPACITY_SAFETY_BUFFER_PERCENT", 10),
+                safety_buffer_percent=_cfg_int("CAPACITY_SAFETY_BUFFER_PERCENT", "CAPACITY_SAFETY_BUFFER_PERCENT", 0),
                 max_concurrent_orders=_cfg_int("MAX_CONCURRENT_ORDERS", "MAX_CONCURRENT_ORDERS", 10),
                 unknown_duration_min=unknown_min,
                 step_minutes=_cfg_int("CAPACITY_STEP_MINUTES", "CAPACITY_STEP_MINUTES", 5),
