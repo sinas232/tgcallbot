@@ -768,7 +768,7 @@ index 0000000..0765e15
 +        logger.debug("[EnvSanity] check failed: %r", exc)
 +        return {}
 diff --git a/services/group_leave_scheduler.py b/services/group_leave_scheduler.py
-index 570d5ae..ecd9fbe 100644
+index 570d5ae..b79b10c 100644
 --- a/services/group_leave_scheduler.py
 +++ b/services/group_leave_scheduler.py
 @@ -43,10 +43,6 @@ except Exception:  # pragma: no cover - محیط تست/بدون استک کام
@@ -782,6 +782,27 @@ index 570d5ae..ecd9fbe 100644
  logger = logging.getLogger(__name__)
  
  
+@@ -279,7 +275,9 @@ class GroupLeaveScheduler:
+         except Exception as exc:
+             msg = str(exc)
+             upper = msg.upper()
+-            if "FLOOD" in upper or "420" in upper or "RETRY AFTER" in upper:
++            # "420" alone is NOT evidence of a FloodWait: FROZEN_METHOD_INVALID
++            # carries the same code, and a chat/user id can contain the digits.
++            if "FLOOD" in upper or "420 FLOOD" in upper or "RETRY AFTER" in upper:
+                 wait_s = self._extract_wait_seconds(msg) or random.uniform(300, 900)
+                 try:
+                     voice_cooldown.record(aid, wait_s, operation="group_leave", source="group_leave_scheduler")
+@@ -291,6 +289,9 @@ class GroupLeaveScheduler:
+             if any(x in upper for x in (
+                 "USER_NOT_PARTICIPANT", "CHAT_NOT_FOUND", "PEER_ID_INVALID",
+                 "CHANNEL_PRIVATE", "USER_DEACTIVATED", "AUTH_KEY", "SESSION_REVOKED",
++                # اکانت یخ‌زده/اسپم‌خورده هیچ‌وقت با تلاش دوباره درست نمی‌شود؛
++                # بدون این‌ها هر leave شکست‌خورده ۳۰۰-۹۰۰ ثانیه cooldown می‌گرفت.
++                "FROZEN_METHOD_INVALID", "ACCOUNT FROZEN", "PEER_FLOOD",
+                 "401", "PARTICIPANT",
+             )):
+                 await _db().finish_group_leave(row_id, "done", f"terminal: {msg[:100]}")
 diff --git a/services/host_resources.py b/services/host_resources.py
 new file mode 100644
 index 0000000..98e9b00
@@ -1080,6 +1101,46 @@ index 0000000..98e9b00
 +        out["mem_used_mb"] = None
 +        out["mem_error"] = repr(exc)
 +    return out
+diff --git a/services/join_brain.py b/services/join_brain.py
+index 8078bd8..52c1932 100644
+--- a/services/join_brain.py
++++ b/services/join_brain.py
+@@ -65,9 +65,34 @@ def classify_message(msg: str) -> str:
+     text = (msg or "").upper()
+     if is_auth_key_duplicated(text):
+         return OUTCOME_DEAD  # skip this order slot; text alone cannot authorize DB deletion
++
++    # ── Permanent ACCOUNT conditions, checked BEFORE the flood bucket ──────
++    # FROZEN_METHOD_INVALID is returned by Telegram with error code 420 - the
++    # same code as FloodWait - so the loose "420" substring test that used to
++    # sit here swallowed it as throttling.  It is not throttling: a frozen
++    # account is unusable until its owner talks to @SpamBot.  Mis-bucketing it
++    # as FLOOD kept the attempt budget ("budget kept, retry deferred"), so the
++    # same frozen account was retried forever while every retry paused the
++    # WHOLE order for VOICE_JOIN_FLOOD_PAUSE_SECONDS.  Order 929 stalled at
++    # live=40/42 for exactly this reason.  PERMANENT replaces it from the pool.
++    #
++    # PEER_FLOOD is grouped with it because voice_call_manager already maps
++    # both to "Account Restricted"; USER_DEACTIVATED is dead, not throttled.
+     if any(k in text for k in (
+-        "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
++        "FROZEN_METHOD_INVALID", "ACCOUNT FROZEN", "PEER_FLOOD",
++        "USER_DEACTIVATED",
+     )):
++        return OUTCOME_PERMANENT
++
++    # ── Real server-directed throttling ────────────────────────────────────
++    # The bare "420" substring is deliberately gone.  See the docstring of
++    # session_ownership.is_fatal_auth_error for why a numeric substring is not
++    # evidence of an RPC code: a chat ID, a trace number, an elapsed-ms figure
++    # or a "FLOOD_WAIT:420" duration can all contain it.  Only match 420 where
++    # Telegram actually puts the code, i.e. immediately before the error name.
++    if any(k in text for k in (
++        "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "SLOW_MODE",
++    )) or "420 FLOOD" in text or "(420)" in text:
+         return OUTCOME_FLOOD
+     if is_fatal_auth_error(text):
+         return OUTCOME_DEAD
 diff --git a/services/memory_guard.py b/services/memory_guard.py
 new file mode 100644
 index 0000000..6123593
@@ -1508,8 +1569,21 @@ index 0e19892..e98de38 100644
  		else:
  			try:
  				await self._eject_all_fast(order_id, joined_accounts, data)
+diff --git a/services/self_healing.py b/services/self_healing.py
+index 490a5b0..05bee81 100644
+--- a/services/self_healing.py
++++ b/services/self_healing.py
+@@ -180,7 +180,7 @@ _RULES = (
+     ("import_error", ("cannot import name", "no module named", "importerror")),
+     ("session_dead", ("session_revoked", "auth_key_invalid", "auth_key_unregistered",
+                       "user_deactivated", "active user required")),
+-    ("flood_wait", ("floodwait", "flood_wait", "retry after", "420")),
++    ("flood_wait", ("floodwait", "flood_wait", "retry after", "420 flood")),
+     ("call_invalid", ("groupcallinvalid", "group call invalid", "gcall_invalid",
+                       "call not found")),
+     ("forbidden", ("forbidden", "403", "not enough rights")),
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 263629f..08096b6 100644
+index 263629f..51fde01 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
 @@ -75,7 +75,6 @@ from services.session_client import close_pyrogram_client
@@ -1520,7 +1594,28 @@ index 263629f..08096b6 100644
      SUSPECTED_DISCONNECT,
      CONFIRMED_ABSENT,
      RECOVERING,
-@@ -1329,6 +1328,36 @@ class VoiceCallManager:
+@@ -584,8 +583,18 @@ def _classify_error(err: Exception, message: str = "") -> str:
+         return FAILURE_NETWORK
+     s = (message or str(err)).lower()
+     # Ordered: most specific first.
+-    if isinstance(err, FloodWait) or "floodwait" in s or "retry after" in s or "420" in s \
+-       or "flood" in s or "slow_mode" in s:
++    # A frozen / spam-flagged / deactivated account is PERMANENT, not a rate
++    # limit. FROZEN_METHOD_INVALID arrives with Telegram error code 420 - the
++    # same code as FloodWait - so the bare "420" substring that used to sit in
++    # the rate-limit test below grabbed it: the account was throttled for
++    # VOICE_JOIN_FLOOD_PAUSE_SECONDS and retried forever instead of being
++    # replaced from the pool. Same bug class as the bare "401" that
++    # session_ownership.is_fatal_auth_error already warns about.
++    if "frozen_method_invalid" in s or "account frozen" in s or "peer_flood" in s \
++       or "user_deactivated" in s:
++        return FAILURE_PERMANENT
++    if isinstance(err, FloodWait) or "floodwait" in s or "retry after" in s \
++       or "420 flood" in s or "flood" in s or "slow_mode" in s:
+         return FAILURE_RATE_LIMITED
+     if isinstance(err, (AuthKeyInvalid, AuthKeyUnregistered, SessionRevoked)) or \
+        is_fatal_auth_error(err) or is_fatal_auth_error(message) or \
+@@ -1329,6 +1338,36 @@ class VoiceCallManager:
                  reserved.update(account_ids)
          return reserved
  
@@ -1557,7 +1652,7 @@ index 263629f..08096b6 100644
      def get_cached_session_account_ids(self) -> Set[int]:
          return set(self._session_cache.keys())
  
-@@ -2221,6 +2250,14 @@ class VoiceCallManager:
+@@ -2221,6 +2260,14 @@ class VoiceCallManager:
                      if now - self._last_memory_log >= log_interval:
                          self._last_memory_log = now
                          logger.info("[VoiceMemory] %s", self.memory_report())
@@ -1572,7 +1667,7 @@ index 263629f..08096b6 100644
                  except asyncio.CancelledError:
                      raise
                  except Exception as exc:
-@@ -3906,9 +3943,17 @@ class VoiceCallManager:
+@@ -3906,9 +3953,17 @@ class VoiceCallManager:
          """
          Track which accounts this order has *selected* so far.
  
@@ -1593,7 +1688,7 @@ index 263629f..08096b6 100644
          """
          async with self._reservation_lock:
              self._reservations[order_id] = set(account_ids)
-@@ -4407,6 +4452,21 @@ class VoiceCallManager:
+@@ -4407,6 +4462,21 @@ class VoiceCallManager:
              key_set.add((order_id, aid))
          keys = list(key_set)
  
@@ -2439,6 +2534,235 @@ index 0000000..8ae4a91
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tests/test_frozen_account.py b/tests/test_frozen_account.py
+new file mode 100644
+index 0000000..371b3e9
+--- /dev/null
++++ b/tests/test_frozen_account.py
+@@ -0,0 +1,223 @@
++"""A Telegram-frozen account must not be mistaken for a FloodWait.
++
++Incident (2026-10-01, order 929). The build stalled at ``live=40/42`` and
++never finished.  Every remaining wave failed on the same two accounts with
++the exact same error, and each failure paused the *whole order* for 45s::
++
++    reason: "membership failed: Group join failed: Telegram says:
++             [420 FROZEN_METHOD_INVALID] - The method can't be used by
++             frozen account."
++    Order 929: account 151 FloodWait 45s - budget kept, retry deferred
++    [JoinBrain] order=929 flood burst at floor window -> pause new waves 45s
++    Order 929: wave 47 done (ok=0 fail=1 in 3s) | live=40/42 ... flood=7
++
++Three things went wrong, all from one loose substring test:
++
++1. ``FROZEN_METHOD_INVALID`` is returned with Telegram error code **420** -
++   the same code as FloodWait.  ``join_brain.classify_message`` matched the
++   bare substring ``"420"`` and bucketed it as ``OUTCOME_FLOOD``.
++2. The FLOOD bucket deliberately keeps the attempt budget ("budget kept,
++   retry deferred"), so the frozen account was retried **forever** instead
++   of exhausting its budget and being replaced from the pool.
++3. The FLOOD bucket also pauses the whole order
++   (``VOICE_JOIN_FLOOD_PAUSE_SECONDS``), so two unusable accounts held 40
++   healthy ones hostage.
++
++A frozen account is permanent, not throttling: it stays unusable until its
++owner talks to @SpamBot.  The right bucket is PERMANENT, which replaces it.
++
++The bare ``"420"`` is also wrong on its own terms - ``session_ownership.
++is_fatal_auth_error`` already documents why a numeric substring is not
++evidence of an RPC code (a chat id, a trace number or an elapsed-ms figure
++can contain it).
++"""
++
++import os
++import sys
++import tempfile
++import unittest
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="frozen-account-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from services import join_brain  # noqa: E402
++from services import voice_call_manager as vcm  # noqa: E402
++
++# Verbatim from the order-929 log (VoiceDiag "reason" field).
++FROZEN_MSG = (
++    "membership failed: Group join failed: Telegram says: "
++    "[420 FROZEN_METHOD_INVALID] - The method can't be used by frozen "
++    "account. You can app"
++)
++# A real server-directed throttle, for contrast.
++REAL_FLOOD_MSG = (
++    "Telegram says: [420 FLOOD_WAIT_37] - A wait of 37 seconds is required"
++)
++
++
++class FrozenAccountClassificationTests(unittest.TestCase):
++    def test_frozen_account_is_permanent_not_flood(self):
++        """The regression: this exact string used to classify as FLOOD."""
++        self.assertEqual(
++            join_brain.classify_message(FROZEN_MSG),
++            join_brain.OUTCOME_PERMANENT,
++            'a frozen account must be replaced from the pool, not throttled '
++            'and retried forever')
++
++    def test_a_real_floodwait_is_still_a_floodwait(self):
++        self.assertEqual(
++            join_brain.classify_message(REAL_FLOOD_MSG),
++            join_brain.OUTCOME_FLOOD)
++
++    def test_floodwait_variants_still_match_without_the_bare_420(self):
++        for msg in ("FloodWait: 12", "flood_wait_x", "FLOOD WAIT 5",
++                    "Retry after 30 seconds", "SLOW_MODE_WAIT_X",
++                    "[420 FLOOD_WAIT_X]", "(420) FLOOD_WAIT_X"):
++            self.assertEqual(
++                join_brain.classify_message(msg), join_brain.OUTCOME_FLOOD,
++                '%r should still be a flood' % msg)
++
++    def test_a_420_inside_an_id_is_not_a_floodwait(self):
++        """Why the bare substring had to go."""
++        for msg in ("failed for chat 1420987654",
++                    "trace 9942011 elapsed 420ms",
++                    "peer 4201234 unreachable"):
++            self.assertNotEqual(
++                join_brain.classify_message(msg), join_brain.OUTCOME_FLOOD,
++                '%r contains the digits 420 but is not throttling' % msg)
++
++    def test_peer_flood_and_deactivated_are_permanent(self):
++        for msg in ("PEER_FLOOD: the account is limited",
++                    "USER_DEACTIVATED_BAN"):
++            self.assertEqual(
++                join_brain.classify_message(msg), join_brain.OUTCOME_PERMANENT,
++                '%r is a dead/flagged account, not pressure' % msg)
++
++
++class VoiceCallManagerClassificationTests(unittest.TestCase):
++    def test_frozen_is_permanent_and_not_retryable(self):
++        cls = vcm._classify_error(RuntimeError(FROZEN_MSG), FROZEN_MSG)
++        self.assertEqual(cls, vcm.FAILURE_PERMANENT)
++        self.assertNotIn(
++            cls, vcm._RETRYABLE_FAILURES,
++            'a frozen account must not sit in the retryable set or VCM will '
++            'keep re-probing it')
++
++    def test_real_floodwait_is_still_rate_limited(self):
++        cls = vcm._classify_error(RuntimeError(REAL_FLOOD_MSG), REAL_FLOOD_MSG)
++        self.assertEqual(cls, vcm.FAILURE_RATE_LIMITED)
++        self.assertIn(cls, vcm._RETRYABLE_FAILURES)
++
++    def test_a_420_inside_an_id_is_not_rate_limited(self):
++        msg = "could not reach chat 1420987654"
++        self.assertNotEqual(
++            vcm._classify_error(RuntimeError(msg), msg),
++            vcm.FAILURE_RATE_LIMITED)
++
++
++class _FakeDB:
++    """Stands in for DatabaseManager inside _process_one's lazy import."""
++
++    def __init__(self):
++        self.finished = []
++        self.retries = []
++
++    async def get_account_by_id(self, aid):
++        return {"account_status": "active", "phone_number": "+10000000000",
++                "session_string": "x" * 40}
++
++    async def is_account_active_in_chat(self, aid, chat_id):
++        return False
++
++    async def finish_group_leave(self, row_id, status, reason=""):
++        self.finished.append((row_id, status, reason))
++
++    async def update_group_leave(self, *a, **kw):
++        self.retries.append((a, kw))
++
++    async def fail_group_leave(self, *a, **kw):
++        self.retries.append((a, kw))
++
++
++class GroupLeaveFrozenTests(unittest.TestCase):
++    """Drive the REAL _process_one: a frozen leave must finish, not reschedule."""
++
++    def _run(self, error_text):
++        import asyncio
++        import types
++        from unittest import mock
++
++        fake_db = _FakeDB()
++
++        class _Client:
++            def __init__(self, *a, **kw):
++                pass
++
++            async def leave_chat(self, target):
++                raise RuntimeError(error_text)
++
++        fake_tc = types.ModuleType("telegram_client")
++        fake_tc.TelegramAccountClient = _Client
++
++        fake_vcd = types.ModuleType("services.voice_cooldown")
++
++        class _VC:
++            @staticmethod
++            def remaining(aid):
++                return 0.0
++
++            @staticmethod
++            def record(*a, **kw):
++                return None
++
++        fake_vcd.voice_cooldown = _VC
++
++        fake_dbmod = types.ModuleType("database")
++        fake_dbmod.DatabaseManager = fake_db
++
++        with mock.patch.dict(sys.modules, {
++            "telegram_client": fake_tc,
++            "services.voice_cooldown": fake_vcd,
++            "database": fake_dbmod,
++        }):
++            from services import group_leave_scheduler as gls
++            sched = gls.GroupLeaveScheduler.__new__(gls.GroupLeaveScheduler)
++            sched._reschedule = mock.AsyncMock(return_value=None)
++            sched._retry_or_fail = mock.AsyncMock(return_value=None)
++            row = {"id": 7, "account_id": 151, "chat_id": -100123,
++                   "target_link": "", "bot_id": 1}
++            result = asyncio.run(sched._process_one(row))
++        return result, fake_db, sched
++
++    def test_frozen_account_leave_is_terminal(self):
++        result, fake_db, sched = self._run(FROZEN_MSG)
++        self.assertTrue(
++            result.startswith("terminal"),
++            'a frozen account can never leave by retrying; got %r' % result)
++        self.assertEqual(
++            [s for (_rid, s, _r) in fake_db.finished], ["done"],
++            'the leave job must be closed, not left pending')
++        sched._reschedule.assert_not_awaited()
++
++    def test_a_real_floodwait_still_defers_the_leave(self):
++        result, fake_db, sched = self._run(REAL_FLOOD_MSG)
++        self.assertIn(
++            "floodwait", result,
++            'a genuine FloodWait must still back off; got %r' % result)
++        self.assertEqual(fake_db.finished, [],
++                         'a throttle is not terminal')
++
++
++if __name__ == '__main__':
++    unittest.main()
 diff --git a/tests/test_host_resources.py b/tests/test_host_resources.py
 new file mode 100644
 index 0000000..d155ce6
