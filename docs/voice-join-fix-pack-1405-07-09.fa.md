@@ -80,7 +80,39 @@ docker logs -f --tail 100 telegram_bot_container | grep --line-buffered -E \
 - پیک سلول‌های بالا یعنی بسته واقعاً فعال است (`🔖 running commit: <sha>` را هم چک کنید).
 - اگر همچنان `BELOW TARGET` دیدید، همان خط دقیقاً می‌گوید کدام اسلات‌ها و به چه دلیلی خالی مانده‌اند.
 
-## ۶) آزمون‌ها
+## ۶) نصب روی سرور (دستورهای تأییدشده)
+
+اگر روی سرور `git apply` با `patch failed: services/order_executor.py:13` خطا داد، یعنی آن
+سرور نسخهٔ **قدیمی‌تری** از `v2323-full-port.diff` را خورده است (نسخه‌های ۱۴۶/۱۶۰/۱۷۵/۱۸۶
+کیلوبایتی، که ایمپورت‌های `join_brain` در آن‌ها یک‌خطی است). مسیر قطعی، شروع از درخت
+تمیزِ v2.3.23 و اعمال یک‌جای «پورت تازه + این چهار فیکس» است:
+
+```bash
+cd /opt/tgcallbot
+git fetch origin arena/01a0f720-tgcallbot
+git checkout -- .                       # فایل‌های ردیابی‌شده به c8259a5 برمی‌گردند
+git clean -fd -- services tests docs    # حذف بازماندهٔ untracked پورت قبلی (.env دست‌نخورده)
+git status --porcelain                  # باید هیچ خطی چاپ نکند
+git show origin/arena/01a0f720-tgcallbot:v2323-full-port.diff > /tmp/port.diff
+git apply /tmp/port.diff                # اگر گیر داد: git apply --3way /tmp/port.diff
+docker compose config --quiet
+docker compose up -d --force-recreate bot
+```
+
+- نام سرویس در compose **`bot`** است (`telegram_bot_container` فقط `container_name` است)، پس
+  `docker compose up -d --force-recreate telegram_bot_container` خطای «no such service» می‌دهد.
+- کد با `volumes: .:/app` داخل کانتینر mount است؛ `--build` لازم نیست ولی `--force-recreate`
+  لازم است تا پروسه با کد تازه بالا بیاید.
+- **قبل از restart مطمئن شوید سفارش فعالی در حال اجرا نیست**: بالا آمدن کانتینر تازه یعنی
+  قطع‌شدن همهٔ سشن‌های ویس؛ همان حادثهٔ ۱۴۰۵/۰۷/۰۴. اگر سفارشی در جریان است، بعد از
+  پایانش استقرار را انجام دهید.
+- اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
+  گاردها را خودش انجام می‌دهد).
+- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
+- فقط اگر درخت سرور دقیقاً هم‌سن `d08a4d8` باشد، `v2323-voice-join-fixes.diff` (۷۴KB) هم
+  کافی است؛ روی پورت‌های قدیمی‌تر اعمال نمی‌شود چون خودِ پورت قدیمی‌تر است.
+
+## ۷) آزمون‌ها
 
 سوئیت کامل: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip** (۱۸ تست تازه). این‌ها آفلاین‌اند و رفتار
 زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند؛
