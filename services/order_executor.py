@@ -32,6 +32,31 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+# Report kinds that must appear AT MOST ONCE per order in the log channel.
+# Two independent producers exist for the end of an order: the executor's own
+# ``_finish_order`` and the 60s ``check_expired_orders_job``.  Both used to
+# post the same "completed" banner while the paced voice cleanup was still
+# running (the order is not committed as completed until cleanup ends).
+_TERMINAL_REPORT_KINDS = frozenset({"completed", "cancelled", "failed"})
+
+# Telegram Markdown/entity failures - the ONLY case where a plain-text
+# re-send is safe.  Any other error (timeout, flood, network) may already
+# have delivered the message, and retrying would duplicate it.
+_PARSE_ERROR_MARKERS = ("can't parse", "can't find end", "unsupported start tag",
+                        "parse entities", "parse_mode", "entity", "imbalanced")
+
+
+def _is_parse_error(exc) -> bool:
+	"""True only for a Telegram formatting failure (BadRequest about entities)."""
+	try:
+		from telegram.error import BadRequest
+	except Exception:
+		return False
+	if not isinstance(exc, BadRequest):
+		return False
+	text = str(exc).lower()
+	return any(marker in text for marker in _PARSE_ERROR_MARKERS)
+
 
 def _format_timer(seconds: float) -> str:
 	"""تبدیل ثانیه به فرمت HH:MM:SS برای نمایش تایمر دقیق"""
@@ -134,6 +159,9 @@ class OrderExecutor:
 		# Strong refs to fire-and-forget tasks so they are not garbage-collected
 		# mid-flight (the customer question must not vanish silently).
 		self._background_tasks: Set[asyncio.Task] = set()
+		# (bot_id, order_id, kind) -> timestamp of the ONE terminal report
+		# already sent for that order (completed/cancelled/failed).
+		self._terminal_reports_sent: Dict[Tuple[int, int, str], float] = {}
 
 	def _chat_closed_ask_gate(self, order_id: int, is_closed: bool) -> bool:
 		"""True exactly ONCE per closure: send the customer question here.
@@ -1851,6 +1879,24 @@ class OrderExecutor:
 			pass
 		self.active_orders.pop(order_id, None)
 
+	@staticmethod
+	def expiry_owned_by_live_session(active_orders, order_id, overdue_seconds,
+	                                 grace_seconds=300) -> bool:
+		"""True while the executor itself is still finishing this order.
+
+		``_finish_order`` ejects dozens of voice accounts with PACED leaves
+		before it commits 'completed' and reports it, so an order can sit past
+		its deadline for minutes while its session is still alive.  The 60s
+		expiry job must leave those alone: taking them over would cancel the
+		cleanup mid-flight and post a second end-of-order report.
+		"""
+		try:
+			if order_id not in active_orders:
+				return False
+			return float(overdue_seconds) < float(grace_seconds)
+		except Exception:
+			return False
+
 	async def _cleanup_order(self, order_id, joined_accounts, data):
 		# Release Join Brain scratch state (idempotent).
 		self._voice_forget_order(order_id)
@@ -2563,6 +2609,40 @@ class OrderExecutor:
 			lines += [f"📝 دلیل: {reason}"]
 		return "\n".join(lines)
 
+	def _claim_terminal_report(self, order_id, kind, bot_id=1):
+		"""Claim the single allowed terminal report for this order.
+	
+		Returns True when the caller must send it, False when another
+		producer already did, None for report kinds that may repeat
+		(started/scheduled).  No await happens between the check and the
+		claim, so two coroutines in the same loop cannot both win it.
+		"""
+		if str(kind) not in _TERMINAL_REPORT_KINDS:
+			return None
+		try:
+			key = (int(bot_id or 1), int(order_id), str(kind))
+		except Exception:
+			return None
+		if key in self._terminal_reports_sent:
+			logger.info("Order %s: duplicate '%s' report suppressed "
+			            "(already sent)", order_id, kind)
+			return False
+		self._terminal_reports_sent[key] = time.time()
+		if len(self._terminal_reports_sent) > 4096:
+			cutoff = time.time() - 172800  # 2 days
+			for old_key, ts in list(self._terminal_reports_sent.items()):
+				if ts < cutoff:
+					self._terminal_reports_sent.pop(old_key, None)
+		return True
+	
+	def _release_terminal_report(self, order_id, kind, bot_id=1):
+		"""Give the claim back after a failed send so it can be retried."""
+		try:
+			self._terminal_reports_sent.pop(
+				(int(bot_id or 1), int(order_id), str(kind)), None)
+		except Exception as exc:
+			logger.debug("Order %s: releasing report claim failed: %r", order_id, exc)
+	
 	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
 		from services.bot_manager import bot_manager
 		app = bot_manager.active_bots.get(bot_id)
@@ -2570,6 +2650,12 @@ class OrderExecutor:
 			return
 		channel_id = await DatabaseManager.get_setting("log_channel_orders", bot_id=bot_id)
 		if not channel_id:
+			return
+		# End-of-order reports are ONE-SHOT per order: the executor's
+		# _finish_order and the 60s expiry job both produce them, and they
+		# used to race during the paced voice cleanup.
+		claim = self._claim_terminal_report(order_id, type, bot_id)
+		if claim is False:
 			return
 		try:
 			order_rec = await DatabaseManager.get_order(order_id) or {}
@@ -2584,9 +2670,16 @@ class OrderExecutor:
 			# fall back to a plain-text send (logging must never be lost).
 			try:
 				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
-			except Exception:
+			except Exception as exc:
+				# Re-send as plain text ONLY for a formatting failure.  Any
+				# other error (timeout/flood/network) may already have
+				# delivered the message - re-sending duplicates the report.
+				if not _is_parse_error(exc):
+					raise
 				await app.bot.send_message(channel_id, txt)
 		except Exception as exc:
+			if claim is True:
+				self._release_terminal_report(order_id, type, bot_id)
 			logger.warning(f"Order {order_id}: report send failed: {exc}")
 
 order_executor = OrderExecutor()

@@ -714,10 +714,28 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
                 end_time = start_time + timedelta(minutes=duration)
                 
                 if now > end_time:
+                    # اگر خودِ executor هنوز روی این سفارش زنده است (خروج پله‌ای
+                    # ده‌ها اکانت از کال + report پایانی)، این جاب نباید وسط کار
+                    # بپرد: تسک در حال پایان را کنسل می‌کند، وضعیت را خراب می‌کند و
+                    # گزارش «پایان سفارش» را دو بار به کانال می‌فرستد. فقط بعد از
+                    # مهلت ۵ دقیقه‌ای (سشن گیرکرده) یا وقتی سشنی وجود ندارد،
+                    # می‌گیریمش.
+                    overdue = (now - end_time).total_seconds()
+                    if order_executor.expiry_owned_by_live_session(
+                            order_executor.active_orders, order['id'], overdue):
+                        logger.info(
+                            f"Order {order['id']} (Bot {bot_id}): past its deadline for "
+                            f"{overdue:.0f}s but its session is still finishing "
+                            f"(cleanup/paced leaves) - the executor owns the report."
+                        )
+                        continue
                     logger.info(f"⏳ Order {order['id']} (Bot {bot_id}) expired. Finishing...")
                     
-                    # توقف سفارش + خروج از کال/گروه
-                    await order_executor.stop_active_order(order['id'], is_expired=True, reason="Order expired")
+                    # توقف سفارش + خروج از کال/گروه. گزارش «cancelled» اجراکننده
+                    # سرکوب می‌شود؛ این جاب خودش گزارش پایانی را می‌فرستد.
+                    await order_executor.stop_active_order(order['id'], is_expired=True,
+                                                          reason="Order expired",
+                                                          suppress_cancel_log=True)
                     try:
                         from services.voice_call_manager import voice_call_manager as _vcm
                         if _vcm:
