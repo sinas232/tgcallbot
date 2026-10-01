@@ -278,6 +278,15 @@ class Config:
     # a confirmed disconnect (and a rejoin), confirm it with a DIRECT
     # per-account presence check.
     VOICE_PRESENCE_DIRECT_RECHECK = os.getenv('VOICE_PRESENCE_DIRECT_RECHECK', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    # ── voice chat closed by the other side ─────────────────────────────────
+    # When Telegram reports the chat's call as CLOSED (the customer ended it),
+    # accounts cannot be present any more. A chat is only marked closed after
+    # this many distinct accounts of the same order report it inside the
+    # window below; the marker then suppresses futile rejoin/media-restore
+    # attempts for this long (a successful join clears it immediately).
+    VOICE_CHAT_CLOSED_MIN_ACCOUNTS = int(os.getenv('VOICE_CHAT_CLOSED_MIN_ACCOUNTS', '2'))
+    VOICE_CHAT_CLOSED_WINDOW_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_WINDOW_SECONDS', '60'))
+    VOICE_CHAT_CLOSED_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_GRACE_SECONDS', '300'))
     # Driver-level attempt budget per account (start_call itself already does
     # bounded retries + respects FloodWait internally).
     VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))

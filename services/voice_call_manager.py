@@ -713,6 +713,18 @@ class VoiceCallManager:
         self._listener_drops = 0
         self._listener_globally_disabled = False
 
+        # ── REMOTE-CLOSED VOICE CHATS (the customer ended the call) ─────────
+        # Telegram reports the chat's group call as CLOSED; the accounts cannot
+        # be present any more and every rejoin/media-restore attempt against a
+        # removed call only produced `ntgcalls: Call ... not found, already
+        # removed` noise for the rest of the paid hour (order 932, 2026-10-01).
+        # One update can be a local artefact, so a chat is marked closed only
+        # after several distinct accounts of the SAME order report it.
+        # _chat_closed_reports[(order_id, chat_id)] = {"accounts": set, "first_ts": float}
+        # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
+        self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._chat_closed_until: Dict[Tuple[int, int], float] = {}
+
         # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
         # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
         # This is the AUTHORITATIVE count for an order. It is NEVER decremented
@@ -1403,6 +1415,9 @@ class VoiceCallManager:
 
         Returns True if newly registered, False if already registered.
         """
+        # A successful join proves the chat is serviceable again (a new call may
+        # have been started in the same group) — drop any "closed" marker.
+        self._clear_chat_closed(order_id, chat_id)
         if order_id not in self.joined_accounts_by_order:
             self.joined_accounts_by_order[order_id] = {}
         inner = self.joined_accounts_by_order[order_id]
@@ -2356,6 +2371,109 @@ class VoiceCallManager:
                 return oid
         return None
 
+    def _active_order_for_chat(self, account_id: int, chat_id: int) -> Optional[int]:
+        """Order this account is CURRENTLY serving in THIS exact chat.
+
+        Deliberately stricter than ``_order_id_for_account``: a durable join
+        record is not proof that a later engine update belongs to that order.
+        Accounts keep stale call subscriptions from earlier orders — the first
+        1405-07-09 log showed order-930 chat updates surfacing under a later
+        order, which disabled listeners and wrote bogus drop rows for chats the
+        order never used. Only an ACTIVE binding may produce order records.
+        """
+        for (oid, aid), info in self.active_calls.items():
+            if aid == account_id and int((info or {}).get("chat_id") or 0) == int(chat_id or 0):
+                return oid
+        return None
+
+    @staticmethod
+    def _is_closed_status(status: Any) -> bool:
+        """True when an engine chat update says the CALL itself is gone.
+
+        PyTgCalls distinguishes ``Status.CLOSED_VOICE_CHAT`` (the call ended)
+        from a plain ``LEFT_CALL`` (this client left). Only the former means
+        "this chat has no call any more", which is what suppresses rejoins.
+        """
+        try:
+            text = str(getattr(status, "name", status) or "")
+        except Exception:
+            text = ""
+        return "CLOSED" in text.upper()
+
+    def _note_chat_closed(self, order_id: int, account_id: int, chat_id: int,
+                          status: Any) -> None:
+        """Corroborated marker: the chat's voice call itself is CLOSED.
+
+        One engine update can be a local artefact, so the chat is only treated
+        as closed after ``VOICE_CHAT_CLOSED_MIN_ACCOUNTS`` distinct accounts of
+        the same order report it inside ``VOICE_CHAT_CLOSED_WINDOW_SECONDS``.
+        While the marker is active nothing rejoins or rebuilds media for that
+        chat (Telegram already removed the call). A successful join clears it,
+        so a NEW call started later in the same group is served again.
+        """
+        try:
+            key = (int(order_id), int(chat_id))
+            now = time.time()
+            min_accounts = max(1, int(getattr(Config, "VOICE_CHAT_CLOSED_MIN_ACCOUNTS", 2)))
+            window = max(1.0, float(getattr(Config, "VOICE_CHAT_CLOSED_WINDOW_SECONDS", 60)))
+            grace = max(0.0, float(getattr(Config, "VOICE_CHAT_CLOSED_GRACE_SECONDS", 300)))
+
+            rec = self._chat_closed_reports.get(key)
+            if rec is None or now - float(rec.get("first_ts") or 0.0) > window:
+                rec = {"accounts": set(), "first_ts": now}
+                self._chat_closed_reports[key] = rec
+            rec["accounts"].add(int(account_id))
+            seen = len(rec["accounts"])
+
+            if seen < min_accounts:
+                logger.info(
+                    "[VoiceChatClosed] order=%s chat=%s: account %s reports %s "
+                    "(confirmations %s/%s)",
+                    order_id, chat_id, account_id, status, seen, min_accounts,
+                )
+                return
+
+            if self._chat_closed_until.get(key, 0.0) > now:
+                return  # already marked and still active → log once
+            self._chat_closed_until[key] = now + grace
+            logger.warning(
+                "[VoiceChatClosed] order=%s chat=%s: Telegram reports the voice chat "
+                "as CLOSED (%s accounts in %.0fs) — suppressing rejoin/media-restore "
+                "for %.0fs. The call is over on Telegram's side; the order timer "
+                "keeps running.",
+                order_id, chat_id, seen, now - float(rec["first_ts"]), grace,
+            )
+            self._vc_event_log(order_id, account_id, "chat_closed_remote", {
+                "chat_id": int(chat_id), "accounts": seen, "grace_s": grace,
+            })
+        except Exception as exc:  # telemetry must never break the engine handler
+            logger.debug("chat_closed marking skipped: %s", exc)
+
+    def _clear_chat_closed(self, order_id: int, chat_id: int) -> None:
+        key = (int(order_id), int(chat_id))
+        if key in self._chat_closed_until or key in self._chat_closed_reports:
+            self._chat_closed_until.pop(key, None)
+            self._chat_closed_reports.pop(key, None)
+            logger.info("[VoiceChatClosed] order=%s chat=%s: reopened (join succeeded)",
+                        order_id, chat_id)
+
+    def _prune_chat_closed(self) -> None:
+        now = time.time()
+        for key, until in list(self._chat_closed_until.items()):
+            if float(until) <= now:
+                self._chat_closed_until.pop(key, None)
+                self._chat_closed_reports.pop(key, None)
+
+    def is_chat_closed(self, order_id: Optional[int] = None,
+                       chat_id: Optional[int] = None) -> bool:
+        """True while the chat's call is known to be closed (see _note_chat_closed)."""
+        self._prune_chat_closed()
+        if order_id is None:
+            return bool(self._chat_closed_until)
+        if chat_id is None:
+            return any(oid == int(order_id) for (oid, _cid) in self._chat_closed_until)
+        return (int(order_id), int(chat_id)) in self._chat_closed_until
+
     def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
         """Register stream-end / kick handlers on a freshly built engine.
 
@@ -2385,8 +2503,22 @@ class VoiceCallManager:
             @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
             async def _on_left_call(_engine, update):  # type: ignore[misc]
                 cid = int(getattr(update, "chat_id", 0) or 0)
-                order_id = self._order_id_for_account(account_id, cid)
                 status = getattr(update, "status", "?")
+                # STRICT attribution: only a chat this account CURRENTLY serves
+                # may produce an order drop record. An account keeps stale call
+                # subscriptions from earlier orders (order-930 chat updates were
+                # logged under a later order, disabling listeners and writing
+                # bogus drops for a chat that order never used).
+                order_id = self._active_order_for_chat(account_id, cid)
+                if order_id is None:
+                    logger.info(
+                        "[VoiceChatUpdate] acc=%s chat=%s status=%s — no active order "
+                        "for this chat (stale/foreign call; not recorded)",
+                        account_id, cid, status,
+                    )
+                    self._vc_event_log(None, account_id, "stale_chat_update",
+                                       {"chat_id": cid, "status": str(status)})
+                    return
                 logger.warning(
                     "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                     order_id, account_id, cid, status,
@@ -2399,8 +2531,10 @@ class VoiceCallManager:
                     order_id, account_id, cid, "chat_left_update",
                     reason=f"engine chat update: {status}",
                 )
-                if order_id is not None and (account_id, cid) in self._listener_bindings:
+                if (account_id, cid) in self._listener_bindings:
                     self._disable_listener_chat(cid, account_id, "left_call_update")
+                if self._is_closed_status(status):
+                    self._note_chat_closed(order_id, account_id, cid, status)
         except Exception as exc:
             logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
 
@@ -2560,6 +2694,12 @@ class VoiceCallManager:
         """
         key = (order_id, account_id)
         if not self._media_restore_due(key):
+            return
+        if self.is_chat_closed(order_id, chat_id):
+            # The call is gone on Telegram's side: play()/leave_call() can only
+            # fail and used to spam `Call ... not found, already removed`.
+            self._vc_event_log(order_id, account_id, "media_restore_skipped_chat_closed",
+                               {"chat_id": int(chat_id)})
             return
         pytg = self.clients.get(account_id)
         if pytg is None:
@@ -4000,6 +4140,13 @@ class VoiceCallManager:
                         self._record_drop(order_id, acc_id, cid, "confirmed_disconnect",
                                           reason="presence absent %dx in a row" % int(fc),
                                           extra={"fail_cycle": int(fc)})
+
+                        if self.is_chat_closed(order_id, cid):
+                            self._vc_event_log(order_id, acc_id, "rejoin_skipped_chat_closed",
+                                               {"chat_id": cid})
+                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = "CHAT_CLOSED"
+                            rec["status"] = "CHAT_CLOSED"
+                            continue
 
                         rejoined = False
                         try:

@@ -388,6 +388,13 @@ class OrderExecutor:
 	                self.active_orders[order_id]["end_time"] = end_time
 	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
 
+	            # The customer (or an admin) can end the group call while the paid timer
+	            # still runs. Telegram then reports CLOSED_VOICE_CHAT for every account;
+	            # the VCM flags the chat and stops futile rejoin/media-restore attempts.
+	            # Surface that here instead of logging a healthy live=40/42 that is no
+	            # longer being served.
+	            _chat_closed_now = False
+	            _chat_closed_logged = False
 	            _tick = 0
 	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
 	            _log_interval = 10
@@ -418,6 +425,7 @@ class OrderExecutor:
 	                    logger.info(
 	                        f"Order {order_id}: {_format_timer(remaining_now)} "
 	                        f"| live={live}/{exact}"
+	                        + (" | chat=CLOSED" if _chat_closed_now else "")
 	                    )
 
 	                if _tick % _check_interval == 0 and _tick > 0:
@@ -460,6 +468,7 @@ class OrderExecutor:
 	                    if order_id in self.active_orders:
 	                        self.active_orders[order_id]["live_count"] = live
 	                        self.active_orders[order_id]["joined_accounts"] = joined_list
+	                        self.active_orders[order_id]["chat_closed"] = _chat_closed_now
 	                    # Durable live count is not continuous media presence.
 	                    # Surface the native binding signal separately (it too
 	                    # cannot guarantee end-to-end WebRTC packet delivery).
@@ -468,6 +477,20 @@ class OrderExecutor:
 	                        _vcm = _get_voice_call_manager()
 	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
 	                            _binding = _vcm.get_binding_status_counts(order_id)
+	                        if _vcm is not None and hasattr(_vcm, "is_chat_closed"):
+	                            try:
+	                                _chat_closed_now = bool(_vcm.is_chat_closed(order_id))
+	                            except Exception:
+	                                _chat_closed_now = False
+	                            if _chat_closed_now and not _chat_closed_logged:
+	                                _chat_closed_logged = True
+	                                logger.error(
+	                                    "Order %s: the voice chat is CLOSED on Telegram's side "
+	                                    "(%s/%s counted). The call has ended - presence cannot be "
+	                                    "served into a closed call; the timer keeps running. Start "
+	                                    "a new voice chat in the group or cancel the order.",
+	                                    order_id, live, exact,
+	                                )
 	                    logger.info(
 	                        "Order %s: durable_live=%s/%s | native_binding=%s "
 	                        "(not proof of UDP packet delivery)",
