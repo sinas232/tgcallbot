@@ -55,7 +55,7 @@ index f21bf42..c51a865 100644
 +.env.bak.*
 +FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..71cda68 100644
+index 5ed9f7c..1f32f01 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -9,6 +9,43 @@
@@ -74,7 +74,7 @@ index 5ed9f7c..71cda68 100644
 +- **«ادامه می‌دهم» یعنی انتظار محدود، نه انتظار بی‌پایان.** مارکر بسته‌بودن پاک می‌شود تا اگر در همان گروه «ویس‌چت تازه» شروع شد اکانت‌ها خودشان برگردند؛ ولی اگر کال تا `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` (پیش‌فرض ۶۰۰ ثانیه) تازه نشود، سفارش **خودکار** با `canceled_by_role='سیستم (کال باز نشد)'` تسویه می‌شود و مبلغ زمانِ سرویس‌نشده برمی‌گردد. اگر تسویه دستی زودتر انجام شده باشد، پیام تکراری/عودت تکراری ندارد.
 +- **پیام‌ها به هویت مقیدند.** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام می‌شود؛ مشتری/ربات دیگر نمی‌تواند سفارش دیگری را تسویه کند. فالبک متنی «پایان» هم فقط سفارش‌های «همین کاربر» با `chat_closed` را می‌بندد و اگر چنین سفارشی نباشد، دست به هیچ پیامی نمی‌زند.
 +- **هیچ رشتهٔ تازه‌ای در مسیر پرداخت/تماس عوض نشده و `BOT_VERSION` دست‌نخورده است.** کدهای `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` در `config.py`/`.env.example` قابل تنظیم است (۰ = خاموش‌کردن تسویهٔ خودکار پس از پاسخ «ادامه»).
-+- **تست:** ۲۶ تست تازه در `tests/test_chat_closed_ask_flow.py` (سقف بیلینگ/`bill_until`، گیتِ یک‌بار‌پرسیدن، انتخاب cutoff از VCM و fallback، پاس‌شدن محاسبه‌گر به لایهٔ DB، متن سؤال و دکمه‌ها، هندلر keep/stop، مالک غیرمجاز، دکمهٔ کهنه، تسویهٔ خودکار پس از مهلت، فالبک متنی «پایان»). کل سوئیت: **۶۴۲ تست، ۶۳۶ موفق، ۶ skip**.
++- **تست:** ۲۷ تست تازه در `tests/test_chat_closed_ask_flow.py` (سقف بیلینگ/`bill_until`، گیتِ یک‌بار‌پرسیدن، انتخاب cutoff از VCM و fallback، پاس‌شدن محاسبه‌گر به لایهٔ DB، متن سؤال و دکمه‌ها، هندلر keep/stop، مالک غیرمجاز، دکمهٔ کهنه، تسویهٔ خودکار پس از مهلت، فالبک متنی «پایان»). کل سوئیت: **۶۴۳ تست، ۶۳۷ موفق، ۶ skip**.
 +
 +</div>
 +
@@ -157,7 +157,7 @@ index e33815d..1b1e23e 100644
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..05c06b9
+index 0000000..38b7ba2
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
 @@ -0,0 +1,205 @@
@@ -321,7 +321,7 @@ index 0000000..05c06b9
 +
 +## ۸) آزمون‌ها
 +
-+سوئیت کامل: **۶۴۲ تست، ۶۳۶ موفق، ۶ skip** (۱۸ + ۱۰ + ۲۶ تست تازه). این‌ها آفلاین‌اند
++سوئیت کامل: **۶۴۳ تست، ۶۳۷ موفق، ۶ skip** (۱۸ + ۱۰ + ۲۷ تست تازه). این‌ها آفلاین‌اند
 +و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
 +کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
 +`tests/test_chat_closed_ask_flow.py` هستند.
@@ -700,7 +700,7 @@ index 52c1932..e707471 100644
              policy.retryable_fails += 1
  
 diff --git a/services/order_executor.py b/services/order_executor.py
-index dfbf816..cc73063 100644
+index dfbf816..70df678 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
 @@ -19,6 +19,16 @@ from services.session_ownership import (SessionInUseError, is_auth_key_duplicate
@@ -835,7 +835,7 @@ index dfbf816..cc73063 100644
 +	                                    _grace = float(getattr(
 +	                                        Config, "VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS", 600) or 0)
 +	                                    _waited = time.time() - self._chat_closed_continue_since[order_id]
-+	                                    if _grace <= 0 or _waited >= _grace:
++	                                    if _grace > 0 and _waited >= _grace:
 +	                                        self._chat_closed_continue_since.pop(order_id, None)
 +	                                        logger.error(
 +	                                            "Order %s: %.0fs after the customer chose to continue the "
@@ -1754,10 +1754,10 @@ index 51fde01..025008a 100644
                  self._set_state(order_id, account_id, FAILED, "client init failed")
 diff --git a/tests/test_chat_closed_ask_flow.py b/tests/test_chat_closed_ask_flow.py
 new file mode 100644
-index 0000000..45d25ca
+index 0000000..17ead51
 --- /dev/null
 +++ b/tests/test_chat_closed_ask_flow.py
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,444 @@
 +"""«ویس‌چت بسته شد» → پرسیدن از مشتری → ادامه یا تسویه با عودت باقی‌مانده.
 +
 +قاعدهٔ مالی (تصمیم کاربر، ۱۴۰۵-۰۷-۱۰):
@@ -1957,6 +1957,15 @@ index 0000000..45d25ca
 +    def test_grace_default_is_ten_minutes(self):
 +        from config import Config
 +        self.assertEqual(Config.VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS, 600.0)
++
++    def test_zero_grace_disables_the_automatic_settlement(self):
++        """۰ = خاموش؛ یعنی «ادامه» بدون سقف زمانی معتبر است، نه تسویهٔ فوری."""
++        import inspect
++        from config import Config
++        src = inspect.getsource(OrderExecutor)
++        self.assertIn("if _grace > 0 and _waited >= _grace:", src)
++        self.assertNotIn("if _grace <= 0 or _waited >= _grace:", src)
++        self.assertGreaterEqual(Config.VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS, 0)
 +
 +
 +class SettleChatClosedOrderTests(unittest.IsolatedAsyncioTestCase):
