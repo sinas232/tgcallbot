@@ -1387,10 +1387,20 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..e98de38 100644
+index 0e19892..dfbf816 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -41,6 +41,48 @@ def _get_voice_call_manager():
+@@ -12,7 +12,8 @@ from database import DatabaseManager
+ from telegram_client import TelegramAccountClient
+ from utils.helpers import format_jalali_datetime
+ from config import Config
+-from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
++from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
++                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
+ from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
+                                         is_fatal_auth_error, fatal_auth_category)
+ from services import self_healing
+@@ -41,6 +42,48 @@ def _get_voice_call_manager():
  		return None
  
  
@@ -1439,7 +1449,7 @@ index 0e19892..e98de38 100644
  class OrderExecutor:
  	"""
  	Core executor for Telegram orders (voice chat, group join, etc.).
-@@ -192,8 +234,23 @@ class OrderExecutor:
+@@ -192,8 +235,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -1465,7 +1475,7 @@ index 0e19892..e98de38 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -526,6 +583,20 @@ class OrderExecutor:
+@@ -526,6 +584,20 @@ class OrderExecutor:
  	    banned = self._voice_banned.get(order_id, set())
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
@@ -1486,7 +1496,7 @@ index 0e19892..e98de38 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +608,7 @@ class OrderExecutor:
+@@ -537,7 +609,7 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -1495,7 +1505,7 @@ index 0e19892..e98de38 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -567,10 +638,24 @@ class OrderExecutor:
+@@ -567,10 +639,24 @@ class OrderExecutor:
  	    banned = self._voice_banned.get(order_id, set())
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
@@ -1521,7 +1531,35 @@ index 0e19892..e98de38 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -671,30 +756,24 @@ class OrderExecutor:
+@@ -594,6 +680,27 @@ class OrderExecutor:
+ 	        best = when if best is None else min(best, when)
+ 	    return best
+ 
++	def _mark_voice_account_permanent(self, order_id: int, aid: int, msg: str,
++	                                  attempt_budget: int) -> None:
++	    """Bookkeeping for an account that failed PERMANENTLY.
++
++	    A permanent failure (a Telegram-frozen account, an invalid invite link,
++	    a restricted peer) produces the IDENTICAL error on every retry, so the
++	    attempt budget is spent for nothing.  ``_voice_banned`` alone is not
++	    enough either: :meth:`_voice_second_chance_retry` deliberately discards
++	    the ban to give *transient* failures another go.  ``_voice_terminal`` is
++	    the one set its ``eligible()`` excludes.
++
++	    Without this, order 930 sat at live=38/42 forever: accounts 139 and 151
++	    were frozen (``[420 FROZEN_METHOD_INVALID]``), got banned, got un-banned
++	    by the second-chance round, failed again, and so on.
++
++	    Extracted so the policy is exercisable without running a real order.
++	    """
++	    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
++	    self._voice_banned.setdefault(order_id, set()).add(aid)
++	    self._voice_terminal.setdefault(order_id, set()).add(aid)
++
+ 	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
+ 	                                    joined_ids: Set[int]) -> bool:
+ 	    """Give transiently exhausted accounts ONE new attempt per bounded round.
+@@ -671,30 +778,24 @@ class OrderExecutor:
  	        _as_profile = await anti_spam.get_profile(bot_id)
  	    except Exception:
  	        _as_profile = None
@@ -1565,7 +1603,7 @@ index 0e19892..e98de38 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -748,6 +827,41 @@ class OrderExecutor:
+@@ -748,6 +849,41 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -1607,7 +1645,7 @@ index 0e19892..e98de38 100644
  	                break
  	            wait = max(0.0, min(earliest - now, 30.0))
  	            if wait <= 0:
-@@ -784,6 +898,16 @@ class OrderExecutor:
+@@ -784,6 +920,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -1624,7 +1662,33 @@ index 0e19892..e98de38 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -1493,6 +1617,15 @@ class OrderExecutor:
+@@ -944,6 +1090,25 @@ class OrderExecutor:
+ 	                    wave_fail += 1
+ 	                    continue
+ 
++
++	                if outcome == OUTCOME_PERMANENT:
++	                    # A permanent failure produces the IDENTICAL error on every retry,
++	                    # so spending the attempt budget on it is pointless - and _voice_banned
++	                    # alone is not enough: the second-chance round deliberately discards
++	                    # the ban to give transient failures another go. That is what made a
++	                    # Telegram-frozen account (FROZEN_METHOD_INVALID) get re-selected and
++	                    # fail again, holding the last slots of the order hostage:
++	                    #   [VoiceFill] order=930 second chance 1/2 accounts=4
++	                    #   account 139 gave up ... [420 FROZEN_METHOD_INVALID]
++	                    # _voice_terminal is the one set eligible() excludes.
++	                    self._mark_voice_account_permanent(order_id, aid, msg, attempt_budget)
++	                    join_brain.report_result(order_id, outcome, msg)
++	                    wave_fail += 1
++	                    logger.warning(
++	                        f"Order {order_id}: account {aid} permanent failure "
++	                        f"({msg[:90]}) - excluded from second-chance retries"
++	                    )
++	                    continue
+ 	                attempts = self._voice_attempts.setdefault(order_id, {})
+ 	                n_att = attempts.get(aid, 0) + 1
+ 	                attempts[aid] = n_att
+@@ -1493,6 +1658,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
@@ -3697,6 +3761,188 @@ index 0000000..8dd7517
 +
 +if __name__ == "__main__":
 +    unittest.main(verbosity=2)
+diff --git a/tests/test_permanent_failure.py b/tests/test_permanent_failure.py
+new file mode 100644
+index 0000000..b60d989
+--- /dev/null
++++ b/tests/test_permanent_failure.py
+@@ -0,0 +1,176 @@
++"""A permanently failed account must not be handed a second chance.
++
++Incident (2026-10-01, order 930). The build reached ``live=38/42`` and then
++churned on the same two accounts forever::
++
++    [VoiceFill] order=930 second chance 1/2 accounts=4
++    Order 930: account 139 gave up after 1 attempt(s)
++        (Group join failed: Telegram says: [420 FROZEN_METHOD_INVALID] ...)
++    Order 930: account 151 gave up after 1 attempt(s) (same)
++
++The accounts were frozen by Telegram, so every retry returned the identical
++error.  They *were* being added to ``_voice_banned`` - but
++``_voice_second_chance_retry`` deliberately **discards** that ban so that
++transient failures get another go::
++
++    for aid in retry_ids:
++        self._voice_banned[order_id].discard(aid)
++
++The method already had the right escape hatch: its ``eligible()`` excludes
++``_voice_terminal``, and three specific cases (AUTH_KEY_DUPLICATED, dead
++session, SESSION_IN_USE) already populated it.  The generic
++``OUTCOME_PERMANENT`` path did not, so a frozen account was banned,
++un-banned, retried, banned again - and the last slots of the order could
++never be filled or released.
++
++These tests drive the real ``_mark_voice_account_permanent`` and the real
++``_voice_second_chance_retry``.
++"""
++
++import asyncio
++import os
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="permanent-fail-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++from services.order_executor import OrderExecutor  # noqa: E402
++
++ORDER = 930
++FROZEN_139, FROZEN_151, TRANSIENT_116 = 139, 151, 116
++FROZEN_MSG = (
++    "membership failed: Group join failed: Telegram says: "
++    "[420 FROZEN_METHOD_INVALID] - The method can't be used by frozen account."
++)
++
++
++class PermanentFailureTests(unittest.TestCase):
++    def setUp(self):
++        self.ex = OrderExecutor()
++        self.ex._voice_pool[ORDER] = [
++            {"id": FROZEN_139}, {"id": FROZEN_151}, {"id": TRANSIENT_116},
++        ]
++        self.ex._voice_attempts[ORDER] = {}
++        self.ex._voice_banned[ORDER] = set()
++        self.ex._voice_terminal[ORDER] = set()
++        self.ex._voice_second_chance[ORDER] = 0
++
++    def test_permanent_failure_lands_in_the_terminal_set(self):
++        self.ex._mark_voice_account_permanent(ORDER, FROZEN_139, FROZEN_MSG, 1)
++        self.assertIn(FROZEN_139, self.ex._voice_terminal[ORDER],
++                      '_voice_terminal is the only set eligible() excludes')
++        self.assertIn(FROZEN_139, self.ex._voice_banned[ORDER])
++        self.assertEqual(self.ex._voice_attempts[ORDER][FROZEN_139], 1,
++                         'the budget must be spent so the wave does not retry it')
++
++    def _second_chance(self, joined):
++        """Drive the real retry round with the pool/DB calls stubbed out."""
++        with mock.patch.multiple(
++            Config,
++            VOICE_SECOND_CHANCE_ROUNDS=2,
++            VOICE_SECOND_CHANCE_COOLDOWN_SECONDS=0,
++        ), mock.patch.object(self.ex, "_voice_load_pool",
++                             new=mock.AsyncMock(return_value=None)), \
++                mock.patch.object(self.ex, "_is_order_active", return_value=True), \
++                mock.patch("services.order_executor.voice_cooldown") as vc:
++            vc.remaining.return_value = 0.0
++            return asyncio.run(
++                self.ex._voice_second_chance_retry(ORDER, 1, joined))
++
++    def test_frozen_accounts_are_never_second_chanced(self):
++        """The order-930 symptom: these two were retried round after round."""
++        for aid in (FROZEN_139, FROZEN_151):
++            self.ex._mark_voice_account_permanent(ORDER, aid, FROZEN_MSG, 1)
++
++        took = self._second_chance(joined=set())
++
++        self.assertFalse(
++            took, 'with only frozen accounts banned there is nothing worth '
++                  'retrying - the round must not run at all')
++        self.assertIn(FROZEN_139, self.ex._voice_banned[ORDER],
++                      'the ban must survive, not be discarded')
++        self.assertIn(FROZEN_151, self.ex._voice_banned[ORDER])
++
++    def test_a_transient_failure_IS_still_second_chanced(self):
++        """The whole point of the round must keep working."""
++        self.ex._voice_banned[ORDER].add(TRANSIENT_116)
++        self.ex._voice_attempts[ORDER][TRANSIENT_116] = 1
++
++        took = self._second_chance(joined=set())
++
++        self.assertTrue(took, 'a transient failure deserves another attempt')
++        self.assertNotIn(TRANSIENT_116, self.ex._voice_banned[ORDER],
++                         'the ban is supposed to be lifted for transient ones')
++
++    def test_frozen_and_transient_are_separated_in_the_same_round(self):
++        """Mixed pool: retry the transient one, leave the frozen ones out."""
++        for aid in (FROZEN_139, FROZEN_151):
++            self.ex._mark_voice_account_permanent(ORDER, aid, FROZEN_MSG, 1)
++        self.ex._voice_banned[ORDER].add(TRANSIENT_116)
++
++        took = self._second_chance(joined=set())
++
++        self.assertTrue(took, 'the transient account should have driven a round')
++        self.assertNotIn(TRANSIENT_116, self.ex._voice_banned[ORDER])
++        self.assertIn(FROZEN_139, self.ex._voice_banned[ORDER],
++                      'frozen accounts must stay banned even when a round runs')
++        self.assertIn(FROZEN_151, self.ex._voice_banned[ORDER])
++
++    def test_already_joined_accounts_are_not_retried(self):
++        self.ex._voice_banned[ORDER].add(TRANSIENT_116)
++        took = self._second_chance(joined={TRANSIENT_116})
++        self.assertFalse(took, 'an account already in the call needs no retry')
++
++
++class OutcomeNameImportTests(unittest.TestCase):
++    """Every OUTCOME_* used in order_executor must actually be imported.
++
++    The permanent branch was first shipped referencing ``OUTCOME_PERMANENT``
++    without importing it.  The resulting NameError was swallowed by the
++    ``except Exception as _bookkeep_err`` guard around the wave bookkeeping,
++    so it surfaced only as a "wave bookkeeping error" log line and the new
++    branch silently never ran.  Calling the helper directly does not catch
++    that - the name has to resolve in the module's own namespace.
++    """
++
++    def test_every_outcome_name_used_is_defined(self):
++        import ast
++        import services.order_executor as oe
++
++        src = open(oe.__file__, encoding='utf-8').read()
++        tree = ast.parse(src)
++        used = {n.id for n in ast.walk(tree)
++                if isinstance(n, ast.Name) and n.id.startswith('OUTCOME_')}
++        self.assertTrue(used, 'sanity: the scan found no OUTCOME_* names')
++        missing = sorted(n for n in used if not hasattr(oe, n))
++        self.assertEqual(
++            missing, [],
++            '%s is referenced in order_executor.py but not imported; the '
++            'NameError would be swallowed by the wave-bookkeeping handler'
++            % missing)
++
++    def test_permanent_branch_exists_and_reports_to_the_brain(self):
++        import inspect
++        import services.order_executor as oe
++        src = inspect.getsource(oe.OrderExecutor._voice_batched_fill)
++        self.assertIn('if outcome == OUTCOME_PERMANENT:', src)
++        self.assertIn('_mark_voice_account_permanent(', src)
++
++
++if __name__ == '__main__':
++    unittest.main()
 diff --git a/tests/test_reservation_leak.py b/tests/test_reservation_leak.py
 new file mode 100644
 index 0000000..5acf38c
