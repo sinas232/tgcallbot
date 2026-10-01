@@ -55,10 +55,10 @@ index f21bf42..c51a865 100644
 +.env.bak.*
 +FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..1f32f01 100644
+index 5ed9f7c..496cee1 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -9,6 +9,43 @@
+@@ -9,6 +9,44 @@
  
  ---
  
@@ -73,8 +73,9 @@ index 5ed9f7c..1f32f01 100644
 +- **«نه، تسویه کن» → فقط زمانِ استفاده‌شده تا لحظهٔ بسته‌شدن کال حساب می‌شود** و باقی مبلغ به **کیف پول** برمی‌گردد (`Transaction(type='order_refund')`)؛ نه عودت درگاه. برای این کار `compute_prorated_settlement`/`compute_order_settlement` پارامتر `bill_until` گرفتند (سقفِ بیلینگ؛ هرگز بیشتر از `now`) و `settle_and_refund_order` همان را به `settle_cancel_order` می‌دهد؛ یعنی همان مسیر اتمیکِ قفل‌دارِ لغو. فشردن دوبارهٔ دکمه یا دکمهٔ کهنه فقط پیام «قبلاً لغو شده» می‌گیرد و هیچ عودت دوباره‌ای انجام نمی‌شود (تست idempotency).
 +- **«ادامه می‌دهم» یعنی انتظار محدود، نه انتظار بی‌پایان.** مارکر بسته‌بودن پاک می‌شود تا اگر در همان گروه «ویس‌چت تازه» شروع شد اکانت‌ها خودشان برگردند؛ ولی اگر کال تا `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` (پیش‌فرض ۶۰۰ ثانیه) تازه نشود، سفارش **خودکار** با `canceled_by_role='سیستم (کال باز نشد)'` تسویه می‌شود و مبلغ زمانِ سرویس‌نشده برمی‌گردد. اگر تسویه دستی زودتر انجام شده باشد، پیام تکراری/عودت تکراری ندارد.
 +- **پیام‌ها به هویت مقیدند.** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام می‌شود؛ مشتری/ربات دیگر نمی‌تواند سفارش دیگری را تسویه کند. فالبک متنی «پایان» هم فقط سفارش‌های «همین کاربر» با `chat_closed` را می‌بندد و اگر چنین سفارشی نباشد، دست به هیچ پیامی نمی‌زند.
++- **گاردِ cutoff:** اگر مقدار `bill_until` یک epoch معتبر نباشد (مثلاً مقدار monotonic یا timestampِ naiveِ یک سرور غیر-UTC)، بی‌سروصدا کل سفارش عودت **نمی‌شود**؛ با یک هشدار نادیده گرفته می‌شود و بیلینگ تا `now` ادامه می‌یابد. تست‌های بخش مالی هم مستقل از TZ شده‌اند (`calendar.timegm`) چون همین اختلاف ۳.۵ ساعته در سرور با `TZ=Asia/Tehran` چهار تست را قرمز کرده بود.
 +- **هیچ رشتهٔ تازه‌ای در مسیر پرداخت/تماس عوض نشده و `BOT_VERSION` دست‌نخورده است.** کدهای `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` در `config.py`/`.env.example` قابل تنظیم است (۰ = خاموش‌کردن تسویهٔ خودکار پس از پاسخ «ادامه»).
-+- **تست:** ۲۷ تست تازه در `tests/test_chat_closed_ask_flow.py` (سقف بیلینگ/`bill_until`، گیتِ یک‌بار‌پرسیدن، انتخاب cutoff از VCM و fallback، پاس‌شدن محاسبه‌گر به لایهٔ DB، متن سؤال و دکمه‌ها، هندلر keep/stop، مالک غیرمجاز، دکمهٔ کهنه، تسویهٔ خودکار پس از مهلت، فالبک متنی «پایان»). کل سوئیت: **۶۴۳ تست، ۶۳۷ موفق، ۶ skip**.
++- **تست:** ۳۱ تست تازه در `tests/test_chat_closed_ask_flow.py` (سقف بیلینگ/`bill_until`، گیتِ یک‌بار‌پرسیدن، انتخاب cutoff از VCM و fallback، پاس‌شدن محاسبه‌گر به لایهٔ DB، متن سؤال و دکمه‌ها، هندلر keep/stop، مالک غیرمجاز، دکمهٔ کهنه، تسویهٔ خودکار پس از مهلت، فالبک متنی «پایان»). کل سوئیت: **۶۴۷ تست، ۶۴۱ موفق، ۶ skip** (هم با TZ=UTC و هم با TZ=Asia/Tehran سرور).
 +
 +</div>
 +
@@ -157,10 +158,10 @@ index e33815d..1b1e23e 100644
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..38b7ba2
+index 0000000..eadf814
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,207 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -274,7 +275,7 @@ index 0000000..38b7ba2
 +- بعد از apply باید ۱۷ فایل ` M` و ۲۲ فایل `??` تازه ببینید (۳۹ مسیر، پورت + فیکس‌ها).
 +- تأیید سریع داخل کانتینر (بعد از بالا آمدن):
 +  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow`
-+  باید ۴۳ تست OK بدهد.
++  باید ۴۸ تست OK بدهد.
 +- `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
 +  تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
 +  `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
@@ -321,7 +322,7 @@ index 0000000..38b7ba2
 +
 +## ۸) آزمون‌ها
 +
-+سوئیت کامل: **۶۴۳ تست، ۶۳۷ موفق، ۶ skip** (۱۸ + ۱۰ + ۲۷ تست تازه). این‌ها آفلاین‌اند
++سوئیت کامل: **۶۴۷ تست، ۶۴۱ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
 +و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
 +کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
 +`tests/test_chat_closed_ask_flow.py` هستند.
@@ -351,7 +352,9 @@ index 0000000..38b7ba2
 +   `VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS` (پیش‌فرض ۶۰۰ ثانیه) تازه نشود،
 +   سفارش **خودکار** تسویه می‌شود (`canceled_by_role='سیستم (کال باز نشد)'`) و باقی
 +   مبلغ برمی‌گردد؛ برای مشتری هم یک پیام خلاصهٔ عودت می‌رود.
-+6. **مالکیت:** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام
++6. **گاردِ مقدار نامعتبر:** اگر `bill_until` یک epoch معتبر نباشد (monotonic یا timestampِ naive)، هشدار لاگ می‌شود و بیلینگ تا `now` ادامه می‌یابد؛ هرگز از یک مقدار خراب «عودت کامل» ساخته نمی‌شود.
++   تست‌های مالی هم با `calendar.timegm` مستقل از TZ شده‌اند — روی سرور `TZ=Asia/Tehran`، `datetime.timestamp()`ِ naive سه‌ونیم ساعت عقب می‌افتد.
++7. **مالکیت:** تسویه با `expected_user_id` (آی‌دی داخلی مالک سفارش) و `bot_id` انجام
 +   می‌شود؛ نه کسی دیگر می‌تواند سفارش دیگری را ببندد و نه فالبک متنی «پایان» به
 +   سفارش کاربر دیگری دست می‌زند (فقط سفارش‌های خودِ همان کاربر با `chat_closed`).
 +
@@ -700,7 +703,7 @@ index 52c1932..e707471 100644
              policy.retryable_fails += 1
  
 diff --git a/services/order_executor.py b/services/order_executor.py
-index dfbf816..70df678 100644
+index dfbf816..a7b2213 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
 @@ -19,6 +19,16 @@ from services.session_ownership import (SessionInUseError, is_auth_key_duplicate
@@ -1109,7 +1112,7 @@ index dfbf816..70df678 100644
  		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
  
  		خروجی: (used_cost, refund_amount, elapsed_seconds)
-@@ -1926,7 +2143,17 @@ class OrderExecutor:
+@@ -1926,7 +2143,27 @@ class OrderExecutor:
  		duration_minutes = int(duration_minutes or 0)
  		if duration_minutes <= 0 or not started_at:
  			return 0.0, total_price, 0.0
@@ -1120,7 +1123,17 @@ index dfbf816..70df678 100644
 +				# Billing stops at this instant (the customer closed the call): the
 +				# unserved remainder must not be charged. Never bill past 'now'.
 +				_cut = datetime.utcfromtimestamp(float(bill_until))
-+				if _cut < now:
++				# A cutoff before 2020 is never a real UTC epoch - it is a
++				# monotonic/bogus value (or a naive timestamp from a non-UTC
++				# box). Silently trusting it would refund the ENTIRE order, so
++				# it is ignored and the caller's log above stays truthful.
++				if _cut.year < 2020:
++					logger.warning(
++						"bill_until=%.3f is not a plausible UTC epoch; "
++						"billing continues to now instead of refunding everything",
++						float(bill_until),
++					)
++				elif _cut < now:
 +					now = _cut
 +			except (TypeError, ValueError, OSError, OverflowError):
 +				pass
@@ -1128,7 +1141,7 @@ index dfbf816..70df678 100644
  		total_seconds = duration_minutes * 60
  		if elapsed_seconds >= total_seconds:
  			used = total_price
-@@ -1936,10 +2163,153 @@ class OrderExecutor:
+@@ -1936,10 +2173,153 @@ class OrderExecutor:
  		refund = max(0.0, total_price - used)
  		return used, refund, elapsed_seconds
  
@@ -1283,7 +1296,7 @@ index dfbf816..70df678 100644
  	):
  		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
  
-@@ -1952,9 +2322,15 @@ class OrderExecutor:
+@@ -1952,9 +2332,15 @@ class OrderExecutor:
  		# Row-locked, atomic claim + settlement: a second callback must not
  		# credit the wallet twice or refund a completed/cancelled order. Price
  		# depends on elapsed time and the FULL plan, never the joined-account ratio.
@@ -1301,10 +1314,10 @@ index dfbf816..70df678 100644
  		)
  		if settled is None:
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 51fde01..025008a 100644
+index 51fde01..c219dc1 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
-@@ -713,6 +713,19 @@ class VoiceCallManager:
+@@ -713,6 +713,20 @@ class VoiceCallManager:
          self._listener_drops = 0
          self._listener_globally_disabled = False
  
@@ -1316,7 +1329,8 @@ index 51fde01..025008a 100644
 +        # One update can be a local artefact, so a chat is marked closed only
 +        # after several distinct accounts of the SAME order report it.
 +        # _chat_closed_reports[(order_id, chat_id)] = {"accounts": set, "first_ts": float}
-+        # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
++        # _chat_closed_until[(order_id, chat_id)]   = epoch deadline (time.time())
++        # _chat_closed_since[(order_id, chat_id)]   = epoch of the first corroborated closure
 +        self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
 +        self._chat_closed_until: Dict[Tuple[int, int], float] = {}
 +        self._chat_closed_since: Dict[Tuple[int, int], float] = {}
@@ -1324,7 +1338,7 @@ index 51fde01..025008a 100644
          # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
          # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
          # This is the AUTHORITATIVE count for an order. It is NEVER decremented
-@@ -1403,6 +1416,9 @@ class VoiceCallManager:
+@@ -1403,6 +1417,9 @@ class VoiceCallManager:
  
          Returns True if newly registered, False if already registered.
          """
@@ -1334,7 +1348,7 @@ index 51fde01..025008a 100644
          if order_id not in self.joined_accounts_by_order:
              self.joined_accounts_by_order[order_id] = {}
          inner = self.joined_accounts_by_order[order_id]
-@@ -2098,19 +2114,79 @@ class VoiceCallManager:
+@@ -2098,19 +2115,79 @@ class VoiceCallManager:
                      # start() can time out AFTER native WebRTC initialized.
                      # Retain the original engine before awaiting it. A retry
                      # must never construct a second engine on a transport that
@@ -1422,7 +1436,7 @@ index 51fde01..025008a 100644
      async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
          # IMPORTANT: use the SAME per-account lock as the warmup/create path.
          # Previously we popped the client (and even removed its lock) BEFORE
-@@ -2296,6 +2372,134 @@ class VoiceCallManager:
+@@ -2296,6 +2373,134 @@ class VoiceCallManager:
                  return oid
          return None
  
@@ -1557,7 +1571,7 @@ index 51fde01..025008a 100644
      def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
          """Register stream-end / kick handlers on a freshly built engine.
  
-@@ -2325,8 +2529,22 @@ class VoiceCallManager:
+@@ -2325,8 +2530,22 @@ class VoiceCallManager:
              @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
              async def _on_left_call(_engine, update):  # type: ignore[misc]
                  cid = int(getattr(update, "chat_id", 0) or 0)
@@ -1581,7 +1595,7 @@ index 51fde01..025008a 100644
                  logger.warning(
                      "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                      order_id, account_id, cid, status,
-@@ -2339,8 +2557,10 @@ class VoiceCallManager:
+@@ -2339,8 +2558,10 @@ class VoiceCallManager:
                      order_id, account_id, cid, "chat_left_update",
                      reason=f"engine chat update: {status}",
                  )
@@ -1593,7 +1607,7 @@ index 51fde01..025008a 100644
          except Exception as exc:
              logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
  
-@@ -2501,6 +2721,12 @@ class VoiceCallManager:
+@@ -2501,6 +2722,12 @@ class VoiceCallManager:
          key = (order_id, account_id)
          if not self._media_restore_due(key):
              return
@@ -1606,7 +1620,7 @@ index 51fde01..025008a 100644
          pytg = self.clients.get(account_id)
          if pytg is None:
              return
-@@ -2791,6 +3017,54 @@ class VoiceCallManager:
+@@ -2791,6 +3018,54 @@ class VoiceCallManager:
          """
          return True if media_binding is True else participant_presence
  
@@ -1661,7 +1675,7 @@ index 51fde01..025008a 100644
      async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
          """Authoritative per-chat media transport liveness.
  
-@@ -3063,21 +3337,30 @@ class VoiceCallManager:
+@@ -3063,21 +3338,30 @@ class VoiceCallManager:
              return None
          return int(my_id) in present_ids
  
@@ -1696,7 +1710,7 @@ index 51fde01..025008a 100644
          my_id = None
          try:
              me = getattr(app, "me", None)
-@@ -3094,9 +3377,10 @@ class VoiceCallManager:
+@@ -3094,9 +3378,10 @@ class VoiceCallManager:
              return None
  
          # Fast path: use the shared snapshot taken during the monitor cycle.
@@ -1710,7 +1724,7 @@ index 51fde01..025008a 100644
  
          try:
              cached = self._active_call_cache.get(int(chat_id))
-@@ -3732,6 +4016,11 @@ class VoiceCallManager:
+@@ -3732,6 +4017,11 @@ class VoiceCallManager:
                          rec['media_binding_alive'] = media_alive
                          rec['media_binding_checked_at'] = time.time()
                          present = self._media_presence_verdict(present, media_alive)
@@ -1722,7 +1736,7 @@ index 51fde01..025008a 100644
                          if media_alive is False:
                              if present is True:
                                  # ── GHOST-MEDIA-ONLY (presence intact) ──────────
-@@ -3878,6 +4167,13 @@ class VoiceCallManager:
+@@ -3878,6 +4168,13 @@ class VoiceCallManager:
                                            reason="presence absent %dx in a row" % int(fc),
                                            extra={"fail_cycle": int(fc)})
  
@@ -1736,7 +1750,7 @@ index 51fde01..025008a 100644
                          rejoined = False
                          try:
                              rejoined = await self._recover_same_account(
-@@ -4147,8 +4443,13 @@ class VoiceCallManager:
+@@ -4147,8 +4444,13 @@ class VoiceCallManager:
                  self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                  return False, f"FloodWait:{wait_s}", 0
              except Exception as e:
@@ -1754,10 +1768,10 @@ index 51fde01..025008a 100644
                  self._set_state(order_id, account_id, FAILED, "client init failed")
 diff --git a/tests/test_chat_closed_ask_flow.py b/tests/test_chat_closed_ask_flow.py
 new file mode 100644
-index 0000000..17ead51
+index 0000000..7ae14d1
 --- /dev/null
 +++ b/tests/test_chat_closed_ask_flow.py
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,506 @@
 +"""«ویس‌چت بسته شد» → پرسیدن از مشتری → ادامه یا تسویه با عودت باقی‌مانده.
 +
 +قاعدهٔ مالی (تصمیم کاربر، ۱۴۰۵-۰۷-۱۰):
@@ -1771,6 +1785,7 @@ index 0000000..17ead51
 +"""
 +
 +import asyncio
++import calendar
 +import os
 +import sys
 +import tempfile
@@ -1802,6 +1817,19 @@ index 0000000..17ead51
 +
 +def _run(coro):
 +    return asyncio.run(coro)
++
++
++def _epoch(naive_utc: datetime) -> float:
++    """Epoch ثانیه‌ای برای یک datetimeِ UTCِ بدون timezone.
++
++    ``datetime.timestamp()`` روی datetimeِ naive، وقتِ **محلی** را فرض می‌کند؛ روی
++    سروری با TZ=Asia/Tehran این ۳.۵ ساعت اختلاف می‌سازد و cutoff را قبل از شروع
++    بیلینگ می‌اندازد (همان ۴ شکستِ سرور در ۱۴۰۵/۰۷/۱۰). ``calendar.timegm``
++    مستقل از TZ است.
++    """
++    return float(calendar.timegm(naive_utc.timetuple()))
++
++
 +
 +
 +class _FakeVCM:
@@ -1842,7 +1870,7 @@ index 0000000..17ead51
 +
 +    def test_prorated_billing_stops_at_the_closure(self):
 +        started = datetime.utcnow() - timedelta(minutes=30)
-+        closed_at = (started + timedelta(minutes=10)).timestamp()
++        closed_at = _epoch(started + timedelta(minutes=10))
 +        used, refund, elapsed = OrderExecutor.compute_prorated_settlement(
 +            600_000, 60, started, bill_until=closed_at)
 +        self.assertAlmostEqual(elapsed, 600, delta=5)
@@ -1852,7 +1880,7 @@ index 0000000..17ead51
 +    def test_cutoff_in_the_future_never_bills_more_than_now(self):
 +        started = datetime.utcnow() - timedelta(minutes=10)
 +        used_future, refund_future, _ = OrderExecutor.compute_prorated_settlement(
-+            600_000, 60, started, bill_until=(datetime.utcnow() + timedelta(hours=1)).timestamp())
++            600_000, 60, started, bill_until=_epoch(datetime.utcnow() + timedelta(hours=1)))
 +        used_now, refund_now, _ = OrderExecutor.compute_prorated_settlement(
 +            600_000, 60, started)
 +        self.assertEqual((used_future, refund_future), (used_now, refund_now))
@@ -1868,7 +1896,7 @@ index 0000000..17ead51
 +
 +    def test_order_settlement_passes_the_cutoff_through(self):
 +        started = datetime.utcnow() - timedelta(minutes=20)
-+        closed_at = (started + timedelta(minutes=5)).timestamp()
++        closed_at = _epoch(started + timedelta(minutes=5))
 +        order = dict(ORDER_ROW, started_at=started)
 +        used_direct, _, _ = OrderExecutor.compute_prorated_settlement(
 +            600_000, 60, started, bill_until=closed_at)
@@ -1876,6 +1904,27 @@ index 0000000..17ead51
 +            order, bill_until=closed_at)
 +        self.assertEqual(used_order, used_direct)
 +        self.assertAlmostEqual(used_order, 50_000, delta=2_000)
++
++    def test_monotonic_or_naive_cutoff_never_refunds_the_whole_order(self):
++        """یک مقدار بی‌معنا (مثل time.monotonic یا timestampِ naive) نباید
++        «عودت کامل» بسازد؛ در آن صورت بیلینگ به now ادامه می‌یابد."""
++        started = datetime.utcnow() - timedelta(minutes=10)
++        used_now, refund_now, _ = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started)
++        for bogus in (time.monotonic(),         # ~ثانیه‌های بوت، نه epoch
++                      -1.0,
++                      calendar.timegm((datetime.utcnow() - timedelta(days=4000)).timetuple())):
++            with self.subTest(bogus=bogus):
++                used, refund, _ = OrderExecutor.compute_prorated_settlement(
++                    600_000, 60, started, bill_until=bogus)
++                self.assertEqual((used, refund), (used_now, refund_now))
++
++    def test_a_cutoff_before_the_start_means_zero_service_zero_charge(self):
++        """ولی cutoffِ *معتبر* قبل از شروع بیلینگ یعنی سرویسی ارائه نشده."""
++        started = datetime.utcnow() - timedelta(minutes=10)
++        used, refund, _ = OrderExecutor.compute_prorated_settlement(
++            600_000, 60, started, bill_until=_epoch(started - timedelta(minutes=5)))
++        self.assertEqual((used, refund), (0.0, 600_000.0))
 +
 +    def test_unstarted_order_still_refunds_everything_with_a_cutoff(self):
 +        order = dict(ORDER_ROW, started_at=None)
@@ -1900,6 +1949,33 @@ index 0000000..17ead51
 +        executor = OrderExecutor()
 +        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
 +        self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
++
++
++class VcmEpochTests(unittest.TestCase):
++    """مارکرِ بسته‌شدن باید epochِ واقعی UTC ذخیره کند، نه monotonic."""
++
++    def test_chat_closed_since_is_a_real_utc_epoch(self):
++        from services.voice_call_manager import VoiceCallManager
++        vcm = VoiceCallManager()
++        before = time.time()
++        vcm._note_chat_closed(ORDER_ID, 101, -1001234, "Status.CLOSED_VOICE_CHAT")
++        vcm._note_chat_closed(ORDER_ID, 102, -1001234, "Status.CLOSED_VOICE_CHAT")
++        since = vcm.chat_closed_since(ORDER_ID)
++        self.assertIsNotNone(since)
++        # monotonicِ بوت حدود ۱e۶ است؛ epochِ واقعی حدود ۱.۸e۹
++        self.assertGreaterEqual(since, before - 1.0)
++        self.assertLessEqual(since, time.time() + 1.0)
++        self.assertTrue(vcm.is_chat_closed(ORDER_ID))
++        self.assertGreaterEqual(vcm._chat_closed_until.get((ORDER_ID, -1001234), 0), before)
++
++    def test_clear_chat_closed_forgets_the_timestamp_too(self):
++        from services.voice_call_manager import VoiceCallManager
++        vcm = VoiceCallManager()
++        vcm._note_chat_closed(ORDER_ID, 101, -1001234, "Status.CLOSED_VOICE_CHAT")
++        vcm._note_chat_closed(ORDER_ID, 102, -1001234, "Status.CLOSED_VOICE_CHAT")
++        vcm.clear_chat_closed(ORDER_ID)
++        self.assertIsNone(vcm.chat_closed_since(ORDER_ID))
++        self.assertFalse(vcm.is_chat_closed(ORDER_ID))
 +
 +
 +class ContinueGraceTests(unittest.IsolatedAsyncioTestCase):
@@ -2015,7 +2091,7 @@ index 0000000..17ead51
 +    async def test_calculator_given_to_db_applies_the_cutoff(self):
 +        executor = OrderExecutor()
 +        started = datetime.utcnow() - timedelta(minutes=30)
-+        closed_at = (started + timedelta(minutes=10)).timestamp()
++        closed_at = _epoch(started + timedelta(minutes=10))
 +        settlement = {"order": dict(ORDER_ROW, started_at=started),
 +                      "total_cost": 600_000, "used_cost": 100_000,
 +                      "refund_amount": 500_000, "refund_tx_id": "TX-1",
