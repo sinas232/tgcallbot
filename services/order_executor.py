@@ -2149,7 +2149,17 @@ class OrderExecutor:
 				# Billing stops at this instant (the customer closed the call): the
 				# unserved remainder must not be charged. Never bill past 'now'.
 				_cut = datetime.utcfromtimestamp(float(bill_until))
-				if _cut < now:
+				# A cutoff before 2020 is never a real UTC epoch - it is a
+				# monotonic/bogus value (or a naive timestamp from a non-UTC
+				# box). Silently trusting it would refund the ENTIRE order, so
+				# it is ignored and the caller's log above stays truthful.
+				if _cut.year < 2020:
+					logger.warning(
+						"bill_until=%.3f is not a plausible UTC epoch; "
+						"billing continues to now instead of refunding everything",
+						float(bill_until),
+					)
+				elif _cut < now:
 					now = _cut
 			except (TypeError, ValueError, OSError, OverflowError):
 				pass

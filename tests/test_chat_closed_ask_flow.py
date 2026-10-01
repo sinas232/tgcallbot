@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import calendar
 import os
 import sys
 import tempfile
@@ -42,6 +43,19 @@ ORDER_ROW = {"id": ORDER_ID, "user_id": 12, "bot_id": 1, "status": "running",
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _epoch(naive_utc: datetime) -> float:
+    """Epoch ثانیه‌ای برای یک datetimeِ UTCِ بدون timezone.
+
+    ``datetime.timestamp()`` روی datetimeِ naive، وقتِ **محلی** را فرض می‌کند؛ روی
+    سروری با TZ=Asia/Tehran این ۳.۵ ساعت اختلاف می‌سازد و cutoff را قبل از شروع
+    بیلینگ می‌اندازد (همان ۴ شکستِ سرور در ۱۴۰۵/۰۷/۱۰). ``calendar.timegm``
+    مستقل از TZ است.
+    """
+    return float(calendar.timegm(naive_utc.timetuple()))
+
+
 
 
 class _FakeVCM:
@@ -82,7 +96,7 @@ class BillingCutoffTests(unittest.TestCase):
 
     def test_prorated_billing_stops_at_the_closure(self):
         started = datetime.utcnow() - timedelta(minutes=30)
-        closed_at = (started + timedelta(minutes=10)).timestamp()
+        closed_at = _epoch(started + timedelta(minutes=10))
         used, refund, elapsed = OrderExecutor.compute_prorated_settlement(
             600_000, 60, started, bill_until=closed_at)
         self.assertAlmostEqual(elapsed, 600, delta=5)
@@ -92,7 +106,7 @@ class BillingCutoffTests(unittest.TestCase):
     def test_cutoff_in_the_future_never_bills_more_than_now(self):
         started = datetime.utcnow() - timedelta(minutes=10)
         used_future, refund_future, _ = OrderExecutor.compute_prorated_settlement(
-            600_000, 60, started, bill_until=(datetime.utcnow() + timedelta(hours=1)).timestamp())
+            600_000, 60, started, bill_until=_epoch(datetime.utcnow() + timedelta(hours=1)))
         used_now, refund_now, _ = OrderExecutor.compute_prorated_settlement(
             600_000, 60, started)
         self.assertEqual((used_future, refund_future), (used_now, refund_now))
@@ -108,7 +122,7 @@ class BillingCutoffTests(unittest.TestCase):
 
     def test_order_settlement_passes_the_cutoff_through(self):
         started = datetime.utcnow() - timedelta(minutes=20)
-        closed_at = (started + timedelta(minutes=5)).timestamp()
+        closed_at = _epoch(started + timedelta(minutes=5))
         order = dict(ORDER_ROW, started_at=started)
         used_direct, _, _ = OrderExecutor.compute_prorated_settlement(
             600_000, 60, started, bill_until=closed_at)
@@ -116,6 +130,27 @@ class BillingCutoffTests(unittest.TestCase):
             order, bill_until=closed_at)
         self.assertEqual(used_order, used_direct)
         self.assertAlmostEqual(used_order, 50_000, delta=2_000)
+
+    def test_monotonic_or_naive_cutoff_never_refunds_the_whole_order(self):
+        """یک مقدار بی‌معنا (مثل time.monotonic یا timestampِ naive) نباید
+        «عودت کامل» بسازد؛ در آن صورت بیلینگ به now ادامه می‌یابد."""
+        started = datetime.utcnow() - timedelta(minutes=10)
+        used_now, refund_now, _ = OrderExecutor.compute_prorated_settlement(
+            600_000, 60, started)
+        for bogus in (time.monotonic(),         # ~ثانیه‌های بوت، نه epoch
+                      -1.0,
+                      calendar.timegm((datetime.utcnow() - timedelta(days=4000)).timetuple())):
+            with self.subTest(bogus=bogus):
+                used, refund, _ = OrderExecutor.compute_prorated_settlement(
+                    600_000, 60, started, bill_until=bogus)
+                self.assertEqual((used, refund), (used_now, refund_now))
+
+    def test_a_cutoff_before_the_start_means_zero_service_zero_charge(self):
+        """ولی cutoffِ *معتبر* قبل از شروع بیلینگ یعنی سرویسی ارائه نشده."""
+        started = datetime.utcnow() - timedelta(minutes=10)
+        used, refund, _ = OrderExecutor.compute_prorated_settlement(
+            600_000, 60, started, bill_until=_epoch(started - timedelta(minutes=5)))
+        self.assertEqual((used, refund), (0.0, 600_000.0))
 
     def test_unstarted_order_still_refunds_everything_with_a_cutoff(self):
         order = dict(ORDER_ROW, started_at=None)
@@ -140,6 +175,33 @@ class AskGateTests(unittest.TestCase):
         executor = OrderExecutor()
         self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
         self.assertFalse(executor._chat_closed_ask_gate(ORDER_ID, False))
+
+
+class VcmEpochTests(unittest.TestCase):
+    """مارکرِ بسته‌شدن باید epochِ واقعی UTC ذخیره کند، نه monotonic."""
+
+    def test_chat_closed_since_is_a_real_utc_epoch(self):
+        from services.voice_call_manager import VoiceCallManager
+        vcm = VoiceCallManager()
+        before = time.time()
+        vcm._note_chat_closed(ORDER_ID, 101, -1001234, "Status.CLOSED_VOICE_CHAT")
+        vcm._note_chat_closed(ORDER_ID, 102, -1001234, "Status.CLOSED_VOICE_CHAT")
+        since = vcm.chat_closed_since(ORDER_ID)
+        self.assertIsNotNone(since)
+        # monotonicِ بوت حدود ۱e۶ است؛ epochِ واقعی حدود ۱.۸e۹
+        self.assertGreaterEqual(since, before - 1.0)
+        self.assertLessEqual(since, time.time() + 1.0)
+        self.assertTrue(vcm.is_chat_closed(ORDER_ID))
+        self.assertGreaterEqual(vcm._chat_closed_until.get((ORDER_ID, -1001234), 0), before)
+
+    def test_clear_chat_closed_forgets_the_timestamp_too(self):
+        from services.voice_call_manager import VoiceCallManager
+        vcm = VoiceCallManager()
+        vcm._note_chat_closed(ORDER_ID, 101, -1001234, "Status.CLOSED_VOICE_CHAT")
+        vcm._note_chat_closed(ORDER_ID, 102, -1001234, "Status.CLOSED_VOICE_CHAT")
+        vcm.clear_chat_closed(ORDER_ID)
+        self.assertIsNone(vcm.chat_closed_since(ORDER_ID))
+        self.assertFalse(vcm.is_chat_closed(ORDER_ID))
 
 
 class ContinueGraceTests(unittest.IsolatedAsyncioTestCase):
@@ -255,7 +317,7 @@ class SettleAndRefundCutoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_calculator_given_to_db_applies_the_cutoff(self):
         executor = OrderExecutor()
         started = datetime.utcnow() - timedelta(minutes=30)
-        closed_at = (started + timedelta(minutes=10)).timestamp()
+        closed_at = _epoch(started + timedelta(minutes=10))
         settlement = {"order": dict(ORDER_ROW, started_at=started),
                       "total_cost": 600_000, "used_cost": 100_000,
                       "refund_amount": 500_000, "refund_tx_id": "TX-1",

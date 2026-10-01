@@ -721,7 +721,8 @@ class VoiceCallManager:
         # One update can be a local artefact, so a chat is marked closed only
         # after several distinct accounts of the SAME order report it.
         # _chat_closed_reports[(order_id, chat_id)] = {"accounts": set, "first_ts": float}
-        # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
+        # _chat_closed_until[(order_id, chat_id)]   = epoch deadline (time.time())
+        # _chat_closed_since[(order_id, chat_id)]   = epoch of the first corroborated closure
         self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._chat_closed_until: Dict[Tuple[int, int], float] = {}
         self._chat_closed_since: Dict[Tuple[int, int], float] = {}
