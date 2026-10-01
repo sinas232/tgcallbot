@@ -116,13 +116,28 @@ index f21bf42..c51a865 100644
 +.env.bak.*
 +FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..496cee1 100644
+index 5ed9f7c..22c9c74 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -9,6 +9,44 @@
+@@ -9,6 +9,59 @@
  
  ---
  
++## گزارش پایان سفارش فقط یک‌بار در کانال (۲.۳.۲۳)
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۷/۱۰ — مشکل گزارش‌شده: «دوبار گزارش سفارشات رو در کانال می‌فرسته». دو علت مستقل پیدا و بسته شد:
++
++- **مسابقهٔ جابِ انقضا با خودِ اجراکننده (علت اصلی).** جابِ `check_expired_orders_job` هر ۶۰ ثانیه سفارش‌های سرِرسیده را می‌پاید، ولی `_finish_order` قبل از اینکه وضعیت را `completed` کند، **خروجِ پله‌ای ده‌ها اکانت** از کال و گروه را انجام می‌دهد (برای ۴۰ اکانت به‌راحتی بیشتر از یک‌دقیقه). در این فاصله سفارش در DB هنوز `running` است، پس جاب آن را «منقضی» می‌دید، **تسکِ در حال پایان را کنسل می‌کرد**، خودش `complete_order` می‌زد و گزارش دوم را می‌فرستاد (و در مسیر `stop_active_order` بدون سرکوب، یک گزارش «لغو» هم اضافه می‌شد). حالا: تا وقتی سشنِ خودِ اجراکننده روی سفارش زنده است و از مهلت کمتر از ۵ دقیقه گذشته، جاب دخالت نمی‌کند (`expiry_owned_by_live_session`)، و در حالت واقعاً گیرکرده هم `suppress_cancel_log=True` می‌دهد تا فقط یک گزارش پایانی برود.
++- **قفلِ یک‌بارمصرفِ گزارش‌های پایانی.** در `_log_to_channel` برای انواع `completed`/`cancelled`/`failed` یک claim اتمیک (بدون `await` بین بررسی و ثبت) اضافه شد: هر سفارش در هر ربات فقط **یک** گزارش پایانی می‌گیرد و تلاش دوم با پیام `duplicate 'completed' report suppressed` در لاگ سرکوب می‌شود. اگر ارسال شکست بخورد، claim آزاد می‌شود تا تلاش بعدی بتواند بفرستد (گزارش گم نمی‌شود). گزارش‌های `started`/`scheduled` مثل قبل تکرارشدنی‌اند.
++- **دوباره‌فرستادن روی خطای ارسال.** `_log_to_channel` قبلاً روی **هر** خطای ارسال Markdown یک نسخهٔ متن‌ساده هم می‌فرستاد؛ یک تایم‌اوت/فیلتر/قطعی شبکه که پیام را رسانده بود، گزارش تکراری می‌ساخت. حالا fallback فقط برای خطای **فرمت** (`BadRequest` مربوط به entity/parse) انجام می‌شود.
++- **تست:** ۱۴ تست تازه در `tests/test_report_dedupe.py` (یک‌بار‌بودن completed/cancelled/failed، مستقل‌بودن انواع، تکرارشدنی‌بودن started/scheduled، تفکیک per-bot، آزادسازی claim بعد از شکست، fallback فقط برای خطای فرمت، و رفتار جابِ انقضا در سه حالت: سشنِ در حال پایان، سفارش بی‌سشن، سشنِ گیرکرده). کل سوئیت: **۶۶۱ تست، ۶۵۵ موفق، ۶ skip**.
++
++</div>
++
++---
++
 +## سؤال از مشتری وقتی ویس‌چت بسته شد + عودت زمانِ سرویس‌نشده (۲.۳.۲۳)
 +
 +<div dir="rtl">
@@ -403,10 +418,10 @@ index d95edf9..4103ec5 100644
        - redis_data:/data
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..eadf814
+index 0000000..3df06b8
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,244 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -567,7 +582,7 @@ index 0000000..eadf814
 +
 +## ۸) آزمون‌ها
 +
-+سوئیت کامل: **۶۴۷ تست، ۶۴۱ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
++سوئیت کامل: **۶۶۱ تست، ۶۵۵ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ + ۱۴ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
 +و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
 +کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
 +`tests/test_chat_closed_ask_flow.py` هستند.
@@ -614,6 +629,43 @@ index 0000000..eadf814
 +
 +نکتهٔ عملیاتی: پیام‌ها به تلگرام خودِ کاربر می‌روند؛ اگر بات نمی‌تواند به کاربر پیام
 +بدهد (بلاک شده) فقط لاگ هشدار می‌خورد و منطق بیلی/عودت دست‌نخورده است.
++
++## ۱۰) گزارش هر سفارش فقط یک‌بار در کانال (۱۴۰۵/۰۷/۱۰)
++
++**علامت:** بنر «پایان سفارش» دو بار در کانال لاگ می‌آمد.
++
++**علت:** دو تولیدکنندهٔ مستقل برای گزارش پایانی وجود داشت و هم‌زمان می‌رسیدند:
++
++* `_finish_order` در خود اجراکننده: اول خروج **پله‌ای** اکانت‌ها (`_cleanup_order`)، بعد
++  `complete_order` و در آخر گزارش. برای ۴۰ اکانت، این پاک‌سازی می‌تواند دقیقه‌ها طول بکشد.
++* `check_expired_orders_job` که **هر ۶۰ ثانیه** اجرا می‌شود: در همان بازه، سفارش را هنوز
++  `running` می‌دید، تسکِ در حال پایان را کنسل می‌کرد، خودش وضعیت را `completed` می‌کرد و
++  گزارش دوم (و در مسیر لغو، یک گزارش «لغو» اضافه) می‌فرستاد.
++
++**فیکس‌ها:**
++
++1. `expiry_owned_by_live_session(active_orders, order_id, overdue)`: تا وقتی سشنِ سفارش زنده
++   است و از مهلت کمتر از ۵ دقیقه گذشته، جاب هیچ کاری نمی‌کند (سشنِ گیرکرده بعد از ۵ دقیقه
++   واگذار می‌شود).
++2. `stop_active_order(..., suppress_cancel_log=True)` در همان جاب، تا گزارش «لغو»
++   اجراکننده با گزارش «پایان» جاب جمع نشود.
++3. claim یک‌بارمصرف برای گزارش‌های `completed`/`cancelled`/`failed` در `_log_to_channel`؛
++   اگر ارسال شکست بخورد claim آزاد می‌شود تا گزارش از دست نرود. `started`/`scheduled`
++   دست‌نخورده‌اند.
++4. fallback متن‌ساده **فقط** برای خطای فرمت (`BadRequest` مربوط به entity)؛ تایم‌اوت یا
++   خطای شبکه دیگر ارسال دوم نمی‌سازد.
++
++در لاگ، سرکوب گزارش تکراری این‌طور دیده می‌شود:
++
++```
++Order 933: duplicate 'completed' report suppressed (already sent)
++```
++
++و اگر جاب ببیند سشن هنوز مشغول پایان‌دادن است:
++
++```
++Order 933 (Bot 1): past its deadline for 42s but its session is still finishing (cleanup/paced leaves) - the executor owns the report.
++```
 diff --git a/handlers/admin_handlers.py b/handlers/admin_handlers.py
 index 85eca61..789e2d8 100644
 --- a/handlers/admin_handlers.py
@@ -815,7 +867,7 @@ index 6df540e..19ebd5e 100644
  
  async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 diff --git a/main.py b/main.py
-index 25df9c1..ba8d781 100644
+index 25df9c1..9d8b08c 100644
 --- a/main.py
 +++ b/main.py
 @@ -575,6 +575,98 @@ async def group_leave_sweeper_job(context: ContextTypes.DEFAULT_TYPE):
@@ -917,7 +969,38 @@ index 25df9c1..ba8d781 100644
  async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
      try:
          due_orders = await DatabaseManager.get_due_scheduled_orders()
-@@ -741,6 +833,24 @@ def register_handlers(application: Application) -> None:
+@@ -622,10 +714,28 @@ async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
+                 end_time = start_time + timedelta(minutes=duration)
+                 
+                 if now > end_time:
++                    # اگر خودِ executor هنوز روی این سفارش زنده است (خروج پله‌ای
++                    # ده‌ها اکانت از کال + report پایانی)، این جاب نباید وسط کار
++                    # بپرد: تسک در حال پایان را کنسل می‌کند، وضعیت را خراب می‌کند و
++                    # گزارش «پایان سفارش» را دو بار به کانال می‌فرستد. فقط بعد از
++                    # مهلت ۵ دقیقه‌ای (سشن گیرکرده) یا وقتی سشنی وجود ندارد،
++                    # می‌گیریمش.
++                    overdue = (now - end_time).total_seconds()
++                    if order_executor.expiry_owned_by_live_session(
++                            order_executor.active_orders, order['id'], overdue):
++                        logger.info(
++                            f"Order {order['id']} (Bot {bot_id}): past its deadline for "
++                            f"{overdue:.0f}s but its session is still finishing "
++                            f"(cleanup/paced leaves) - the executor owns the report."
++                        )
++                        continue
+                     logger.info(f"⏳ Order {order['id']} (Bot {bot_id}) expired. Finishing...")
+                     
+-                    # توقف سفارش + خروج از کال/گروه
+-                    await order_executor.stop_active_order(order['id'], is_expired=True, reason="Order expired")
++                    # توقف سفارش + خروج از کال/گروه. گزارش «cancelled» اجراکننده
++                    # سرکوب می‌شود؛ این جاب خودش گزارش پایانی را می‌فرستد.
++                    await order_executor.stop_active_order(order['id'], is_expired=True,
++                                                          reason="Order expired",
++                                                          suppress_cancel_log=True)
+                     try:
+                         from services.voice_call_manager import voice_call_manager as _vcm
+                         if _vcm:
+@@ -741,6 +851,24 @@ def register_handlers(application: Application) -> None:
          group=-4,
      )
  
@@ -942,7 +1025,7 @@ index 25df9c1..ba8d781 100644
      # گارد ضداسپم در گروهٔ مستقل 3-: تنها هندلرِ همین گروه است پس بلعیدنِ
      # آپدیت فقط به همین گروه ختم می‌شود و گروه‌های بعدی (نگهبان تعمیرات،
      # پیش‌روتر، مکالمه‌ها) سالم می‌مانند. توقفِ میوت با raise
-@@ -1071,31 +1181,36 @@ def register_handlers(application: Application) -> None:
+@@ -1071,31 +1199,36 @@ def register_handlers(application: Application) -> None:
          MessageHandler(FILTER_BACK, admin_panel_start),
      ]
      admin_conv = ConversationHandler(
@@ -996,7 +1079,7 @@ index 25df9c1..ba8d781 100644
          ],
          states={
              AWAITING_SETTINGS_ACTION: [
-@@ -1586,6 +1701,16 @@ async def main_loop():
+@@ -1586,6 +1719,16 @@ async def main_loop():
      # راه‌اندازی ربات‌های نمایندگی
      await bot_manager.start_all_active_bots()
      
@@ -1013,7 +1096,7 @@ index 25df9c1..ba8d781 100644
      # زمان‌بندی جاب‌ها
      if main_app.job_queue:
          main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
-@@ -1609,9 +1734,12 @@ async def main_loop():
+@@ -1609,9 +1752,12 @@ async def main_loop():
      stop_event = asyncio.Event()
      try:
          _loop = asyncio.get_running_loop()
@@ -2075,10 +2158,10 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..a7b2213 100644
+index 0e19892..9cd4701 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -12,12 +12,23 @@ from database import DatabaseManager
+@@ -12,15 +12,51 @@ from database import DatabaseManager
  from telegram_client import TelegramAccountClient
  from utils.helpers import format_jalali_datetime
  from config import Config
@@ -2103,7 +2186,35 @@ index 0e19892..a7b2213 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -41,6 +52,48 @@ def _get_voice_call_manager():
++# Report kinds that must appear AT MOST ONCE per order in the log channel.
++# Two independent producers exist for the end of an order: the executor's own
++# ``_finish_order`` and the 60s ``check_expired_orders_job``.  Both used to
++# post the same "completed" banner while the paced voice cleanup was still
++# running (the order is not committed as completed until cleanup ends).
++_TERMINAL_REPORT_KINDS = frozenset({"completed", "cancelled", "failed"})
++
++# Telegram Markdown/entity failures - the ONLY case where a plain-text
++# re-send is safe.  Any other error (timeout, flood, network) may already
++# have delivered the message, and retrying would duplicate it.
++_PARSE_ERROR_MARKERS = ("can't parse", "can't find end", "unsupported start tag",
++                        "parse entities", "parse_mode", "entity", "imbalanced")
++
++
++def _is_parse_error(exc) -> bool:
++	"""True only for a Telegram formatting failure (BadRequest about entities)."""
++	try:
++		from telegram.error import BadRequest
++	except Exception:
++		return False
++	if not isinstance(exc, BadRequest):
++		return False
++	text = str(exc).lower()
++	return any(marker in text for marker in _PARSE_ERROR_MARKERS)
++
+ 
+ def _format_timer(seconds: float) -> str:
+ 	"""تبدیل ثانیه به فرمت HH:MM:SS برای نمایش تایمر دقیق"""
+@@ -41,6 +77,48 @@ def _get_voice_call_manager():
  		return None
  
  
@@ -2152,7 +2263,7 @@ index 0e19892..a7b2213 100644
  class OrderExecutor:
  	"""
  	Core executor for Telegram orders (voice chat, group join, etc.).
-@@ -71,6 +124,34 @@ class OrderExecutor:
+@@ -71,6 +149,37 @@ class OrderExecutor:
  		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
  		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
  		self._suppress_cancel_log: Set[int] = set()
@@ -2166,6 +2277,9 @@ index 0e19892..a7b2213 100644
 +		# Strong refs to fire-and-forget tasks so they are not garbage-collected
 +		# mid-flight (the customer question must not vanish silently).
 +		self._background_tasks: Set[asyncio.Task] = set()
++		# (bot_id, order_id, kind) -> timestamp of the ONE terminal report
++		# already sent for that order (completed/cancelled/failed).
++		self._terminal_reports_sent: Dict[Tuple[int, int, str], float] = {}
 +
 +	def _chat_closed_ask_gate(self, order_id: int, is_closed: bool) -> bool:
 +		"""True exactly ONCE per closure: send the customer question here.
@@ -2187,7 +2301,7 @@ index 0e19892..a7b2213 100644
  
  	def _consume_cancel_log_suppression(self, order_id: int) -> bool:
  		"""اگر گزارش لغو این سفارش سرکوب شده باشد True برمی‌گرداند و flag را مصرف می‌کند."""
-@@ -192,8 +273,23 @@ class OrderExecutor:
+@@ -192,8 +301,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -2213,7 +2327,7 @@ index 0e19892..a7b2213 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -325,6 +421,13 @@ class OrderExecutor:
+@@ -325,6 +449,13 @@ class OrderExecutor:
  	                self.active_orders[order_id]["end_time"] = end_time
  	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
  
@@ -2227,7 +2341,7 @@ index 0e19892..a7b2213 100644
  	            _tick = 0
  	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
  	            _log_interval = 10
-@@ -355,6 +458,7 @@ class OrderExecutor:
+@@ -355,6 +486,7 @@ class OrderExecutor:
  	                    logger.info(
  	                        f"Order {order_id}: {_format_timer(remaining_now)} "
  	                        f"| live={live}/{exact}"
@@ -2235,7 +2349,7 @@ index 0e19892..a7b2213 100644
  	                    )
  
  	                if _tick % _check_interval == 0 and _tick > 0:
-@@ -397,6 +501,7 @@ class OrderExecutor:
+@@ -397,6 +529,7 @@ class OrderExecutor:
  	                    if order_id in self.active_orders:
  	                        self.active_orders[order_id]["live_count"] = live
  	                        self.active_orders[order_id]["joined_accounts"] = joined_list
@@ -2243,7 +2357,7 @@ index 0e19892..a7b2213 100644
  	                    # Durable live count is not continuous media presence.
  	                    # Surface the native binding signal separately (it too
  	                    # cannot guarantee end-to-end WebRTC packet delivery).
-@@ -405,6 +510,65 @@ class OrderExecutor:
+@@ -405,6 +538,65 @@ class OrderExecutor:
  	                        _vcm = _get_voice_call_manager()
  	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
  	                            _binding = _vcm.get_binding_status_counts(order_id)
@@ -2309,7 +2423,7 @@ index 0e19892..a7b2213 100644
  	                    logger.info(
  	                        "Order %s: durable_live=%s/%s | native_binding=%s "
  	                        "(not proof of UDP packet delivery)",
-@@ -523,9 +687,26 @@ class OrderExecutor:
+@@ -523,9 +715,26 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -2337,7 +2451,7 @@ index 0e19892..a7b2213 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +718,7 @@ class OrderExecutor:
+@@ -537,7 +746,7 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -2346,7 +2460,7 @@ index 0e19892..a7b2213 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -564,13 +745,30 @@ class OrderExecutor:
+@@ -564,13 +773,30 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -2379,7 +2493,7 @@ index 0e19892..a7b2213 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -594,6 +792,27 @@ class OrderExecutor:
+@@ -594,6 +820,27 @@ class OrderExecutor:
  	        best = when if best is None else min(best, when)
  	    return best
  
@@ -2407,7 +2521,7 @@ index 0e19892..a7b2213 100644
  	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
  	                                    joined_ids: Set[int]) -> bool:
  	    """Give transiently exhausted accounts ONE new attempt per bounded round.
-@@ -671,30 +890,32 @@ class OrderExecutor:
+@@ -671,30 +918,32 @@ class OrderExecutor:
  	        _as_profile = await anti_spam.get_profile(bot_id)
  	    except Exception:
  	        _as_profile = None
@@ -2459,7 +2573,7 @@ index 0e19892..a7b2213 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -702,6 +923,9 @@ class OrderExecutor:
+@@ -702,6 +951,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -2469,7 +2583,7 @@ index 0e19892..a7b2213 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -748,12 +972,55 @@ class OrderExecutor:
+@@ -748,12 +1000,55 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -2525,7 +2639,7 @@ index 0e19892..a7b2213 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -784,6 +1051,16 @@ class OrderExecutor:
+@@ -784,6 +1079,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -2542,7 +2656,7 @@ index 0e19892..a7b2213 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -829,6 +1106,15 @@ class OrderExecutor:
+@@ -829,6 +1134,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -2558,7 +2672,7 @@ index 0e19892..a7b2213 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -872,6 +1158,7 @@ class OrderExecutor:
+@@ -872,6 +1186,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -2566,7 +2680,7 @@ index 0e19892..a7b2213 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -882,6 +1169,7 @@ class OrderExecutor:
+@@ -882,6 +1197,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -2574,7 +2688,7 @@ index 0e19892..a7b2213 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -903,6 +1191,7 @@ class OrderExecutor:
+@@ -903,6 +1219,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -2582,7 +2696,7 @@ index 0e19892..a7b2213 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -921,6 +1210,7 @@ class OrderExecutor:
+@@ -921,6 +1238,7 @@ class OrderExecutor:
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -2590,13 +2704,13 @@ index 0e19892..a7b2213 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -942,8 +1232,49 @@ class OrderExecutor:
+@@ -942,8 +1260,49 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
 +	                    wave_system += 1
- 	                    continue
- 
++	                    continue
++
 +	                if outcome == OUTCOME_SYSTEM:
 +	                    # Telegram-side infrastructure failure (500 INTERDC,
 +	                    # internal server error, transport timeout, unresolved
@@ -2616,8 +2730,8 @@ index 0e19892..a7b2213 100644
 +	                    join_brain.report_result(order_id, outcome, msg)
 +	                    wave_fail += 1
 +	                    wave_system += 1
-+	                    continue
-+
+ 	                    continue
+ 
 +	                if outcome == OUTCOME_PERMANENT:
 +	                    # A permanent failure produces the IDENTICAL error on every retry,
 +	                    # so spending the attempt budget on it is pointless - and _voice_banned
@@ -2640,7 +2754,7 @@ index 0e19892..a7b2213 100644
  	                attempts = self._voice_attempts.setdefault(order_id, {})
  	                n_att = attempts.get(aid, 0) + 1
  	                attempts[aid] = n_att
-@@ -993,11 +1324,16 @@ class OrderExecutor:
+@@ -993,11 +1352,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -2659,7 +2773,7 @@ index 0e19892..a7b2213 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1031,6 +1367,44 @@ class OrderExecutor:
+@@ -1031,6 +1395,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
@@ -2704,7 +2818,32 @@ index 0e19892..a7b2213 100644
  	    # Return only the accounts this call newly joined; the CALLER owns
  	    # merging them into the order's running joined_accounts list (the
  	    # VoiceCallManager remains the authoritative source for counting).
-@@ -1493,6 +1867,15 @@ class OrderExecutor:
+@@ -1477,6 +1879,24 @@ class OrderExecutor:
+ 			pass
+ 		self.active_orders.pop(order_id, None)
+ 
++	@staticmethod
++	def expiry_owned_by_live_session(active_orders, order_id, overdue_seconds,
++	                                 grace_seconds=300) -> bool:
++		"""True while the executor itself is still finishing this order.
++
++		``_finish_order`` ejects dozens of voice accounts with PACED leaves
++		before it commits 'completed' and reports it, so an order can sit past
++		its deadline for minutes while its session is still alive.  The 60s
++		expiry job must leave those alone: taking them over would cancel the
++		cleanup mid-flight and post a second end-of-order report.
++		"""
++		try:
++			if order_id not in active_orders:
++				return False
++			return float(overdue_seconds) < float(grace_seconds)
++		except Exception:
++			return False
++
+ 	async def _cleanup_order(self, order_id, joined_accounts, data):
+ 		# Release Join Brain scratch state (idempotent).
+ 		self._voice_forget_order(order_id)
+@@ -1493,6 +1913,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
@@ -2720,7 +2859,7 @@ index 0e19892..a7b2213 100644
  		else:
  			try:
  				await self._eject_all_fast(order_id, joined_accounts, data)
-@@ -1516,6 +1899,9 @@ class OrderExecutor:
+@@ -1516,6 +1945,9 @@ class OrderExecutor:
  
  	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
  	                            suppress_cancel_log: bool = False):
@@ -2730,7 +2869,7 @@ index 0e19892..a7b2213 100644
  		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
  		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
  		if suppress_cancel_log:
-@@ -1706,7 +2092,7 @@ class OrderExecutor:
+@@ -1706,7 +2138,7 @@ class OrderExecutor:
  		return name, user.get("telegram_id", "---")
  
  	@staticmethod
@@ -2739,7 +2878,7 @@ index 0e19892..a7b2213 100644
  		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
  
  		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
-@@ -1714,6 +2100,9 @@ class OrderExecutor:
+@@ -1714,6 +2146,9 @@ class OrderExecutor:
  		- scheduled → هنوز مصرفی نشده: عودت کامل.
  		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
  		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
@@ -2749,7 +2888,7 @@ index 0e19892..a7b2213 100644
  		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
  		"""
  		order = order or {}
-@@ -1732,10 +2121,12 @@ class OrderExecutor:
+@@ -1732,10 +2167,12 @@ class OrderExecutor:
  				used = 0.0
  			return used, max(0.0, total_price - used), 0.0
  		# Never bill the build phase: created_at is NOT a service start.
@@ -2764,7 +2903,7 @@ index 0e19892..a7b2213 100644
  		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
  
  		خروجی: (used_cost, refund_amount, elapsed_seconds)
-@@ -1752,7 +2143,27 @@ class OrderExecutor:
+@@ -1752,7 +2189,27 @@ class OrderExecutor:
  		duration_minutes = int(duration_minutes or 0)
  		if duration_minutes <= 0 or not started_at:
  			return 0.0, total_price, 0.0
@@ -2793,7 +2932,7 @@ index 0e19892..a7b2213 100644
  		total_seconds = duration_minutes * 60
  		if elapsed_seconds >= total_seconds:
  			used = total_price
-@@ -1762,10 +2173,153 @@ class OrderExecutor:
+@@ -1762,10 +2219,153 @@ class OrderExecutor:
  		refund = max(0.0, total_price - used)
  		return used, refund, elapsed_seconds
  
@@ -2948,7 +3087,7 @@ index 0e19892..a7b2213 100644
  	):
  		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
  
-@@ -1778,9 +2332,15 @@ class OrderExecutor:
+@@ -1778,9 +2378,15 @@ class OrderExecutor:
  		# Row-locked, atomic claim + settlement: a second callback must not
  		# credit the wallet twice or refund a completed/cancelled order. Price
  		# depends on elapsed time and the FULL plan, never the joined-account ratio.
@@ -2965,6 +3104,78 @@ index 0e19892..a7b2213 100644
  			expected_user_id=expected_user_id,
  		)
  		if settled is None:
+@@ -2003,6 +2609,40 @@ class OrderExecutor:
+ 			lines += [f"📝 دلیل: {reason}"]
+ 		return "\n".join(lines)
+ 
++	def _claim_terminal_report(self, order_id, kind, bot_id=1):
++		"""Claim the single allowed terminal report for this order.
++	
++		Returns True when the caller must send it, False when another
++		producer already did, None for report kinds that may repeat
++		(started/scheduled).  No await happens between the check and the
++		claim, so two coroutines in the same loop cannot both win it.
++		"""
++		if str(kind) not in _TERMINAL_REPORT_KINDS:
++			return None
++		try:
++			key = (int(bot_id or 1), int(order_id), str(kind))
++		except Exception:
++			return None
++		if key in self._terminal_reports_sent:
++			logger.info("Order %s: duplicate '%s' report suppressed "
++			            "(already sent)", order_id, kind)
++			return False
++		self._terminal_reports_sent[key] = time.time()
++		if len(self._terminal_reports_sent) > 4096:
++			cutoff = time.time() - 172800  # 2 days
++			for old_key, ts in list(self._terminal_reports_sent.items()):
++				if ts < cutoff:
++					self._terminal_reports_sent.pop(old_key, None)
++		return True
++	
++	def _release_terminal_report(self, order_id, kind, bot_id=1):
++		"""Give the claim back after a failed send so it can be retried."""
++		try:
++			self._terminal_reports_sent.pop(
++				(int(bot_id or 1), int(order_id), str(kind)), None)
++		except Exception as exc:
++			logger.debug("Order %s: releasing report claim failed: %r", order_id, exc)
++	
+ 	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
+ 		from services.bot_manager import bot_manager
+ 		app = bot_manager.active_bots.get(bot_id)
+@@ -2011,6 +2651,12 @@ class OrderExecutor:
+ 		channel_id = await DatabaseManager.get_setting("log_channel_orders", bot_id=bot_id)
+ 		if not channel_id:
+ 			return
++		# End-of-order reports are ONE-SHOT per order: the executor's
++		# _finish_order and the 60s expiry job both produce them, and they
++		# used to race during the paced voice cleanup.
++		claim = self._claim_terminal_report(order_id, type, bot_id)
++		if claim is False:
++			return
+ 		try:
+ 			order_rec = await DatabaseManager.get_order(order_id) or {}
+ 			if not user and order_rec:
+@@ -2024,9 +2670,16 @@ class OrderExecutor:
+ 			# fall back to a plain-text send (logging must never be lost).
+ 			try:
+ 				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
+-			except Exception:
++			except Exception as exc:
++				# Re-send as plain text ONLY for a formatting failure.  Any
++				# other error (timeout/flood/network) may already have
++				# delivered the message - re-sending duplicates the report.
++				if not _is_parse_error(exc):
++					raise
+ 				await app.bot.send_message(channel_id, txt)
+ 		except Exception as exc:
++			if claim is True:
++				self._release_terminal_report(order_id, type, bot_id)
+ 			logger.warning(f"Order {order_id}: report send failed: {exc}")
+ 
+ order_executor = OrderExecutor()
 diff --git a/services/self_healing.py b/services/self_healing.py
 index 490a5b0..05bee81 100644
 --- a/services/self_healing.py
@@ -6320,6 +6531,258 @@ index 0000000..0b97f40
 +        self.assertIs(got, True,
 +                      "the direct answer must come from Telegram, not the snapshot")
 +        self.assertGreaterEqual(app.invokes, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_report_dedupe.py b/tests/test_report_dedupe.py
+new file mode 100644
+index 0000000..f336f28
+--- /dev/null
++++ b/tests/test_report_dedupe.py
+@@ -0,0 +1,246 @@
++"""گزارش هر سفارش در کانال لاگ باید دقیقاً **یک‌بار** برود.
++
++مشکل گزارش‌شده (۱۴۰۵/۰۷/۱۰، سفارش ۹۳۳): بنر «پایان سفارش» دو بار در کانال
++آمد. دو تولیدکنندهٔ مستقل وجود دارد:
++
++1. حلقهٔ خودِ اجراکننده: `_finish_order` → `_cleanup_order` (خروج **پله‌ای**
++   ده‌ها اکانت از کال/گروه) و بعد `complete_order` + گزارش «completed».
++2. جابِ ۶۰ثانیه‌ای `check_expired_orders_job`: سفارش را «منقضی» می‌بیند چون
++   هنوز در DB وضعیتش عوض نشده، تسک در حال پایان را کنسل می‌کند، خودش
++   `complete_order` می‌زند و **گزارش دوم** را می‌فرستد (و در مسیر
++   `stop_active_order` بدون سرکوب، گزارش «لغو» هم اضافه می‌شود).
++
++یک مسیر سوم هم برای دوباره‌فرستادن وجود داشت: `_log_to_channel` روی **هر**
++خطای ارسال Markdown، یک نسخهٔ متن‌ساده هم می‌فرستاد؛ یک تایم‌اوت شبکه‌ای
++ممکن است پیام را رسانده باشد و آن ارسال دوم، تکرار گزارش بسازد.
++
++این فایل هر سه را قفل می‌کند:
++
++* claim یک‌بارمصرف برای گزارش‌های پایانی (completed/cancelled/failed)؛
++* fallback متن‌ساده فقط برای خطای *فرمت* (BadRequest مربوط به entity)؛
++* جابِ انقضا سفارشی را که سشنش هنوز زنده است رها می‌کند و در غیر آن هم
++  گزارش «cancelled» اجراکننده را سرکوب می‌کند.
++"""
++
++import os
++import sys
++import tempfile
++import unittest
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="report-dedupe-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("BOT_TOKEN", "test-token")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH", os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH", os.path.join(_TMP, "strategy.json"))
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++import database  # noqa: E402
++import main  # noqa: E402
++from services.order_executor import OrderExecutor  # noqa: E402
++
++ORDER_ID = 933
++CHANNEL = "-100777"
++ROOT_ORDER = {"id": ORDER_ID, "user_id": 12, "bot_id": 1, "order_type": "voice_chat",
++              "accounts_count": 42, "duration_minutes": 60, "price_paid": 600_000,
++              "duration": 60, "target_link": "https://t.me/x"}
++
++
++class _FakeBot:
++    """Records every send, optionally failing the FIRST (Markdown) call."""
++
++    def __init__(self, fail_first=None):
++        self.sent = []
++        self.fail_first = fail_first
++
++    async def send_message(self, chat_id, text, **kwargs):
++        self.sent.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
++        if self.fail_first is not None and len(self.sent) == 1:
++            raise self.fail_first
++        return SimpleNamespace(message_id=len(self.sent))
++
++
++class TerminalReportDedupeTests(unittest.IsolatedAsyncioTestCase):
++    """دو تولیدکننده ⇒ یک گزارش."""
++
++    async def _send(self, executor, kind, bot, bot_id=1):
++        with patch("services.bot_manager.bot_manager") as bm, \
++             patch.object(database.DatabaseManager, "get_setting",
++                          new_callable=AsyncMock, return_value=CHANNEL), \
++             patch.object(database.DatabaseManager, "get_order",
++                          new_callable=AsyncMock, return_value=dict(ROOT_ORDER)), \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=None):
++            bm.active_bots = {bot_id: SimpleNamespace(bot=bot)}
++            await executor._log_to_channel(kind, ORDER_ID, dict(ROOT_ORDER),
++                                           bot_id=bot_id)
++
++    async def test_completed_report_is_sent_exactly_once(self):
++        executor = OrderExecutor()
++        bot = _FakeBot()
++        await self._send(executor, "completed", bot)
++        await self._send(executor, "completed", bot)   # جابِ انقضا / مسیر موازی
++        await self._send(executor, "completed", bot)
++        self.assertEqual(len(bot.sent), 1)
++        self.assertIn("پایان", bot.sent[0]["text"])
++
++    async def test_cancelled_and_failed_are_also_one_shot(self):
++        for kind in ("cancelled", "failed"):
++            with self.subTest(kind=kind):
++                executor = OrderExecutor()
++                bot = _FakeBot()
++                await self._send(executor, kind, bot)
++                await self._send(executor, kind, bot)
++                self.assertEqual(len(bot.sent), 1)
++
++    async def test_cancelled_and_completed_are_independent_kinds(self):
++        executor = OrderExecutor()
++        bot = _FakeBot()
++        await self._send(executor, "cancelled", bot)
++        await self._send(executor, "completed", bot)
++        self.assertEqual(len(bot.sent), 2)
++
++    async def test_repeatable_reports_are_not_blocked(self):
++        executor = OrderExecutor()
++        bot = _FakeBot()
++        for _ in range(3):
++            await self._send(executor, "started", bot)
++            await self._send(executor, "scheduled", bot)
++        self.assertEqual(len(bot.sent), 6)
++
++    async def test_dedupe_is_per_order_and_per_bot(self):
++        executor = OrderExecutor()
++        bot = _FakeBot()
++        await self._send(executor, "completed", bot, bot_id=1)
++        await self._send(executor, "completed", bot, bot_id=2)
++        self.assertEqual(len(bot.sent), 2)   # هر ربات کانال خودش را دارد
++
++    async def test_claim_release_allows_a_retry_after_a_real_failure(self):
++        executor = OrderExecutor()
++        self.assertTrue(executor._claim_terminal_report(ORDER_ID, "completed", 1))
++        self.assertFalse(executor._claim_terminal_report(ORDER_ID, "completed", 1))
++        executor._release_terminal_report(ORDER_ID, "completed", 1)
++        self.assertTrue(executor._claim_terminal_report(ORDER_ID, "completed", 1))
++        self.assertIsNone(executor._claim_terminal_report(ORDER_ID, "started", 1))
++
++
++class MarkdownFallbackTests(unittest.IsolatedAsyncioTestCase):
++    """fallback متن‌ساده فقط برای خطای فرمت؛ نه برای تایم‌اوت/شبکه."""
++
++    async def _send(self, executor, bot):
++        with patch("services.bot_manager.bot_manager") as bm, \
++             patch.object(database.DatabaseManager, "get_setting",
++                          new_callable=AsyncMock, return_value=CHANNEL), \
++             patch.object(database.DatabaseManager, "get_order",
++                          new_callable=AsyncMock, return_value=dict(ROOT_ORDER)), \
++             patch.object(database.DatabaseManager, "get_user_by_id",
++                          new_callable=AsyncMock, return_value=None):
++            bm.active_bots = {1: SimpleNamespace(bot=bot)}
++            await executor._log_to_channel("completed", ORDER_ID,
++                                           dict(ROOT_ORDER), bot_id=1)
++
++    async def test_parse_error_gets_the_plain_text_fallback(self):
++        from telegram.error import BadRequest
++        executor = OrderExecutor()
++        bot = _FakeBot(fail_first=BadRequest(
++            "Can't parse entities: Can't find end of the entity starting at byte offset 3"))
++        await self._send(executor, bot)
++        self.assertEqual(len(bot.sent), 2)
++        self.assertIn("parse_mode", bot.sent[0]["kwargs"])
++        self.assertNotIn("parse_mode", bot.sent[1]["kwargs"])
++
++    async def test_timeout_does_not_re_send_the_report(self):
++        from telegram.error import TimedOut
++        executor = OrderExecutor()
++        bot = _FakeBot(fail_first=TimedOut())
++        await self._send(executor, bot)
++        self.assertEqual(len(bot.sent), 1)   # ارسال دوم = گزارش تکراری
++        # و claim آزاد شده تا یک تلاش بعدی بتواند گزارش را بفرستد.
++        self.assertNotIn((1, ORDER_ID, "completed"), executor._terminal_reports_sent)
++
++    async def test_other_bad_requests_do_not_re_send(self):
++        from telegram.error import BadRequest
++        executor = OrderExecutor()
++        bot = _FakeBot(fail_first=BadRequest("Message is too long"))
++        await self._send(executor, bot)
++        self.assertEqual(len(bot.sent), 1)
++
++
++class ExpiryJobTests(unittest.IsolatedAsyncioTestCase):
++    """جابِ انقضا نباید وسط پایان‌دادنِ اجراکننده بپرد."""
++
++    def test_helper_detects_a_live_session(self):
++        active = {ORDER_ID: {"task": object()}}
++        self.assertTrue(OrderExecutor.expiry_owned_by_live_session(active, ORDER_ID, 45))
++        # سشنِ گیرکرده (خیلی بعد از مهلت) دیگر مالِ اجراکننده حساب نمی‌شود.
++        self.assertFalse(OrderExecutor.expiry_owned_by_live_session(active, ORDER_ID, 900))
++        self.assertFalse(OrderExecutor.expiry_owned_by_live_session({}, ORDER_ID, 5))
++
++    async def _run_job(self, *, in_active_orders, overdue_seconds, order_status="running"):
++        from datetime import datetime, timedelta
++        # deadline دقیقاً overdue_seconds ثانیه قبل از «حالا» می‌افتد.
++        order = dict(ROOT_ORDER, status=order_status, duration_minutes=60,
++                     started_at=(datetime.utcnow() - timedelta(minutes=60)
++                                 - timedelta(seconds=overdue_seconds)))
++        app = SimpleNamespace(bot=_FakeBot())
++        stop = AsyncMock(return_value=(True, "stopped"))
++        report = AsyncMock()
++        with patch.object(main, "bot_manager") as bm, \
++             patch.object(main.DatabaseManager, "get_all_orders_extended",
++                          new_callable=AsyncMock,
++                          return_value=[{"order": order,
++                                         "user": {"telegram_id": 555, "id": 12}}]), \
++             patch.object(main.DatabaseManager, "complete_order",
++                          new_callable=AsyncMock) as complete, \
++             patch.object(main.order_executor, "stop_active_order", stop), \
++             patch.object(main.order_executor, "_log_to_channel", report), \
++             patch.object(main, "voice_call_manager", None, create=True):
++            bm.active_bots = {1: app}
++            main.order_executor.active_orders.clear()
++            if in_active_orders:
++                main.order_executor.active_orders[ORDER_ID] = {"task": object()}
++            try:
++                await main.check_expired_orders_job(SimpleNamespace())
++            finally:
++                main.order_executor.active_orders.clear()
++        return stop, report, complete
++
++    async def test_job_skips_an_order_its_own_session_is_finishing(self):
++        stop, report, complete = await self._run_job(in_active_orders=True,
++                                                    overdue_seconds=30)
++        stop.assert_not_awaited()
++        report.assert_not_awaited()
++        complete.assert_not_awaited()
++
++    async def test_job_takes_over_an_orphaned_order_and_suppresses_the_cancel_log(self):
++        stop, report, complete = await self._run_job(in_active_orders=False,
++                                                    overdue_seconds=120)
++        stop.assert_awaited_once()
++        self.assertTrue(stop.await_args.kwargs.get("suppress_cancel_log"))
++        self.assertTrue(stop.await_args.kwargs.get("is_expired"))
++        report.assert_awaited_once()
++        self.assertEqual(report.await_args.args[0], "completed")
++        self.assertEqual(report.await_args.args[1], ORDER_ID)
++        self.assertEqual(report.await_args.kwargs.get("success_cnt"), 42)
++        self.assertEqual(report.await_args.kwargs.get("bot_id"), 1)
++        complete.assert_awaited_once()
++
++    async def test_job_takes_over_a_session_stuck_far_past_the_deadline(self):
++        stop, report, complete = await self._run_job(in_active_orders=True,
++                                                    overdue_seconds=900)
++        stop.assert_awaited_once()
++        report.assert_awaited_once()
++        complete.assert_awaited_once()
++
++    def test_job_source_uses_the_guard_and_suppresses_the_cancel_report(self):
++        src = __import__("inspect").getsource(main.check_expired_orders_job)
++        self.assertIn("expiry_owned_by_live_session", src)
++        self.assertIn("suppress_cancel_log=True", src)
 +
 +
 +if __name__ == "__main__":
