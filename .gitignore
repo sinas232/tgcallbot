@@ -16,3 +16,9 @@ diag_voice.py
 .env.newserver
 backups/
 .test-*.log
+
+# Server-side leftovers that must never block the deploy guard
+# (`git status --porcelain` non-empty aborts deploy-warp.sh): .env backups
+# written by an operator and a stray FETCH_HEAD left by a manual fetch.
+.env.bak.*
+FETCH_HEAD
