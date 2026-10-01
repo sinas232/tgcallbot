@@ -1,5 +1,5 @@
 diff --git a/.env.example b/.env.example
-index 82fa755..8acfa8b 100644
+index 82fa755..d1141b8 100644
 --- a/.env.example
 +++ b/.env.example
 @@ -85,9 +85,19 @@ ORDER_LINK_MODE=any
@@ -81,7 +81,7 @@ index 82fa755..8acfa8b 100644
  # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه):
  ANTISPAM_LEAVE_GAP_MIN=1.5
  ANTISPAM_LEAVE_GAP_MAX=4.0
-@@ -253,3 +302,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
+@@ -253,3 +302,36 @@ GROUP_LEAVE_SWEEP_BATCH=25
  
  # ── ممنوعیت ثبت سفارش جدید پس از لغو (دقیقه) — 0 = خاموش
  CANCEL_COOLDOWN_MINUTES=20
@@ -94,6 +94,23 @@ index 82fa755..8acfa8b 100644
 +# نمی‌دزدد. (رویداد ۱۴۰۵/۰۷/۰۴ — سفارش‌های ۸۵۹ و ۸۶۰)
 +VOICE_STARVED_WAIT_ROUNDS=6
 +VOICE_STARVED_WAIT_SECONDS=20
++
++# ── خودترمیم نگه‌داشتن‌های محلی (quarantine heal) ──────────────────────────
++# اگر قطع‌اتصالِ یکی از اکانت‌ها «تأیید» نشود (معمولاً وسط طوفان تایم‌اوتِ تلگرام)،
++# آن اکانت در همین پروسه قفل می‌شود تا کلیدِ سشن دوباره استفاده نشود. این قفل
++# همیشگی نیست: جارویِ نگهدار هر چند وقت دوباره تلاشِ قطع‌اتصال می‌کند و اگر
++# قطع شدن تأیید شد، اکانت برمی‌گردد. HEAL_SECONDS فاصلهٔ این تلاش‌ها (و مهلت
++# تأخیرِ executor روی همان اکانت) است؛ در هر جارو حداکثر MAX_PER_SWEEP اکانت
++# بررسی می‌شود تا جارو بلوکه نشود. (حادثة ۱۴۰۵-۰۷-۱۱: ۲۲ از ۴۲ اکانت قفل ماند
++# و بیلدِ سفارش ۹۴۱ با live=۰/۲۲ تمام شد.)
++VOICE_QUARANTINE_HEAL_SECONDS=180
++VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP=6
++
++# وقتی سفارشی هنوز حتی یک اکانت زنده ندارد و همهٔ استخر پیشِ سفارش‌های دیگر
++# است، به‌جای ۶ راند، تا این تعداد راند (× VOICE_STARVED_WAIT_SECONDS) برای
++# آزادشدن اکانت صبر می‌کند — تحویلِ صفر اکانت بدتر از صبر است، چون زمان
++# پولیِ سفارش بعد از پایانِ بیلد شروع می‌شود.
++VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE=45
 +
 +# ── بازیابی سفارش بعد از ری‌استارت پروسه ────────────────────────────────────
 +# سفارش‌هایی که موقع OOM-kill / دیپلوی «در حال اجرا» بودند، برای مدت
@@ -116,13 +133,27 @@ index f21bf42..c51a865 100644
 +.env.bak.*
 +FETCH_HEAD
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 5ed9f7c..22c9c74 100644
+index 5ed9f7c..b7beb7c 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -9,6 +9,59 @@
+@@ -9,6 +9,73 @@
  
  ---
  
++## قفل محلی اکانت‌ها خودترمیم شد؛ بیلد صفر اکانت تحویل نمی‌شود (۲.۳.۲۳)
++
++<div dir="rtl">
++
++**تاریخ:** ۱۴۰۵/۰۷/۱۱ — مشکل گزارش‌شده: «سفارش داشتیم اصلاً وارد ویس‌کال نشدن و نتونستند کار کنند». طوفان تایم‌اوتِ تلگرام (۰۰:۲۶ به بعد) باعث شد هر اتصالِ نیمه‌باز، اکانت را **عمراً** در quarantine محلی پروسه قفل کند: `[VoiceMemory] quarantined: 22` از ۴۲ اکانت، موج‌های فیل‌شده در ۰-۲ ثانیه، و بیلدِ سفارش ۹۴۱ با `live=0/22`.
++
++- **جاروی خودترمیم (`heal_quarantine_holds`).** همان حلقهٔ نگهدار، قفل‌های محلی را دوباره بررسی می‌کند: teardown مجدد، و فقط با **تأییدِ** قطع‌شدن، قفل برداشته می‌شود. اکانتی که سفارش زنده‌ای لازم دارد هرگز دست‌نخورده می‌ماند؛ probe ناموفق backoff می‌کند تا DCِ خراب کوبیده نشود.
++- **تفکیک دلیل.** `SESSION_IN_USE[uncertain]` (قفل محلیِ قابل‌بازگشت) حالا فقط defer می‌شود با حفظِ بودجهٔ تلاش؛ دیگر slot را برای سفارش terminal نمی‌کند. دلایل ماندگار (رجیسترِ دیتابیسی `AUTH_KEY_DUPLICATED`، سشن جابه‌جا/کهنه) مثل قبل‌اند.
++- **زمان‌بندی آگاه.** انتخاب کاندیدا و دورِ second-chance، اکانتِ قفل‌شده را تا بازشدن قفل برنمی‌دارند؛ به‌جای موج فیل‌های صُفرثانیه‌ای، یک پنجرهٔ heal صبر می‌کنند. `FAILED → STARTING` هم ترنزیشن مجاز شد (نویز «invalid transition» در second-chance حذف شد).
++- **ممنوعیت تحویل صفر.** بیلدی که هنوز هیچ اکانت زنده ندارد برای آزادشدن استخر تا `VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE` راند (پیش‌فرض ۴۵×۲۰ ثانیه) صبر می‌کند؛ زمان پولی بعد از بیلد شروع می‌شود، پس این صبر رایگان است.
++- **تست:** ۲۲ تست تازه در `tests/test_quarantine_heal.py`. کل سوئیت: **۶۸۳ تست، ۶۷۷ موفق، ۶ skip** (با `TZ=Asia/Tehran`).
++
++</div>
++
 +## گزارش پایان سفارش فقط یک‌بار در کانال (۲.۳.۲۳)
 +
 +<div dir="rtl">
@@ -180,7 +211,7 @@ index 5ed9f7c..22c9c74 100644
  
  <div dir="rtl">
 diff --git a/config.py b/config.py
-index a95d3c1..1b1e23e 100644
+index a95d3c1..3e3c1c1 100644
 --- a/config.py
 +++ b/config.py
 @@ -7,6 +7,32 @@ from dotenv import load_dotenv
@@ -241,7 +272,19 @@ index a95d3c1..1b1e23e 100644
      BATCH_SIZE = int(os.getenv('ACCOUNT_BATCH_SIZE', '20'))               # eligible accounts fetched per DB batch
      RETRY_LIMIT = int(os.getenv('JOIN_RETRY_LIMIT', '3'))                 # bounded retry attempts per account
      BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
-@@ -150,11 +181,14 @@ class Config:
+@@ -132,6 +163,11 @@ class Config:
+     VOICE_IDLE_CLIENT_TTL = int(os.getenv('VOICE_IDLE_CLIENT_TTL', '300'))
+     VOICE_IDLE_SWEEP_INTERVAL = int(os.getenv('VOICE_IDLE_SWEEP_INTERVAL', '60'))
+     VOICE_MEMORY_LOG_INTERVAL = int(os.getenv('VOICE_MEMORY_LOG_INTERVAL', '600'))
++    # 🩹 خودترمیم نگه‌داشتن‌های محلی (quarantine heal): اکانتی که قطعِ اتصالش تأیید نشده بوده موقتاً در همین پروسه قفل می‌شود؛ جاروی نگهدار دوباره بررسی می‌کند و قفل را برمی‌دارد. این فاصله (ثانیه) مبنای تلاشِ مجدد در manager و مهلت تأخیرِ executor است. حادثة ۱۴۰۵-۰۷-۱۱: طوفانِ تایم‌اوت ۲۲ از ۴۲ اکانتِ سالم را تا پایانِ پروسه میخکوب کرد و بیلدِ جدید ۰/۲۲ شد.
++    VOICE_QUARANTINE_HEAL_SECONDS = int(os.getenv('VOICE_QUARANTINE_HEAL_SECONDS', '180'))
++    VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP = int(os.getenv('VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP', '6'))
++    # سقف صبر برای آزادشدن استخر وقتی هنوز حتی یک اکانت زنده نداریم (هر راند = VOICE_STARVED_WAIT_SECONDS ثانیه).
++    VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE', '45'))
+     VOICE_RAM_SOFT_LIMIT_MB = int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0'))
+     # 'auto' tests one canary per chat; other accounts use media until a
+     # participant-list AND native-binding observation proves its dwell time.
+@@ -150,11 +186,14 @@ class Config:
      # voice handshake. The Join Brain may still widen this (up to the max).
      VOICE_JOIN_INITIAL_CONCURRENCY = int(os.getenv('VOICE_JOIN_INITIAL_CONCURRENCY', '1'))   # first wave size (start at 1; the brain widens on clean waves)
      VOICE_JOIN_MIN_CONCURRENCY = int(os.getenv('VOICE_JOIN_MIN_CONCURRENCY', '1'))          # floor when Telegram is stressed
@@ -261,7 +304,7 @@ index a95d3c1..1b1e23e 100644
      # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
      # Accounts of one wave do NOT fire their joins in the same millisecond:
      # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
-@@ -215,6 +249,48 @@ class Config:
+@@ -215,6 +254,48 @@ class Config:
      # Telegram still answers with FloodWait (server-directed waits are always
      # respected first — this only paces NEW waves).
      VOICE_JOIN_FLOOD_PAUSE_SECONDS = int(os.getenv('VOICE_JOIN_FLOOD_PAUSE_SECONDS', '15'))
@@ -310,7 +353,7 @@ index a95d3c1..1b1e23e 100644
      # Driver-level attempt budget per account (start_call itself already does
      # bounded retries + respects FloodWait internally).
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
-@@ -323,6 +399,11 @@ class Config:
+@@ -323,6 +404,11 @@ class Config:
      ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
      # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
      ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
@@ -322,7 +365,7 @@ index a95d3c1..1b1e23e 100644
      # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
      ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
      ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
-@@ -362,6 +443,18 @@ class Config:
+@@ -362,6 +448,18 @@ class Config:
      # Hard deadline per adaptive wave: stragglers are cancelled and deferred
      # to the next wave so one slow/stuck account never freezes the build.
      VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
@@ -418,10 +461,10 @@ index d95edf9..4103ec5 100644
        - redis_data:/data
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..3df06b8
+index 0000000..ffd18a6
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,295 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -534,8 +577,8 @@ index 0000000..3df06b8
 +  گاردها را خودش انجام می‌دهد).
 +- بعد از apply باید ۱۷ فایل ` M` و ۲۲ فایل `??` تازه ببینید (۳۹ مسیر، پورت + فیکس‌ها).
 +- تأیید سریع داخل کانتینر (بعد از بالا آمدن):
-+  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow`
-+  باید ۴۸ تست OK بدهد.
++  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow tests.test_report_dedupe tests.test_quarantine_heal`
++  باید ۸۴ تست OK بدهد.
 +- `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
 +  تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
 +  `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
@@ -582,7 +625,7 @@ index 0000000..3df06b8
 +
 +## ۸) آزمون‌ها
 +
-+سوئیت کامل: **۶۶۱ تست، ۶۵۵ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ + ۱۴ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
++سوئیت کامل: **۶۸۳ تست، ۶۷۷ موفق، ۶ skip** (۱۸ + ۱۰ + ۳۱ + ۱۴ + ۲۲ تست تازه؛ با TZ=UTC و TZ=Asia/Tehran). این‌ها آفلاین‌اند
 +و رفتار زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین، باز/بسته‌شدن
 +کال) را اثبات نمی‌کنند؛ تأیید نهایی همان لاگ پروداکشن است. تست‌های بخش ۹ در
 +`tests/test_chat_closed_ask_flow.py` هستند.
@@ -666,6 +709,57 @@ index 0000000..3df06b8
 +```
 +Order 933 (Bot 1): past its deadline for 42s but its session is still finishing (cleanup/paced leaves) - the executor owns the report.
 +```
++
++## ۱۱) قفلِ محلی اکانت‌ها خودبه‌خود باز می‌شود؛ بیلد ۰/N دیگر تحویل نمی‌شود (۱۴۰۵/۰۷/۱۱)
++
++**علامت (لاگ سرور، ۰۰:۲۷):** طوفان `Retrying "channels.GetMessages" due to: Request timed out` روی
++همه اکانت‌ها، `[VoiceMemory] ... 'quarantined': 22`، موج‌هایی که در ۰-۲ ثانیه با `fail`
++تمام می‌شدند، `[VoiceState] ... invalid transition FAILED -> STARTING` و `all 42 remaining pool
++account(s) are held by other live order(s)` — یعنی اکانت‌ها اصلاً وارد ویس‌کال نشدند.
++
++**علت:** هر «قطع‌اتصالِ تأییدنشده» (تایم‌اوتِ `pytg.start()` یا disconnect وسط قطعی تلگرام)
++اکانت را در `_quarantined_accounts` قفل می‌کند تا اتصال دومی روی همان auth-key باز نشود —
++قفل درست است، ولی **هیچ‌کس دوباره بررسیش نمی‌کرد**؛ عمراً تا پایان پروسه می‌ماند. executor هم
++با `SESSION_IN_USE` همان اسلات را برای سفارش terminal می‌کرد. ۲۲ قفل = استخر عملاً نصف؛
++سفارش تازه (۹۴۱) بعد از ۶×۲۰ ثانیه انتظار، ۰/۲۲ تحویل شد.
++
++**فیکس‌ها:**
++
++1. `heal_quarantine_holds()` در همان جارویِ نگهدار (`_idle_reaper_loop`): برای اکانت‌های
++   قفل‌شده‌ای که هیچ سفارش زنده‌ای لازمشان ندارد، teardown دوباره تلاش می‌شود و فقط اگر
++   قطع‌شدن **تأیید** شد، قفل برداشته می‌شود (همان invariant که قفل ازش محافظت می‌کرد).
++   حداکثر `VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP` (پیش‌فرض ۶) در هر جارو و backoff
++   `VOICE_QUARANTINE_HEAL_SECONDS×۳` برای قفل‌هایی که هنوز تأیید نمی‌شوند.
++2. برچسب دلیل در پیام: `SESSION_IN_USE[uncertain]: …`. دلیل `uncertain` = قفلِ محلیِ
++   قابل‌بازگشت → بودجه attempt حفظ می‌شود، اکانت terminal **نمی‌شود**، موج با تأخیرِ پنجرهٔ
++   heal ادامه می‌کند (`OUTCOME_SYSTEM`). دلایل ماندگار (`quarantined` دیتابیسی، `stale`،
++   `replaced`) مثل قبل رفتار می‌کنند.
++3. انتخاب کاندیدا (موج و second-chance) اکانتِ قفل‌شده را فعلاً برنمی‌دارد؛ به‌جای موجِ
++   فیل‌های صُفرثانیه‌ای، یک بار به اندازه پنجره heal صبر می‌کند.
++4. `VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE` (پیش‌فرض ۴۵ راند ×۲۰ ثانیه ≈ ۱۵ دقیقه): بیلدی که
++   هنوز **هیچ** اکانت زنده ندارد، به‌جای ۶ راند، برای آزادشدن استخر صبر می‌کند — چون زمان
++   پولی بعد از بیلد شروع می‌شود، صبر کردن رایگان است و تحویلِ صفر بدترین نتیجه.
++5. `FAILED -> STARTING` حالا ترنزیشن قانونی است (دورِ second-chance عمداً اکانت fail شده را
++   دوباره مسلح می‌کند؛ آن warning فقط نویز لاگ بود).
++
++در لاگ، بازگشت اکانت‌ها این‌طور دیده می‌شود:
++
++```
++[VoiceQuarantine] acc=137: stale transport confirmed gone - quarantine lifted, the account is joinable again
++[VoiceQuarantine] acc=144: transport still unconfirmed - hold kept, next probe in 540s
++Order 940: account 144 local session hold (previous disconnect unconfirmed) - retry deferred 180s for the quarantine heal, budget kept
++```
++
++**تست:** ۲۲ تست تازه در `tests/test_quarantine_heal.py` (برداشتن قفل با تأیید teardown،
++backoff، عدم دست‌زدن به اکانت درگیرِ سفارش زنده، سقف هر جارو، تأخیر زمان‌بندی موج،
++abstain/صبر second-chance، تگِ دلیل در start_call، کلاسیفیکاسیون uncertain و گاردهای سیم‌کشی).
++
++⚠️ **هشدار عملیاتی (همان حادثه، از جنس جدا):** در ترمینال سرور، `git pull origin arena/01a0f958-tgcallbot --rebase`
++اجرا شده — این برنچ مربوط به **یک نشست کاری دیگر** (دوره v2.3.1، حذف Capacity Guard) است و
++rebase روی آن، درخت `/opt/tgcallbot` را وسطِ کنفلکت رها می‌کند و بیلد ایمیج را از کدِ
++دارای marker خراب می‌سازد. مسیر مجاز فقط همان شش دستور بخش ۶ است (fetch همان برنچِ خودمان +
++`git apply` پورت کامل؛ بدون pull/rebase). اگر `git status` روی سرور کثیف بود:
++`git rebase --abort; git checkout -- .; git clean -fd -- services tests docs` و بعد مراحل عادی.
 diff --git a/handlers/admin_handlers.py b/handlers/admin_handlers.py
 index 85eca61..789e2d8 100644
 --- a/handlers/admin_handlers.py
@@ -2158,10 +2252,10 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..9cd4701 100644
+index 0e19892..c1512e5 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -12,15 +12,51 @@ from database import DatabaseManager
+@@ -12,15 +12,68 @@ from database import DatabaseManager
  from telegram_client import TelegramAccountClient
  from utils.helpers import format_jalali_datetime
  from config import Config
@@ -2200,6 +2294,23 @@ index 0e19892..9cd4701 100644
 +                        "parse entities", "parse_mode", "entity", "imbalanced")
 +
 +
++def _is_local_session_hold(msg: str) -> bool:
++    """True when a SESSION_IN_USE failure is only a LOCAL, healable hold.
++
++    ``voice_call_manager`` tags the reason into the failure text
++    (``SESSION_IN_USE[uncertain]: ...``). 'uncertain' means a previous
++    disconnect or engine stop could not be CONFIRMED - the typical fallout
++    of a Telegram timeout storm - while the account itself is healthy and
++    the quarantine heal sweep releases it shortly. Marking such an account
++    terminal for the order (the old behaviour) is what turned the
++    2026-10-02 blip into 22 dead slots and a build that ended 0/22 live.
++    Message shapes without a ``[reason]`` tag stay conservative: terminal,
++    exactly as before.
++    """
++    text = (msg or "").upper()
++    return "SESSION_IN_USE" in text and "[UNCERTAIN]" in text
++
++
 +def _is_parse_error(exc) -> bool:
 +	"""True only for a Telegram formatting failure (BadRequest about entities)."""
 +	try:
@@ -2214,7 +2325,7 @@ index 0e19892..9cd4701 100644
  
  def _format_timer(seconds: float) -> str:
  	"""تبدیل ثانیه به فرمت HH:MM:SS برای نمایش تایمر دقیق"""
-@@ -41,6 +77,48 @@ def _get_voice_call_manager():
+@@ -41,6 +94,48 @@ def _get_voice_call_manager():
  		return None
  
  
@@ -2263,7 +2374,7 @@ index 0e19892..9cd4701 100644
  class OrderExecutor:
  	"""
  	Core executor for Telegram orders (voice chat, group join, etc.).
-@@ -71,6 +149,37 @@ class OrderExecutor:
+@@ -71,6 +166,37 @@ class OrderExecutor:
  		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
  		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
  		self._suppress_cancel_log: Set[int] = set()
@@ -2301,7 +2412,7 @@ index 0e19892..9cd4701 100644
  
  	def _consume_cancel_log_suppression(self, order_id: int) -> bool:
  		"""اگر گزارش لغو این سفارش سرکوب شده باشد True برمی‌گرداند و flag را مصرف می‌کند."""
-@@ -192,8 +301,23 @@ class OrderExecutor:
+@@ -192,8 +318,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -2327,7 +2438,7 @@ index 0e19892..9cd4701 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -325,6 +449,13 @@ class OrderExecutor:
+@@ -325,6 +466,13 @@ class OrderExecutor:
  	                self.active_orders[order_id]["end_time"] = end_time
  	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
  
@@ -2341,7 +2452,7 @@ index 0e19892..9cd4701 100644
  	            _tick = 0
  	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
  	            _log_interval = 10
-@@ -355,6 +486,7 @@ class OrderExecutor:
+@@ -355,6 +503,7 @@ class OrderExecutor:
  	                    logger.info(
  	                        f"Order {order_id}: {_format_timer(remaining_now)} "
  	                        f"| live={live}/{exact}"
@@ -2349,7 +2460,7 @@ index 0e19892..9cd4701 100644
  	                    )
  
  	                if _tick % _check_interval == 0 and _tick > 0:
-@@ -397,6 +529,7 @@ class OrderExecutor:
+@@ -397,6 +546,7 @@ class OrderExecutor:
  	                    if order_id in self.active_orders:
  	                        self.active_orders[order_id]["live_count"] = live
  	                        self.active_orders[order_id]["joined_accounts"] = joined_list
@@ -2357,7 +2468,7 @@ index 0e19892..9cd4701 100644
  	                    # Durable live count is not continuous media presence.
  	                    # Surface the native binding signal separately (it too
  	                    # cannot guarantee end-to-end WebRTC packet delivery).
-@@ -405,6 +538,65 @@ class OrderExecutor:
+@@ -405,6 +555,65 @@ class OrderExecutor:
  	                        _vcm = _get_voice_call_manager()
  	                        if _vcm and hasattr(_vcm, "get_binding_status_counts"):
  	                            _binding = _vcm.get_binding_status_counts(order_id)
@@ -2423,7 +2534,7 @@ index 0e19892..9cd4701 100644
  	                    logger.info(
  	                        "Order %s: durable_live=%s/%s | native_binding=%s "
  	                        "(not proof of UDP packet delivery)",
-@@ -523,9 +715,26 @@ class OrderExecutor:
+@@ -523,9 +732,26 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -2451,7 +2562,7 @@ index 0e19892..9cd4701 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +746,7 @@ class OrderExecutor:
+@@ -537,12 +763,24 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -2460,7 +2571,24 @@ index 0e19892..9cd4701 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -564,13 +773,30 @@ class OrderExecutor:
+ 	        if retry_after.get(aid, 0) > now:
+ 	            continue
++	        # Skip accounts parked on a LOCAL auth-key hold: selecting one
++	        # would only produce an instant SESSION_IN_USE fail. The heal
++	        # sweep re-admits them once the stale transport is proven gone.
++	        if vcm is not None:
++	            try:
++	                _held = vcm.is_locally_quarantined(aid)
++	            except Exception as _probe_exc:
++	                logger.debug("Order %s: candidate quarantine probe failed "
++	                             "for %s: %r", order_id, aid, _probe_exc)
++	                _held = False
++	            if _held:
++	                continue
+ 	        # Persisted server-directed FloodWait (may survive wave
+ 	        # cancellation and restarts): never re-issue early.
+ 	        if vcm is not None and vcm.flood_wait_remaining(aid) > 0:
+@@ -564,13 +802,30 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -2493,7 +2621,26 @@ index 0e19892..9cd4701 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -594,6 +820,27 @@ class OrderExecutor:
+@@ -581,6 +836,18 @@ class OrderExecutor:
+ 	            flood_when = now + vcm.flood_wait_remaining(aid)
+ 	            if flood_when > when:
+ 	                when = flood_when
++	            # A LOCAL quarantine hold turns an instant attempt into an
++	            # instant SESSION_IN_USE fail that burns a wave slot; schedule
++	            # the account around the heal sweep instead.
++	            try:
++	                if vcm.is_locally_quarantined(aid):
++	                    heal_when = now + max(30.0, float(getattr(
++	                        Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
++	                    if heal_when > when:
++	                        when = heal_when
++	            except Exception as _probe_exc:
++	                logger.debug("Order %s: quarantine probe failed for %s: %r",
++	                             order_id, aid, _probe_exc)
+ 	        # 🛡 استراحت ضد اسپم هم در زمان‌بندی موج لحاظ می‌شود تا موتور موج
+ 	        # به‌جای «پول تمام شد»، تا اتمام نزدیک‌ترین استراحت صبر کند.
+ 	        try:
+@@ -594,6 +861,27 @@ class OrderExecutor:
  	        best = when if best is None else min(best, when)
  	    return best
  
@@ -2521,7 +2668,49 @@ index 0e19892..9cd4701 100644
  	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
  	                                    joined_ids: Set[int]) -> bool:
  	    """Give transiently exhausted accounts ONE new attempt per bounded round.
-@@ -671,30 +918,32 @@ class OrderExecutor:
+@@ -621,7 +909,40 @@ class OrderExecutor:
+ 	    if not self._is_order_active(order_id):
+ 	        return False
+ 	    await self._voice_load_pool(bot_id, order_id)
+-	    retry_ids = eligible()
++
++	    def _on_local_hold(ids) -> set:
++	        _vcm = _get_voice_call_manager()
++	        if _vcm is None:
++	            return set()
++	        held = set()
++	        for _id in ids:
++	            try:
++	                if _vcm.is_locally_quarantined(_id):
++	                    held.add(_id)
++	            except Exception as _probe_exc:
++	                logger.debug("second-chance quarantine probe failed for %s: %r",
++	                    _id, _probe_exc)
++	        return held
++
++	    retry_ids = [i for i in eligible() if i not in _on_local_hold(eligible())]
++	    if not retry_ids and eligible():
++	        # Everything worth retrying sits on a LOCAL session hold;
++	        # starting them now fails in milliseconds. Spend this round
++	        # on ONE wait for the heal sweep instead of a wave of
++	        # instant SESSION_IN_USE fails.
++	        gap = max(30.0, float(getattr(
++	            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
++	        logger.info(
++	            "[VoiceFill] order=%s: %s second-chance candidate(s) sit on a "
++	            "local session hold - waiting %.0fs for the quarantine heal",
++	            order_id, len(eligible()), gap)
++	        try:
++	            await asyncio.sleep(gap)
++	        except asyncio.CancelledError:
++	            return False
++	        if not self._is_order_active(order_id):
++	            return False
++	        retry_ids = [i for i in eligible() if i not in _on_local_hold(eligible())]
+ 	    if not retry_ids:
+ 	        return False
+ 	    budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+@@ -671,30 +992,32 @@ class OrderExecutor:
  	        _as_profile = await anti_spam.get_profile(bot_id)
  	    except Exception:
  	        _as_profile = None
@@ -2573,7 +2762,7 @@ index 0e19892..9cd4701 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -702,6 +951,9 @@ class OrderExecutor:
+@@ -702,6 +1025,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -2583,7 +2772,7 @@ index 0e19892..9cd4701 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -748,12 +1000,55 @@ class OrderExecutor:
+@@ -748,12 +1074,64 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -2603,6 +2792,15 @@ index 0e19892..9cd4701 100644
 +	                    if (a.get("id") or 0) not in joined_ids
 +	                ])
 +	                max_rounds = max(0, int(getattr(Config, "VOICE_STARVED_WAIT_ROUNDS", 6)))
++	                # A build must NEVER end at 0/N because of pool contention
++	                # while other orders are live: delivering nothing is strictly
++	                # worse than waiting (billing starts only AFTER the build, so
++	                # the wait itself is free). Orders that already have at least
++	                # one live account keep the short ceiling and deliver
++	                # best-effort.
++	                if live == 0:
++	                    max_rounds = max(max_rounds, int(getattr(
++	                        Config, "VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE", 45)))
 +	                starve_gap = max(5.0, float(getattr(Config, "VOICE_STARVED_WAIT_SECONDS", 20)))
 +	                if busy_now and pool_left > 0 and starved_rounds < max_rounds:
 +	                    starved_rounds += 1
@@ -2639,7 +2837,7 @@ index 0e19892..9cd4701 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -784,6 +1079,16 @@ class OrderExecutor:
+@@ -784,6 +1162,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -2656,7 +2854,7 @@ index 0e19892..9cd4701 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -829,6 +1134,15 @@ class OrderExecutor:
+@@ -829,6 +1217,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -2672,7 +2870,7 @@ index 0e19892..9cd4701 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -872,6 +1186,7 @@ class OrderExecutor:
+@@ -872,6 +1269,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -2680,7 +2878,7 @@ index 0e19892..9cd4701 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -882,6 +1197,7 @@ class OrderExecutor:
+@@ -882,6 +1280,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -2688,7 +2886,7 @@ index 0e19892..9cd4701 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -903,6 +1219,7 @@ class OrderExecutor:
+@@ -903,6 +1302,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -2696,7 +2894,32 @@ index 0e19892..9cd4701 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -921,6 +1238,7 @@ class OrderExecutor:
+@@ -916,11 +1316,31 @@ class OrderExecutor:
+ 	                        continue
+ 
+ 	                if "SESSION_IN_USE" in msg.upper():
+-	                    # A local owner is serving this key; do not turn the
++	                    if _is_local_session_hold(msg):
++	                        # LOCAL auth-key hold only: the account is healthy
++	                        # and the heal sweep may release it within minutes.
++	                        # Keep the attempt budget, never terminalise the
++	                        # slot - defer past the next heal window instead.
++	                        hold = max(30.0, float(getattr(
++	                            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)))
++	                        self._voice_retry_after.setdefault(order_id, {})[aid] = \
++	                            time.time() + hold
++	                        logger.warning(
++	                            f"Order {order_id}: account {aid} local session hold "
++	                            f"(previous disconnect unconfirmed) - retry deferred "
++	                            f"{hold:.0f}s for the quarantine heal, budget kept"
++	                        )
++	                        join_brain.report_result(order_id, OUTCOME_SYSTEM, msg)
++	                        wave_fail += 1
++	                        wave_system += 1
++	                        continue
++	                    # A local owner is serving this key (or the DB row is
++	                    # quarantined for a typed 406); do not turn the
+ 	                    # second-chance loop into repeated connection probes.
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -2704,7 +2927,7 @@ index 0e19892..9cd4701 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -942,8 +1260,49 @@ class OrderExecutor:
+@@ -942,8 +1362,49 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -2754,7 +2977,7 @@ index 0e19892..9cd4701 100644
  	                attempts = self._voice_attempts.setdefault(order_id, {})
  	                n_att = attempts.get(aid, 0) + 1
  	                attempts[aid] = n_att
-@@ -993,11 +1352,16 @@ class OrderExecutor:
+@@ -993,11 +1454,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -2773,7 +2996,7 @@ index 0e19892..9cd4701 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1031,6 +1395,44 @@ class OrderExecutor:
+@@ -1031,6 +1497,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
@@ -2818,7 +3041,19 @@ index 0e19892..9cd4701 100644
  	    # Return only the accounts this call newly joined; the CALLER owns
  	    # merging them into the order's running joined_accounts list (the
  	    # VoiceCallManager remains the authoritative source for counting).
-@@ -1477,6 +1879,24 @@ class OrderExecutor:
+@@ -1437,7 +1941,10 @@ class OrderExecutor:
+ 		except SessionInUseError as e:
+ 			# Same session is held by the voice engine — opening a duplicate
+ 			# connection would revoke the auth key. Skip (never mark dead).
+-			return {"success": False, "status": "failed", "msg": f"SESSION_IN_USE: {e}"}
++			# The [reason] tag lets the wave classifier tell a healable
++			# local hold apart from a durable one.
++			return {"success": False, "status": "failed",
++					"msg": f"SESSION_IN_USE[{getattr(e, 'reason', 'voice') or 'voice'}]: {e}"}
+ 		except Exception as e:
+ 			return {"success": False, "status": "error", "msg": str(e)}
+ 
+@@ -1477,6 +1984,24 @@ class OrderExecutor:
  			pass
  		self.active_orders.pop(order_id, None)
  
@@ -2843,7 +3078,7 @@ index 0e19892..9cd4701 100644
  	async def _cleanup_order(self, order_id, joined_accounts, data):
  		# Release Join Brain scratch state (idempotent).
  		self._voice_forget_order(order_id)
-@@ -1493,6 +1913,15 @@ class OrderExecutor:
+@@ -1493,6 +2018,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
@@ -2859,7 +3094,7 @@ index 0e19892..9cd4701 100644
  		else:
  			try:
  				await self._eject_all_fast(order_id, joined_accounts, data)
-@@ -1516,6 +1945,9 @@ class OrderExecutor:
+@@ -1516,6 +2050,9 @@ class OrderExecutor:
  
  	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
  	                            suppress_cancel_log: bool = False):
@@ -2869,7 +3104,7 @@ index 0e19892..9cd4701 100644
  		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
  		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
  		if suppress_cancel_log:
-@@ -1706,7 +2138,7 @@ class OrderExecutor:
+@@ -1706,7 +2243,7 @@ class OrderExecutor:
  		return name, user.get("telegram_id", "---")
  
  	@staticmethod
@@ -2878,7 +3113,7 @@ index 0e19892..9cd4701 100644
  		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
  
  		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
-@@ -1714,6 +2146,9 @@ class OrderExecutor:
+@@ -1714,6 +2251,9 @@ class OrderExecutor:
  		- scheduled → هنوز مصرفی نشده: عودت کامل.
  		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
  		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
@@ -2888,7 +3123,7 @@ index 0e19892..9cd4701 100644
  		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
  		"""
  		order = order or {}
-@@ -1732,10 +2167,12 @@ class OrderExecutor:
+@@ -1732,10 +2272,12 @@ class OrderExecutor:
  				used = 0.0
  			return used, max(0.0, total_price - used), 0.0
  		# Never bill the build phase: created_at is NOT a service start.
@@ -2903,7 +3138,7 @@ index 0e19892..9cd4701 100644
  		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
  
  		خروجی: (used_cost, refund_amount, elapsed_seconds)
-@@ -1752,7 +2189,27 @@ class OrderExecutor:
+@@ -1752,7 +2294,27 @@ class OrderExecutor:
  		duration_minutes = int(duration_minutes or 0)
  		if duration_minutes <= 0 or not started_at:
  			return 0.0, total_price, 0.0
@@ -2932,7 +3167,7 @@ index 0e19892..9cd4701 100644
  		total_seconds = duration_minutes * 60
  		if elapsed_seconds >= total_seconds:
  			used = total_price
-@@ -1762,10 +2219,153 @@ class OrderExecutor:
+@@ -1762,10 +2324,153 @@ class OrderExecutor:
  		refund = max(0.0, total_price - used)
  		return used, refund, elapsed_seconds
  
@@ -3087,7 +3322,7 @@ index 0e19892..9cd4701 100644
  	):
  		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
  
-@@ -1778,9 +2378,15 @@ class OrderExecutor:
+@@ -1778,9 +2483,15 @@ class OrderExecutor:
  		# Row-locked, atomic claim + settlement: a second callback must not
  		# credit the wallet twice or refund a completed/cancelled order. Price
  		# depends on elapsed time and the FULL plan, never the joined-account ratio.
@@ -3104,7 +3339,7 @@ index 0e19892..9cd4701 100644
  			expected_user_id=expected_user_id,
  		)
  		if settled is None:
-@@ -2003,6 +2609,40 @@ class OrderExecutor:
+@@ -2003,6 +2714,40 @@ class OrderExecutor:
  			lines += [f"📝 دلیل: {reason}"]
  		return "\n".join(lines)
  
@@ -3145,7 +3380,7 @@ index 0e19892..9cd4701 100644
  	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
  		from services.bot_manager import bot_manager
  		app = bot_manager.active_bots.get(bot_id)
-@@ -2011,6 +2651,12 @@ class OrderExecutor:
+@@ -2011,6 +2756,12 @@ class OrderExecutor:
  		channel_id = await DatabaseManager.get_setting("log_channel_orders", bot_id=bot_id)
  		if not channel_id:
  			return
@@ -3158,7 +3393,7 @@ index 0e19892..9cd4701 100644
  		try:
  			order_rec = await DatabaseManager.get_order(order_id) or {}
  			if not user and order_rec:
-@@ -2024,9 +2670,16 @@ class OrderExecutor:
+@@ -2024,9 +2775,16 @@ class OrderExecutor:
  			# fall back to a plain-text send (logging must never be lost).
  			try:
  				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
@@ -3190,7 +3425,7 @@ index 490a5b0..05bee81 100644
                        "call not found")),
      ("forbidden", ("forbidden", "403", "not enough rights")),
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 263629f..c219dc1 100644
+index 263629f..21d9945 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
 @@ -75,7 +75,6 @@ from services.session_client import close_pyrogram_client
@@ -3201,7 +3436,21 @@ index 263629f..c219dc1 100644
      SUSPECTED_DISCONNECT,
      CONFIRMED_ABSENT,
      RECOVERING,
-@@ -584,8 +583,18 @@ def _classify_error(err: Exception, message: str = "") -> str:
+@@ -454,8 +453,11 @@ _VALID_TRANSITIONS = {
+     RECONNECTING: {REJOINING, TEMPORARILY_UNKNOWN, FAILED},
+     REJOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED},
+     RATE_LIMITED: {RETRY_PENDING, FAILED, LEAVING},
+-    RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING},
+-    FAILED: {LEAVING, COMPLETED},
++    RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING, STARTING},
++    # A VoiceFill "second chance" round deliberately RE-ARMS a failed
++    # account, so FAILED -> STARTING is legal (it used to log
++    # "invalid transition" noise on every retry, e.g. order 940 acc 144).
++    FAILED: {LEAVING, COMPLETED, STARTING},
+     LEAVING: {COMPLETED},
+     COMPLETED: set(),
+ }
+@@ -584,8 +586,18 @@ def _classify_error(err: Exception, message: str = "") -> str:
          return FAILURE_NETWORK
      s = (message or str(err)).lower()
      # Ordered: most specific first.
@@ -3222,7 +3471,21 @@ index 263629f..c219dc1 100644
          return FAILURE_RATE_LIMITED
      if isinstance(err, (AuthKeyInvalid, AuthKeyUnregistered, SessionRevoked)) or \
         is_fatal_auth_error(err) or is_fatal_auth_error(message) or \
-@@ -704,6 +713,20 @@ class VoiceCallManager:
+@@ -687,6 +699,13 @@ class VoiceCallManager:
+         # A disconnect that could not be confirmed is NOT permission to
+         # reconnect. Keep its hold until shutdown (never burn the same key).
+         self._quarantined_accounts: Set[int] = set()
++        # A quarantine is a LOCAL, recoverable hold: "the previous transport
++        # might still be open, so no second connection on this auth key" -
++        # not a verdict on the account. The maintenance sweep re-probes the
++        # holds (heal_quarantine_holds) instead of keeping healthy accounts
++        # dead until process exit. Incident 2026-10-02: a DC timeout storm
++        # parked 22 of 42 accounts here and starved every later build.
++        self._quarantine_heal_last: Dict[int, float] = {}
+         self._shutting_down = False
+         self._client_locks: Dict[int, asyncio.Lock] = {}
+         self._reservation_lock = asyncio.Lock()
+@@ -704,6 +723,20 @@ class VoiceCallManager:
          self._listener_drops = 0
          self._listener_globally_disabled = False
  
@@ -3243,7 +3506,7 @@ index 263629f..c219dc1 100644
          # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
          # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
          # This is the AUTHORITATIVE count for an order. It is NEVER decremented
-@@ -1329,6 +1352,36 @@ class VoiceCallManager:
+@@ -1329,6 +1362,36 @@ class VoiceCallManager:
                  reserved.update(account_ids)
          return reserved
  
@@ -3280,7 +3543,7 @@ index 263629f..c219dc1 100644
      def get_cached_session_account_ids(self) -> Set[int]:
          return set(self._session_cache.keys())
  
-@@ -1364,6 +1417,9 @@ class VoiceCallManager:
+@@ -1364,6 +1427,9 @@ class VoiceCallManager:
  
          Returns True if newly registered, False if already registered.
          """
@@ -3290,7 +3553,7 @@ index 263629f..c219dc1 100644
          if order_id not in self.joined_accounts_by_order:
              self.joined_accounts_by_order[order_id] = {}
          inner = self.joined_accounts_by_order[order_id]
-@@ -2059,19 +2115,79 @@ class VoiceCallManager:
+@@ -2059,19 +2125,79 @@ class VoiceCallManager:
                      # start() can time out AFTER native WebRTC initialized.
                      # Retain the original engine before awaiting it. A retry
                      # must never construct a second engine on a transport that
@@ -3378,7 +3641,100 @@ index 263629f..c219dc1 100644
      async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
          # IMPORTANT: use the SAME per-account lock as the warmup/create path.
          # Previously we popped the client (and even removed its lock) BEFORE
-@@ -2221,6 +2337,14 @@ class VoiceCallManager:
+@@ -2154,6 +2280,77 @@ class VoiceCallManager:
+             self._client_last_used.pop(account_id, None)
+             return True
+ 
++    def is_locally_quarantined(self, account_id: int) -> bool:
++        """True while a LOCAL auth-key hold blocks new connections for the account.
++
++        The DB row is still healthy - only THIS process refuses to open a
++        second connection on a transport whose teardown was never confirmed.
++        The executor uses this to DEFER such an account until the heal sweep
++        releases it, instead of burning a wave slot on a guaranteed instant
++        fail (``SESSION_IN_USE`` in 0s).
++        """
++        return account_id in self._quarantined_accounts
++
++    async def heal_quarantine_holds(self) -> int:
++        """Re-probe quarantine holds and release the ones that are provably stale.
++
++        Why this exists (incident 2026-10-02, orders 940/941): a Telegram
++        timeout storm made dozens of engine ``start()`` calls and disconnects
++        unconfirmable, and every one of them parked the account in
++        ``_quarantined_accounts`` permanently - ``[VoiceMemory]`` showed
++        ``quarantined: 22`` of 42 accounts while a fresh order built 0/22
++        live. Nothing ever re-checked a hold, so a ten-minute DC blip cost
++        the whole night.
++
++        The hold itself stays correct - no second connection while the old
++        transport might be alive - but it must not outlive its reason:
++        ``_cleanup_client(force=True)`` re-issues the teardown and only
++        DROPS the quarantine when the disconnect is CONFIRMED, the exact
++        invariant the hold guards. Accounts any live order still needs are
++        never touched, and a failed probe backs off for
++        ``VOICE_QUARANTINE_HEAL_SECONDS * 3`` so a DC that is still down is
++        not hammered every sweep.
++        """
++        if not self._quarantined_accounts:
++            return 0
++        max_per_sweep = max(1, int(getattr(
++            Config, "VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP", 6)))
++        retry_gap = max(60.0, float(getattr(
++            Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180)) * 3.0)
++        now = time.time()
++        healed = 0
++        for aid in list(self._quarantined_accounts):
++            if healed >= max_per_sweep:
++                break
++            if now - self._quarantine_heal_last.get(aid, 0.0) < retry_gap:
++                continue
++            # A live reservation is exactly what the hold protects.
++            if (self._busy_accounts.get(aid)
++                    or self._account_in_any_order(aid)
++                    or aid in self.get_reserved_account_ids()
++                    or any(_k[0] == aid for _k in self._inflight_joins)):
++                continue
++            self._quarantine_heal_last[aid] = now
++            try:
++                await self._cleanup_client(aid, force=True)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:  # noqa: BLE001 - keep the hold, re-probe later
++                logger.warning(
++                    "[VoiceQuarantine] acc=%s heal probe failed: %r", aid, exc)
++                continue
++            if aid in self._quarantined_accounts:
++                logger.info(
++                    "[VoiceQuarantine] acc=%s: transport still unconfirmed - "
++                    "hold kept, next probe in %.0fs", aid, retry_gap)
++                continue
++            healed += 1
++            self._quarantine_heal_last.pop(aid, None)
++            logger.info(
++                "[VoiceQuarantine] acc=%s: stale transport confirmed gone - "
++                "quarantine lifted, the account is joinable again", aid)
++        return healed
++
+     async def reap_idle_clients(self, *, force: bool = False) -> int:
+         """Close unused MTProto clients after TTL (or immediately on pressure).
+ 
+@@ -2214,6 +2411,14 @@ class VoiceCallManager:
+                     closed = await self.reap_idle_clients(force=bool(soft and rss > soft))
+                     if closed:
+                         logger.info("[VoiceReaper] closed %s idle client(s)", closed)
++                    # Quarantine holds are recoverable - re-probe them on
++                    # every maintenance sweep (see heal_quarantine_holds).
++                    healed = await self.heal_quarantine_holds()
++                    if healed:
++                        logger.info(
++                            "[VoiceQuarantine] released %s stale hold(s); "
++                            "still held: %s", healed,
++                            len(self._quarantined_accounts))
+                     if soft and rss > soft:
+                         logger.warning("[VoiceMemory] RSS %s MB > soft %s MB; "
+                                        "only unreferenced clients can be reaped", rss, soft)
+@@ -2221,6 +2426,14 @@ class VoiceCallManager:
                      if now - self._last_memory_log >= log_interval:
                          self._last_memory_log = now
                          logger.info("[VoiceMemory] %s", self.memory_report())
@@ -3393,7 +3749,7 @@ index 263629f..c219dc1 100644
                  except asyncio.CancelledError:
                      raise
                  except Exception as exc:
-@@ -2249,6 +2373,134 @@ class VoiceCallManager:
+@@ -2249,6 +2462,134 @@ class VoiceCallManager:
                  return oid
          return None
  
@@ -3528,7 +3884,7 @@ index 263629f..c219dc1 100644
      def _attach_engine_handlers(self, pytg: PyTgCalls, account_id: int) -> None:
          """Register stream-end / kick handlers on a freshly built engine.
  
-@@ -2278,8 +2530,22 @@ class VoiceCallManager:
+@@ -2278,8 +2619,22 @@ class VoiceCallManager:
              @pytg.on_update(pytgcalls_filters.chat_update(ChatUpdate.Status.LEFT_CALL))
              async def _on_left_call(_engine, update):  # type: ignore[misc]
                  cid = int(getattr(update, "chat_id", 0) or 0)
@@ -3552,7 +3908,7 @@ index 263629f..c219dc1 100644
                  logger.warning(
                      "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                      order_id, account_id, cid, status,
-@@ -2292,8 +2558,10 @@ class VoiceCallManager:
+@@ -2292,8 +2647,10 @@ class VoiceCallManager:
                      order_id, account_id, cid, "chat_left_update",
                      reason=f"engine chat update: {status}",
                  )
@@ -3564,7 +3920,7 @@ index 263629f..c219dc1 100644
          except Exception as exc:
              logger.debug("engine handler attach skipped acc=%s: %s", account_id, exc)
  
-@@ -2454,6 +2722,12 @@ class VoiceCallManager:
+@@ -2454,6 +2811,12 @@ class VoiceCallManager:
          key = (order_id, account_id)
          if not self._media_restore_due(key):
              return
@@ -3577,7 +3933,7 @@ index 263629f..c219dc1 100644
          pytg = self.clients.get(account_id)
          if pytg is None:
              return
-@@ -2744,6 +3018,54 @@ class VoiceCallManager:
+@@ -2744,6 +3107,54 @@ class VoiceCallManager:
          """
          return True if media_binding is True else participant_presence
  
@@ -3632,7 +3988,7 @@ index 263629f..c219dc1 100644
      async def _is_media_call_active(self, pytg: Optional[PyTgCalls], chat_id: int) -> Optional[bool]:
          """Authoritative per-chat media transport liveness.
  
-@@ -3016,21 +3338,30 @@ class VoiceCallManager:
+@@ -3016,21 +3427,30 @@ class VoiceCallManager:
              return None
          return int(my_id) in present_ids
  
@@ -3667,7 +4023,7 @@ index 263629f..c219dc1 100644
          my_id = None
          try:
              me = getattr(app, "me", None)
-@@ -3047,9 +3378,10 @@ class VoiceCallManager:
+@@ -3047,9 +3467,10 @@ class VoiceCallManager:
              return None
  
          # Fast path: use the shared snapshot taken during the monitor cycle.
@@ -3681,7 +4037,7 @@ index 263629f..c219dc1 100644
  
          try:
              cached = self._active_call_cache.get(int(chat_id))
-@@ -3685,6 +4017,11 @@ class VoiceCallManager:
+@@ -3685,6 +4106,11 @@ class VoiceCallManager:
                          rec['media_binding_alive'] = media_alive
                          rec['media_binding_checked_at'] = time.time()
                          present = self._media_presence_verdict(present, media_alive)
@@ -3693,7 +4049,7 @@ index 263629f..c219dc1 100644
                          if media_alive is False:
                              if present is True:
                                  # ── GHOST-MEDIA-ONLY (presence intact) ──────────
-@@ -3831,6 +4168,13 @@ class VoiceCallManager:
+@@ -3831,6 +4257,13 @@ class VoiceCallManager:
                                            reason="presence absent %dx in a row" % int(fc),
                                            extra={"fail_cycle": int(fc)})
  
@@ -3707,7 +4063,7 @@ index 263629f..c219dc1 100644
                          rejoined = False
                          try:
                              rejoined = await self._recover_same_account(
-@@ -3906,9 +4250,17 @@ class VoiceCallManager:
+@@ -3906,9 +4339,17 @@ class VoiceCallManager:
          """
          Track which accounts this order has *selected* so far.
  
@@ -3728,7 +4084,22 @@ index 263629f..c219dc1 100644
          """
          async with self._reservation_lock:
              self._reservations[order_id] = set(account_ids)
-@@ -4092,8 +4444,13 @@ class VoiceCallManager:
+@@ -4084,7 +4525,13 @@ class VoiceCallManager:
+                 return False, f"SESSION_REVOKED: {e}", 0
+             except SessionInUseError as e:
+                 self._set_state(order_id, account_id, RETRY_PENDING, e.technical)
+-                return False, f"SESSION_IN_USE: {e}", 0
++                # Carry the machine-readable reason into the message: the
++                # executor must tell a LOCAL recoverable hold ('uncertain',
++                # released by the quarantine heal) apart from a durable one
++                # (DB 'quarantined' row, 'stale', 'replaced', ...) before it
++                # decides defer-vs-terminal.
++                _reason = getattr(e, "reason", "voice") or "voice"
++                return False, f"SESSION_IN_USE[{_reason}]: {e}", 0
+             except FloodWait as e:
+                 wait_s = int(getattr(e, "value", 3) or 3)
+                 voice_cooldown.record(account_id, wait_s,
+@@ -4092,8 +4539,13 @@ class VoiceCallManager:
                  self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                  return False, f"FloodWait:{wait_s}", 0
              except Exception as e:
@@ -3744,7 +4115,7 @@ index 263629f..c219dc1 100644
  
              if not pytg:
                  self._set_state(order_id, account_id, FAILED, "client init failed")
-@@ -4407,6 +4764,21 @@ class VoiceCallManager:
+@@ -4407,6 +4859,21 @@ class VoiceCallManager:
              key_set.add((order_id, aid))
          keys = list(key_set)
  
@@ -6531,6 +6902,394 @@ index 0000000..0b97f40
 +        self.assertIs(got, True,
 +                      "the direct answer must come from Telegram, not the snapshot")
 +        self.assertGreaterEqual(app.invokes, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_quarantine_heal.py b/tests/test_quarantine_heal.py
+new file mode 100644
+index 0000000..a4e46a6
+--- /dev/null
++++ b/tests/test_quarantine_heal.py
+@@ -0,0 +1,382 @@
++"""A LOCAL quarantine hold must heal itself, and must never terminalise a
++healthy account for the order.
++
++Incident (2026-10-02 00:27, orders 940/941 — the user's production log)::
++
++    [VoiceMemory] {'clients': 42, ..., 'quarantined': 22, ...}
++    Order 941: wave 10 ... (window=4, live=0/22)
++    Order 941: wave 10 done (ok=0 fail=1 in 2s)
++    Order 940: all 24 remaining pool account(s) are held by other live
++               order(s) - waiting 20s for a release (3/6)
++    [VoiceState] Order 940 acc 144: invalid transition FAILED -> STARTING
++
++A Telegram DC timeout storm (``Request timed out`` on every account's
++transport) made engine ``start()`` calls and disconnects unconfirmable.
++Each unconfirmed teardown parked the account in
++``VoiceCallManager._quarantined_accounts`` — permanently, because nothing
++ever re-checked a hold.  Result: 22 of 42 perfectly healthy accounts were
++dead weight for the rest of the process, waves failed in 0-2 seconds with
++``SESSION_IN_USE``, and a fresh order built ``live=0/22`` — the customer's
++accounts "never even entered the call".
++
++The fix has three parts, all exercised here:
++
++  1. the maintenance sweep re-probes holds
++     (:meth:`VoiceCallManager.heal_quarantine_holds`) and lifts them once
++     the stale transport is proven gone — accounts under live work are
++     never touched, and a failed probe backs off instead of hammering a
++     DC that is still down;
++  2. the executor defers a held account (``SESSION_IN_USE[uncertain]``)
++     instead of marking it terminal, and candidate selection waits for the
++     heal window rather than picking it up for a guaranteed instant fail;
++  3. a build with ZERO live accounts waits much longer for pool releases
++     than the 6x20s best-effort ceiling (delivering nothing is strictly
++     worse than waiting — billing has not started during the build).
++"""
++
++import asyncio
++import inspect
++import os
++import sys
++import tempfile
++import time
++import unittest
++from types import SimpleNamespace
++from unittest import mock
++from unittest.mock import AsyncMock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="quarantine-heal-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++from services.voice_call_manager import (  # noqa: E402
++    VoiceCallManager, FAILED, RETRY_PENDING, STARTING, _VALID_TRANSITIONS,
++)
++from services import order_executor as oe_mod  # noqa: E402
++from services.order_executor import OrderExecutor, _is_local_session_hold  # noqa: E402
++from services.session_ownership import SessionInUseError  # noqa: E402
++from services.voice_cooldown import voice_cooldown  # noqa: E402
++
++
++def _fake_vcm(held, *, busy_other=()):
++    """A VoiceCallManager stand-in exposing only what the executor queries."""
++    return SimpleNamespace(
++        is_locally_quarantined=lambda aid: aid in held,
++        flood_wait_remaining=lambda aid: 0,
++        accounts_busy_in_other_orders=lambda oid: set(busy_other),
++    )
++
++
++class HealSweepTests(unittest.TestCase):
++    def setUp(self):
++        self.loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(self.loop)
++        self.mgr = VoiceCallManager()
++
++    def tearDown(self):
++        self.loop.close()
++
++    def test_heal_lifts_hold_when_teardown_is_confirmed(self):
++        """A confirmed teardown proves the transport gone -> hold released."""
++        self.mgr._quarantined_accounts = {7}
++        seen = []
++
++        async def fake_cleanup(aid, order_id=None, force=False):
++            seen.append((aid, force))
++            self.mgr._quarantined_accounts.discard(aid)
++
++        self.mgr._cleanup_client = fake_cleanup
++        healed = self.loop.run_until_complete(self.mgr.heal_quarantine_holds())
++        self.assertEqual(healed, 1)
++        self.assertEqual(seen, [(7, True)])
++        self.assertFalse(self.mgr._quarantined_accounts)
++        self.assertNotIn(7, self.mgr._quarantine_heal_last)
++
++    def test_failed_probe_backs_off_instead_of_hammering(self):
++        """While the transport is still unconfirmed, do not re-probe every
++        sweep — a DC that is still down must not be hammered."""
++        self.mgr._quarantined_accounts = {7}
++        probe = AsyncMock()  # never lifts the hold
++        self.mgr._cleanup_client = probe
++
++        self.assertEqual(
++            self.loop.run_until_complete(self.mgr.heal_quarantine_holds()), 0)
++        self.assertEqual(
++            self.loop.run_until_complete(self.mgr.heal_quarantine_holds()), 0)
++        self.assertEqual(probe.await_count, 1)  # backoff suppressed the retry
++
++        self.mgr._quarantine_heal_last[7] = time.time() - 10_000
++        self.assertEqual(
++            self.loop.run_until_complete(self.mgr.heal_quarantine_holds()), 0)
++        self.assertEqual(probe.await_count, 2)
++        self.assertIn(7, self.mgr._quarantined_accounts)
++
++    def test_heal_never_touches_accounts_with_live_work(self):
++        """The hold exists to protect live work: busy / joined / reserved /
++        in-flight accounts are skipped outright."""
++        self.mgr._quarantined_accounts = {11, 12, 13, 14}
++        self.mgr._busy_accounts[11] = 1
++        self.mgr.active_calls[(940, 12)] = {"chat_id": -1}
++        self.mgr._reservations[940] = {13}
++        self.mgr._inflight_joins[(14, -1001)] = object()
++        probe = AsyncMock()
++        self.mgr._cleanup_client = probe
++        self.assertEqual(
++            self.loop.run_until_complete(self.mgr.heal_quarantine_holds()), 0)
++        probe.assert_not_awaited()
++
++    def test_heal_is_bounded_per_sweep(self):
++        """A storm can quarantine dozens of accounts; one sweep must not turn
++        into 40 serial disconnect probes."""
++        self.mgr._quarantined_accounts = set(range(100, 110))
++
++        async def fake_cleanup(aid, order_id=None, force=False):
++            self.mgr._quarantined_accounts.discard(aid)
++
++        self.mgr._cleanup_client = fake_cleanup
++        healed = self.loop.run_until_complete(self.mgr.heal_quarantine_holds())
++        self.assertEqual(healed, max(1, int(getattr(
++            Config, "VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP", 6))))
++        self.assertTrue(self.mgr._quarantined_accounts)  # rest waits next sweep
++
++    def test_reaper_loop_wires_the_heal(self):
++        src = inspect.getsource(VoiceCallManager._idle_reaper_loop)
++        self.assertIn("heal_quarantine_holds()", src)
++
++    def test_accessor_reports_current_holds(self):
++        self.mgr._quarantined_accounts = {42}
++        self.assertTrue(self.mgr.is_locally_quarantined(42))
++        self.assertFalse(self.mgr.is_locally_quarantined(43))
++
++
++class StateMachineRearmTests(unittest.TestCase):
++    """A second-chance round RE-ARMS a failed account; the state machine must
++    say so instead of logging 'invalid transition FAILED -> STARTING'."""
++
++    def test_failed_may_restart(self):
++        self.assertIn(STARTING, _VALID_TRANSITIONS[FAILED])
++
++    def test_retry_pending_may_restart(self):
++        self.assertIn(STARTING, _VALID_TRANSITIONS[RETRY_PENDING])
++
++
++@unittest.skipUnless(
++    all(hasattr(VoiceCallManager, n) for n in ("start_call",)),
++    "manager incomplete")
++class HoldReasonTaggingTests(unittest.TestCase):
++    """``start_call`` must carry the machine-readable SessionInUseError
++    reason into the failure text — the executor's defer-vs-terminal decision
++    hinges on the ``[uncertain]`` tag."""
++
++    def setUp(self):
++        self.loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(self.loop)
++        self.mgr = VoiceCallManager()
++        voice_cooldown.clear(5501)
++
++    def tearDown(self):
++        voice_cooldown.clear(5501)
++        self.loop.close()
++
++    def test_start_call_tags_the_uncertain_reason(self):
++        self.mgr._get_or_create_client = AsyncMock(
++            side_effect=SessionInUseError(5501, "uncertain"))
++        ok, msg, cid = self.loop.run_until_complete(
++            self.mgr.start_call(944, 5501, "ignored-session", "t.me/somechat", 0))
++        self.assertFalse(ok)
++        self.assertTrue(msg.startswith("SESSION_IN_USE[uncertain]"), msg)
++        self.assertEqual(cid, 0)
++        self.assertEqual(self.mgr._state(944, 5501), RETRY_PENDING)
++
++    def test_start_call_tags_a_durable_reason(self):
++        self.mgr._get_or_create_client = AsyncMock(
++            side_effect=SessionInUseError(5502, "quarantined"))
++        ok, msg, cid = self.loop.run_until_complete(
++            self.mgr.start_call(945, 5502, "ignored-session", "t.me/somechat", 0))
++        self.assertFalse(ok)
++        self.assertTrue(msg.startswith("SESSION_IN_USE[quarantined]"), msg)
++
++
++class LocalHoldClassificationTests(unittest.TestCase):
++    def test_uncertain_tag_is_a_local_hold(self):
++        self.assertTrue(_is_local_session_hold(
++            "SESSION_IN_USE[uncertain]: قطع اتصال تأیید نشد"))
++
++    def test_everything_else_stays_terminal(self):
++        for msg in (
++            "SESSION_IN_USE: some legacy message",           # no tag
++            "SESSION_IN_USE[quarantined]: db row",           # durable
++            "SESSION_IN_USE[stale]: rotated session",        # durable
++            "SESSION_IN_USE[replaced]: session changed",     # durable
++            "",
++        ):
++            self.assertFalse(_is_local_session_hold(msg), msg)
++        self.assertFalse(_is_local_session_hold(None))
++
++
++class SecondChanceHoldAwareTests(unittest.TestCase):
++    """A second-chance round must wait the heal window out instead of
++    re-selecting accounts that will fail in milliseconds."""
++
++    def setUp(self):
++        self.loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(self.loop)
++        self.ex = OrderExecutor()
++        self.oid = 944
++        self.ex._voice_pool[self.oid] = [{"id": 21}, {"id": 22}]
++        self.ex._voice_banned[self.oid] = {21, 22}
++        self.ex._voice_terminal[self.oid] = set()
++        self.ex._voice_attempts[self.oid] = {}
++        self.ex._voice_second_chance[self.oid] = 0
++        for aid in (21, 22):
++            voice_cooldown.clear(aid)
++
++    def tearDown(self):
++        for aid in (21, 22):
++            voice_cooldown.clear(aid)
++        self.loop.close()
++
++    def _run(self, held_after_wait):
++        held = {21, 22}
++        fake = _fake_vcm(held)
++        sleeps = []
++
++        async def fake_sleep(g):
++            sleeps.append(g)
++            held.clear()
++            held.update(held_after_wait)
++
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake), \
++                mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2), \
++                mock.patch.object(Config, "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS", 0), \
++                mock.patch.object(Config, "VOICE_QUARANTINE_HEAL_SECONDS", 60), \
++                mock.patch.object(asyncio, "sleep", fake_sleep), \
++                mock.patch.object(self.ex, "_voice_load_pool", new=AsyncMock()), \
++                mock.patch.object(self.ex, "_is_order_active", return_value=True):
++            ok = self.loop.run_until_complete(
++                self.ex._voice_second_chance_retry(self.oid, 1, set()))
++        return ok, sleeps
++
++    def test_waits_out_the_heal_then_retries(self):
++        ok, sleeps = self._run(held_after_wait=set())
++        self.assertTrue(ok)
++        self.assertTrue(any(g >= 60 for g in sleeps), sleeps)
++        self.assertFalse(self.ex._voice_banned[self.oid])  # both re-armed
++        self.assertEqual(self.ex._voice_second_chance[self.oid], 1)
++
++    def test_abstains_without_burning_a_round_when_still_held(self):
++        ok, sleeps = self._run(held_after_wait={21, 22})
++        self.assertFalse(ok)
++        self.assertEqual(self.ex._voice_second_chance[self.oid], 0)
++        self.assertEqual(self.ex._voice_banned[self.oid], {21, 22})
++
++    def test_free_candidate_is_used_immediately(self):
++        held = {21}
++        fake = _fake_vcm(held)
++        sleeps = []
++
++        async def fake_sleep(g):
++            sleeps.append(g)
++
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake), \
++                mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 2), \
++                mock.patch.object(Config, "VOICE_SECOND_CHANCE_COOLDOWN_SECONDS", 0), \
++                mock.patch.object(asyncio, "sleep", fake_sleep), \
++                mock.patch.object(self.ex, "_voice_load_pool", new=AsyncMock()), \
++                mock.patch.object(self.ex, "_is_order_active", return_value=True):
++            ok = self.loop.run_until_complete(
++                self.ex._voice_second_chance_retry(self.oid, 1, set()))
++        self.assertTrue(ok)
++        self.assertEqual(sleeps, [])  # no wait needed
++        self.assertNotIn(22, self.ex._voice_banned[self.oid])
++        self.assertIn(21, self.ex._voice_banned[self.oid])  # held: still parked
++
++
++class SchedulingAwarenessTests(unittest.TestCase):
++    """Held accounts must be invisible to wave selection until the heal ran,
++    so no wave slot is burned on a guaranteed instant fail."""
++
++    def setUp(self):
++        self.loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(self.loop)
++        self.ex = OrderExecutor()
++        self.oid = 945
++        self.ex._voice_pool[self.oid] = [{"id": 31}]
++        self.ex._voice_banned[self.oid] = set()
++        self.ex._voice_terminal[self.oid] = set()
++        self.ex._voice_attempts[self.oid] = {}
++        self.ex._voice_retry_after[self.oid] = {}
++        voice_cooldown.clear(31)
++
++    def tearDown(self):
++        voice_cooldown.clear(31)
++        self.loop.close()
++
++    def test_held_account_is_not_ready_now(self):
++        fake = _fake_vcm({31})
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake), \
++                mock.patch.object(Config, "VOICE_QUARANTINE_HEAL_SECONDS", 180):
++            when = self.ex._voice_earliest_retry(self.oid, set())
++        self.assertIsNotNone(when)
++        self.assertGreater(when, time.time() + 100)  # deferred past the heal
++
++    def test_free_account_is_ready_now(self):
++        fake = _fake_vcm(set())
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake):
++            when = self.ex._voice_earliest_retry(self.oid, set())
++        # "Ready" is expressed as now (absolute stamp), not a future heal date.
++        self.assertLess(when, time.time() + 2.0)
++
++    def test_candidates_skip_held_accounts(self):
++        fake = _fake_vcm({31})
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake):
++            picked = self.ex._voice_candidates(self.oid, 1, set(), set(), time.time())
++        self.assertEqual(picked, [])
++        fake_free = _fake_vcm(set())
++        with mock.patch.object(oe_mod, "_get_voice_call_manager", lambda: fake_free):
++            picked = self.ex._voice_candidates(self.oid, 1, set(), set(), time.time())
++        self.assertEqual([a["id"] for a in picked], [31])
++
++
++class WiringGuardTests(unittest.TestCase):
++    """Source-level guards for the pieces that live inside the big wave loop
++    and are impractical to drive without a real order."""
++
++    def test_uncertain_defers_instead_of_terminalising(self):
++        src = inspect.getsource(OrderExecutor._voice_batched_fill)
++        self.assertIn("_is_local_session_hold(msg)", src)
++        self.assertIn("budget kept", src)
++        # the deferral must report the hold as infrastructure, not churn
++        self.assertIn("join_brain.report_result(order_id, OUTCOME_SYSTEM, msg)",
++                      src)
++
++    def test_zero_live_build_waits_longer_for_pool_releases(self):
++        src = inspect.getsource(OrderExecutor._voice_batched_fill)
++        self.assertIn("VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE", src)
++        self.assertIn("if live == 0:", src)
++
++    def test_direct_join_path_tags_the_reason(self):
++        src = inspect.getsource(oe_mod)
++        self.assertIn('f"SESSION_IN_USE[{getattr(e, \'reason\', \'voice\') or \'voice\'}]',
++                      src)
++
++    def test_config_knobs_exist(self):
++        self.assertGreaterEqual(int(Config.VOICE_QUARANTINE_HEAL_SECONDS), 30)
++        self.assertGreaterEqual(int(Config.VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP), 1)
++        self.assertGreaterEqual(int(Config.VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE),
++                                int(getattr(Config, "VOICE_STARVED_WAIT_ROUNDS", 6)))
 +
 +
 +if __name__ == "__main__":
