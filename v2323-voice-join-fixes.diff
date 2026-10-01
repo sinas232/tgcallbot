@@ -157,10 +157,10 @@ index e33815d..1b1e23e 100644
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..de31f22
+index 0000000..05c06b9
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,205 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -271,7 +271,10 @@ index 0000000..de31f22
 +  پایانش استقرار را انجام دهید.
 +- اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
 +  گاردها را خودش انجام می‌دهد).
-+- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
++- بعد از apply باید ۱۷ فایل ` M` و ۲۲ فایل `??` تازه ببینید (۳۹ مسیر، پورت + فیکس‌ها).
++- تأیید سریع داخل کانتینر (بعد از بالا آمدن):
++  `docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow`
++  باید ۴۳ تست OK بدهد.
 +- `v2323-voice-join-fixes.diff` فقط روی درختی اعمال می‌شود که **دقیقاً** هم‌سن پورتِ
 +  تازه باشد؛ روی پورت‌های قدیمی‌تر (۱۴۶/۱۶۰/۱۷۵/۱۸۶ کیلوبایتی) به
 +  `patch failed: services/order_executor.py:1088` می‌خورد چون حلقهٔ تعویض اکانت در
