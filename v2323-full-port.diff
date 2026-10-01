@@ -1,5 +1,5 @@
 diff --git a/.env.example b/.env.example
-index 82fa755..6037f17 100644
+index 82fa755..cfd55d7 100644
 --- a/.env.example
 +++ b/.env.example
 @@ -85,9 +85,19 @@ ORDER_LINK_MODE=any
@@ -25,7 +25,25 @@ index 82fa755..6037f17 100644
  HEALTH_CHECK_INTERVAL=3600
  LOG_LEVEL=INFO
  
-@@ -253,3 +263,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
+@@ -232,8 +242,16 @@ ANTISPAM_JOIN_GAP_MIN=3.0
+ ANTISPAM_JOIN_GAP_MAX=8.0
+ # jitter انسانیِ اضافه روی فاصلهٔ join:
+ ANTISPAM_JOIN_JITTER_MAX=2.5
+-# سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود):
++# سقف هم‌زمانی موج join که پنل ضد اسپم پیشنهاد می‌دهد.
++# توجه: این عدد «نرخ» ورود را کنترل نمی‌کند — نرخ را ANTISPAM_JOIN_GAP_MIN/MAX
++# کنترل می‌کند. این عدد فقط می‌گوید چند اکانت هم‌زمان اجازهٔ join دارند.
+ ANTISPAM_MAX_JOIN_CONCURRENCY=2
++# کفِ پنجرهٔ join وقتی ضد اسپم فعال است. هر join بین ۳۰ تا ۴۵ ثانیه طول
++# می‌کشد و هر شروع ۳ تا ۸ ثانیه بعد از قبلی است، پس پنجرهٔ ۱ عملاً join‌ها را
++# سریالی می‌کند بدون اینکه نرخ RPC را پایین‌تر ببرد — فقط ساخت سفارش را چند
++# برابر کندتر می‌کند. سقف نهایی همچنان VOICE_JOIN_MAX_CONCURRENCY است.
++# مقدار ۱ = رفتار کاملاً سریالیِ قبل.
++ANTISPAM_JOIN_WINDOW_FLOOR=4
+ # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه):
+ ANTISPAM_LEAVE_GAP_MIN=1.5
+ ANTISPAM_LEAVE_GAP_MAX=4.0
+@@ -253,3 +271,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
  
  # ── ممنوعیت ثبت سفارش جدید پس از لغو (دقیقه) — 0 = خاموش
  CANCEL_COOLDOWN_MINUTES=20
@@ -46,7 +64,7 @@ index 82fa755..6037f17 100644
 +# ابد «running» می‌ماند.
 +ORDER_RECOVERY_ENABLED=true
 diff --git a/config.py b/config.py
-index a95d3c1..544a26d 100644
+index a95d3c1..e33815d 100644
 --- a/config.py
 +++ b/config.py
 @@ -7,6 +7,32 @@ from dotenv import load_dotenv
@@ -127,7 +145,19 @@ index a95d3c1..544a26d 100644
      # ── STAGGERED WAVE STARTS (managed pacing, the anti-burst layer) ──────
      # Accounts of one wave do NOT fire their joins in the same millisecond:
      # each account's join starts VOICE_JOIN_START_STAGGER_MIN..MAX seconds
-@@ -362,6 +396,18 @@ class Config:
+@@ -323,6 +357,11 @@ class Config:
+     ANTISPAM_JOIN_JITTER_MAX = float(os.getenv('ANTISPAM_JOIN_JITTER_MAX', '2.5'))
+     # سقف هم‌زمانی موج join (Join Brain هرگز بالاتر نمی‌رود).
+     ANTISPAM_MAX_JOIN_CONCURRENCY = int(os.getenv('ANTISPAM_MAX_JOIN_CONCURRENCY', '2'))
++    # کفِ پنجرهٔ join وقتی ضدِ‌اسپم فعال است.
++    # نرخِ JoinGroupCall را start-gap مهار می‌کند نه پنجره؛ پنجره فقط
++    # اجازهٔ هم‌پوشانی می‌دهد. مقدار ۱ رفتارِ قبلی را بازمی‌گرداند
++    # (joinها کاملاً سریال). سقفِ نهایی همچنان VOICE_JOIN_MAX_CONCURRENCY است.
++    ANTISPAM_JOIN_WINDOW_FLOOR = int(os.getenv('ANTISPAM_JOIN_WINDOW_FLOOR', '4'))
+     # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه) — انسانی‌تر از عادی.
+     ANTISPAM_LEAVE_GAP_MIN = float(os.getenv('ANTISPAM_LEAVE_GAP_MIN', '1.5'))
+     ANTISPAM_LEAVE_GAP_MAX = float(os.getenv('ANTISPAM_LEAVE_GAP_MAX', '4.0'))
+@@ -362,6 +401,18 @@ class Config:
      # Hard deadline per adaptive wave: stragglers are cancelled and deferred
      # to the next wave so one slow/stuck account never freezes the build.
      VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
@@ -1225,10 +1255,59 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..7f4e7db 100644
+index 0e19892..e98de38 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -192,8 +192,23 @@ class OrderExecutor:
+@@ -41,6 +41,48 @@ def _get_voice_call_manager():
+ 		return None
+ 
+ 
++def resolve_join_window(profile, *, sequential=False, adaptive=True):
++    """Decide ``(initial, min_window, max_window, reason)`` for join pacing.
++
++    Extracted verbatim out of :meth:`OrderExecutor._voice_batched_fill` so the
++    pacing policy can be exercised without running a real order.
++
++    ``profile`` is an ``anti_spam.AntiSpamProfile`` or ``None``.
++
++    The important invariant: the **rate** of ``phone.JoinGroupCall`` RPCs is
++    paced by the start-gap (``ANTISPAM_JOIN_GAP_MIN``/``MAX`` + jitter), not by
++    this window.  A single join takes 30-45s, so a window of 1 serialises the
++    joins without lowering the RPC rate any further than the gap already does -
++    it only makes order build several times slower.  ``ANTISPAM_JOIN_WINDOW_FLOOR``
++    therefore sets a floor under the anti-spam cap; the ceiling stays
++    ``VOICE_JOIN_MAX_CONCURRENCY``.  Set the floor to 1 for fully serial joins.
++    """
++    if sequential:
++        return 1, 1, 1, "sequential"
++
++    hw_cap = max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 2)))
++    initial_cfg = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 1)))
++    min_cfg = max(1, int(getattr(Config, "VOICE_JOIN_MIN_CONCURRENCY", 1)))
++
++    if profile is not None and getattr(profile, "enabled", False):
++        as_cap = max(1, int(getattr(profile, "max_join_concurrency", 1)))
++        floor = max(1, int(getattr(Config, "ANTISPAM_JOIN_WINDOW_FLOOR", 4)))
++        cap = max(1, min(hw_cap, max(as_cap, floor)))
++        reason = ("anti-spam cap=%s, window floor=%s, hardware=%s"
++                  % (as_cap, floor, hw_cap))
++    elif adaptive:
++        cap = hw_cap
++        reason = "adaptive, hardware=%s" % hw_cap
++    else:
++        cap = initial_cfg
++        reason = "fixed batch, initial=%s" % initial_cfg
++
++    initial = max(1, min(initial_cfg, cap))
++    # min_window must never exceed the cap, or JoinBrain can never widen
++    # (``window < max_window`` stays false forever) and never shrink either.
++    min_window = max(1, min(min_cfg, cap))
++    return initial, min_window, cap, reason
++
+ class OrderExecutor:
+ 	"""
+ 	Core executor for Telegram orders (voice chat, group join, etc.).
+@@ -192,8 +234,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -1254,7 +1333,7 @@ index 0e19892..7f4e7db 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -526,6 +541,20 @@ class OrderExecutor:
+@@ -526,6 +583,20 @@ class OrderExecutor:
  	    banned = self._voice_banned.get(order_id, set())
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
@@ -1275,7 +1354,7 @@ index 0e19892..7f4e7db 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +566,7 @@ class OrderExecutor:
+@@ -537,7 +608,7 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -1284,7 +1363,7 @@ index 0e19892..7f4e7db 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -567,10 +596,24 @@ class OrderExecutor:
+@@ -567,10 +638,24 @@ class OrderExecutor:
  	    banned = self._voice_banned.get(order_id, set())
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
@@ -1310,7 +1389,43 @@ index 0e19892..7f4e7db 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -695,6 +738,7 @@ class OrderExecutor:
+@@ -671,30 +756,24 @@ class OrderExecutor:
+ 	        _as_profile = await anti_spam.get_profile(bot_id)
+ 	    except Exception:
+ 	        _as_profile = None
+-	    if sequential:
+-	        # Also cap monitor recovery joins via the same per-order gate in VCM.
+-	        join_brain.register_order(order_id, initial=1, min_window=1, max_window=1)
+-	    elif _as_profile is not None and _as_profile.enabled:
+-	        _cap = max(1, min(
+-	            int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 2)),
+-	            _as_profile.max_join_concurrency,
+-	        ))
+-	        _initial = max(1, min(int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 1)), _cap))
+-	        join_brain.register_order(
+-	            order_id,
+-	            initial=_initial,
+-	            min_window=max(1, int(getattr(Config, "VOICE_JOIN_MIN_CONCURRENCY", 1))),
+-	            max_window=_cap,
++	    _initial, _min_win, _max_win, _why = resolve_join_window(
++	        _as_profile, sequential=sequential, adaptive=adaptive,
++	    )
++	    # صریح بگو کدام سقف دارد محدود می‌کند — قبلاً بی‌صدا اعمال می‌شد.
++	    if _max_win < max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 2))):
++	        logger.warning(
++	            f"Order {order_id}: join window capped at {_max_win} "
++	            f"(hardware suggests {int(getattr(Config, 'VOICE_JOIN_MAX_CONCURRENCY', 2))}); {_why} — "
++	            f"join RATE is paced by start-gap, not by this window"
+ 	        )
+-	    elif adaptive:
+-	        join_brain.register_order(order_id)
+-	    else:
+-	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
+-	        join_brain.register_order(order_id, initial=fixed, min_window=fixed, max_window=fixed)
++	    join_brain.register_order(
++	        order_id, initial=_initial, min_window=_min_win, max_window=_max_win,
++	    )
+ 
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
  	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
  	    wave_no = 0
@@ -1318,7 +1433,7 @@ index 0e19892..7f4e7db 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -748,6 +792,41 @@ class OrderExecutor:
+@@ -748,6 +827,41 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -1360,7 +1475,7 @@ index 0e19892..7f4e7db 100644
  	                break
  	            wait = max(0.0, min(earliest - now, 30.0))
  	            if wait <= 0:
-@@ -784,6 +863,16 @@ class OrderExecutor:
+@@ -784,6 +898,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -1377,7 +1492,7 @@ index 0e19892..7f4e7db 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -1493,6 +1582,15 @@ class OrderExecutor:
+@@ -1493,6 +1617,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
@@ -2694,6 +2809,187 @@ index 0000000..d155ce6
 +    def test_a_healthy_import_leaves_no_error_key(self):
 +        snap = snapshot()
 +        self.assertNotIn("mem_error", snap)
+diff --git a/tests/test_join_window.py b/tests/test_join_window.py
+new file mode 100644
+index 0000000..a80a006
+--- /dev/null
++++ b/tests/test_join_window.py
+@@ -0,0 +1,175 @@
++"""Regression tests for the voice-join pacing window.
++
++Incident (2026-10-01, order 928): a 42-account order took ~9.5 minutes to
++build because the Join Brain window was pinned at 1 for its whole life::
++
++    [JoinBrain] order=928 registered window=1 (min=1 max=1)
++
++The anti-spam panel stored ``antispam_max_join_concurrency = 1`` and
++``_voice_batched_fill`` fed that straight into ``register_order`` as
++``max_window``.  ``JoinBrain.finish_wave`` only widens when
++``window < max_window``, so ``1 < 1`` was false forever and the window could
++never grow.
++
++That protection was also redundant: the RPC *rate* is paced by the start-gap
++(``ANTISPAM_JOIN_GAP_MIN``/``MAX`` + jitter), not by the window.  A join takes
++30-45s, so a window of 1 serialises joins without lowering the RPC rate any
++further than the gap already does.
++
++These tests call the real ``resolve_join_window`` that
++``_voice_batched_fill`` now uses.
++"""
++
++import os
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++# ── environment must exist BEFORE project imports ──────────────────────
++_TMP = tempfile.mkdtemp(prefix="join-window-tests-")
++os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
++os.environ.setdefault("SESSION_ENCRYPTION_KEY",
++                      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
++os.environ.setdefault("VOICE_FLOOD_COOLDOWN_PATH",
++                      os.path.join(_TMP, "cooldown.json"))
++os.environ.setdefault("VOICE_STRATEGY_CACHE_PATH",
++                      os.path.join(_TMP, "strategy.json"))
++os.makedirs(os.path.join(_TMP, "logs"), exist_ok=True)
++os.chdir(_TMP)  # keep artefacts out of the repo
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from config import Config  # noqa: E402
++from services.join_brain import AdaptiveJoinBrain  # noqa: E402
++from services.order_executor import resolve_join_window  # noqa: E402
++
++
++class _Profile:
++    """Stand-in for anti_spam.AntiSpamProfile (same attributes)."""
++
++    def __init__(self, *, enabled=True, max_join_concurrency=1):
++        self.enabled = enabled
++        self.max_join_concurrency = max_join_concurrency
++
++
++class ResolveJoinWindowTests(unittest.TestCase):
++    def _resolve(self, *, hw, initial, minw, floor, profile,
++                 sequential=False, adaptive=True):
++        vals = {
++            "VOICE_JOIN_MAX_CONCURRENCY": hw,
++            "VOICE_JOIN_INITIAL_CONCURRENCY": initial,
++            "VOICE_JOIN_MIN_CONCURRENCY": minw,
++            "ANTISPAM_JOIN_WINDOW_FLOOR": floor,
++        }
++        with mock.patch.multiple(Config, **vals):
++            return resolve_join_window(
++                profile, sequential=sequential, adaptive=adaptive)
++
++    # ── the actual production regression ───────────────────────────────
++    def test_antispam_cap_of_one_no_longer_pins_the_window(self):
++        """order 928: anti-spam said 1, hardware said 16, window froze at 1."""
++        initial, min_window, max_window, reason = self._resolve(
++            hw=16, initial=1, minw=1, floor=4,
++            profile=_Profile(enabled=True, max_join_concurrency=1),
++        )
++        self.assertGreater(max_window, 1,
++                           'the window must be able to widen or a large order '
++                           'builds one account per wave for minutes')
++        self.assertEqual(max_window, 4)
++        self.assertLess(min_window, max_window,
++                        'min_window must be strictly below max_window or '
++                        'JoinBrain.finish_wave can never widen')
++        self.assertIn('anti-spam cap=1', reason)
++
++    def test_floor_never_exceeds_the_hardware_ceiling(self):
++        _, _, max_window, _ = self._resolve(
++            hw=2, initial=1, minw=1, floor=4,
++            profile=_Profile(enabled=True, max_join_concurrency=1),
++        )
++        self.assertEqual(max_window, 2)
++
++    def test_floor_of_one_restores_the_old_serial_behaviour(self):
++        """The escape hatch must actually reproduce the pre-fix behaviour."""
++        initial, min_window, max_window, _ = self._resolve(
++            hw=16, initial=1, minw=1, floor=1,
++            profile=_Profile(enabled=True, max_join_concurrency=1),
++        )
++        self.assertEqual((initial, min_window, max_window), (1, 1, 1))
++
++    def test_a_higher_antispam_cap_still_wins_over_the_floor(self):
++        _, _, max_window, _ = self._resolve(
++            hw=16, initial=1, minw=1, floor=4,
++            profile=_Profile(enabled=True, max_join_concurrency=8),
++        )
++        self.assertEqual(max_window, 8)
++
++    def test_min_window_is_clamped_to_the_cap(self):
++        """Second bug: min_window used to be passed through unclamped.
++
++        With cap=4 and VOICE_JOIN_MIN_CONCURRENCY=8 the old code registered
++        min=8, max=4, so ``window < max_window`` was false and
++        ``max(min_window, window/2)`` pushed the window back above the cap.
++        """
++        _, min_window, max_window, _ = self._resolve(
++            hw=16, initial=1, minw=8, floor=4,
++            profile=_Profile(enabled=True, max_join_concurrency=4),
++        )
++        self.assertEqual((min_window, max_window), (4, 4))
++        self.assertLessEqual(min_window, max_window)
++
++    def test_disabled_profile_falls_back_to_hardware(self):
++        _, _, max_window, reason = self._resolve(
++            hw=16, initial=1, minw=1, floor=4,
++            profile=_Profile(enabled=False, max_join_concurrency=1),
++        )
++        self.assertEqual(max_window, 16)
++        self.assertIn('adaptive', reason)
++
++    def test_sequential_mode_still_pins_everything_to_one(self):
++        """VOICE_JOIN_SEQUENTIAL is an explicit operator choice - untouched."""
++        result = self._resolve(
++            hw=16, initial=8, minw=4, floor=4,
++            profile=_Profile(enabled=True, max_join_concurrency=8),
++            sequential=True,
++        )
++        self.assertEqual(result[:3], (1, 1, 1))
++
++
++class JoinBrainWidensTests(unittest.TestCase):
++    """End-to-end: feed the resolved values into the real JoinBrain."""
++
++    def test_window_actually_widens_after_clean_waves(self):
++        brain = AdaptiveJoinBrain()
++        profile = _Profile(enabled=True, max_join_concurrency=1)
++        with mock.patch.multiple(
++            Config,
++            VOICE_JOIN_MAX_CONCURRENCY=16,
++            VOICE_JOIN_INITIAL_CONCURRENCY=1,
++            VOICE_JOIN_MIN_CONCURRENCY=1,
++            ANTISPAM_JOIN_WINDOW_FLOOR=4,
++            VOICE_JOIN_GROWTH_AFTER_WAVES=2,
++        ):
++            initial, min_window, max_window, _ = resolve_join_window(profile)
++            brain.register_order(
++                928, initial=initial, min_window=min_window,
++                max_window=max_window,
++            )
++            self.assertEqual(brain.get_window(928), 1)
++
++            seen = [brain.get_window(928)]
++            for _ in range(12):
++                brain.start_wave(928, brain.get_window(928))
++                brain.finish_wave(928, joined=seen[-1], failed=0,
++                                  ok_rate=1.0, duration_s=5.0)
++                seen.append(brain.get_window(928))
++
++        self.assertGreater(
++            seen[-1], 1,
++            'after 12 clean waves the window still had not widened - this is '
++            'the order-928 symptom: %s' % seen)
++        self.assertEqual(seen[-1], 4, 'it should have reached the cap: %s' % seen)
++
++
++if __name__ == '__main__':
++    unittest.main()
 diff --git a/tests/test_memory_guard.py b/tests/test_memory_guard.py
 new file mode 100644
 index 0000000..8dd7517
