@@ -833,6 +833,24 @@ def register_handlers(application: Application) -> None:
         group=-4,
     )
 
+    # پاسخ مشتری به «ویس‌چت بسته شد؛ ادامه می‌دهید؟» — همان گروهٔ 4- و همان
+    # دلیلِ امن: تسویهٔ سفارشِ خودِ کاربر اتمیک و idempotent است و باید حتی در
+    # حالت تعمیرات/میوت هم کار کند. الگو از cancel_order_ جدا است پس تداخل
+    # ندارند. فالبک متنی «پایان» هم با همین گروه ثبت می‌شود تا فقط وقتی که
+    # واقعاً سفارشی با ویس‌چتِ بسته وجود دارد، جلوی بقیهٔ فلوها را بگیرد.
+    application.add_handler(
+        CallbackQueryHandler(chat_closed_decision_callback,
+                            pattern=r"^chatclosed_\d+_(keep|stop)$"),
+        group=-4,
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(r"^(⛔️\s*)?پایان(\s+سفارش)?$|^تسویه$") & ~filters.COMMAND,
+            chat_closed_text_fallback,
+        ),
+        group=-4,
+    )
+
     # گارد ضداسپم در گروهٔ مستقل 3-: تنها هندلرِ همین گروه است پس بلعیدنِ
     # آپدیت فقط به همین گروه ختم می‌شود و گروه‌های بعدی (نگهبان تعمیرات،
     # پیش‌روتر، مکالمه‌ها) سالم می‌مانند. توقفِ میوت با raise

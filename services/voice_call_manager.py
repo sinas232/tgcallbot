@@ -724,6 +724,7 @@ class VoiceCallManager:
         # _chat_closed_until[(order_id, chat_id)]   = monotonic deadline
         self._chat_closed_reports: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._chat_closed_until: Dict[Tuple[int, int], float] = {}
+        self._chat_closed_since: Dict[Tuple[int, int], float] = {}
 
         # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
         # joined_accounts_by_order[order_id][account_id] = {chat_id, joined_at, target, status}
@@ -2436,6 +2437,7 @@ class VoiceCallManager:
             if self._chat_closed_until.get(key, 0.0) > now:
                 return  # already marked and still active → log once
             self._chat_closed_until[key] = now + grace
+            self._chat_closed_since[key] = now
             logger.warning(
                 "[VoiceChatClosed] order=%s chat=%s: Telegram reports the voice chat "
                 "as CLOSED (%s accounts in %.0fs) — suppressing rejoin/media-restore "
@@ -2454,8 +2456,31 @@ class VoiceCallManager:
         if key in self._chat_closed_until or key in self._chat_closed_reports:
             self._chat_closed_until.pop(key, None)
             self._chat_closed_reports.pop(key, None)
+            self._chat_closed_since.pop(key, None)
             logger.info("[VoiceChatClosed] order=%s chat=%s: reopened (join succeeded)",
                         order_id, chat_id)
+
+    def clear_chat_closed(self, order_id: int, chat_id: Optional[int] = None) -> None:
+        """Public: forget the closed marker for an order (chat_id=None → all chats).
+
+        Used when the customer answers "continue": the next monitor cycle may try
+        to rejoin immediately instead of waiting out the grace period.
+        """
+        if chat_id is None:
+            for (oid, cid) in [k for k in self._chat_closed_until if k[0] == int(order_id)]:
+                self._clear_chat_closed(oid, cid)
+        else:
+            self._clear_chat_closed(int(order_id), int(chat_id))
+
+    def chat_closed_since(self, order_id: int,
+                          chat_id: Optional[int] = None) -> Optional[float]:
+        """When the closure was corroborated (billing stops at this instant)."""
+        self._prune_chat_closed()
+        if chat_id is not None:
+            return self._chat_closed_since.get((int(order_id), int(chat_id)))
+        times = [ts for (oid, _cid), ts in self._chat_closed_since.items()
+                 if oid == int(order_id)]
+        return min(times) if times else None
 
     def _prune_chat_closed(self) -> None:
         now = time.time()
@@ -2463,6 +2488,7 @@ class VoiceCallManager:
             if float(until) <= now:
                 self._chat_closed_until.pop(key, None)
                 self._chat_closed_reports.pop(key, None)
+                self._chat_closed_since.pop(key, None)
 
     def is_chat_closed(self, order_id: Optional[int] = None,
                        chat_id: Optional[int] = None) -> bool:

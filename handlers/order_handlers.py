@@ -586,6 +586,159 @@ async def cancel_order_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     return ConversationHandler.END
 
+# -------------------- بسته‌شدن ویس‌چت توسط مشتری --------------------
+
+def _closed_chat_order_ids(user, bot_id):
+    """سفارش‌های فعالِ همین کاربر که ویس‌چتشان بسته است (فالبک متنی)."""
+    ids = []
+    try:
+        for oid, info in list(order_executor.active_orders.items()):
+            if not isinstance(info, dict):
+                continue
+            if info.get('user_id') != user['id']:
+                continue
+            if int(info.get('bot_id') or 1) != int(bot_id):
+                continue
+            if info.get('chat_closed'):
+                ids.append(oid)
+    except Exception:
+        logger.debug("closed-chat order scan failed", exc_info=True)
+    return ids
+
+
+def _chat_closed_result_text(prefix, summary):
+    refund = summary.get('refund_amount') or 0
+    return (
+        f"{prefix}\n\n"
+        f"💰 مبلغ کل پلن: {format_price(summary['total_cost'])} تومان\n"
+        f"⏱ مصرف تا لحظهٔ بسته‌شدن کال: {format_price(summary['used_cost'])} تومان\n"
+        f"💵 عودت به کیف پول: {format_price(refund)} تومان\n"
+        f"🧾 کد پیگیری عودت: {summary.get('refund_tx_id') or '—'}\n"
+        f"👛 موجودی فعلی کیف‌پول: {format_price(summary['user_wallet_balance'])} تومان"
+    )
+
+
+async def chat_closed_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    پاسخ مشتری به پیام «ویس‌چت بسته شد» (chatclosed_<order>_keep | _stop).
+
+    keep → ادامه تا پایان مهلت (مارکر بسته‌بودن پاک می‌شود و به کال تازهٔ همان
+           گروه ملحق می‌شویم).
+    stop → تسویهٔ فوری: فقط زمان استفاده‌شده تا لحظهٔ بسته‌شدن کال حساب و
+           باقی مبلغ به کیف پول عودت می‌شود (همان مسیر اتمیک لغو).
+    """
+    query = update.callback_query
+    await safe_answer(query)
+
+    data = query.data or ""
+    m = re.match(r'^chatclosed_(\d+)_(keep|stop)$', data)
+    if not m:
+        return ConversationHandler.END
+    order_id, choice = int(m.group(1)), m.group(2)
+
+    bot_id = context.bot_data.get('bot_id', 1)
+    tg_user_id = update.effective_user.id
+    logger.info("chat_closed_decision_callback fired: user=%s order=%s choice=%s",
+                tg_user_id, order_id, choice)
+
+    try:
+        user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)
+        if not user:
+            await query.edit_message_text("❌ حساب شما در سیستم یافت نشد.")
+            return ConversationHandler.END
+
+        order = await DatabaseManager.get_order(order_id)
+        if not order or order.get('bot_id', 1) != bot_id or order['user_id'] != user['id']:
+            await query.edit_message_text("❌ این سفارش برای شما یا این ربات نیست.")
+            return ConversationHandler.END
+
+        if order['status'] not in ('running', 'scheduled', 'pending'):
+            await query.edit_message_text(
+                "ℹ️ این سفارش دیگر فعال نیست (قبلاً لغو/تکمیل شده است)."
+            )
+            return ConversationHandler.END
+
+        if choice == 'keep':
+            await order_executor.continue_after_chat_closed(order_id)
+            await query.edit_message_text(
+                "✅ باشه، سفارش تا پایان مهلت ادامه می‌دهد.\n\n"
+                "اگر در همان گروه یک «ویس‌چت تازه» شروع کنید، اکانت‌ها خودشان ملحق می‌شوند.\n"
+                "اگر تا پایان مهلتِ تنظیم‌شده کال تازه‌ای شروع نشود، سفارش خودکار بسته "
+                "می‌شود و مبلغ زمانِ استفاده‌نشده به کیف پول برمی‌گردد."
+            )
+            return ConversationHandler.END
+
+        try:
+            summary = await order_executor.settle_chat_closed_order(
+                order_id, bot_id=bot_id, expected_user_id=user['id'],
+            )
+        except ValueError:
+            await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تسویه شده است.")
+            return ConversationHandler.END
+
+        await query.edit_message_text(_chat_closed_result_text(
+            "✅ سفارش خاتمه یافت؛ فقط زمان استفاده‌شده تا لحظهٔ بسته‌شدن کال محاسبه شد.",
+            summary,
+        ))
+    except Exception:
+        logger.exception("chat_closed_decision failed: order=%s", order_id)
+        try:
+            await query.edit_message_text(
+                "❌ خطای غیرمنتظره هنگام پردازش درخواست. لطفاً دوباره تلاش کنید."
+            )
+        except Exception:
+            logger.exception("chat_closed_decision: could not edit the message")
+
+    return ConversationHandler.END
+
+
+async def chat_closed_text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فالبک متنی: مشتری به‌جای دکمه، «پایان» می‌فرستد تا سفارش تسویه شود."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    bot_id = context.bot_data.get('bot_id', 1)
+    try:
+        user = await DatabaseManager.get_user(update.effective_user.id, bot_id=bot_id)
+    except Exception:
+        user = None
+    if not user:
+        return
+
+    order_ids = _closed_chat_order_ids(user, bot_id)
+    if not order_ids:
+        # سفارشی با ویس‌چتِ بسته وجود ندارد؛ این پیام برای ما نیست.
+        return
+
+    results = []
+    for oid in order_ids:
+        try:
+            summary = await order_executor.settle_chat_closed_order(
+                oid, bot_id=bot_id, expected_user_id=user['id'],
+            )
+            results.append(_chat_closed_result_text(
+                f"✅ سفارش #{oid} خاتمه یافت.", summary))
+        except ValueError:
+            results.append(f"ℹ️ سفارش #{oid} قبلاً بسته شده است.")
+        except Exception:
+            logger.exception("chat_closed_text_fallback failed: order=%s", oid)
+
+    if results:
+        try:
+            await send_safe(
+                context.bot, msg.chat_id, "\n\n".join(results),
+                reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True),
+            )
+        except Exception:
+            try:
+                await msg.reply_text("\n\n".join(results))
+            except Exception:
+                logger.debug("chat closed text fallback reply failed", exc_info=True)
+        # فقط وقتی واقعاً کاری انجام دادیم، جلوی ادامهٔ فلو را می‌گیریم.
+        from telegram.ext import ApplicationHandlerStop
+        raise ApplicationHandlerStop
+
+
 # -------------------- تاریخچه سفارشات --------------------
 
 async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

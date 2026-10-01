@@ -19,11 +19,16 @@ from services.session_ownership import (SessionInUseError, is_auth_key_duplicate
 from services import self_healing
 from services.anti_spam import anti_spam
 from services.voice_cooldown import voice_cooldown
-# ── Telegram-side (infrastructure) failures ─────────────────────────────────
-# OUTCOME_SYSTEM is imported on its own line so this fix applies cleanly on
-# every v2.3.23 port revision of this file (older ports import the other
-# outcomes through a different, multi-line statement).
-from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
+# ── Telegram-side (infrastructure) failure bucket ───────────────────────────
+# Imported on its OWN statement (never merged into the big ``join_brain``
+# import above): that import is formatted differently across v2.3.23 port
+# revisions, so touching it would make this patch un-appliable on some
+# servers.  Older join_brain modules without OUTCOME_SYSTEM fall back to a
+# plain string, which still classifies correctly in ``_is_system_outcome``.
+try:  # pragma: no cover - depends on the deployed port revision
+	from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
+except ImportError:  # pragma: no cover
+	OUTCOME_SYSTEM = "system"
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +124,34 @@ class OrderExecutor:
 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
 		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
 		self._suppress_cancel_log: Set[int] = set()
+		# Order ids already asked "the call closed — continue?" for the CURRENT
+		# closure. Re-armed when the chat reopens, so a second closure asks again.
+		self._chat_closed_asked: Dict[int, bool] = {}
+		# Order id -> when the customer chose «ادامه می‌دهم». If the chat is still closed
+		# after VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS the order is settled
+		# automatically (only the served part is charged, the rest is refunded).
+		self._chat_closed_continue_since: Dict[int, float] = {}
+		# Strong refs to fire-and-forget tasks so they are not garbage-collected
+		# mid-flight (the customer question must not vanish silently).
+		self._background_tasks: Set[asyncio.Task] = set()
+
+	def _chat_closed_ask_gate(self, order_id: int, is_closed: bool) -> bool:
+		"""True exactly ONCE per closure: send the customer question here.
+
+		The countdown loop calls this every cycle. A closed chat must produce ONE
+		question (not one per second), and after the chat reopens (a new call was
+		started, or the customer chose to continue) the gate re-arms so the next
+		closure asks again.
+		"""
+		asked = bool(self._chat_closed_asked.get(order_id))
+		if not is_closed:
+			if asked:
+				self._chat_closed_asked[order_id] = False
+			return False
+		if asked:
+			return False
+		self._chat_closed_asked[order_id] = True
+		return True
 
 	def _consume_cancel_log_suppression(self, order_id: int) -> bool:
 		"""اگر گزارش لغو این سفارش سرکوب شده باشد True برمی‌گرداند و flag را مصرف می‌کند."""
@@ -491,6 +524,51 @@ class OrderExecutor:
 	                                    "a new voice chat in the group or cancel the order.",
 	                                    order_id, live, exact,
 	                                )
+	                            if _chat_closed_now:
+	                                # Ask the CUSTOMER (once per closure) whether to keep
+	                                # the order alive or settle now with a refund for the
+	                                # unserved remainder. Billing keeps running until the
+	                                # customer answers, so asking cannot be used to get
+	                                # free presence time.
+	                                _closed_since = None
+	                                if _vcm is not None and hasattr(_vcm, "chat_closed_since"):
+	                                    try:
+	                                        _closed_since = _vcm.chat_closed_since(order_id)
+	                                    except Exception:
+	                                        _closed_since = None
+	                                if _closed_since is None:
+	                                    _closed_since = time.time()
+	                                if order_id in self.active_orders:
+	                                    self.active_orders[order_id].setdefault(
+	                                        "chat_closed_at", _closed_since)
+	                                if self._chat_closed_ask_gate(order_id, True):
+	                                    _ask_task = asyncio.create_task(
+	                                        self.ask_customer_chat_closed(
+	                                            order_id, dict(data), _closed_since)
+	                                    )
+	                                    self._background_tasks.add(_ask_task)
+	                                    _ask_task.add_done_callback(
+	                                        self._background_tasks.discard)
+	                                if _chat_closed_now and order_id in self._chat_closed_continue_since:
+	                                    # The customer chose «ادامه می‌دهم» but no new call was started in
+	                                    # this group: settle with a refund for the unserved remainder instead
+	                                    # of billing a service that cannot be delivered.
+	                                    _grace = float(getattr(
+	                                        Config, "VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS", 600) or 0)
+	                                    _waited = time.time() - self._chat_closed_continue_since[order_id]
+	                                    if _grace <= 0 or _waited >= _grace:
+	                                        self._chat_closed_continue_since.pop(order_id, None)
+	                                        logger.error(
+	                                            "Order %s: %.0fs after the customer chose to continue the "
+	                                            "voice chat is STILL closed - settling now.",
+	                                            order_id, _waited,
+	                                        )
+	                                        _settle_task = asyncio.create_task(
+	                                            self._auto_settle_after_closed_chat(order_id, dict(data))
+	                                        )
+	                                        self._background_tasks.add(_settle_task)
+	                                        _settle_task.add_done_callback(self._background_tasks.discard)
+	                                        return
 	                    logger.info(
 	                        "Order %s: durable_live=%s/%s | native_binding=%s "
 	                        "(not proof of UDP packet delivery)",
@@ -1821,6 +1899,9 @@ class OrderExecutor:
 
 	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
 	                            suppress_cancel_log: bool = False):
+		# حالت‌های پیگیری «کال بسته» سفارش‌های تمام‌شده را نگه نداریم.
+		self._chat_closed_asked.pop(order_id, None)
+		self._chat_closed_continue_since.pop(order_id, None)
 		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
 		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
 		if suppress_cancel_log:
@@ -2011,7 +2092,7 @@ class OrderExecutor:
 		return name, user.get("telegram_id", "---")
 
 	@staticmethod
-	def compute_order_settlement(order) -> Tuple[float, float, float]:
+	def compute_order_settlement(order, bill_until=None) -> Tuple[float, float, float]:
 		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
 
 		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
@@ -2019,6 +2100,9 @@ class OrderExecutor:
 		- scheduled → هنوز مصرفی نشده: عودت کامل.
 		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
 		- مدتی → ثانیه‌ای دقیق فقط از started_at؛ فاز build رایگان است.
+			- ``bill_until`` (اختیاری): لحظه‌ای که سرویس واقعاً تمام شده
+			  (مثلاً بسته‌شدن ویس‌چت توسط مشتری)؛ مصرف فقط تا همان لحظه
+			  حساب می‌شود و باقی مبلغ برمی‌گردد (هرگز بیشتر از now).
 		  اگر تایمر هنوز آغاز نشده، مصرف صفر و عودت کامل است.
 		"""
 		order = order or {}
@@ -2037,10 +2121,12 @@ class OrderExecutor:
 				used = 0.0
 			return used, max(0.0, total_price - used), 0.0
 		# Never bill the build phase: created_at is NOT a service start.
-		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
+		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at,
+		                                                  bill_until=bill_until)
 
 	@staticmethod
-	def compute_prorated_settlement(total_price, duration_minutes, started_at):
+	def compute_prorated_settlement(total_price, duration_minutes, started_at,
+	                                bill_until=None):
 		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
 
 		خروجی: (used_cost, refund_amount, elapsed_seconds)
@@ -2057,7 +2143,17 @@ class OrderExecutor:
 		duration_minutes = int(duration_minutes or 0)
 		if duration_minutes <= 0 or not started_at:
 			return 0.0, total_price, 0.0
-		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
+		now = datetime.utcnow()
+		if bill_until is not None:
+			try:
+				# Billing stops at this instant (the customer closed the call): the
+				# unserved remainder must not be charged. Never bill past 'now'.
+				_cut = datetime.utcfromtimestamp(float(bill_until))
+				if _cut < now:
+					now = _cut
+			except (TypeError, ValueError, OSError, OverflowError):
+				pass
+		elapsed_seconds = max(0.0, (now - started_at).total_seconds())
 		total_seconds = duration_minutes * 60
 		if elapsed_seconds >= total_seconds:
 			used = total_price
@@ -2067,10 +2163,153 @@ class OrderExecutor:
 		refund = max(0.0, total_price - used)
 		return used, refund, elapsed_seconds
 
+	async def ask_customer_chat_closed(self, order_id: int, data: dict,
+	                                  closed_at: float) -> bool:
+		"""Tell the order owner the call was closed and ask continue / settle.
+
+		The customer (or a group admin) can end the group call while the paid
+		timer still runs. The bot cannot serve presence into a closed call, so the
+		owner decides: continue until the deadline (a NEW call in the same group is
+		joined automatically), or stop now - only the time up to ``closed_at`` is
+		charged and the rest is refunded to the wallet.
+		"""
+		try:
+			from services.bot_manager import bot_manager
+			app = bot_manager.active_bots.get(int(data.get('bot_id') or 1))
+			if not app:
+				logger.warning(f"Order {order_id}: no bot app to ask the customer "
+				               f"about the closed voice chat")
+				return False
+			user = await DatabaseManager.get_user_by_id(data['user_id'])
+			if not user:
+				return False
+			from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+			kb = InlineKeyboardMarkup([[
+				InlineKeyboardButton("\u2705 \u0627\u062f\u0627\u0645\u0647 \u0645\u06cc\u200c\u062f\u0647\u0645",
+				                     callback_data=f"chatclosed_{order_id}_keep"),
+				InlineKeyboardButton("\u26d4\ufe0f \u0646\u0647\u060c \u062a\u0633\u0648\u06cc\u0647 \u06a9\u0646",
+				                     callback_data=f"chatclosed_{order_id}_stop"),
+			]])
+			remaining = float((self.active_orders.get(order_id) or {}).get('remaining_seconds') or 0)
+			msg = (
+				f"\u26a0\ufe0f \u0648\u06cc\u0633\u200c\u0686\u062a \u0633\u0641\u0627\u0631\u0634 #{order_id} \u0627\u0632 \u0633\u0645\u062a \u062a\u0644\u06af\u0631\u0627\u0645 \u0628\u0633\u062a\u0647 \u0634\u062f (\u062a\u0648\u0633\u0637 \u062e\u0648\u062f\u062a\u0627\u0646 \u06cc\u0627 \u0627\u062f\u0645\u06cc\u0646 \u06af\u0631\u0648\u0647).\n\n"
+				f"\u23f3 \u0632\u0645\u0627\u0646 \u0628\u0627\u0642\u06cc\u200c\u0645\u0627\u0646\u062f\u0647\u0654 \u0633\u0641\u0627\u0631\u0634: {_format_timer(remaining)}\n"
+				"\u0627\u06a9\u0627\u0646\u062a\u200c\u0647\u0627 \u0628\u0647\u200c\u062e\u0627\u0637\u0631 \u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u06a9\u0627\u0644 \u0628\u06cc\u0631\u0648\u0646 \u0622\u0645\u062f\u0647\u200c\u0627\u0646\u062f \u0648 \u062a\u0627 \u0648\u0642\u062a\u06cc \u06a9\u0627\u0644 \u062a\u0627\u0632\u0647\u200c\u0627\u06cc \u062f\u0631 \u0647\u0645\u0627\u0646 "
+				"\u06af\u0631\u0648\u0647 \u0634\u0631\u0648\u0639 \u0646\u0634\u0648\u062f\u060c \u062d\u0636\u0648\u0631 \u0642\u0627\u0628\u0644 \u0627\u0631\u0627\u0626\u0647 \u0646\u06cc\u0633\u062a.\n\n"
+				"\u0627\u062f\u0627\u0645\u0647 \u0645\u06cc\u200c\u062f\u0647\u06cc\u062f (\u062a\u0627 \u067e\u0627\u06cc\u0627\u0646 \u0645\u0647\u0644\u062a\u060c \u0628\u0627 \u06a9\u0627\u0644 \u062a\u0627\u0632\u0647) \u06cc\u0627 \u0647\u0645\u06cc\u0646\u200c\u062c\u0627 \u062e\u0627\u062a\u0645\u0647 \u0648 \u062a\u0633\u0648\u06cc\u0647 \u0634\u0648\u062f\u061f\n"
+				"\u062f\u0631 \u0635\u0648\u0631\u062a \u062e\u0627\u062a\u0645\u0647\u060c \u0641\u0642\u0637 \u0632\u0645\u0627\u0646 \u0627\u0633\u062a\u0641\u0627\u062f\u0647\u200c\u0634\u062f\u0647 \u062a\u0627 \u0644\u062d\u0638\u0647\u0654 \u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u06a9\u0627\u0644 \u062d\u0633\u0627\u0628 \u0645\u06cc\u200c\u0634\u0648\u062f \u0648 "
+				"\u0628\u0627\u0642\u06cc \u0645\u0628\u0644\u063a \u0628\u0647 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0628\u0631\u0645\u06cc\u200c\u06af\u0631\u062f\u062f."
+			)
+			await app.bot.send_message(user['telegram_id'], msg, reply_markup=kb)
+			# Fallback line: the customer can also settle by TYPING «پایان» (the
+			# text handler picks it up) instead of pressing an inline button.
+			try:
+				from helpers.message_utils import send_safe as _send_safe
+				from telegram import ReplyKeyboardMarkup
+				await _send_safe(
+					app.bot, user['telegram_id'],
+					"⌛️ اگر نمی‌خواهید منتظر بمانید، دکمهٔ زیر را بزنید یا کلمهٔ «پایان» را بفرستید.",
+					reply_markup=ReplyKeyboardMarkup([["⛔️ پایان سفارش"]],
+					                                 resize_keyboard=True,
+					                                 one_time_keyboard=True),
+				)
+			except Exception as exc:
+				logger.debug(f"Order {order_id}: text fallback line failed: {exc}")
+			logger.warning(f"Order {order_id}: asked the customer about the closed "
+			               f"voice chat (closed_at={closed_at:.0f})")
+			return True
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: could not ask the customer about the "
+			               f"closed voice chat: {type(exc).__name__}")
+			return False
+
+	async def continue_after_chat_closed(self, order_id: int) -> bool:
+		"""Customer chose "continue": drop the closed marker so a NEW call is joined."""
+		try:
+			vcm = _get_voice_call_manager()
+			if vcm and hasattr(vcm, "clear_chat_closed"):
+				vcm.clear_chat_closed(order_id)
+			self._chat_closed_asked[order_id] = False
+			self._chat_closed_continue_since[order_id] = time.time()
+			logger.info(f"Order {order_id}: customer chose to continue after the "
+			            f"voice chat closed; markers cleared")
+			return True
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: continue-after-closed failed: {exc}")
+			return False
+
+	async def settle_chat_closed_order(self, order_id: int, *, bot_id: int = 1,
+	                                   expected_user_id=None,
+	                                   canceled_by_role=None,
+	                                   cancellation_reason=None) -> dict:
+		"""Customer chose to stop: bill only up to the closure, refund the rest.
+
+		The unserved period (from the moment the call was closed) must not be
+		charged - the same atomic claim/refund path as a normal cancellation is
+		used, with ``bill_until`` as the billing cutoff.
+		"""
+		closed_at = None
+		try:
+			vcm = _get_voice_call_manager()
+			if vcm and hasattr(vcm, "chat_closed_since"):
+				closed_at = vcm.chat_closed_since(order_id)
+		except Exception:
+			closed_at = None
+		if closed_at is None:
+			closed_at = (self.active_orders.get(order_id) or {}).get("chat_closed_at")
+		return await self.settle_and_refund_order(
+			order_id, do_refund=True,
+			canceled_by_role=canceled_by_role or "\u0645\u0634\u062a\u0631\u06cc (\u0628\u0633\u062a\u0647\u200c\u0634\u062f\u0646 \u0648\u06cc\u0633\u200c\u0686\u062a)",
+			cancellation_reason=cancellation_reason or "\u0648\u06cc\u0633\u200c\u0686\u062a \u0628\u0633\u062a\u0647 \u0634\u062f \u0648 \u0645\u0634\u062a\u0631\u06cc \u0627\u062f\u0627\u0645\u0647 \u0646\u062f\u0627\u062f",
+			bot_id=bot_id, expected_user_id=expected_user_id,
+			bill_until=closed_at,
+		)
+
+	async def _auto_settle_after_closed_chat(self, order_id: int, data: dict):
+		"""مشتری «ادامه» را زد ولی کال باز نشد → تسویهٔ خودکار.
+
+		فقط زمانِ سرو‌شدهٔ تا لحظهٔ بسته‌شدن کال شارژ می‌شود؛ باقی به کیف پول
+		برمی‌گردد (همان مسیر اتمیک لغو با bill_until).
+		"""
+		try:
+			summary = await self.settle_chat_closed_order(
+				order_id, bot_id=int(data.get("bot_id") or 1),
+				expected_user_id=data.get("user_id"),
+				canceled_by_role="سیستم (کال باز نشد)",
+				cancellation_reason="ویس‌چت بسته ماند و کال تازه‌ای شروع نشد",
+			)
+		except ValueError:
+			logger.info(f"Order {order_id}: already settled before the closed-chat "
+			            f"grace expired")
+			return
+		except Exception as exc:
+			logger.error(f"Order {order_id}: auto-settlement after a closed chat "
+			             f"failed ({type(exc).__name__}); left for the operator")
+			return
+		self._chat_closed_asked.pop(order_id, None)
+		self._chat_closed_continue_since.pop(order_id, None)
+		logger.warning("Order %s: closed-chat grace expired - settled as system; "
+		               "used=%s refunded=%s",
+		               order_id, summary.get('used_cost'), summary.get('refund_amount'))
+		try:
+			from services.bot_manager import bot_manager
+			app = bot_manager.active_bots.get(int(data.get('bot_id') or 1))
+			user = await DatabaseManager.get_user_by_id(data.get('user_id'))
+			if app and user:
+				await app.bot.send_message(
+					user['telegram_id'],
+					f"⛔️ سفارش #{order_id} بسته شد: بعد از انتخاب «ادامه»، کال تازه‌ای در گروه شروع نشد.\n"
+					f"⏱ مصرف تا لحظهٔ بسته‌شدن کال: {float(summary.get('used_cost') or 0):,.0f} تومان\n"
+					f"💵 عودت به کیف پول: {float(summary.get('refund_amount') or 0):,.0f} تومان\n"
+					f"👛 موجودی: {float(summary.get('user_wallet_balance') or 0):,.0f} تومان",
+				)
+		except Exception as exc:
+			logger.debug(f"Order {order_id}: settle notice to the customer failed: {exc}")
+
 	async def settle_and_refund_order(
 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
 		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
-		expected_user_id=None,
+		expected_user_id=None, bill_until=None,
 	):
 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
 
@@ -2083,9 +2322,15 @@ class OrderExecutor:
 		# Row-locked, atomic claim + settlement: a second callback must not
 		# credit the wallet twice or refund a completed/cancelled order. Price
 		# depends on elapsed time and the FULL plan, never the joined-account ratio.
+		# Billing cutoff: when the service actually ended before 'now' (the voice
+		# chat was closed by the customer), only the served part is charged.
+		calculator = self.compute_order_settlement
+		if bill_until is not None:
+			calculator = (lambda _order, _b=float(bill_until):
+			              self.compute_order_settlement(_order, bill_until=_b))
 		settled = await DatabaseManager.settle_cancel_order(
 			order_id, bot_id=bot_id, do_refund=do_refund,
-			settlement_calculator=self.compute_order_settlement,
+			settlement_calculator=calculator,
 			expected_user_id=expected_user_id,
 		)
 		if settled is None:

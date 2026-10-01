@@ -287,6 +287,10 @@ class Config:
     VOICE_CHAT_CLOSED_MIN_ACCOUNTS = int(os.getenv('VOICE_CHAT_CLOSED_MIN_ACCOUNTS', '2'))
     VOICE_CHAT_CLOSED_WINDOW_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_WINDOW_SECONDS', '60'))
     VOICE_CHAT_CLOSED_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_GRACE_SECONDS', '300'))
+    # پس از پاسخ «ادامه می‌دهم»: اگر کال تا این مدت در همان گروه تازه نشود،
+    # سفارش خودکار تسویه می‌شود (فقط زمانِ تا لحظهٔ بسته‌شدن کال شارژ و
+    # باقی به کیف پول عودت می‌شود). صفر = خاموش.
+    VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS = float(os.getenv('VOICE_CHAT_CLOSED_CONTINUE_GRACE_SECONDS', '600'))
     # Driver-level attempt budget per account (start_call itself already does
     # bounded retries + respects FloodWait internally).
     VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
