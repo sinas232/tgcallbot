@@ -1,5 +1,5 @@
 diff --git a/.env.example b/.env.example
-index 82fa755..cfd55d7 100644
+index 82fa755..dd15e73 100644
 --- a/.env.example
 +++ b/.env.example
 @@ -85,9 +85,19 @@ ORDER_LINK_MODE=any
@@ -25,7 +25,20 @@ index 82fa755..cfd55d7 100644
  HEALTH_CHECK_INTERVAL=3600
  LOG_LEVEL=INFO
  
-@@ -232,8 +242,16 @@ ANTISPAM_JOIN_GAP_MIN=3.0
+@@ -129,6 +139,12 @@ VOICE_SILENCE_MODE=media
+ VOICE_LISTENER_PROBE_SECONDS=60
+ VOICE_LISTENER_MAX_FAILURES=2
+ VOICE_LISTENER_MAX_DROPS=3
++# سقفِ زمانیِ معافیتِ TEMPORARILY_UNKNOWN. وقتی فهرستِ شرکت‌کنندگان پاسخ نمی‌دهد
++# (present=None) اکانت شمارش‌شده می‌ماند و شمارندهٔ قطعِ مطمئن جلو نمی‌رود. بدونِ سقف، در
++# سفارشِ 930 هشت اکانت با مدیایِ مرده 200 ثانیه live شمرده شدند. پس از این
++# مدت بی‌پاسخیِ پیوسته، سیاستِ معمولیِ CHECK_FAILED اجرا می‌شود تا بازیابی از همان
++# مسیرِ مجاز (بازپیوندِ همان اکانت) رد شود. 0 = سقف خاموش (رفتارِ قبلی).
++VOICE_PRESENCE_UNKNOWN_MAX_SECONDS=120
+ # پس از 406، کلید از سفارش‌های بعدی کنار می‌ماند؛ فقط از کارت همان اکانت
+ # (در پردازهٔ خود ربات) پس از این مکث بررسی/رفع قرنطینه می‌شود؛ خودکار retry نشود.
+ VOICE_SESSION_CONFLICT_RETRY_SECONDS=60
+@@ -232,8 +248,16 @@ ANTISPAM_JOIN_GAP_MIN=3.0
  ANTISPAM_JOIN_GAP_MAX=8.0
  # jitter انسانیِ اضافه روی فاصلهٔ join:
  ANTISPAM_JOIN_JITTER_MAX=2.5
@@ -43,7 +56,7 @@ index 82fa755..cfd55d7 100644
  # pacing خروج از ویس‌کال در پایان/لغو سفارش (ثانیه):
  ANTISPAM_LEAVE_GAP_MIN=1.5
  ANTISPAM_LEAVE_GAP_MAX=4.0
-@@ -253,3 +271,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
+@@ -253,3 +277,19 @@ GROUP_LEAVE_SWEEP_BATCH=25
  
  # ── ممنوعیت ثبت سفارش جدید پس از لغو (دقیقه) — 0 = خاموش
  CANCEL_COOLDOWN_MINUTES=20
@@ -1718,7 +1731,7 @@ index 490a5b0..05bee81 100644
                        "call not found")),
      ("forbidden", ("forbidden", "403", "not enough rights")),
 diff --git a/services/voice_call_manager.py b/services/voice_call_manager.py
-index 263629f..51fde01 100644
+index 263629f..020c177 100644
 --- a/services/voice_call_manager.py
 +++ b/services/voice_call_manager.py
 @@ -75,7 +75,6 @@ from services.session_client import close_pyrogram_client
@@ -1802,7 +1815,90 @@ index 263629f..51fde01 100644
                  except asyncio.CancelledError:
                      raise
                  except Exception as exc:
-@@ -3906,9 +3953,17 @@ class VoiceCallManager:
+@@ -3573,6 +3620,9 @@ class VoiceCallManager:
+              disconnect could NOT be recovered (bounded attempts).
+         """
+         fail_cycles: Dict[int, int] = {}  # account_id -> consecutive confirmed absences
++        # account_id -> wall-clock start of the CURRENT run of cycles in which
++        # the participant listing could not answer.  Bounds the exemption below.
++        unknown_since: Dict[int, float] = {}
+         try:
+             while True:
+                 await asyncio.sleep(KEEPALIVE_INTERVAL + random.uniform(0, 5))
+@@ -3737,6 +3787,7 @@ class VoiceCallManager:
+                                     "reason": "media_binding_lost_and_participant_query_unknown",
+                                 })
+ 
++
+                         # ── DL HOLD-RISK (online deep-learning model) ───
+                         # Score every cycle, learn from the resolved outcome, and
+                         # keep per-cycle telemetry so WHY an account is at risk
+@@ -3788,6 +3839,7 @@ class VoiceCallManager:
+                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = observed_state
+                             fail_cycles.pop(acc_id, None)
+                             self._rejoin_failures.pop((order_id, acc_id), None)
++                            unknown_since.pop(acc_id, None)
+                             rec.pop("unrecoverable", None)
+                             rec["status"] = observed_state
+                             rec["last_ok"] = time.time()
+@@ -3803,9 +3855,45 @@ class VoiceCallManager:
+                         if present is None:
+                             # TEMPORARILY_UNKNOWN — API error / unknown. Keep counted,
+                             # do NOT increment fail counter, do NOT recover.
+-                            self._account_states_by_order.setdefault(order_id, {})[acc_id] = "TEMPORARILY_UNKNOWN"
+-                            rec["status"] = "TEMPORARILY_UNKNOWN"
+-                            continue
++                            #
++                            # ...but only for a bounded time.  "Unknown" is an
++                            # exemption from the disconnect policy, and an
++                            # exemption with no ceiling is how order 930 kept
++                            # eight media-dead accounts counted as live for
++                            # 200s: the listing API was timing out (the
++                            # channels.GetMessages storm), `present` stayed
++                            # None, the fail counter never advanced, and the
++                            # confirmed-disconnect path was never reached.
++                            # The cycle-count threshold is no bound either when
++                            # cycles themselves stretch under load — one cycle
++                            # there took 164s instead of the intended 7-12s.
++                            #
++                            # After VOICE_PRESENCE_UNKNOWN_MAX_SECONDS of
++                            # CONTINUOUS unknown we stop exempting the slot and
++                            # let the ordinary CHECK_FAILED policy run, so
++                            # recovery still goes through the one sanctioned
++                            # path (_recover_same_account) rather than a new
++                            # action invented here.  0 disables the ceiling.
++                            _now = time.time()
++                            if acc_id not in unknown_since:
++                                unknown_since[acc_id] = _now
++                            _unknown_max = float(getattr(
++                                Config, "VOICE_PRESENCE_UNKNOWN_MAX_SECONDS", 120) or 0)
++                            # <= 0 disables the ceiling entirely (original
++                            # unbounded exemption); otherwise the slot stays
++                            # exempt only until the ceiling elapses.
++                            if _unknown_max <= 0 or (_now - unknown_since[acc_id]) < _unknown_max:
++                                self._account_states_by_order.setdefault(order_id, {})[acc_id] = "TEMPORARILY_UNKNOWN"
++                                rec["status"] = "TEMPORARILY_UNKNOWN"
++                                continue
++                            self._vc_event_log(order_id, acc_id, "presence_unknown_expired", {
++                                "chat_id": cid,
++                                "unknown_for_s": round(_now - unknown_since[acc_id], 1),
++                                "limit_s": _unknown_max,
++                            })
++                            # fall through: treat as CHECK_FAILED
++                        else:
++                            unknown_since.pop(acc_id, None)
+ 
+                         # present is False → CHECK_FAILED (not found this cycle).
+                         self._account_states_by_order.setdefault(order_id, {})[acc_id] = "CHECK_FAILED"
+@@ -3845,6 +3933,7 @@ class VoiceCallManager:
+                             # Same account rejoined — DO NOT increment count.
+                             fail_cycles.pop(acc_id, None)
+                             self._rejoin_failures.pop((order_id, acc_id), None)
++                            unknown_since.pop(acc_id, None)
+                             self._vc_event_log(order_id, acc_id, "rejoined_same_account", {"chat_id": cid})
+                             self._record_drop(order_id, acc_id, cid, "recovered",
+                                               reason="same-account rejoin ok", extra={"fail_cycle": int(fc)})
+@@ -3906,9 +3995,17 @@ class VoiceCallManager:
          """
          Track which accounts this order has *selected* so far.
  
@@ -1823,7 +1919,7 @@ index 263629f..51fde01 100644
          """
          async with self._reservation_lock:
              self._reservations[order_id] = set(account_ids)
-@@ -4407,6 +4462,21 @@ class VoiceCallManager:
+@@ -4407,6 +4504,21 @@ class VoiceCallManager:
              key_set.add((order_id, aid))
          keys = list(key_set)
  
@@ -3939,6 +4035,174 @@ index 0000000..b60d989
 +        src = inspect.getsource(oe.OrderExecutor._voice_batched_fill)
 +        self.assertIn('if outcome == OUTCOME_PERMANENT:', src)
 +        self.assertIn('_mark_voice_account_permanent(', src)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_presence_unknown_ceiling.py b/tests/test_presence_unknown_ceiling.py
+new file mode 100644
+index 0000000..958ccce
+--- /dev/null
++++ b/tests/test_presence_unknown_ceiling.py
+@@ -0,0 +1,162 @@
++"""The TEMPORARILY_UNKNOWN exemption from the disconnect policy must be bounded.
++
++Order 930 kept eight accounts (116, 119, 117, 122, 149, 123, 133, 124) counted
++as live while their engine media binding was provably dead:
++
++    13:49:16 acc=116 media_transport_lost dwell=77.7s
++    13:49:29 acc=116 media_transport_lost dwell=91.2s
++    13:49:40 acc=116 media_transport_lost dwell=102.5s
++    13:49:52 acc=116 media_transport_lost dwell=114.2s
++    13:52:36 acc=116 confirmed_disconnect  presence absent 5x in a row
++
++Confirmation is counted in CYCLES (CONFIRMED_DISCONNECT_THRESHOLD, default 5)
++and a cycle is meant to be KEEPALIVE_INTERVAL (7) + up to 5s of jitter, so the
++intended latency was about 48s.  It took 200s for two compounding reasons:
++
++  * the listing API was timing out (the channels.GetMessages storm), and
++    `present is None` deliberately does NOT advance the fail counter, so the
++    exemption had no ceiling at all;
++  * the cycle count is not a time bound when cycles themselves stretch under
++    load -- one cycle there took 164s instead of 7-12s.
++
++`presence_check_error` only goes to the JSONL event log, so the whole 164s
++gap was invisible in the console too.
++
++These tests drive the REAL `_monitor_loop`.
++"""
++from __future__ import annotations
++
++import asyncio
++import os
++import sys
++import tempfile
++import time
++import unittest
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++_TMP = tempfile.mkdtemp(prefix='unknownceil-')
++os.environ.setdefault('DATABASE_URL', 'postgresql+asyncpg://u:p@localhost/db')
++os.environ.setdefault('SESSION_ENCRYPTION_KEY',
++                      'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=')
++os.environ['VOICE_FLOOD_COOLDOWN_PATH'] = os.path.join(_TMP, 'cooldown.json')
++os.environ['VOICE_STRATEGY_CACHE_PATH'] = os.path.join(_TMP, 'strategy.json')
++os.makedirs(os.path.join(_TMP, 'logs'), exist_ok=True)
++os.chdir(_TMP)
++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _ROOT not in sys.path:
++    sys.path.insert(0, _ROOT)
++
++from config import Config  # noqa: E402
++from services import voice_call_manager as vcm  # noqa: E402
++from services.voice_call_manager import VoiceCallManager  # noqa: E402
++
++ORDER, ACC, CHAT = 930, 116, -1001956513128
++
++
++class UnknownCeilingTests(unittest.IsolatedAsyncioTestCase):
++
++    def _manager(self, present):
++        mgr = VoiceCallManager()
++        mgr.joined_accounts_by_order[ORDER] = {
++            ACC: {'chat_id': CHAT, 'target': 'w0ehcifhemk4ownk',
++                  'status': 'JOINED', 'joined_at': time.time()},
++        }
++        mgr.active_calls[(ORDER, ACC)] = {'chat_id': CHAT}
++        mgr.pyrogram_clients[ACC] = SimpleNamespace(
++            me=SimpleNamespace(id=420), is_connected=True)
++        mgr.clients[ACC] = object()
++        mgr._is_in_voice_call = AsyncMock(return_value=present)
++        mgr._is_media_call_active = AsyncMock(return_value=False)
++        mgr._fetch_shared_participants = AsyncMock(return_value=None)
++        return mgr
++
++    async def _run(self, mgr, *, ceiling, seconds=0.6, threshold=5):
++        rejoin = AsyncMock(return_value=True)
++        restore = AsyncMock()
++        mgr._recover_same_account = rejoin
++        mgr._schedule_media_restore = restore
++        with patch.object(vcm, 'KEEPALIVE_INTERVAL', 0), \
++             patch.object(vcm, 'CONFIRMED_DISCONNECT_THRESHOLD', threshold), \
++             patch.object(vcm.random, 'uniform', return_value=0), \
++             patch.object(Config, 'VOICE_PRESENCE_UNKNOWN_MAX_SECONDS', ceiling,
++                          create=True), \
++             patch.object(Config, 'VOICE_SESSION_GUARD', False, create=True), \
++             patch.object(Config, 'VOICE_DL_HOLD_RISK', False, create=True):
++            task = asyncio.ensure_future(mgr._monitor_loop(ORDER))
++            await asyncio.sleep(seconds)
++            task.cancel()
++            try:
++                await task
++            except (asyncio.CancelledError, Exception):
++                pass
++        return rejoin, restore
++
++    async def test_within_the_ceiling_the_old_behaviour_is_untouched(self):
++        """A brief listing hiccup must still be tolerated, not acted on."""
++        mgr = self._manager(present=None)
++        rejoin, restore = await self._run(mgr, ceiling=3600)
++        self.assertEqual(
++            mgr._account_states_by_order[ORDER][ACC], 'TEMPORARILY_UNKNOWN')
++        rejoin.assert_not_awaited()
++        restore.assert_not_awaited()
++
++    async def test_past_the_ceiling_the_sanctioned_recovery_is_reached(self):
++        """The order-930 case: unknown forever must not mean live forever."""
++        mgr = self._manager(present=None)
++        rejoin, _restore = await self._run(mgr, ceiling=0.05, threshold=2)
++        self.assertTrue(
++            rejoin.await_count >= 1,
++            'after VOICE_PRESENCE_UNKNOWN_MAX_SECONDS of continuous unknown the '
++            'slot must reach _recover_same_account, not stay exempt indefinitely')
++        # No status assertion here: with an instant mocked rejoin the loop
++        # legitimately cycles (recovered -> unknown -> expired -> recovered),
++        # so the state observed at cancel time is arbitrary.  The point under
++        # test is that the sanctioned recovery path is reached at all.
++
++    async def test_unknown_presence_never_schedules_a_media_restore(self):
++        """Guard the mistake this change was almost shipped with.
++
++        `_schedule_media_restore`'s L1 is a play() and its L2 comment states
++        plainly "This sends LeaveGroupCall for the target if bound".  In the
++        ambiguous case we do not know whether the account is still in the
++        call, so that ladder must not run here -- it is exactly the
++        join/leave churn the ghost-media-only design avoids.
++        """
++        mgr = self._manager(present=None)
++        _rejoin, restore = await self._run(mgr, ceiling=0.05, threshold=2)
++        restore.assert_not_awaited()
++
++    async def test_a_resolved_presence_resets_the_streak(self):
++        """Only CONTINUOUS unknown counts; a good answer clears the clock.
++
++        Cadence is deliberate: each cycle takes ~30ms, the ceiling is 50ms, so
++        a run of two unknowns (30ms) never expires -- but WITHOUT the reset the
++        accumulated run would cross 50ms by the third unknown and recovery
++        would fire.  With threshold=2 that difference is observable.
++        """
++        mgr = self._manager(present=None)
++        seen = []
++
++        async def flaky(*_a):
++            await asyncio.sleep(0.03)
++            # None, None, True, None, None, True, ...
++            seen.append(len(seen))
++            return True if (len(seen) - 1) % 3 == 2 else None
++
++        mgr._is_in_voice_call = flaky
++        rejoin, _r = await self._run(mgr, ceiling=0.05, threshold=2, seconds=0.7)
++        self.assertGreater(len(seen), 5, 'sanity: the loop ran several cycles')
++        rejoin.assert_not_awaited()
++
++    async def test_the_ceiling_can_be_switched_off(self):
++        """0 restores the original unbounded exemption (escape hatch)."""
++        mgr = self._manager(present=None)
++        rejoin, _r = await self._run(mgr, ceiling=0, threshold=2)
++        rejoin.assert_not_awaited()
++        self.assertEqual(
++            mgr._account_states_by_order[ORDER][ACC], 'TEMPORARILY_UNKNOWN')
 +
 +
 +if __name__ == '__main__':
