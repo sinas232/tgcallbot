@@ -344,10 +344,10 @@ index d95edf9..4103ec5 100644
        - redis_data:/data
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..1890aa7
+index 0000000..d3ace80
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,121 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -430,7 +430,39 @@ index 0000000..1890aa7
 +- پیک سلول‌های بالا یعنی بسته واقعاً فعال است (`🔖 running commit: <sha>` را هم چک کنید).
 +- اگر همچنان `BELOW TARGET` دیدید، همان خط دقیقاً می‌گوید کدام اسلات‌ها و به چه دلیلی خالی مانده‌اند.
 +
-+## ۶) آزمون‌ها
++## ۶) نصب روی سرور (دستورهای تأییدشده)
++
++اگر روی سرور `git apply` با `patch failed: services/order_executor.py:13` خطا داد، یعنی آن
++سرور نسخهٔ **قدیمی‌تری** از `v2323-full-port.diff` را خورده است (نسخه‌های ۱۴۶/۱۶۰/۱۷۵/۱۸۶
++کیلوبایتی، که ایمپورت‌های `join_brain` در آن‌ها یک‌خطی است). مسیر قطعی، شروع از درخت
++تمیزِ v2.3.23 و اعمال یک‌جای «پورت تازه + این چهار فیکس» است:
++
++```bash
++cd /opt/tgcallbot
++git fetch origin arena/01a0f720-tgcallbot
++git checkout -- .                       # فایل‌های ردیابی‌شده به c8259a5 برمی‌گردند
++git clean -fd -- services tests docs    # حذف بازماندهٔ untracked پورت قبلی (.env دست‌نخورده)
++git status --porcelain                  # باید هیچ خطی چاپ نکند
++git show origin/arena/01a0f720-tgcallbot:v2323-full-port.diff > /tmp/port.diff
++git apply /tmp/port.diff                # اگر گیر داد: git apply --3way /tmp/port.diff
++docker compose config --quiet
++docker compose up -d --force-recreate bot
++```
++
++- نام سرویس در compose **`bot`** است (`telegram_bot_container` فقط `container_name` است)، پس
++  `docker compose up -d --force-recreate telegram_bot_container` خطای «no such service» می‌دهد.
++- کد با `volumes: .:/app` داخل کانتینر mount است؛ `--build` لازم نیست ولی `--force-recreate`
++  لازم است تا پروسه با کد تازه بالا بیاید.
++- **قبل از restart مطمئن شوید سفارش فعالی در حال اجرا نیست**: بالا آمدن کانتینر تازه یعنی
++  قطع‌شدن همهٔ سشن‌های ویس؛ همان حادثهٔ ۱۴۰۵/۰۷/۰۴. اگر سفارشی در جریان است، بعد از
++  پایانش استقرار را انجام دهید.
++- اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
++  گاردها را خودش انجام می‌دهد).
++- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
++- فقط اگر درخت سرور دقیقاً هم‌سن `d08a4d8` باشد، `v2323-voice-join-fixes.diff` (۷۴KB) هم
++  کافی است؛ روی پورت‌های قدیمی‌تر اعمال نمی‌شود چون خودِ پورت قدیمی‌تر است.
++
++## ۷) آزمون‌ها
 +
 +سوئیت کامل: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip** (۱۸ تست تازه). این‌ها آفلاین‌اند و رفتار
 +زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند؛
@@ -1709,21 +1741,30 @@ index 0000000..6123593
 +        return False, pct
 +    return True, pct
 diff --git a/services/order_executor.py b/services/order_executor.py
-index 0e19892..ed8634b 100644
+index 0e19892..b6b54de 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -12,7 +12,9 @@ from database import DatabaseManager
+@@ -12,12 +12,18 @@ from database import DatabaseManager
  from telegram_client import TelegramAccountClient
  from utils.helpers import format_jalali_datetime
  from config import Config
 -from services.join_brain import join_brain, OUTCOME_OK, OUTCOME_DEAD, OUTCOME_FLOOD
 +from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
-+                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
-+                                 OUTCOME_SYSTEM)
++                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
  from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
                                          is_fatal_auth_error, fatal_auth_category)
  from services import self_healing
-@@ -41,6 +43,48 @@ def _get_voice_call_manager():
+ from services.anti_spam import anti_spam
+ from services.voice_cooldown import voice_cooldown
++# ── Telegram-side (infrastructure) failures ─────────────────────────────────
++# OUTCOME_SYSTEM is imported on its own line so this fix applies cleanly on
++# every v2.3.23 port revision of this file (older ports import the other
++# outcomes through a different, multi-line statement).
++from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -41,6 +47,48 @@ def _get_voice_call_manager():
  		return None
  
  
@@ -1772,7 +1813,7 @@ index 0e19892..ed8634b 100644
  class OrderExecutor:
  	"""
  	Core executor for Telegram orders (voice chat, group join, etc.).
-@@ -192,8 +236,23 @@ class OrderExecutor:
+@@ -192,8 +240,23 @@ class OrderExecutor:
  	        order_type = data["order_type"]
  
  	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
@@ -1798,7 +1839,7 @@ index 0e19892..ed8634b 100644
  
  	        if exact <= 0:
  	            await self._fail_order(order_id, "No eligible active accounts available.")
-@@ -523,9 +582,26 @@ class OrderExecutor:
+@@ -523,9 +586,26 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -1826,7 +1867,7 @@ index 0e19892..ed8634b 100644
  	    chosen: List[Dict] = []
  	    cursor = self._voice_cursor.get(order_id, 0)
  	    n = len(pool)
-@@ -537,7 +613,7 @@ class OrderExecutor:
+@@ -537,7 +617,7 @@ class OrderExecutor:
  	        aid = acc.get("id")
  	        if not aid:
  	            continue
@@ -1835,7 +1876,7 @@ index 0e19892..ed8634b 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -564,13 +640,30 @@ class OrderExecutor:
+@@ -564,13 +644,30 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -1868,7 +1909,7 @@ index 0e19892..ed8634b 100644
  	            continue
  	        if attempts.get(aid, 0) >= attempt_budget:
  	            continue
-@@ -594,6 +687,27 @@ class OrderExecutor:
+@@ -594,6 +691,27 @@ class OrderExecutor:
  	        best = when if best is None else min(best, when)
  	    return best
  
@@ -1896,7 +1937,7 @@ index 0e19892..ed8634b 100644
  	async def _voice_second_chance_retry(self, order_id: int, bot_id: int,
  	                                    joined_ids: Set[int]) -> bool:
  	    """Give transiently exhausted accounts ONE new attempt per bounded round.
-@@ -671,30 +785,32 @@ class OrderExecutor:
+@@ -671,30 +789,32 @@ class OrderExecutor:
  	        _as_profile = await anti_spam.get_profile(bot_id)
  	    except Exception:
  	        _as_profile = None
@@ -1948,7 +1989,7 @@ index 0e19892..ed8634b 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -702,6 +818,9 @@ class OrderExecutor:
+@@ -702,6 +822,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -1958,7 +1999,7 @@ index 0e19892..ed8634b 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -748,12 +867,55 @@ class OrderExecutor:
+@@ -748,12 +871,55 @@ class OrderExecutor:
  	            if earliest is None:
  	                if await self._voice_second_chance_retry(order_id, bot_id, joined_ids):
  	                    continue
@@ -2014,7 +2055,7 @@ index 0e19892..ed8634b 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -784,6 +946,16 @@ class OrderExecutor:
+@@ -784,6 +950,16 @@ class OrderExecutor:
  	            f"live={live}/{target_count})"
  	        )
  
@@ -2031,7 +2072,7 @@ index 0e19892..ed8634b 100644
  	        wave_tasks: List[asyncio.Task] = []
  	        for _i, acc in enumerate(candidates):
  	            if _i > 0:
-@@ -829,6 +1001,15 @@ class OrderExecutor:
+@@ -829,6 +1005,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -2047,7 +2088,7 @@ index 0e19892..ed8634b 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -872,6 +1053,7 @@ class OrderExecutor:
+@@ -872,6 +1057,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -2055,7 +2096,7 @@ index 0e19892..ed8634b 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -882,6 +1064,7 @@ class OrderExecutor:
+@@ -882,6 +1068,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -2063,7 +2104,7 @@ index 0e19892..ed8634b 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -903,6 +1086,7 @@ class OrderExecutor:
+@@ -903,6 +1090,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -2071,7 +2112,7 @@ index 0e19892..ed8634b 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -921,6 +1105,7 @@ class OrderExecutor:
+@@ -921,6 +1109,7 @@ class OrderExecutor:
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -2079,7 +2120,7 @@ index 0e19892..ed8634b 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -942,8 +1127,49 @@ class OrderExecutor:
+@@ -942,8 +1131,49 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -2129,7 +2170,7 @@ index 0e19892..ed8634b 100644
  	                attempts = self._voice_attempts.setdefault(order_id, {})
  	                n_att = attempts.get(aid, 0) + 1
  	                attempts[aid] = n_att
-@@ -993,11 +1219,16 @@ class OrderExecutor:
+@@ -993,11 +1223,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -2148,7 +2189,7 @@ index 0e19892..ed8634b 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1031,6 +1262,44 @@ class OrderExecutor:
+@@ -1031,6 +1266,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
@@ -2193,7 +2234,7 @@ index 0e19892..ed8634b 100644
  	    # Return only the accounts this call newly joined; the CALLER owns
  	    # merging them into the order's running joined_accounts list (the
  	    # VoiceCallManager remains the authoritative source for counting).
-@@ -1493,6 +1762,15 @@ class OrderExecutor:
+@@ -1493,6 +1766,15 @@ class OrderExecutor:
  					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
  				except Exception as exc:
  					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")

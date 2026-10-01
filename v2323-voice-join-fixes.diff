@@ -99,10 +99,10 @@ index e33815d..3388376 100644
      VOICE_ACCOUNT_ATTEMPT_LIMIT = int(os.getenv('VOICE_ACCOUNT_ATTEMPT_LIMIT', '3'))
 diff --git a/docs/voice-join-fix-pack-1405-07-09.fa.md b/docs/voice-join-fix-pack-1405-07-09.fa.md
 new file mode 100644
-index 0000000..1890aa7
+index 0000000..d3ace80
 --- /dev/null
 +++ b/docs/voice-join-fix-pack-1405-07-09.fa.md
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,121 @@
 +<div dir="rtl">
 +
 +# 🔧 بستهٔ اصلاحی سفارش ۹۳۰/۹۳۱ — چهار باگ، چهار فیکس
@@ -185,7 +185,39 @@ index 0000000..1890aa7
 +- پیک سلول‌های بالا یعنی بسته واقعاً فعال است (`🔖 running commit: <sha>` را هم چک کنید).
 +- اگر همچنان `BELOW TARGET` دیدید، همان خط دقیقاً می‌گوید کدام اسلات‌ها و به چه دلیلی خالی مانده‌اند.
 +
-+## ۶) آزمون‌ها
++## ۶) نصب روی سرور (دستورهای تأییدشده)
++
++اگر روی سرور `git apply` با `patch failed: services/order_executor.py:13` خطا داد، یعنی آن
++سرور نسخهٔ **قدیمی‌تری** از `v2323-full-port.diff` را خورده است (نسخه‌های ۱۴۶/۱۶۰/۱۷۵/۱۸۶
++کیلوبایتی، که ایمپورت‌های `join_brain` در آن‌ها یک‌خطی است). مسیر قطعی، شروع از درخت
++تمیزِ v2.3.23 و اعمال یک‌جای «پورت تازه + این چهار فیکس» است:
++
++```bash
++cd /opt/tgcallbot
++git fetch origin arena/01a0f720-tgcallbot
++git checkout -- .                       # فایل‌های ردیابی‌شده به c8259a5 برمی‌گردند
++git clean -fd -- services tests docs    # حذف بازماندهٔ untracked پورت قبلی (.env دست‌نخورده)
++git status --porcelain                  # باید هیچ خطی چاپ نکند
++git show origin/arena/01a0f720-tgcallbot:v2323-full-port.diff > /tmp/port.diff
++git apply /tmp/port.diff                # اگر گیر داد: git apply --3way /tmp/port.diff
++docker compose config --quiet
++docker compose up -d --force-recreate bot
++```
++
++- نام سرویس در compose **`bot`** است (`telegram_bot_container` فقط `container_name` است)، پس
++  `docker compose up -d --force-recreate telegram_bot_container` خطای «no such service» می‌دهد.
++- کد با `volumes: .:/app` داخل کانتینر mount است؛ `--build` لازم نیست ولی `--force-recreate`
++  لازم است تا پروسه با کد تازه بالا بیاید.
++- **قبل از restart مطمئن شوید سفارش فعالی در حال اجرا نیست**: بالا آمدن کانتینر تازه یعنی
++  قطع‌شدن همهٔ سشن‌های ویس؛ همان حادثهٔ ۱۴۰۵/۰۷/۰۴. اگر سفارشی در جریان است، بعد از
++  پایانش استقرار را انجام دهید.
++- اگر مسیر رسمی را ترجیح می‌دهید: `DEPLOY_CONFIRMED=yes bash ./deploy-warp.sh` (بکاپ DB و
++  گاردها را خودش انجام می‌دهد).
++- بعد از apply باید ۱۵ فایل `M` و ۲۰ فایل `??` تازه ببینید (پورت + فیکس‌ها).
++- فقط اگر درخت سرور دقیقاً هم‌سن `d08a4d8` باشد، `v2323-voice-join-fixes.diff` (۷۴KB) هم
++  کافی است؛ روی پورت‌های قدیمی‌تر اعمال نمی‌شود چون خودِ پورت قدیمی‌تر است.
++
++## ۷) آزمون‌ها
 +
 +سوئیت کامل: **۶۰۶ تست، ۶۰۰ موفق، ۶ skip** (۱۸ تست تازه). این‌ها آفلاین‌اند و رفتار
 +زندهٔ تلگرام (پاسخ InterDC، لیست شرکت‌کنندگان، بالاآمدن انجین) را اثبات نمی‌کنند؛
@@ -333,20 +365,22 @@ index 52c1932..e707471 100644
              policy.retryable_fails += 1
  
 diff --git a/services/order_executor.py b/services/order_executor.py
-index dfbf816..ed8634b 100644
+index dfbf816..b6b54de 100644
 --- a/services/order_executor.py
 +++ b/services/order_executor.py
-@@ -13,7 +13,8 @@ from telegram_client import TelegramAccountClient
- from utils.helpers import format_jalali_datetime
- from config import Config
- from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
--                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
-+                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
-+                                 OUTCOME_SYSTEM)
- from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
-                                         is_fatal_auth_error, fatal_auth_category)
+@@ -19,6 +19,11 @@ from services.session_ownership import (SessionInUseError, is_auth_key_duplicate
  from services import self_healing
-@@ -581,7 +582,10 @@ class OrderExecutor:
+ from services.anti_spam import anti_spam
+ from services.voice_cooldown import voice_cooldown
++# ── Telegram-side (infrastructure) failures ─────────────────────────────────
++# OUTCOME_SYSTEM is imported on its own line so this fix applies cleanly on
++# every v2.3.23 port revision of this file (older ports import the other
++# outcomes through a different, multi-line statement).
++from services.join_brain import OUTCOME_SYSTEM  # noqa: E402
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -581,7 +586,10 @@ class OrderExecutor:
  	        return []
  	    vcm = _get_voice_call_manager()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -358,7 +392,7 @@ index dfbf816..ed8634b 100644
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
  	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
-@@ -636,7 +640,10 @@ class OrderExecutor:
+@@ -636,7 +644,10 @@ class OrderExecutor:
  	    vcm = _get_voice_call_manager()
  	    now = time.time()
  	    attempts = self._voice_attempts.get(order_id, {})
@@ -370,7 +404,7 @@ index dfbf816..ed8634b 100644
  	    retry_after = self._voice_retry_after.get(order_id, {})
  	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
  	    # ── CROSS-ORDER EXCLUSION (incident 1405-07-04) ──────────────────────
-@@ -796,6 +803,14 @@ class OrderExecutor:
+@@ -796,6 +807,14 @@ class OrderExecutor:
  	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
  	    wave_no = 0
  	    starved_rounds = 0
@@ -385,7 +419,7 @@ index dfbf816..ed8634b 100644
  	    # A run of 406 errors suggests a systemic auth-key collision (including
  	    # same-process reseller copies), not proof of another server or a usable
  	    # key. Abort the wave to avoid hammering possibly invalidated keys.
-@@ -803,6 +818,9 @@ class OrderExecutor:
+@@ -803,6 +822,9 @@ class OrderExecutor:
  	    live = int(vcm.get_active_count(order_id))
  
  	    while self._is_order_active(order_id) and live < target_count:
@@ -395,7 +429,7 @@ index dfbf816..ed8634b 100644
  	        await join_brain.wait_if_paused(order_id)
  	        if not self._is_order_active(order_id):
  	            break
-@@ -890,6 +908,14 @@ class OrderExecutor:
+@@ -890,6 +912,14 @@ class OrderExecutor:
  	                # Should not happen (a ready account would have been
  	                # selected); avoid any possibility of a hot spin.
  	                break
@@ -410,7 +444,7 @@ index dfbf816..ed8634b 100644
  	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
  	            await asyncio.sleep(wait)
  	            continue
-@@ -975,6 +1001,15 @@ class OrderExecutor:
+@@ -975,6 +1005,15 @@ class OrderExecutor:
  	        wave_ok = 0
  	        wave_fail = 0
  	        wave_dead = 0
@@ -426,7 +460,7 @@ index dfbf816..ed8634b 100644
  	        for acc, _t in zip(candidates, wave_tasks):
  	            res = results.get(_t)
  	            if res is None:
-@@ -1018,6 +1053,7 @@ class OrderExecutor:
+@@ -1018,6 +1057,7 @@ class OrderExecutor:
  	                        f"retrying in 5s (budget kept)"
  	                    )
  	                    wave_fail += 1
@@ -434,7 +468,7 @@ index dfbf816..ed8634b 100644
  	                    continue
  
  	                # A typed AUTH_KEY_DUPLICATED (406) means Telegram invalidated
-@@ -1028,6 +1064,7 @@ class OrderExecutor:
+@@ -1028,6 +1068,7 @@ class OrderExecutor:
  	                    dead_count += 1  # order statistics, not a DB auto-disable
  	                    wave_dead += 1
  	                    wave_fail += 1
@@ -442,7 +476,7 @@ index dfbf816..ed8634b 100644
  	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                    self._voice_banned.setdefault(order_id, set()).add(aid)
  	                    self._voice_terminal[order_id].add(aid)
-@@ -1049,6 +1086,7 @@ class OrderExecutor:
+@@ -1049,6 +1090,7 @@ class OrderExecutor:
  	                        # Account itself is dead — mark inactive & replace.
  	                        dead_count += 1
  	                        wave_dead += 1
@@ -450,7 +484,7 @@ index dfbf816..ed8634b 100644
  	                        self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
  	                        self._voice_banned.setdefault(order_id, set()).add(aid)
  	                        self._voice_terminal[order_id].add(aid)
-@@ -1067,6 +1105,7 @@ class OrderExecutor:
+@@ -1067,6 +1109,7 @@ class OrderExecutor:
  	                    self._voice_banned[order_id].add(aid)
  	                    self._voice_terminal[order_id].add(aid)
  	                    wave_fail += 1
@@ -458,7 +492,7 @@ index dfbf816..ed8634b 100644
  	                    continue
  
  	                outcome = join_brain.classify_message(msg)
-@@ -1088,8 +1127,29 @@ class OrderExecutor:
+@@ -1088,8 +1131,29 @@ class OrderExecutor:
  	                    )
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -488,7 +522,7 @@ index dfbf816..ed8634b 100644
  
  	                if outcome == OUTCOME_PERMANENT:
  	                    # A permanent failure produces the IDENTICAL error on every retry,
-@@ -1104,6 +1164,7 @@ class OrderExecutor:
+@@ -1104,6 +1168,7 @@ class OrderExecutor:
  	                    self._mark_voice_account_permanent(order_id, aid, msg, attempt_budget)
  	                    join_brain.report_result(order_id, outcome, msg)
  	                    wave_fail += 1
@@ -496,7 +530,7 @@ index dfbf816..ed8634b 100644
  	                    logger.warning(
  	                        f"Order {order_id}: account {aid} permanent failure "
  	                        f"({msg[:90]}) - excluded from second-chance retries"
-@@ -1158,11 +1219,16 @@ class OrderExecutor:
+@@ -1158,11 +1223,16 @@ class OrderExecutor:
  	        # Wave fully resolved → recompute authoritative live count, adapt.
  	        live = int(vcm.get_active_count(order_id))
  	        wave_duration = time.monotonic() - wave_started
@@ -515,7 +549,7 @@ index dfbf816..ed8634b 100644
  	        )
  
  	        if order_id in self.active_orders:
-@@ -1196,6 +1262,44 @@ class OrderExecutor:
+@@ -1196,6 +1266,44 @@ class OrderExecutor:
  	                jit_hi = max(jit_lo, jit_hi, jitter_max)
  	            await asyncio.sleep(random.uniform(gap_lo, gap_hi) + random.uniform(jit_lo, jit_hi))
  
