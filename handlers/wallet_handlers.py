@@ -199,7 +199,7 @@ async def _prompt_charge_amount(update, context, bot_id, gw_instance, status, ms
         f"💰 **افزایش موجودی حساب**\n"
         f"درگاه: **{gw_instance['name']}**\n{msg_add}\n\n"
         "لطفاً مبلغ (تومان) را وارد کنید:\n"
-        "🔹 حداقل: ۱,۰۰۰ تومان\n"
+        f"🔹 حداقل: {payment_service.gateways[gw_instance['slug']].minimum_amount_toman():,} تومان\n"
         "🔹 حداکثر: ۵۰,۰۰۰,۰۰۰ تومان"
     )
 
@@ -312,8 +312,13 @@ async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         amount = int(clean_number(text))
-        if amount < 1000:
-            await update.message.reply_text("❌ حداقل مبلغ ۱,۰۰۰ تومان است.")
+        selected_slug = context.user_data.get('charge_gateway_slug')
+        gateway = payment_service.gateways.get(selected_slug) if selected_slug else None
+        minimum = gateway.minimum_amount_toman() if gateway else 1000
+        if amount < minimum:
+            await update.message.reply_text(
+                f"❌ حداقل مبلغ این درگاه {minimum:,} تومان است."
+            )
             return AWAITING_CHARGE_AMOUNT
             
         tg_user = update.effective_user
@@ -321,8 +326,6 @@ async def handle_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # درگاهی که کاربر انتخاب کرده (اگر چند درگاه فعال بود)؛ در غیر این‌صورت None
         # و سرویس اولین درگاه فعال را برمی‌دارد.
-        selected_slug = context.user_data.get('charge_gateway_slug')
-
         wait_msg = await update.message.reply_text("⏳ در حال اتصال به درگاه بانکی...")
         success, result = await payment_service.create_payment_link(user_id=user['id'], amount=amount, mobile=user.get('phone_number'), bot_id=bot_id, gateway_slug=selected_slug)
         

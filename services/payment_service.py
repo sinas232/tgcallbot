@@ -49,6 +49,10 @@ class BasePaymentGateway(ABC):
     def __init__(self, slug: str, name: str):
         self.slug = slug
         self.name = name
+
+    def minimum_amount_toman(self) -> int:
+        """Minimum amount accepted by this gateway, in toman."""
+        return 1000
     
     @abstractmethod
     async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str], config: dict) -> Tuple[bool, str, Optional[str]]:
@@ -162,6 +166,10 @@ class ZarinPalGateway(BasePaymentGateway):
     
     def __init__(self):
         super().__init__(GATEWAY_SLUG_ZARINPAL, "زرین‌پال")
+
+    def minimum_amount_toman(self) -> int:
+        # ZarinPal rejects requests below 15,000 toman (API error -9).
+        return 15000
         
     async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str], config: dict) -> Tuple[bool, str, Optional[str]]:
         merchant_id = config.get('merchant_id', Config.ZARINPAL_MERCHANT_ID)
@@ -272,6 +280,13 @@ class PaymentService:
         gateway = self.gateways.get(slug)
         
         if not gateway: return False, "Gateway Error"
+
+        minimum = gateway.minimum_amount_toman()
+        if amount < minimum:
+            return False, (
+                f"حداقل مبلغ شارژ با درگاه {gateway.name} "
+                f"{minimum:,} تومان است."
+            )
         
         config = {}
         if active_gw_db.get('config_json'):
