@@ -69,7 +69,9 @@ docker compose version
 ```bash
 # مسیر دلخواه (این سند از /opt/tgcallbot استفاده می‌کند)
 cd /opt
-git clone --branch arena/01a0ccf5-tgcallbot https://github.com/sinas232/tgcallbot.git
+# نکته: این برنچ خودش «کد کامل» است (v2.3.23 + همهٔ فیکس‌ها تا ۱۴۰۵/۰۷/۱۱).
+# روی سرور تازه هیچ git apply / پچی لازم نیست — فقط همین کلون.
+git clone --branch arena/01a0f720-tgcallbot https://github.com/sinas232/tgcallbot.git /opt/tgcallbot
 cd tgcallbot
 # فقط برای نصب واقعاً تازه؛ اگر DB یا ربات قبلی دارید، ادامهٔ این سند
 # مناسب نیست: ابتدا docs/deploy-final.fa.md را برای استقرار ایمن بخوانید.
@@ -223,9 +225,11 @@ WARP مستقیم داخل `docker-compose.yml` ادغام شده است؛ پس 
 می‌شود و ربات **هرگز بدون WARP بالا نمی‌آید**:
 
 ```bash
-cd ~/callmanager
+cd /opt/tgcallbot
 docker compose up -d --build
 docker compose ps
+# تأیید کد و سلامت تست‌ها روی سرور تازه (باید ۸۴ تست OK بدهد):
+docker exec telegram_bot_container python -m unittest tests.test_telegram_system_failures tests.test_presence_direct_recheck tests.test_chat_closed_ask_flow tests.test_report_dedupe tests.test_quarantine_heal
 ```
 
 برای **نصب تازه** دستور مستقیم Compose بالا کافی است. `deploy-warp.sh` مخصوص
@@ -252,7 +256,7 @@ docker exec telegram_bot_container sh -c "apt-get -qq install -y curl >/dev/null
 ## گام ۶ — بررسی سلامت و لاگ‌ها
 
 ```bash
-cd ~/callmanager
+cd /opt/tgcallbot
 docker compose logs -f bot \
   | grep -E "staggered|media restore|media_restore|VoiceEngine|VoiceMedia|VoicePresence|silence stream ready"
 ```
@@ -328,7 +332,7 @@ docker compose logs -f bot \
   را بی‌هدف پاک نمی‌کند.
 - **خطای `Database not ready ... Name or service not known`:** وضعیت DNS و
   مسیر WARP را بررسی کنید؛ `git pull` کورکورانه روی شاخهٔ قدیمی جای عیب‌یابی
-  نیست. کد باید روی `arena/01a0ccf5-tgcallbot` باشد و مقادیر DB/Redis
+  نیست. کد باید روی `arena/01a0f720-tgcallbot` باشد و مقادیر DB/Redis
   در `.env` با همین Compose منطبق باشند.
 
 
