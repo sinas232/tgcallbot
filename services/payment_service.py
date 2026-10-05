@@ -168,8 +168,8 @@ class ZarinPalGateway(BasePaymentGateway):
         super().__init__(GATEWAY_SLUG_ZARINPAL, "زرین‌پال")
 
     def minimum_amount_toman(self) -> int:
-        # ZarinPal rejects requests below 15,000 toman (API error -9).
-        return 15000
+# ZarinPal's API amount is in rial; its 15,000-rial floor equals 1,500 toman.
+        return 1500
         
     async def create_payment_link(self, user_id: int, amount: int, mobile: Optional[str], email: Optional[str], config: dict) -> Tuple[bool, str, Optional[str]]:
         merchant_id = config.get('merchant_id', Config.ZARINPAL_MERCHANT_ID)
