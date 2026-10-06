@@ -260,8 +260,15 @@ class OrderExecutor:
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
 	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
-		"""Claim a paid open order and register its worker; False if settled."""
+		"""Claim one paid order; concurrent voice orders are unsafe."""
 		if order_id in self.active_orders:
+			return False
+		if self.active_orders:
+			logger.warning(
+				"Order %s rejected: order %s is already active; "
+				"concurrent voice orders are disabled for MTProto safety",
+				order_id, next(iter(self.active_orders)),
+			)
 			return False
 		self.active_orders[order_id] = {
 			"status": "running",
