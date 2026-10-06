@@ -261,6 +261,28 @@ class OrderExecutor:
 
 	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
 		"""Claim one paid order; concurrent voice orders are unsafe."""
+		# A stale conversation/cancel response must never become the Telegram
+		# target. Legacy permissive link mode accepted arbitrary text, so a
+		# cancellation message could be persisted as target_link and make every
+		# account wave open Pyrogram before failing with Invalid Link.
+		target = str(order_data.get("target_link") or "").strip()
+		if not re.search(
+			 r"(?:https?://)?(?:www\\.)?(?:t|telegram)\\.(?:me|dog)/|tg://join\\?invite=",
+			 target, re.I,
+		):
+			logger.error(
+				"Order %s rejected before account startup: invalid target_link=%r",
+				order_id, target[:160],
+			)
+			try:
+				await self.settle_and_refund_order(
+					order_id, do_refund=True, canceled_by_role="system",
+					cancellation_reason="invalid target link",
+					bot_id=int(order_data.get("bot_id") or 1),
+				)
+			except Exception:
+				logger.exception("Order %s invalid-link settlement failed", order_id)
+			return False
 		if order_id in self.active_orders:
 			return False
 		if self.active_orders:
