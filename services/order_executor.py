@@ -267,7 +267,7 @@ class OrderExecutor:
 		# account wave open Pyrogram before failing with Invalid Link.
 		target = str(order_data.get("target_link") or "").strip()
 		if not re.search(
-			 r"(?:https?://)?(?:www\\.)?(?:t|telegram)\\.(?:me|dog)/|tg://join\\?invite=",
+			 r"(?:https?://)?(?:www\.)?(?:t|telegram)\.(?:me|dog)/|tg://join\?invite=",
 			 target, re.I,
 		):
 			logger.error(
