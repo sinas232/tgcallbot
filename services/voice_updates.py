@@ -38,6 +38,12 @@ class VoiceUpdates:
     async def handle(self, packet):
         if self.closing:
             return
+        # Session.handle_packet can forward MTProto acknowledgements here.
+        # They carry transport message IDs, not application/call updates; the
+        # upstream Client.handle_updates also ignores them. Do not dispatch,
+        # fetch peers, send another ACK, or call them an unsupported envelope.
+        if isinstance(packet, raw.types.MsgsAck):
+            return
         task = asyncio.current_task()
         self.tasks.add(task)
         try:

@@ -124,6 +124,35 @@ class VoiceUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(voice.skip_updates)
         self.assertFalse(voice.no_updates)
 
+    async def test_ack_burst_is_not_an_update_or_warning(self):
+        client = self.client()
+        pipeline = configure_voice_updates(client)
+        previous_time = client.last_update_time
+        with self.assertNoLogs('services.voice_updates', level='WARNING'):
+            for number in range(100):
+                await client.handle_updates(raw.types.MsgsAck(msg_ids=[number]))
+        self.assertEqual(client.last_update_time, previous_time)
+        self.assertTrue(client.dispatcher.updates_queue.empty())
+        self.assertEqual(pipeline.delivered, 0)
+        self.assertEqual(pipeline.filtered_messages, 0)
+        self.assertFalse(pipeline.tasks)
+        client.fetch_peers.assert_not_awaited()
+        client.invoke.assert_not_awaited()
+        # A following real call update must still be delivered unchanged.
+        call = raw.types.UpdateGroupCallParticipants(
+            call=raw.types.InputGroupCall(id=1, access_hash=2), participants=[], version=1)
+        await client.handle_updates(self.packet([call]))
+        self.assertIs(client.dispatcher.updates_queue.get_nowait()[0], call)
+        self.assertEqual(pipeline.delivered, 1)
+
+    async def test_unknown_envelopes_still_warn(self):
+        client = self.client()
+        configure_voice_updates(client)
+        with self.assertLogs('services.voice_updates', level='WARNING') as logs:
+            await client.handle_updates(object())
+        self.assertIn('unsupported envelope: object', '\n'.join(logs.output))
+        client.invoke.assert_not_awaited()
+
     async def test_live_errors_are_not_silenced(self):
         client = self.client()
         configure_voice_updates(client)
