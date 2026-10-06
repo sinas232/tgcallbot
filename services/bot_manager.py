@@ -11,6 +11,7 @@ from typing import Dict, Any
 
 from telegram.ext import Application, PicklePersistence
 from telegram.request import HTTPXRequest
+from services.bot_startup import initialize_bot_application
 from telegram import Update
 
 from database import DatabaseManager
@@ -143,7 +144,7 @@ class BotManager:
                 return False
 
             # مقداردهی اولیه (لود کردن فایل‌های ذخیره شده)
-            await app.initialize()
+            await initialize_bot_application(app, bot_id=bot_id)
             
             # 🔥🔥🔥 نکته کلیدی رفع باگ ایزوله‌سازی 🔥🔥🔥
             # بعد از initialize، حتماً bot_id را دوباره ست می‌کنیم.

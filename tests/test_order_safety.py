@@ -542,7 +542,7 @@ class MaintenanceStartupTests(unittest.IsolatedAsyncioTestCase):
 
     def test_main_bot_reads_global_flag_after_persistence_is_loaded(self):
         source = (Path(__file__).resolve().parents[1] / 'main.py').read_text()
-        start = source.index('await main_app.initialize()')
+        start = source.index('await initialize_bot_application(main_app,')
         flag = source.index("main_app.bot_data['maintenance_mode'] = await")
         running = source.index('await main_app.start()', start)
         self.assertLess(start, flag)

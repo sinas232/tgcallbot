@@ -60,6 +60,7 @@ from telegram.ext import (
 )
 # 🔥 تنظیمات پیشرفته شبکه برای جلوگیری از تایم‌اوت
 from telegram.request import HTTPXRequest
+from services.bot_startup import initialize_bot_application
 
 from config import Config
 from database import DatabaseManager
@@ -1704,7 +1705,7 @@ async def main_loop():
     
     register_handlers(main_app)
     instance_lock.ensure_held()
-    await main_app.initialize()
+    await initialize_bot_application(main_app, bot_id=1, ensure_held=instance_lock.ensure_held)
     instance_lock.ensure_held()
     # initialize() restores PTB persistence and may overwrite bot_data. Set
     # authoritative runtime identity/maintenance only AFTER it has completed.
