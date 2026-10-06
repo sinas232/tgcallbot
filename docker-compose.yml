@@ -37,7 +37,8 @@ services:
       - AUDIT_WRITE
       - NET_ADMIN
     sysctls:
-      - net.ipv6.conf.all.disable_ipv6=0
+      # Telegram API IPv6 is unreachable on this WARP route (IPv4 works); force MTProto over IPv4.
+      - net.ipv6.conf.all.disable_ipv6=1
       - net.ipv4.conf.all.src_valid_mark=1
       # لازم برای NAT mode (تونل لایهٔ ۳)؛ طبق سند رسمی warp-docker:
       - net.ipv4.ip_forward=1
