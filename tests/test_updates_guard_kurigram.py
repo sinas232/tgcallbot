@@ -17,11 +17,13 @@ Skipped automatically when pyrogram/kurigram is not installed (offline runs).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -265,6 +267,185 @@ class KurigramUpdatesGuardTests(unittest.IsolatedAsyncioTestCase):
                 muted=True,
             ), retry_delay=0.0)
         self.assertEqual(len(session.sent), RealSession.MAX_RETRIES)
+
+
+@unittest.skipUnless(pyrogram is not None,
+                     f"pyrogram/kurigram not installed here ({_IMPORT_ERROR})")
+class KurigramParseGuardTests(unittest.IsolatedAsyncioTestCase):
+    """The real Dispatcher: parsing costs RPCs — and can swallow a packet.
+
+    Incident 2026-10-06 (order 995).  ``handler_worker`` parses every update
+    before it looks at the handlers, and a voice client's only handler is
+    PyTgCalls' ``RawUpdateHandler``.  Two production symptoms follow:
+
+      * ``Waiting for N seconds before continuing (required by
+        "channels.GetMessages")`` — 192 lines in 33 s — from
+        ``fetch_replies``/``fetch_stories`` inside ``Message._parse``, and
+      * ``pyrogram.dispatcher - ERROR ... [400 PEER_ID_INVALID]`` from
+        ``Story._parse`` → ``resolve_peer``.
+
+    The second one is worse than noise: the packet-level ``except`` in
+    ``handler_worker`` logs and CONTINUES, so the raw group-call update in the
+    same packet never reaches PyTgCalls.
+    """
+
+    @staticmethod
+    def _dispatcher(handlers=(), client_name="shared_client_155"):
+        from collections import OrderedDict
+
+        from pyrogram.dispatcher import Dispatcher
+
+        client = SimpleNamespace(
+            name=client_name, loop=None, executor=None, me=None,
+            fetch_replies=True, fetch_stories=True,
+        )
+        dispatcher = Dispatcher(client)
+        dispatcher.groups = OrderedDict()
+        if handlers:
+            dispatcher.groups[-9999] = list(handlers)   # PyTgCalls' group
+        client.dispatcher = dispatcher
+        return client, dispatcher
+
+    @staticmethod
+    def _channel_message_packet():
+        now = int(time.time())
+        message = raw.types.Message(
+            id=77,
+            peer_id=raw.types.PeerChannel(channel_id=CHANNEL_ID),
+            date=now,
+            message="hello",
+        )
+        return (raw.types.UpdateNewChannelMessage(message=message, pts=500, pts_count=1),
+                {}, {})
+
+    async def _run_one_packet(self, dispatcher, packet):
+        """Run the REAL handler_worker over one packet, then stop it."""
+        worker = asyncio.get_running_loop().create_task(
+            dispatcher.handler_worker(asyncio.Lock()))
+        await dispatcher.updates_queue.put(packet)
+        await dispatcher.updates_queue.put(None)        # sentinel: stop worker
+        await asyncio.wait_for(worker, timeout=5)
+
+    async def test_pinned_library_really_parses_channel_messages(self):
+        """Voice clients DO parse every group message (the RPC source)."""
+        from pyrogram.dispatcher import Dispatcher
+
+        _client, dispatcher = self._dispatcher()
+        parsers = dispatcher.update_parsers
+        self.assertIn(raw.types.UpdateNewChannelMessage, parsers,
+                      "kurigram changed: channel messages are no longer parsed")
+        self.assertGreater(len(parsers), 20, "the parser table is the work we skip")
+
+        # Message._parse → _parse_message → __parse_reply: the reply fetch
+        # (kurigram 2.2.26, message.py:2316) is the channels.GetMessages storm.
+        message_cls = pyrogram.types.Message
+        message_src = "".join(
+            inspect.getsource(getattr(message_cls, name))
+            for name in ("_parse", "_parse_message", "_Message__parse_reply")
+            if callable(getattr(message_cls, name, None))
+        )
+        self.assertIn("client.fetch_replies", message_src)
+        self.assertIn("client.get_messages", message_src,
+                      "the channels.GetMessages FloodWait comes from here")
+        story_src = inspect.getsource(pyrogram.types.Story._parse)
+        self.assertIn("GetStoriesByID", story_src)
+        self.assertIn("resolve_peer", story_src,
+                      "the PEER_ID_INVALID traceback comes from here")
+
+    async def test_before_the_guard_a_parser_error_drops_the_raw_update(self):
+        """Reproduce production: PEER_ID_INVALID while parsing → packet lost."""
+        from pyrogram.errors import PeerIdInvalid
+        from pyrogram.handlers import RawUpdateHandler
+
+        delivered = []
+        parse_calls = []
+
+        async def raw_callback(_client, update, _users, _chats):
+            delivered.append(update)
+
+        async def failing_parser(update, users, chats):
+            parse_calls.append(type(update).__name__)
+            raise PeerIdInvalid(rpc_name="channels.GetMessages")
+
+        client, dispatcher = self._dispatcher([RawUpdateHandler(raw_callback)])
+        dispatcher.update_parsers[raw.types.UpdateNewChannelMessage] = failing_parser
+
+        with self.assertLogs("pyrogram.dispatcher", level="ERROR") as logs:
+            await self._run_one_packet(dispatcher, self._channel_message_packet())
+
+        self.assertEqual(parse_calls, ["UpdateNewChannelMessage"],
+                         "the parser ran for a client that discards its result")
+        self.assertEqual(delivered, [], "…and its failure ate the whole packet")
+        self.assertTrue(any("PEER_ID_INVALID" in line for line in logs.output),
+                        "this is the dispatcher ERROR traceback from the log")
+
+    async def test_after_the_guard_the_raw_update_is_delivered(self):
+        from pyrogram.handlers import RawUpdateHandler
+
+        delivered = []
+        parse_calls = []
+
+        async def raw_callback(_client, update, _users, _chats):
+            delivered.append(update)
+
+        async def failing_parser(update, users, chats):
+            parse_calls.append(type(update).__name__)
+            raise AssertionError("no parser may run on a raw-only client")
+
+        client, dispatcher = self._dispatcher([RawUpdateHandler(raw_callback)])
+        dispatcher.update_parsers[raw.types.UpdateNewChannelMessage] = failing_parser
+
+        self.assertTrue(guard.silence_client_parsers(client))
+        await self._run_one_packet(dispatcher, self._channel_message_packet())
+
+        self.assertEqual(parse_calls, [], "no parsing → no RPC → no FloodWait")
+        self.assertEqual([type(u).__name__ for u in delivered],
+                         ["UpdateNewChannelMessage"],
+                         "PyTgCalls still receives every raw update")
+        self.assertFalse(client.fetch_replies)
+        self.assertFalse(client.fetch_stories)
+
+    async def test_a_group_call_update_reaches_pytgcalls_untouched(self):
+        """The update the whole product depends on must survive the guard."""
+        from pyrogram.handlers import RawUpdateHandler
+
+        delivered = []
+
+        async def raw_callback(_client, update, _users, _chats):
+            delivered.append(update)
+
+        _client, dispatcher = self._dispatcher([RawUpdateHandler(raw_callback)])
+        guard.silence_client_parsers(dispatcher.client)
+
+        now = int(time.time())
+        packet = (raw.types.UpdateGroupCallParticipants(
+            call=raw.types.InputGroupCall(id=991, access_hash=4242),
+            participants=[raw.types.GroupCallParticipant(
+                peer=raw.types.PeerChannel(channel_id=CHANNEL_ID), date=now, source=1)],
+            version=7), {}, {})
+        await self._run_one_packet(dispatcher, packet)
+        self.assertEqual([type(u).__name__ for u in delivered],
+                         ["UpdateGroupCallParticipants"])
+
+    async def test_a_client_with_a_message_handler_is_refused(self):
+        from pyrogram.handlers import MessageHandler, RawUpdateHandler
+
+        client, dispatcher = self._dispatcher(
+            [RawUpdateHandler(None), MessageHandler(None)])
+        self.assertFalse(guard.silence_client_parsers(client))
+        self.assertGreater(len(dispatcher.update_parsers), 20,
+                           "a client that consumes parsed updates keeps them")
+
+    async def test_silencing_survives_a_client_restart_shape(self):
+        """Client.dispatcher is built once in __init__ → one call is enough."""
+        from pyrogram.handlers import RawUpdateHandler
+
+        client, dispatcher = self._dispatcher([RawUpdateHandler(None)])
+        self.assertTrue(guard.silence_client_parsers(client))
+        self.assertTrue(guard.silence_client_parsers(client), "idempotent")
+        self.assertEqual(dispatcher.update_parsers, {})
+        self.assertTrue(guard.restore_client_parsers(client))
+        self.assertGreater(len(dispatcher.update_parsers), 20)
 
 
 if __name__ == "__main__":

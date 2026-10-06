@@ -72,7 +72,7 @@ from services.session_ownership import (session_ownership, SessionInUseError,
                                         is_auth_key_duplicated, is_fatal_auth_error,
                                         fatal_auth_category)
 from services.session_client import close_pyrogram_client
-from services.pyrogram_updates_guard import install_updates_guard
+from services.pyrogram_updates_guard import install_updates_guard, silence_client_parsers
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -656,6 +656,70 @@ def _chat_id_from_join_result(res: object) -> Optional[int]:
     raise RuntimeError(
         f"Join not completed ({type(res).__name__}); approval may be required"
     )
+
+
+def _chat_ids_match(a: Any, b: Any) -> bool:
+    """Compare two chat ids tolerating the raw/marked channel-id forms.
+
+    Pyrogram hands us MARKED supergroup/channel ids (``-100<raw>``) while raw
+    MTProto objects (``messages.CheckChatInvite`` → ``inv.chat.id``,
+    ``UpdateGroupCall.chat_id`` before PyTgCalls normalises it) carry the
+    POSITIVE raw id.  Comparing those two forms with ``==`` silently fails,
+    which is how a chat-closed event ends up attributed to "no order" and a
+    pending group-leave fails to be cancelled.  Only a marked id and its own
+    raw form are considered equal — two different ids never match.
+    """
+    try:
+        left = int(a or 0)
+        right = int(b or 0)
+    except (TypeError, ValueError):
+        return False
+    if not left or not right:
+        return False          # 0/None is "no chat", never an id to match on
+    if left == right:
+        return True
+    if left > 0 > right:
+        return _raw_channel_id(right) == left
+    if right > 0 > left:
+        return _raw_channel_id(left) == right
+    return False
+
+
+def _raw_channel_id(marked_id: int) -> Optional[int]:
+    """``-1001236211346`` → ``1236211346``; ``None`` when not channel-marked.
+
+    A basic group (``-123456``) is NOT the channel ``123456``, so anything
+    that is not in the ``-100…`` form yields no raw equivalent.
+    """
+    text = str(abs(int(marked_id)))
+    if text.startswith("100") and len(text) > 3:
+        return int(text[3:])
+    return None
+
+
+def _marked_chat_id_from_raw(raw_chat: Any) -> Optional[int]:
+    """Marked chat id for a RAW MTProto chat object (``Channel`` / ``Chat``).
+
+    ``messages.CheckChatInvite`` answers with raw TL objects whose ``id`` is
+    the POSITIVE internal id; storing that as "the order's chat" breaks every
+    later comparison with Pyrogram/engine ids.  Pyrogram's own ``types.Chat``
+    is already marked and passes through untouched.
+    """
+    cid = getattr(raw_chat, "id", None)
+    if cid is None:
+        return None
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return None
+    if cid < 0:
+        return cid  # already marked (pyrogram types.Chat, or a marked raw id)
+    kind = type(raw_chat).__name__
+    if kind == "Channel":
+        return int(f"-100{cid}")
+    if kind == "Chat":
+        return -cid  # basic group: pyrogram marks it with a single minus
+    return cid
 
 
 def _is_transient(err: Exception) -> bool:
@@ -2045,7 +2109,14 @@ class VoiceCallManager:
                     proxy=_voice_proxy_config(),
                     **_client_device_fingerprint(account_id),
                 )
+                # This client only ever feeds PyTgCalls' RawUpdateHandler.
+                # Drop the parser table BEFORE start() so the very first
+                # update backlog (GetDifference on connect) is not parsed
+                # into RPCs nobody consumes. Idempotent; refuses to touch a
+                # client that has handlers needing parsed updates.
+                silence_client_parsers(app, reason=f"voice client acc={account_id}")
                 await asyncio.wait_for(app.start(), timeout=timeout)
+                silence_client_parsers(app, reason=f"voice client acc={account_id}")
                 await asyncio.sleep(random.uniform(0.8, 2.0))
                 if self._shutting_down:
                     raise RuntimeError("voice engine shutting down")
@@ -2090,6 +2161,10 @@ class VoiceCallManager:
                         # Reconnect the SAME client; never create another
                         # client while its previous transport might be alive.
                         await asyncio.wait_for(app.start(), timeout=15)
+                        # A reconnect replays the update backlog; keep the
+                        # parser table empty (idempotent).
+                        silence_client_parsers(
+                            app, reason=f"voice client reconnect acc={account_id}")
                     except BaseException as exc:
                         if isinstance(exc, FloodWait):
                             voice_cooldown.record(account_id, int(getattr(exc, "value", 3) or 3),
@@ -2137,6 +2212,13 @@ class VoiceCallManager:
                     # quarantines the account when every attempt fails.
                     self.clients[account_id] = pytg
                     await self._start_engine_with_retries(pytg, account_id)
+                    # pytgcalls.start() has registered its RawUpdateHandler and
+                    # the loop has run every pending add_handler, so this is the
+                    # first moment the client's handler inventory is complete:
+                    # re-assert the parse guard (it restores the parsers by
+                    # itself if anything registered needs parsed updates).
+                    silence_client_parsers(
+                        app, reason=f"voice client acc={account_id} post pytgcalls.start")
 
             self._client_last_used[account_id] = time.time()
             return pytg
@@ -2472,17 +2554,128 @@ class VoiceCallManager:
     def _active_order_for_chat(self, account_id: int, chat_id: int) -> Optional[int]:
         """Order this account is CURRENTLY serving in THIS exact chat.
 
-        Deliberately stricter than ``_order_id_for_account``: a durable join
-        record is not proof that a later engine update belongs to that order.
-        Accounts keep stale call subscriptions from earlier orders — the first
-        1405-07-09 log showed order-930 chat updates surfacing under a later
-        order, which disabled listeners and wrote bogus drop rows for chats the
-        order never used. Only an ACTIVE binding may produce order records.
+        Thin wrapper over :meth:`_active_order_and_chat` kept for callers and
+        tests that only need the order id.
         """
-        for (oid, aid), info in self.active_calls.items():
-            if aid == account_id and int((info or {}).get("chat_id") or 0) == int(chat_id or 0):
-                return oid
-        return None
+        order_id, _cid = self._active_order_and_chat(account_id, chat_id)
+        return order_id
+
+    def _active_order_and_chat(self, account_id: int,
+                               chat_id: int) -> Tuple[Optional[int], int]:
+        """Attribute an engine chat update to the order it belongs to.
+
+        Returns ``(order_id, chat_id)`` where ``chat_id`` is OUR canonical id
+        for that chat (the form stored in the order's records), so closed-chat
+        markers, drop rows and listener keys stay comparable with the rest of
+        the code base.  ``order_id`` is ``None`` when nothing ties this
+        account to this chat.
+
+        Deliberately stricter than ``_order_id_for_account``: a durable join
+        record for ANOTHER chat is not proof that an update belongs to that
+        order (incident 1405-07-09: order-930 chat updates surfaced under a
+        later order, disabling listeners and writing bogus drop rows).  But
+        "strict" must not mean "blind" — incident 2026-10-06 (order 995)
+        showed the opposite failure: five accounts of the RUNNING order
+        reported ``CLOSED_VOICE_CHAT`` for the order's own chat and every
+        event was discarded as "stale/foreign", so the bot kept building and
+        billing into a call Telegram had already ended.  The transport
+        binding is therefore the first choice, not the only one:
+
+        1. ``active_calls`` — the live transport binding (authoritative).
+        2. durable join record for the SAME chat (newest first).  A record
+           can outlive/be missing from ``active_calls`` when a monitor
+           recovery or a stop/rejoin cycle moved it.
+        3. the order whose target chat is this one and which still has live
+           slots — the update is about the chat the order is building in,
+           even if this account's own row is momentarily gone.
+        """
+        cid = int(chat_id or 0)
+        aid = int(account_id or 0)
+
+        def _best(rows) -> Optional[Tuple[int, int]]:
+            """(order_id, canonical chat id) of the newest match, or None.
+
+            An account can serve the SAME chat for two orders (a group that is
+            re-ordered before the previous order was cleaned up); the newest
+            join wins, ties break towards the higher order id.
+            """
+            winner: Optional[Tuple[float, int, int]] = None
+            for joined_at, oid, canonical in rows:
+                if winner is None or (joined_at, oid) > (winner[0], winner[1]):
+                    winner = (joined_at, oid, canonical)
+            return None if winner is None else (winner[1], winner[2])
+
+        # 1) live transport binding (authoritative)
+        bindings = []
+        for (oid, bound_aid), info in self.active_calls.items():
+            if int(bound_aid) != aid:
+                continue
+            info = info or {}
+            bound_cid = int(info.get("chat_id") or 0)
+            if _chat_ids_match(bound_cid, cid):
+                bindings.append((float(info.get("joined_at") or 0.0), int(oid),
+                                 bound_cid or cid))
+        found = _best(bindings)
+        if found is not None:
+            return found
+
+        # 2) durable join record for this exact chat (newest wins)
+        records = []
+        for oid, recs in self.joined_accounts_by_order.items():
+            rec = (recs or {}).get(aid)
+            if not rec:
+                continue
+            rec_cid = int(rec.get("chat_id") or 0)
+            if _chat_ids_match(rec_cid, cid):
+                records.append((float(rec.get("joined_at") or 0.0), int(oid),
+                                rec_cid or cid))
+        found = _best(records)
+        if found is not None:
+            return found
+
+        # 3) the order that targets this chat AND still counts this account.
+        #    ``_order_accounts`` survives a stop/rejoin cycle (it is only
+        #    dropped when the whole order is cleaned up), so this is the
+        #    order-995 case: the account's own rows moved, but the chat is
+        #    unquestionably the one this order is building in.
+        candidates = []
+        for oid, target_cid in self.order_chat_ids.items():
+            oid = int(oid)
+            if aid not in (self._order_accounts.get(oid) or set()):
+                continue
+            if not _chat_ids_match(int(target_cid or 0), cid):
+                continue
+            live_slots = len(self.joined_accounts_by_order.get(oid) or {})
+            if not live_slots:
+                continue  # order has no live slots → finished, not attributable
+            candidates.append((live_slots, oid, int(target_cid or 0) or cid))
+        if candidates:
+            # most live slots wins; ties break towards the newer order id
+            _slots, oid, canonical = max(candidates, key=lambda c: (c[0], c[1]))
+            return oid, canonical
+
+        return None, cid
+
+    def _account_chat_bindings(self, account_id: int) -> str:
+        """Diagnostic: what this account is bound to right now (log helper).
+
+        Printed with the "no active order" line so a production capture says
+        WHY an update was not attributable instead of leaving us guessing.
+        """
+        aid = int(account_id or 0)
+        parts = []
+        for (oid, bound_aid), info in self.active_calls.items():
+            if int(bound_aid) == aid:
+                parts.append(f"call:o{oid}/c{(info or {}).get('chat_id')}")
+        for oid, recs in self.joined_accounts_by_order.items():
+            rec = (recs or {}).get(aid)
+            if rec:
+                parts.append(f"durable:o{oid}/c{rec.get('chat_id')}")
+        for oid in sorted({oid for oid, accs in self._order_accounts.items()
+                           if aid in (accs or set())}):
+            parts.append(f"member:o{oid}/c{self.order_chat_ids.get(oid)}")
+        return ",".join(parts[:8]) or "none"
+
 
     @staticmethod
     def _is_closed_status(status: Any) -> bool:
@@ -2627,21 +2820,31 @@ class VoiceCallManager:
             async def _on_left_call(_engine, update):  # type: ignore[misc]
                 cid = int(getattr(update, "chat_id", 0) or 0)
                 status = getattr(update, "status", "?")
-                # STRICT attribution: only a chat this account CURRENTLY serves
-                # may produce an order drop record. An account keeps stale call
-                # subscriptions from earlier orders (order-930 chat updates were
-                # logged under a later order, disabling listeners and writing
-                # bogus drops for a chat that order never used).
-                order_id = self._active_order_for_chat(account_id, cid)
+                # STRICT-BUT-NOT-BLIND attribution: an update is only recorded
+                # against an order this account/chat pair actually belongs to
+                # (transport binding → durable record for the SAME chat →
+                # the order currently targeting this chat).  See
+                # _active_order_and_chat for both incidents this balances.
+                order_id, known_cid = self._active_order_and_chat(account_id, cid)
                 if order_id is None:
                     logger.info(
                         "[VoiceChatUpdate] acc=%s chat=%s status=%s — no active order "
-                        "for this chat (stale/foreign call; not recorded)",
-                        account_id, cid, status,
+                        "for this chat (stale/foreign call; not recorded) known=[%s]",
+                        account_id, cid, status, self._account_chat_bindings(account_id),
                     )
                     self._vc_event_log(None, account_id, "stale_chat_update",
                                        {"chat_id": cid, "status": str(status)})
                     return
+                if int(known_cid or 0) != cid:
+                    # Engine and our records disagree about the id FORM
+                    # (raw vs marked).  Log it once per event: the canonical
+                    # id below is what markers/drops/listeners are keyed by.
+                    logger.warning(
+                        "[VoiceChatUpdate] order=%s acc=%s chat-id form mismatch: "
+                        "engine=%s records=%s (using records)",
+                        order_id, account_id, cid, known_cid,
+                    )
+                cid = int(known_cid or cid)
                 logger.warning(
                     "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                     order_id, account_id, cid, status,
@@ -3301,7 +3504,9 @@ class VoiceCallManager:
                             invite = target.split("+")[-1].split("/")[-1]
                             inv = await app.invoke(functions.messages.CheckChatInvite(hash=invite))
                             if getattr(inv, "chat", None):
-                                chat_id = inv.chat.id
+                                # RAW TL object → mark the id, otherwise every
+                                # later comparison with engine/Pyrogram ids fails.
+                                chat_id = _marked_chat_id_from_raw(inv.chat)
                         except Exception:
                             pass
             else:

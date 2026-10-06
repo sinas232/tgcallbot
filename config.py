@@ -399,6 +399,14 @@ class Config:
     # از قبل نادیده می‌گیرد. false ⇒ رفتارِ اصلیِ کتابخانه برمی‌گردد.
     PYROGRAM_UPDATES_GUARD = os.getenv('PYROGRAM_UPDATES_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     PYROGRAM_UPDATES_DIFF_ATTEMPTS = int(os.getenv('PYROGRAM_UPDATES_DIFF_ATTEMPTS', '2'))
+    # گارد دوم (رودیداد ۲۰۲۶-۱۰-۰۶، سفارش ۹۹۵): کلاینت‌های ویس فقط یک
+    # RawUpdateHandler دارند (PyTgCalls)، ولی پیروگرام هر آپدیت را پیش از
+    # بررسیِ هندلرها پارس می‌کند؛ همان پارس برای هر «ریپلای» یک
+    # channels.GetMessages و برای هر «استوری» یک stories.GetStoriesByID به
+    # تلگرام می‌فرستد → سیل FloodWait (۱۹۲ بار در ۳۳ ثانیه) و خطای
+    # PEER_ID_INVALID برای داده‌ای که یک خط بعد دور ریخته می‌شود.
+    # این گارد جدول پارسر را فقط برای کلاینت‌های خام‌مصرف خالی می‌کند.
+    PYROGRAM_VOICE_PARSE_GUARD = os.getenv('PYROGRAM_VOICE_PARSE_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
     # پنجرهٔ خلاصه‌سازیِ هشدارهای یک‌شکلِ پیاپیِ کتابخانه در کنسول (ثانیه):
     # خطِ اول همیشه چاپ می‌شود، خطِ بعدی تعدادِ خط‌های جمع‌شده را گزارش می‌دهد.
     PYROGRAM_LOG_DEDUPE_WINDOW = float(os.getenv('PYROGRAM_LOG_DEDUPE_WINDOW', '30'))

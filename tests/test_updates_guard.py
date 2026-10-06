@@ -173,6 +173,43 @@ _PRISTINE_INVOKE = StubSession.invoke
 _PRISTINE_HANDLE_UPDATES = StubClient.handle_updates
 
 
+# Handler classes the parse guard inspects.  Only their NAMES/identity matter:
+# Dispatcher.handler_worker matches handlers with isinstance(), exactly like
+# the real library, and the guard classifies them the same way.
+class Handler:
+    def __init__(self, callback=None, filters=None):
+        self.callback = callback
+        self.filters = filters
+
+
+class RawUpdateHandler(Handler):
+    """PyTgCalls registers exactly one of these on every voice client."""
+
+
+class ErrorHandler(Handler):
+    pass
+
+
+class ConnectHandler(Handler):
+    pass
+
+
+class DisconnectHandler(Handler):
+    pass
+
+
+class StartHandler(Handler):
+    pass
+
+
+class StopHandler(Handler):
+    pass
+
+
+class MessageHandler(Handler):
+    """Needs PARSED updates → the guard must refuse to silence such a client."""
+
+
 def _build_pyrogram_stub() -> Dict[str, types.ModuleType]:
     """Build the fake package WITHOUT touching sys.modules (setUp registers it)."""
     pyrogram = types.ModuleType("pyrogram")
@@ -198,6 +235,12 @@ def _build_pyrogram_stub() -> Dict[str, types.ModuleType]:
     pyrogram.session = session_pkg
     pyrogram.Client = StubClient
 
+    handlers = types.ModuleType("pyrogram.handlers")
+    for cls in (Handler, RawUpdateHandler, ErrorHandler, ConnectHandler,
+                DisconnectHandler, StartHandler, StopHandler, MessageHandler):
+        setattr(handlers, cls.__name__, cls)
+    pyrogram.handlers = handlers
+
     return {
         "pyrogram": pyrogram,
         "pyrogram.raw": raw,
@@ -206,6 +249,7 @@ def _build_pyrogram_stub() -> Dict[str, types.ModuleType]:
         "pyrogram.errors": errors,
         "pyrogram.session": session_pkg,
         "pyrogram.session.session": session_mod,
+        "pyrogram.handlers": handlers,
     }
 
 
@@ -219,6 +263,8 @@ def _reset_guard_state() -> None:
         "installed": False, "patched_handle_updates": False, "difference_calls": 0,
         "difference_fast_failed": 0, "packets_preserved": 0, "packets_lost": 0,
         "last_error": None, "last_report": 0.0,
+        "parse_guard_clients": 0, "parse_guard_entries": 0, "parse_guard_refused": 0,
+        "parse_guard_skipped": 0, "parse_guard_restored": 0, "parse_guard_errors": 0,
     })
     guard._DIFFERENCE_KINDS.clear()
 
@@ -469,6 +515,212 @@ class GuardTestCase(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 # Source-level guards (the repo's convention for "wired where it must be")
 # ---------------------------------------------------------------------------
+class _FakeDispatcher:
+    """Dispatcher shape: ``update_parsers`` dict + ``groups`` of handlers."""
+
+    def __init__(self, parsers=None, handlers=()):
+        from collections import OrderedDict
+
+        self.update_parsers = (
+            dict(parsers) if parsers is not None else {
+                "UpdateNewChannelMessage": _PARSER_SENTINEL,
+                "UpdateEditChannelMessage": _PARSER_SENTINEL,
+                "UpdateGroupCallParticipants": _PARSER_SENTINEL,
+            }
+        )
+        self.groups = OrderedDict()
+        if handlers:
+            self.groups[0] = list(handlers)
+
+
+_PARSER_SENTINEL = object()
+
+
+class _FakeApp:
+    """A Pyrogram client as the parse guard sees it (no I/O, no library)."""
+
+    def __init__(self, name="shared_client_155", handlers=(), parsers=None,
+                 dispatcher="default", fetch_replies=True, fetch_stories=True):
+        self.name = name
+        self.fetch_replies = fetch_replies
+        self.fetch_stories = fetch_stories
+        if dispatcher == "default":
+            self.dispatcher = _FakeDispatcher(parsers, handlers)
+        else:
+            self.dispatcher = dispatcher
+
+
+class ParseGuardTests(unittest.TestCase):
+    """Incident 2026-10-06 (order 995): parsing updates nobody consumes.
+
+    ``Dispatcher.handler_worker`` parses every update BEFORE it looks at the
+    registered handlers.  A voice client has exactly one handler — PyTgCalls'
+    ``RawUpdateHandler`` — so the parsed object is built and thrown away, but
+    building it costs real RPCs (``channels.GetMessages`` per reply via
+    ``fetch_replies``, ``stories.GetStoriesByID`` + ``resolve_peer`` via
+    ``fetch_stories``): ~190 FloodWaits in 33 s and PEER_ID_INVALID
+    tracebacks in production.  When a parser raises, the packet-level
+    ``except`` in handler_worker also drops the RAW update PyTgCalls needs.
+    """
+
+    def setUp(self):
+        self._saved_modules = {name: sys.modules.get(name) for name in _STUB_MODULES}
+        sys.modules.update(_STUB_MODULES)
+        _reset_guard_state()
+        os.environ["PYROGRAM_VOICE_PARSE_GUARD"] = "true"
+
+    def tearDown(self):
+        for name, module in self._saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        _reset_guard_state()
+
+    # ── the fix ─────────────────────────────────────────────────────────
+    def test_a_raw_only_client_stops_parsing_updates(self):
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        self.assertTrue(guard.silence_client_parsers(app))
+        self.assertEqual(app.dispatcher.update_parsers, {},
+                         "no parser may run: nothing consumes parsed updates")
+        self.assertEqual(len(getattr(app.dispatcher, guard._PARSER_BACKUP_ATTR)), 3,
+                         "the original table is kept so it can be restored")
+        self.assertFalse(app.fetch_replies, "channels.GetMessages per reply must stop")
+        self.assertFalse(app.fetch_stories, "stories.GetStoriesByID must stop")
+        stats = guard.guard_stats()
+        self.assertEqual(stats["parse_guard_clients"], 1)
+        self.assertEqual(stats["parse_guard_entries"], 3)
+
+    def test_a_client_without_handlers_is_silenced_too(self):
+        """Parsers are cleared BEFORE pytgcalls.start() adds its raw handler."""
+        app = _FakeApp()
+        self.assertTrue(guard.silence_client_parsers(app))
+        self.assertEqual(app.dispatcher.update_parsers, {})
+
+    def test_silencing_is_idempotent(self):
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        self.assertTrue(guard.silence_client_parsers(app))
+        self.assertTrue(guard.silence_client_parsers(app), "reconnect calls it again")
+        stats = guard.guard_stats()
+        self.assertEqual(stats["parse_guard_entries"], 3, "counted once, not twice")
+
+    def test_restore_puts_the_parser_table_back(self):
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        guard.silence_client_parsers(app)
+        self.assertTrue(guard.restore_client_parsers(app))
+        self.assertEqual(len(app.dispatcher.update_parsers), 3)
+        self.assertEqual(guard.guard_stats()["parse_guard_restored"], 1)
+        self.assertFalse(guard.restore_client_parsers(_FakeApp()),
+                         "nothing to restore on a client we never silenced")
+
+    # ── safety: never break a client that consumes parsed updates ───────
+    def test_a_client_with_a_message_handler_keeps_its_parsers(self):
+        app = _FakeApp(handlers=[RawUpdateHandler(), MessageHandler()])
+        self.assertFalse(guard.silence_client_parsers(app))
+        self.assertEqual(len(app.dispatcher.update_parsers), 3)
+        self.assertTrue(app.fetch_replies, "untouched client stays untouched")
+        self.assertEqual(guard.guard_stats()["parse_guard_refused"], 1)
+
+    def test_a_handler_registered_later_gets_its_parsers_back(self):
+        """``add_handler`` goes through ``loop.create_task``.
+
+        The registration can land AFTER we emptied the table, which is why the
+        guard is re-asserted once the engine has started.  A handler that needs
+        parsed updates must never be starved silently.
+        """
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        self.assertTrue(guard.silence_client_parsers(app))
+        self.assertEqual(app.dispatcher.update_parsers, {})
+
+        app.dispatcher.groups[0].append(MessageHandler())   # the late arriver
+        self.assertFalse(guard.silence_client_parsers(app))
+        self.assertEqual(len(app.dispatcher.update_parsers), 3,
+                         "the original table is handed back")
+        self.assertIsNone(getattr(app.dispatcher, guard._PARSER_BACKUP_ATTR),
+                          "…and the backup is consumed")
+        self.assertEqual(guard.guard_stats()["parse_guard_refused"], 1)
+
+    def test_reasserting_a_still_raw_only_client_is_a_no_op(self):
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        guard.silence_client_parsers(app)
+        self.assertTrue(guard.silence_client_parsers(app),
+                        "the post-engine re-assert must not flap")
+        self.assertEqual(guard.guard_stats()["parse_guard_clients"], 1)
+
+    def test_lifecycle_and_error_handlers_do_not_block_silencing(self):
+        app = _FakeApp(handlers=[RawUpdateHandler(), ErrorHandler(),
+                                 ConnectHandler(), DisconnectHandler(),
+                                 StartHandler(), StopHandler()])
+        self.assertTrue(guard.silence_client_parsers(app))
+        self.assertEqual(app.dispatcher.update_parsers, {})
+
+    def test_handlers_in_every_group_are_inspected(self):
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        app.dispatcher.groups[-9999] = [MessageHandler()]
+        self.assertFalse(guard.silence_client_parsers(app),
+                         "PyTgCalls uses group=-9999; a stray handler anywhere counts")
+
+    # ── fail OPEN ───────────────────────────────────────────────────────
+    def test_no_dispatcher_is_skipped_without_raising(self):
+        app = _FakeApp(dispatcher=None)
+        self.assertFalse(guard.silence_client_parsers(app))
+        self.assertEqual(guard.guard_stats()["parse_guard_skipped"], 1)
+
+    def test_an_unparsable_parser_table_is_skipped(self):
+        app = _FakeApp()
+        app.dispatcher.update_parsers = "not-a-dict"
+        self.assertFalse(guard.silence_client_parsers(app))
+        self.assertEqual(app.dispatcher.update_parsers, "not-a-dict")
+
+    def test_unknown_handler_classes_mean_no_silencing(self):
+        """If we cannot identify raw handlers we must not guess."""
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        with mock.patch.object(guard, "_load_handler_types", return_value=()):
+            self.assertFalse(guard.silence_client_parsers(app))
+        self.assertEqual(len(app.dispatcher.update_parsers), 3)
+
+    def test_an_internal_error_is_logged_not_raised(self):
+        class ExplodingDispatcher(_FakeDispatcher):
+            @property
+            def groups(self):  # type: ignore[override]
+                raise RuntimeError("boom")
+
+            @groups.setter
+            def groups(self, _value):
+                pass
+
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        app.dispatcher = ExplodingDispatcher()
+        with self.assertLogs("services.pyrogram_updates_guard", level="WARNING") as logs:
+            self.assertFalse(guard.silence_client_parsers(app))
+        self.assertTrue(any("not silenced" in line for line in logs.output))
+        self.assertEqual(guard.guard_stats()["parse_guard_errors"], 1)
+
+    def test_none_client_is_a_no_op(self):
+        self.assertFalse(guard.silence_client_parsers(None))
+        self.assertFalse(guard.restore_client_parsers(None))
+
+    # ── kill switch ─────────────────────────────────────────────────────
+    def test_disabled_by_configuration(self):
+        os.environ["PYROGRAM_VOICE_PARSE_GUARD"] = "false"
+        app = _FakeApp(handlers=[RawUpdateHandler()])
+        try:
+            from config import Config
+            patcher = mock.patch.object(
+                Config, "PYROGRAM_VOICE_PARSE_GUARD", False, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        except Exception as exc:  # config.py may need env this sandbox lacks
+            self.addCleanup(lambda: None)
+            logging.debug("config knob not patchable here: %s", exc)
+        try:
+            self.assertFalse(guard.silence_client_parsers(app))
+            self.assertEqual(len(app.dispatcher.update_parsers), 3,
+                             "upstream behaviour is back")
+        finally:
+            os.environ["PYROGRAM_VOICE_PARSE_GUARD"] = "true"
+
+
 class WiringTests(unittest.TestCase):
     def test_main_installs_guard_and_log_filter(self):
         src = _read_source("main.py")
@@ -482,11 +734,28 @@ class WiringTests(unittest.TestCase):
         self.assertIn("from services.pyrogram_updates_guard import install_updates_guard", src)
         self.assertIn("install_updates_guard()", src)
 
+    def test_voice_clients_silence_parsers_before_and_after_start(self):
+        """The connect backlog is parsed too, so the table goes first."""
+        src = _read_source("services/voice_call_manager.py")
+        self.assertIn("silence_client_parsers", src)
+        create = src.index("app = Client(\n                    f\"shared_client_")
+        start = src.index("await asyncio.wait_for(app.start(), timeout=timeout)", create)
+        before = src.index("silence_client_parsers(app", create)
+        after = src.index("silence_client_parsers(app", start)
+        self.assertLess(before, start, "parsers must be cleared before start()")
+        self.assertLess(start, after, "… and re-asserted after start()")
+        reconnect = src.index("voice client reconnect acc=")
+        self.assertIn("silence_client_parsers(", src[reconnect - 400:reconnect],
+                      "a reconnect replays the update backlog too")
+        engine = src.index("post pytgcalls.start")
+        self.assertIn("silence_client_parsers(", src[engine - 400:engine],
+                      "the handler inventory is only complete after pytgcalls starts")
+
     def test_knobs_are_configured_and_documented(self):
         config_src = _read_source("config.py")
         env_src = _read_source(".env.example")
         for knob in ("PYROGRAM_UPDATES_GUARD", "PYROGRAM_UPDATES_DIFF_ATTEMPTS",
-                     "PYROGRAM_LOG_DEDUPE_WINDOW"):
+                     "PYROGRAM_LOG_DEDUPE_WINDOW", "PYROGRAM_VOICE_PARSE_GUARD"):
             self.assertIn(knob, config_src, f"{knob} missing from config.py")
             self.assertIn(knob, env_src, f"{knob} missing from .env.example")
 

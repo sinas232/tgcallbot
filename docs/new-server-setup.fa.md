@@ -331,6 +331,39 @@ docker compose logs -f bot \
 > اگر در لاگ `[UpdatesGuard] not installed (...)` دیدید یعنی ساختارِ نسخهٔ
 > نصب‌شدهٔ kurigram شناخته نشده و گارد به‌صورت fail-open نصب نشده است.
 
+> **دو منبعِ رخدادِ `channels.GetMessages` روی کلاینت‌های ویس (رودیداد ۲۰۲۶-۱۰-۰۶،
+> سفارش ۹۹۵):** `Dispatcher.handler_worker` پیش از نگاه‌کردن به هندلرها **هر**
+> آپدیت را پارس می‌کند، در حالی که کلاینت ویس فقط یک `RawUpdateHandler`
+> (مخصوص PyTgCalls) دارد و نتیجهٔ پارس دور ریخته می‌شود. همان پارس دو RPC واقعی
+> می‌زند: برای هر «ریپلای» یک `channels.GetMessages` (از `fetch_replies` در
+> `Message._parse`) و برای هر «استوری» یک `stories.GetStoriesByID` + `resolve_peer`
+> (از `fetch_stories` در `Story._parse`). نتیجه در پروداکشن: **۱۹۲ خط
+> `Waiting for N seconds before continuing (required by "channels.GetMessages")`
+> در ۳۳ ثانیه** و تریس‌های `pyrogram.dispatcher - ERROR ... [400 PEER_ID_INVALID]`
+> که همان بستهٔ آپدیت را (و رویدادِ ویس‌کالِ داخلش را) دور می‌انداختند.
+> گاردِ دوم (`silence_client_parsers` در همان ماژول) جدولِ پارسرِ کلاینت را خالی
+> می‌کند؛ تحویلِ **خام** به `RawUpdateHandler` مو‌به‌مو یکسان می‌ماند، پس PyTgCalls
+> هیچ چیزی از دست نمی‌دهد. کلاینتی که هندلری نیازمند آپدیتِ پارس‌شده داشته باشد
+> اصلاً دست‌نخورده می‌ماند (و اگر هندلر دیرتر ثبت شود، جدول **برگردانده**
+> می‌شود). کلید: `PYROGRAM_VOICE_PARSE_GUARD=false`. برای دیدن نتیجه در لاگ
+> دنبال `[ParseGuard] shared_client_<acc>: 38 update parser(s) disabled` بگردید.
+
+> **«`no active order for this chat (stale/foreign call; not recorded)`» برای چتِ
+> خودِ سفارش (رودیداد ۲۰۲۶-۱۰-۰۶، سفارش ۹۹۵):** وقتی مشتری کالِ گروه را می‌بندد،
+> PyTgCalls برای هر اکانت `Status.CLOSED_VOICE_CHAT` می‌دهد و اکانت‌ها با
+> `ntgcalls ... Call ... not found, already removed` ریزش می‌کنند. اگر این رخداد
+> به سفارش منتسب نشود، نشانِ «کال بسته است» هرگز ساخته نمی‌شود و ربات به
+> ساختن/بیلینگ ادامه می‌دهد (در لاگ: `live=6/42` و موج‌های ادامه‌دار).
+> علت: انتساب فقط به `active_calls` تکیه می‌کرد و آن هم با `==` ساده مقایسه
+> می‌شد؛ پس هم ردیفِ نبودنِ binding (بعد از ری‌استارت/بازیابیِ مانیتور) و هم
+> اختلافِ شکلِ شناسه (`1236211346` خام در برابر `-1001236211346` نشان‌دار)
+> انتساب را می‌شکست. حالا `_active_order_and_chat` اول `active_calls`، بعد
+> رکوردِ ماندگارِ همان چت (تازه‌ترین) و بعد سفارشی که همان چت را هدف گرفته و
+> هنوز slot زنده دارد را بررسی می‌کند، و `_chat_ids_match` شکلِ خام/نشان‌دار را
+> یکی می‌داند. خطِ «no active order» هم حالا فهرستِ bindingهای همان اکانت را
+> چاپ می‌کند (`known=[call:o995/c-100...,durable:...,member:...]`) تا دفعهٔ بعد
+> دقیقاً بدانیم چرا منتسب نشد.
+
 بعد از هر تغییرِ `requirements.txt` ایمیج باید دوباره ساخته شود. دستور
 `docker compose up -d --build` فقط روی **سرور تازه** بدون سفارش مجاز است؛ برای
 نصب موجود [دستور استقرار با کنترل سفارش و بکاپ](deploy-final.fa.md) را به‌جای

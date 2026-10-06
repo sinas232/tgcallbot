@@ -64,6 +64,8 @@ __all__ = [
     "guard_stats",
     "install_repeat_warning_filter",
     "install_updates_guard",
+    "restore_client_parsers",
+    "silence_client_parsers",
 ]
 
 
@@ -123,6 +125,13 @@ _STATS: Dict[str, Any] = {
     "packets_lost": 0,             # handle_updates raised despite the guard
     "last_error": None,
     "last_report": 0.0,
+    # ── update-parsing guard (raw-only voice clients) ──
+    "parse_guard_clients": 0,      # clients whose parser table we emptied
+    "parse_guard_entries": 0,      # parser entries disabled in total
+    "parse_guard_refused": 0,      # clients kept parsing (they have handlers)
+    "parse_guard_skipped": 0,      # unsupported/not-started dispatcher
+    "parse_guard_restored": 0,     # restore_client_parsers() successes
+    "parse_guard_errors": 0,       # guard itself raised (fail-open)
 }
 
 REPORT_INTERVAL_SECONDS = 300.0
@@ -527,3 +536,218 @@ def install_repeat_warning_filter(window: Optional[float] = None) -> int:
         attached += 1
     _STATS["log_filter_handlers"] += attached
     return attached
+
+
+# ─── Update-parsing guard (raw-only voice clients) ───────────────────
+#
+# Why this exists (incident 2026-10-06, order 995)
+# ------------------------------------------------
+# ``Dispatcher.handler_worker`` parses EVERY update it dequeues *before* it
+# looks at which handlers are registered::
+#
+#     parser = self.update_parsers.get(type(update), None)
+#     parsed_update, handler_type = (
+#         await parser(update, users, chats)
+#         if parser is not None else (None, type(None))
+#     )
+#
+# A voice client registers exactly ONE Pyrogram handler — PyTgCalls'
+# ``@app.on_raw_update(group=-9999)`` (pytgcalls/mtproto/pyrogram_client.py),
+# a ``RawUpdateHandler`` that consumes the RAW update.  The parsed object is
+# built and thrown away.  Building it is not free — it issues real RPCs:
+#
+#   * ``Message._parse`` → ``client.fetch_replies`` → ``client.get_messages``
+#     → ``channels.GetMessages`` for EVERY reply in the group
+#     (message.py:2316), and
+#   * ``Story._parse`` → ``client.fetch_stories`` → ``stories.GetStoriesByID``
+#     plus ``resolve_peer`` for peers this client has never seen
+#     (story.py:315/329).
+#
+# In production, with 8 accounts sitting in one active group, that produced
+#
+#   * ~190 ``Waiting for N seconds before continuing (required by
+#     "channels.GetMessages")`` FloodWaits inside 33 s — each one sleeping
+#     INSIDE ``Session.invoke`` on a client whose job is joining voice
+#     calls, and
+#   * ``pyrogram.dispatcher - ERROR ... [400 PEER_ID_INVALID]`` tracebacks
+#     ending in ``resolve_peer`` ← ``Story._parse`` ← ``Message._parse``.
+#
+# Neither RPC is in our own code (``grep get_messages services/`` → nothing):
+# it is all parsing work for objects that are discarded one line later.
+#
+# Emptying the dispatcher's parser table keeps raw delivery byte-for-byte
+# identical (``handler_type`` becomes ``NoneType``, no handler matches it,
+# ``RawUpdateHandler`` still gets ``(update, users, chats)``) and removes
+# every one of those RPCs.  The guard inspects the client first and REFUSES
+# to touch one that has any handler needing parsed updates, so a client
+# driven by ``on_message``/``on_chat_member_updated``/... keeps working.
+#
+# ``PYROGRAM_VOICE_PARSE_GUARD=false`` disables it without a code change.
+
+# Handler types that never need a parsed update: raw delivery, error
+# reporting and the client lifecycle callbacks.  Anything else means the
+# client consumes parsed updates and must keep its parser table.
+_RAW_SAFE_HANDLER_NAMES: Tuple[str, ...] = (
+    "RawUpdateHandler",
+    "ErrorHandler",
+    "ConnectHandler",
+    "DisconnectHandler",
+    "StartHandler",
+    "StopHandler",
+)
+
+# Attribute used to remember the original table (idempotency + restore).
+_PARSER_BACKUP_ATTR = "_tgcallbot_parsers_backup"
+
+
+def _load_handler_types() -> Tuple[type, ...]:
+    """Handler classes that are safe to serve without parsing.
+
+    Returns an empty tuple when the installed library does not expose them —
+    callers then refuse to silence anything (fail OPEN, never break a
+    client's handlers because we could not identify them).
+    """
+    try:
+        from pyrogram import handlers as _handlers
+    except Exception as exc:
+        logger.debug("[ParseGuard] pyrogram.handlers unavailable: %s", exc)
+        return ()
+    return tuple(
+        klass
+        for klass in (
+            getattr(_handlers, name, None) for name in _RAW_SAFE_HANDLER_NAMES
+        )
+        if isinstance(klass, type)
+    )
+
+
+def _dispatcher_handlers(dispatcher: Any) -> list:
+    """Flat list of every handler registered on a dispatcher (all groups)."""
+    handlers: list = []
+    groups = getattr(dispatcher, "groups", None)
+    try:
+        if isinstance(groups, dict):
+            for group in groups.values():
+                handlers.extend(list(group or ()))
+    except Exception as exc:
+        logger.warning("[ParseGuard] handler inventory failed: %s", exc)
+    return handlers
+
+
+def silence_client_parsers(app: Any, *, reason: str = "raw-only voice client") -> bool:
+    """Stop a raw-only client from parsing updates nobody consumes.
+
+    Idempotent, self-healing and fail-open.  Returns ``True`` only when the
+    parser table is empty because no registered handler needs parsed updates.
+
+    Call it before ``start()``, after ``start()``, after a reconnect and once
+    the engine has started — ``add_handler`` registers through
+    ``loop.create_task``, so the handler inventory only becomes trustworthy
+    after the loop has run.  If a handler that needs parsed updates appears
+    later, the next call RESTORES the table instead of leaving it empty.
+    """
+    if app is None:
+        return False
+    if not _as_bool(_cfg("PYROGRAM_VOICE_PARSE_GUARD", True), True):
+        return False
+    name = getattr(app, "name", None) or reason
+    try:
+        dispatcher = getattr(app, "dispatcher", None)
+        parsers = getattr(dispatcher, "update_parsers", None)
+        if dispatcher is None or not isinstance(parsers, dict):
+            # Not constructed yet / a library layout we do not recognise.
+            _STATS["parse_guard_skipped"] += 1
+            return False
+
+        safe_types = _load_handler_types()
+        if not safe_types:
+            _STATS["parse_guard_skipped"] += 1
+            logger.debug("[ParseGuard] %s: handler types unavailable; parsers kept", name)
+            return False
+
+        backup = getattr(dispatcher, _PARSER_BACKUP_ATTR, None)
+        needs_parse = sorted({
+            type(handler).__name__
+            for handler in _dispatcher_handlers(dispatcher)
+            if not isinstance(handler, safe_types)
+        })
+
+        if needs_parse:
+            _STATS["parse_guard_refused"] += 1
+            # Self-healing: ``add_handler`` schedules the registration on the
+            # client's loop, so a handler can turn up AFTER we emptied the
+            # table (this is why the guard is re-asserted once the loop has
+            # settled).  A client that needs parsed updates gets its parsers
+            # back — silently starving its handlers is never acceptable.
+            if isinstance(backup, dict) and not parsers:
+                dispatcher.update_parsers = dict(backup)
+                setattr(dispatcher, _PARSER_BACKUP_ATTR, None)
+                logger.warning(
+                    "[ParseGuard] %s: parsers RESTORED — handler(s) need parsed "
+                    "updates: %s",
+                    name, ", ".join(needs_parse[:6]),
+                )
+            else:
+                logger.warning(
+                    "[ParseGuard] %s: parser table KEPT — handler(s) need parsed "
+                    "updates: %s",
+                    name, ", ".join(needs_parse[:6]),
+                )
+            return False
+
+        if isinstance(backup, dict) and not parsers:
+            return True  # already silenced by an earlier call, still safe
+
+        if not isinstance(backup, dict):
+            setattr(dispatcher, _PARSER_BACKUP_ATTR, dict(parsers))
+            silenced = len(parsers)
+        else:
+            silenced = len(backup)
+        dispatcher.update_parsers = {}
+
+        # Belt and braces: these two flags are what make parsing EXPENSIVE —
+        # ``fetch_replies`` turns every reply into a ``channels.GetMessages``
+        # RPC (the FloodWait storm) and ``fetch_stories`` into
+        # ``stories.GetStoriesByID`` + ``resolve_peer`` (the PEER_ID_INVALID
+        # tracebacks).  With the parser table empty they are never consulted,
+        # but flip them anyway so a future library that parses eagerly cannot
+        # reintroduce the traffic.
+        for flag in ("fetch_replies", "fetch_stories"):
+            if getattr(app, flag, None):
+                setattr(app, flag, False)
+
+        _STATS["parse_guard_clients"] += 1
+        _STATS["parse_guard_entries"] += silenced
+        logger.info(
+            "[ParseGuard] %s: %s update parser(s) disabled (%s)",
+            name, silenced, reason,
+        )
+        return True
+    except Exception as exc:
+        _STATS["parse_guard_errors"] += 1
+        logger.warning(
+            "[ParseGuard] %s: not silenced (%s: %s)", name, type(exc).__name__, exc
+        )
+        return False
+
+
+def restore_client_parsers(app: Any) -> bool:
+    """Undo :func:`silence_client_parsers` (tests, shutdown, debugging)."""
+    if app is None:
+        return False
+    name = getattr(app, "name", None) or "client"
+    try:
+        dispatcher = getattr(app, "dispatcher", None)
+        backup = getattr(dispatcher, _PARSER_BACKUP_ATTR, None)
+        if not isinstance(backup, dict):
+            return False
+        dispatcher.update_parsers = dict(backup)
+        setattr(dispatcher, _PARSER_BACKUP_ATTR, None)
+        _STATS["parse_guard_restored"] += 1
+        logger.debug("[ParseGuard] %s: parser table restored", name)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[ParseGuard] %s: restore failed (%s: %s)", name, type(exc).__name__, exc
+        )
+        return False
