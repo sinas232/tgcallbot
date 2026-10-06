@@ -2538,14 +2538,20 @@ class OrderExecutor:
 		refund_tx_id = settled['refund_tx_id']
 		new_balance = settled['user_wallet_balance']
 
-		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
-		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
-		try:
-			await self.stop_active_order(order_id, is_expired=False,
-			                             reason=cancellation_reason,
-			                             suppress_cancel_log=True)
-		except Exception as exc:
-			logger.warning(f"Order {order_id}: stop during settlement failed: {exc}")
+		# Do not hold the callback open on a Telegram transport stuck in
+		# GetChannelDifference. Settle the DB row first, release the worker,
+		# and finish voice cleanup asynchronously so the cancel button responds.
+		info = self.active_orders.get(order_id)
+		if info:
+			info["cancel_requested"] = True
+			task = info.get("task")
+			if task and not task.done():
+				task.cancel()
+			self.active_orders.pop(order_id, None)
+			asyncio.create_task(
+				self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {})),
+				name=f"order-cancel-cleanup-{order_id}",
+			)
 
 		if not canceled_by_name:
 			canceled_by_name = self._user_display(user)[0] if user else "—"
