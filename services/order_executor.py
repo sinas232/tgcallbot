@@ -2073,8 +2073,13 @@ class OrderExecutor:
 				try:
 					await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
 				except (asyncio.CancelledError, asyncio.TimeoutError):
-					pass
-				return True, "Order cancelled and accounts left."
+					# The worker may be blocked inside a Telegram RPC. Do not return
+					# here: settlement already marked the DB row stopped, so leaving
+					# active_orders populated would let the cancelled worker continue
+					# creating waves and recreate the retry storm.
+					logger.warning(
+						"Order %s worker did not stop within cancellation grace; "
+						"forcing executor cleanup", order_id)
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))
 			# A manual settlement already claimed 'stopped' atomically. Never
 			# turn it into 'failed' merely because the worker had no task handle.
