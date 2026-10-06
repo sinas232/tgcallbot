@@ -317,6 +317,20 @@ docker compose logs -f bot \
 > کلاینت‌های ویس عمداً با `no_updates=False` ساخته می‌شوند. (بار پردازشیِ این
 > آپدیت‌ها با `no_updates` حذف نمی‌شود، بلکه با خفه‌کردن لاگ‌ها و uvloop مهار شده.)
 
+> **طوفانِ `[N] Retrying "updates.GetChannelDifference" ... 500
+> PERSISTENT_TIMESTAMP_OUTDATED`:** همین `no_updates=False` باعث می‌شود
+> Pyrogram برای حلِ min-peerها `updates.GetChannelDifference` بزند و تلگرام در
+> گروه شلوغ به آن ۵۰۰ بدهد. کتابخانه ۱۰ بار با تأخیر ۱s تکرار می‌کرد و در
+> پایان `TimeoutError` می‌ساخت که `handle_updates` نمی‌گیرد ⇒ **بقیهٔ آپدیت‌های
+> همان بسته (رویدادهای ویس‌کال/شرکت‌کننده‌ها) بی‌صدا دور ریخته می‌شدند**.
+> `services/pyrogram_updates_guard.py` (که در `main.py` و
+> `services/voice_call_manager.py` نصب می‌شود) همان فراخوانی را سریع‌شکست
+> می‌کند و خطایی می‌دهد که خودِ کتابخانه نادیده می‌گیرد، پس بستهٔ آپدیت زنده
+> می‌ماند و کنسول هم پر نمی‌شود. تنظیمات: `PYROGRAM_UPDATES_GUARD` (کلید
+> خاموش)، `PYROGRAM_UPDATES_DIFF_ATTEMPTS`، `PYROGRAM_LOG_DEDUPE_WINDOW`.
+> اگر در لاگ `[UpdatesGuard] not installed (...)` دیدید یعنی ساختارِ نسخهٔ
+> نصب‌شدهٔ kurigram شناخته نشده و گارد به‌صورت fail-open نصب نشده است.
+
 بعد از هر تغییرِ `requirements.txt` ایمیج باید دوباره ساخته شود. دستور
 `docker compose up -d --build` فقط روی **سرور تازه** بدون سفارش مجاز است؛ برای
 نصب موجود [دستور استقرار با کنترل سفارش و بکاپ](deploy-final.fa.md) را به‌جای
@@ -334,6 +348,25 @@ docker compose logs -f bot \
   مسیر WARP را بررسی کنید؛ `git pull` کورکورانه روی شاخهٔ قدیمی جای عیب‌یابی
   نیست. کد باید روی `arena/01a0f720-tgcallbot` باشد و مقادیر DB/Redis
   در `.env` با همین Compose منطبق باشند.
+- **تغییراتی که می‌دهیم هیچ اثری ندارد / باگِ قدیمی هنوز هست:** اول از همه
+  بررسی کنید درختِ روی سرور همان کدی است که اجرا می‌شود، نه یک شاخهٔ قدیمی:
+  `git -C /opt/tgcallbot log -1 --oneline` را با خطِ بوت
+  `🔖 running commit: <sha>` مقایسه کنید. `main` از درختِ استقرار عقب‌تر است
+  (نسخهٔ `2.2.3`)؛ استقرار روی شاخهٔ `arena/...` روز است. اگر ایمیج از
+  checkout دیگری ساخته شده باشد، هر فیکسی که روی شاخهٔ دیگر نوشته شده باشد
+  هرگز به کانتینر نمی‌رسد — این شایع‌ترین دلیلِ «هر تغییری می‌دهیم درست
+  نمی‌شود» است. بعد از اطمینان از درخت: `docker compose build bot` و سپس
+  `docker compose up -d bot`، و دوباره `running commit` را چک کنید (لایهٔ
+  `COPY . /app` کش نمی‌شود، ولی اگر `git pull` فراموش شده باشد ایمیج قدیمی
+  می‌ماند).
+- **لاگ پُر از `[N] Retrying "updates.GetChannelDifference" ... 500
+  PERSISTENT_TIMESTAMP_OUTDATED`:** این دیگر نباید رخ دهد؛
+  `services/pyrogram_updates_guard.py` آن را در بوت سریع‌شکست می‌کند (خطِ
+  `[UpdatesGuard] active: ...` را در شروع لاگ ببینید). اگر هنوز این طوفان را
+  می‌بینید یعنی درختِ اجرا شده قدیمی است (بندِ بالا) یا گارد نصب نشده
+  (`[UpdatesGuard] not installed (...)` در لاگ) — در آن صورت
+  `PYROGRAM_UPDATES_GUARD` را دست نزنید و همان خط `not installed` را بررسی
+  کنید، چون یعنی ساختارِ kurigramِ نصب‌شده با آنچه گارد می‌شناسد فرق دارد.
 
 
 - **کانتینر warp بالا نمی‌آید / healthy نمی‌شود:**

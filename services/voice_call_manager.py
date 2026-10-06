@@ -72,6 +72,7 @@ from services.session_ownership import (session_ownership, SessionInUseError,
                                         is_auth_key_duplicated, is_fatal_auth_error,
                                         fatal_auth_category)
 from services.session_client import close_pyrogram_client
+from services.pyrogram_updates_guard import install_updates_guard
 from services.presence_reconciler import (
     PresenceReconciler,
     CONFIRMED_PRESENT,
@@ -160,6 +161,12 @@ def _patch_pyrogram_channel_id_range() -> None:
 
 
 _patch_pyrogram_channel_id_range()
+
+# 🧯 همان گاردِ آپدیتی که main.py نصب می‌کند (idempotent). اینجا هم صدا زده
+# می‌شود تا مسیرهایی که main.py را ایمپورت نمی‌کنند (tools/، اسکریپت‌های
+# تشخیصی، تست‌ها) هم از طوفانِ 500 PERSISTENT_TIMESTAMP_OUTDATED در امان
+# باشند؛ نصبِ دوم هیچ اثری ندارد.
+install_updates_guard()
 
 SILENT_AUDIO_PATH = "silence.wav"
 

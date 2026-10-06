@@ -387,6 +387,22 @@ class Config:
     # inside the monitor cycle (a dead session kills the call minutes later).
     VOICE_SESSION_GUARD = os.getenv('VOICE_SESSION_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
+    # 🧯 گاردِ آپدیتِ Pyrogram — services/pyrogram_updates_guard.py
+    # برای حلِ min-peerها خودِ کتابخانه در handle_updates متد
+    # updates.GetChannelDifference را صدا می‌زند؛ تلگرام در گروه‌های شلوغ به آن
+    # «500 PERSISTENT_TIMESTAMP_OUTDATED» می‌دهد. Session.invoke این ۵۰۰ را ۱۰
+    # بار با تأخیر ۱s تکرار می‌کرد (هر بار یک خط WARNING) و در پایان یک
+    # TimeoutError می‌ساخت که handle_updates نمی‌گیرد ⇒ بقیهٔ آپدیت‌های همان
+    # بسته — از جمله رویدادهای ویس‌کال/شرکت‌کننده‌ها که PyTgCalls به آن‌ها
+    # وابسته است — بی‌صدا دور ریخته می‌شدند. گارد همان فراخوانی را با تعداد
+    # تلاشِ زیر و بدون تأخیر انجام می‌دهد و خطایی برمی‌گرداند که خودِ کتابخانه
+    # از قبل نادیده می‌گیرد. false ⇒ رفتارِ اصلیِ کتابخانه برمی‌گردد.
+    PYROGRAM_UPDATES_GUARD = os.getenv('PYROGRAM_UPDATES_GUARD', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    PYROGRAM_UPDATES_DIFF_ATTEMPTS = int(os.getenv('PYROGRAM_UPDATES_DIFF_ATTEMPTS', '2'))
+    # پنجرهٔ خلاصه‌سازیِ هشدارهای یک‌شکلِ پیاپیِ کتابخانه در کنسول (ثانیه):
+    # خطِ اول همیشه چاپ می‌شود، خطِ بعدی تعدادِ خط‌های جمع‌شده را گزارش می‌دهد.
+    PYROGRAM_LOG_DEDUPE_WINDOW = float(os.getenv('PYROGRAM_LOG_DEDUPE_WINDOW', '30'))
+
     # ═══════════════════════════════════════════════════════════════════
     # 🛡 حالت ضد اسپم (Anti-Spam Protection) — services/anti_spam.py
     # ═══════════════════════════════════════════════════════════════════

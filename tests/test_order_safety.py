@@ -898,10 +898,80 @@ class CancellationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             first = await executor.settle_and_refund_order(846, bot_id=1)
             with self.assertRaises(ValueError):
                 await executor.settle_and_refund_order(846, bot_id=1)
+            # The Telegram half runs as a tracked background task so the cancel
+            # callback is not held open on the paced voice leaves.  Drain it
+            # INSIDE the patch context, then assert the official stop path ran
+            # exactly once.
+            pending = [t for t in asyncio.all_tasks()
+                       if t.get_name() == 'order-cancel-stop-846']
+            self.assertEqual(len(pending), 1, 'one tracked stop task per settlement')
+            await asyncio.gather(*pending)
         self.assertEqual(first['refund_amount'], 500_000)
         self.assertEqual(claim.await_count, 2)
         stop.assert_awaited_once()
         old_refund.assert_not_awaited()
+
+    async def test_settled_cancel_still_stops_an_order_missing_from_active_orders(self):
+        """Cancelling after a restart (no worker in memory) must still eject.
+
+        The hand-rolled replacement of stop_active_order only acted when the
+        order was in active_orders, so a settled cancellation of a recovered
+        order refunded the wallet and left every account inside the voice
+        chat.  stop_active_order is the path that falls back to
+        vcm.stop_all_for_order in exactly that case.
+        """
+        executor = OrderExecutor()
+        order = {'id': 990, 'user_id': 12, 'bot_id': 1,
+                 'status': 'running', 'duration_minutes': 60,
+                 'price_paid': 500_000, 'started_at': None}
+        settlement = {'order': order, 'total_cost': 500_000,
+                      'used_cost': 0, 'refund_amount': 500_000,
+                      'refund_tx_id': 'TX-990', 'user_wallet_balance': 600_000}
+        self.assertNotIn(990, executor.active_orders)
+        with patch.object(database.DatabaseManager, 'settle_cancel_order',
+                          new_callable=AsyncMock, return_value=settlement), \
+             patch.object(database.DatabaseManager, 'get_user_by_id',
+                          new_callable=AsyncMock, return_value={'id': 12, 'credit': 600_000}), \
+             patch.object(executor, 'stop_active_order', new_callable=AsyncMock) as stop, \
+             patch.object(executor, '_log_to_channel', new_callable=AsyncMock):
+            await executor.settle_and_refund_order(990, bot_id=1)
+            pending = [t for t in asyncio.all_tasks()
+                       if t.get_name() == 'order-cancel-stop-990']
+            self.assertEqual(len(pending), 1)
+            await asyncio.gather(*pending)
+        stop.assert_awaited_once()
+        self.assertEqual(stop.await_args.kwargs.get('suppress_cancel_log'), True,
+                         'the settle path sends the full report; executor must not duplicate it')
+        self.assertIn(990, executor._suppress_cancel_log,
+                      'suppression is armed synchronously: the worker can report '
+                      'before the background task reaches stop_active_order')
+
+    async def test_settled_cancel_arms_cancel_flag_synchronously(self):
+        """The worker must see cancel_requested before the task is created."""
+        executor = OrderExecutor()
+        executor.active_orders[991] = {'data': {}, 'joined_accounts': [], 'task': None}
+        order = {'id': 991, 'user_id': 12, 'bot_id': 1,
+                 'status': 'running', 'duration_minutes': 60,
+                 'price_paid': 500_000, 'started_at': None}
+        settlement = {'order': order, 'total_cost': 500_000,
+                      'used_cost': 0, 'refund_amount': 500_000,
+                      'refund_tx_id': 'TX-991', 'user_wallet_balance': 600_000}
+        with patch.object(database.DatabaseManager, 'settle_cancel_order',
+                          new_callable=AsyncMock, return_value=settlement), \
+             patch.object(database.DatabaseManager, 'get_user_by_id',
+                          new_callable=AsyncMock, return_value={'id': 12, 'credit': 600_000}), \
+             patch.object(executor, 'stop_active_order', new_callable=AsyncMock), \
+             patch.object(executor, '_log_to_channel', new_callable=AsyncMock):
+            await executor.settle_and_refund_order(991, bot_id=1)
+            self.assertTrue(executor.active_orders[991]['cancel_requested'])
+            pending = [t for t in asyncio.all_tasks()
+                       if t.get_name() == 'order-cancel-stop-991']
+            await asyncio.gather(*pending)
+            await asyncio.sleep(0)  # let the done-callbacks run
+            # The order is only dropped by the official stop path, so an
+            # in-flight worker can never be orphaned by the settlement; the
+            # task keeps a strong ref until it is finished.
+            self.assertEqual(executor._background_tasks, set())
 
     async def test_no_task_handle_cancellation_keeps_stopped_not_failed(self):
         executor = OrderExecutor()

@@ -108,6 +108,11 @@ from utils.helpers import format_jalali_datetime, format_price, get_tehran_time
 # 💎 ایموجی پریمیوم (Custom Emoji) — لایهٔ خروجی + پنل ادمین
 from utils.premium_bot import PremiumEmojiApplication, PremiumEmojiBot
 from services import premium_emoji_service
+# 🧯 گاردِ آپدیتِ Pyrogram (خطای ۵۰۰ PERSISTENT_TIMESTAMP_OUTDATED)
+from services.pyrogram_updates_guard import (
+    install_repeat_warning_filter,
+    install_updates_guard,
+)
 from handlers.premium_emoji_handlers import (
     premium_emoji_menu,
     premium_emoji_callback,
@@ -148,6 +153,26 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 logging.getLogger("ntgcalls").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# 🔇 لایهٔ دوم در برابر طوفانِ لاگ: هشدارهای یک‌شکلِ پیاپیِ کتابخانه‌ها
+# (مثل «[N] Retrying ... due to» پشت‌سرهم) در هر بازهٔ زمانی به یک خط خلاصه
+# می‌شوند؛ خطِ اول همیشه رد می‌شود و خطِ بعدی تعدادِ خط‌های جمع‌شده را دارد،
+# پس هیچ سیگنالی گم نمی‌شود. نوشتن لاگ همگام است: صدها خط در ثانیه مستقیماً
+# از زمانِ event loopِ ویس‌کال‌ها کم می‌کرد.
+install_repeat_warning_filter()
+
+# 🧯 وصلهٔ اصلیِ خطای 500 PERSISTENT_TIMESTAMP_OUTDATED:
+# برای حل‌کردنِ min-peer ها، خودِ Pyrogram در handle_updates متد
+# updates.GetChannelDifference را صدا می‌زند. وقتی تلگرام ۵۰۰ می‌دهد،
+# Session.invoke ده بار (هر بار ۱ ثانیه + یک خط WARNING) تلاش می‌کند و در
+# پایان یک TimeoutError می‌سازد که handle_updates آن را نمی‌گیرد ⇒ بقیهٔ
+# آپدیت‌های همان بسته — از جمله رویدادهای ویس‌کال/شرکت‌کننده‌ها که PyTgCalls
+# به آن‌ها وابسته است — بی‌صدا دور ریخته می‌شدند (آمار live کهنه، از دست رفتن
+# LEFT_CALL/CALL_ENDED). گارد همان فراخوانی را سریع‌شکست می‌کند و نوع خطایی
+# را می‌دهد که خودِ کتابخانه از قبل نادیده می‌گیرد؛ سیاست retry بقیهٔ
+# فراخوانی‌ها دست‌نخورده می‌ماند. اگر ساختارِ کتابخانه عوض شود، گارد به‌صورت
+# fail-open نصب نمی‌شود. کلید خاموش: PYROGRAM_UPDATES_GUARD=false
+install_updates_guard()
 
 # فیلترهای عمومی برای ناوبری
 # الگوی دکمه‌های ناوبری که نباید به‌عنوان «متن آزاد» مصرف شوند.

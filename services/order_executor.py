@@ -2077,6 +2077,27 @@ class OrderExecutor:
 					await client.leave_chat(chat_id)
 			except: pass
 
+	async def _settlement_stop(self, order_id: int, reason: Optional[str]) -> None:
+		"""Telegram half of an already-settled cancellation (background task).
+
+		``settle_and_refund_order`` answers the user immediately; the official
+		stop path must still run in full — worker cancellation grace,
+		``_cleanup_order`` (paced voice leaves / group-leave scheduling), the
+		``stopped`` status write and the cancel-log suppression.  Unconditional:
+		an order that is NOT in ``active_orders`` (cancellation after a restart,
+		recovered order) is exactly the case where ``stop_active_order`` falls
+		back to ``vcm.stop_all_for_order`` and takes the accounts out of the
+		call.  Skipping it left them in the voice chat after the refund.
+		"""
+		try:
+			await self.stop_active_order(order_id, is_expired=False, reason=reason,
+			                             suppress_cancel_log=True)
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			logger.warning("Order %s: background stop during settlement failed: %s",
+			               order_id, exc)
+
 	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
 	                            suppress_cancel_log: bool = False):
 		# حالت‌های پیگیری «کال بسته» سفارش‌های تمام‌شده را نگه نداریم.
@@ -2538,20 +2559,28 @@ class OrderExecutor:
 		refund_tx_id = settled['refund_tx_id']
 		new_balance = settled['user_wallet_balance']
 
-		# Do not hold the callback open on a Telegram transport stuck in
-		# GetChannelDifference. Settle the DB row first, release the worker,
-		# and finish voice cleanup asynchronously so the cancel button responds.
+		# پاسخِ دکمهٔ لغو نباید منتظرِ پاک‌سازیِ تلگرام بماند: ترکِ ویس‌کالِ N
+		# اکانت (pace‌شده، ضد burst) ثانیه‌ها طول می‌کشد و callback تلگرام
+		# تایم‌اوت می‌شود. ردیف DB همین‌جا atomically تسویه شد، پس:
+		#   ۱) همگام: پرچم لغو + سرکوبِ گزارش «cancelled» executor (گزارشِ کامل
+		#      را همین تابع پایین‌تر می‌فرستد؛ flag یک‌بارمصرف است و worker ممکن
+		#      است قبل از رسیدنِ تسکِ پس‌زمینه آن را مصرف کند)؛
+		#   ۲) ناهمگام: کلِ مسیرِ رسمیِ توقف در یک تسکِ رهگیری‌شده.
+		# جایگزینِ قبلی (task.cancel + _cleanup_orderِ دستی) سه چیز را جا
+		# می‌انداخت: suppress_cancel_log (گزارش تکراری/ناقص)، grace برای worker
+		# (رقابتِ workerِ در حالِ ساختِ موج با پاک‌سازی)، و وقتی سفارش در
+		# active_orders نبود (مثلاً لغو بعد از ری‌استارت) هیچ اکانتی از ویس
+		# خارج نمی‌شد — مشتری لغو می‌کرد و اکانت‌ها در کال می‌ماندند.
+		self._suppress_cancel_log.add(order_id)
 		info = self.active_orders.get(order_id)
 		if info:
 			info["cancel_requested"] = True
-			task = info.get("task")
-			if task and not task.done():
-				task.cancel()
-			self.active_orders.pop(order_id, None)
-			asyncio.create_task(
-				self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {})),
-				name=f"order-cancel-cleanup-{order_id}",
-			)
+		_stop_task = asyncio.create_task(
+			self._settlement_stop(order_id, cancellation_reason),
+			name=f"order-cancel-stop-{order_id}",
+		)
+		self._background_tasks.add(_stop_task)
+		_stop_task.add_done_callback(self._background_tasks.discard)
 
 		if not canceled_by_name:
 			canceled_by_name = self._user_display(user)[0] if user else "—"
