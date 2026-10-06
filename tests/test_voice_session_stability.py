@@ -203,6 +203,31 @@ class VoiceStopIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.manager.clients[self.aid] = self.engine
         self.manager.pyrogram_clients[self.aid] = self.app
 
+    async def test_stalled_fallback_is_bounded_and_local_cleanup_runs(self):
+        self.manager.active_calls[(101, self.aid)] = {'chat_id': self.cid}
+        cancelled = asyncio.Event()
+        async def stalled(*args):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+        real_timeout = asyncio.timeout
+        from database import DatabaseManager
+        with patch.object(DatabaseManager, 'update_voice_call_session', new_callable=AsyncMock), \
+             patch.object(self.manager, '_is_in_voice_call', side_effect=stalled), \
+             patch.object(self.manager, '_cleanup_client', new_callable=AsyncMock) as cleanup, \
+             patch.object(self.manager, '_vc_event_log'), \
+             patch.object(self.manager, '_record_drop'), \
+             patch('services.voice_call_manager.asyncio.timeout',
+                   side_effect=lambda seconds: real_timeout(0.01)) as timeout, \
+             self.assertLogs('services.voice_call_manager', level='WARNING') as logs:
+            ok, _ = await self.manager.stop_call(101, self.aid)
+        self.assertTrue(ok)
+        self.assertTrue(cancelled.is_set())
+        timeout.assert_called_once_with(12)
+        cleanup.assert_awaited_once()
+        self.assertIn('departure unconfirmed', '\n'.join(logs.output))
+
     async def test_finishing_one_order_never_leaves_shared_voice_call(self):
         for oid in (101, 102):
             self.manager.active_calls[(oid, self.aid)] = {'chat_id': self.cid}

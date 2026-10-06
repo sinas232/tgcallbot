@@ -2045,6 +2045,8 @@ class VoiceCallManager:
                     proxy=_voice_proxy_config(),
                     **_client_device_fingerprint(account_id),
                 )
+                from services.voice_updates import configure_voice_updates
+                configure_voice_updates(app)
                 await asyncio.wait_for(app.start(), timeout=timeout)
                 await asyncio.sleep(random.uniform(0.8, 2.0))
                 if self._shutting_down:
@@ -4764,16 +4766,28 @@ class VoiceCallManager:
                         await asyncio.sleep(0.5)
             if app and chat_id:
                 try:
-                    if await self._is_in_voice_call(app, int(chat_id)) is True:
-                        peer = await app.resolve_peer(int(chat_id))
-                        full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
-                        call = getattr(full.full_chat, "call", None)
-                        if call:
-                            await app.invoke(
-                                functions.phone.LeaveGroupCall(call=call, source=0)
-                            )
-                except Exception:
-                    pass
+                    # Bound the entire fallback (presence/peer/full-chat/leave),
+                    # not just the native engine call above. Library retries on
+                    # this path used to hold cleanup for minutes after deadline.
+                    async with asyncio.timeout(12):
+                        if await self._is_in_voice_call(app, int(chat_id)) is True:
+                            peer = await app.resolve_peer(int(chat_id))
+                            full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
+                            call = getattr(full.full_chat, "call", None)
+                            if call:
+                                await app.invoke(
+                                    functions.phone.LeaveGroupCall(call=call, source=0),
+                                    retries=0, timeout=8, sleep_threshold=0,
+                                )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[VoiceLeave] order=%s acc=%s chat=%s fallback timed out; "
+                        "Telegram departure unconfirmed, continuing local cleanup",
+                        order_id, account_id, chat_id,
+                    )
+                except Exception as exc:
+                    logger.warning("[VoiceLeave] order=%s acc=%s fallback failed: %s",
+                                   order_id, account_id, type(exc).__name__)
 
         try:
             await DatabaseManager.update_voice_call_session(

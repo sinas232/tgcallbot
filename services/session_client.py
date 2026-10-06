@@ -23,6 +23,9 @@ async def close_pyrogram_client(client, *, timeout: float = 10.0) -> bool:
     could NOT be confirmed; the caller must quarantine the key.
     """
     async def _close() -> bool:
+        pipeline = getattr(client, "_voice_updates", None)
+        if pipeline is not None:
+            await asyncio.wait_for(pipeline.quiesce(), timeout=timeout)
         if getattr(client, "is_initialized", False):
             await asyncio.wait_for(client.stop(), timeout=timeout)
         elif getattr(client, "is_connected", False):

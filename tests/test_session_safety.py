@@ -449,6 +449,8 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeApp:
             def __init__(self, *_args, **_kwargs):
+                self.name = "fake-voice"
+                self.dispatcher = SimpleNamespace(update_parsers={})
                 self.is_initialized = False
                 self.is_connected = False
                 self.session = None
@@ -500,6 +502,8 @@ class VoiceClientOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         class FaultyApp:
             def __init__(self, *_args, **_kwargs):
+                self.name = "fake-voice"
+                self.dispatcher = SimpleNamespace(update_parsers={})
                 self.is_initialized = False
                 self.is_connected = False
                 self.session = None
