@@ -1128,6 +1128,51 @@ class DatabaseManager:
             return started_at
     
     @staticmethod
+    async def claim_order_recovery(order_id: int) -> bool:
+        """Startup-only reattachment, protected by the process-wide DB lock.
+
+        Keep normal admission strict: pending/scheduled claims must never accept
+        running orders. The conditional update also loses safely to cancellation.
+        Do not reset the paid clock before a successful rebuild.
+        """
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                result = await db_session.execute(
+                    update(Order)
+                    .where(Order.id == order_id, Order.status == 'running')
+                    .values(status='running')
+                )
+                return bool(result.rowcount)
+
+    @staticmethod
+    async def start_recovered_duration(order_id: int, *, previous_started_at,
+                                       remaining_minutes: int) -> Optional[datetime]:
+        """Rebase the deadline after rebuild without changing price/plan length.
+
+        The original plan duration remains in DB for settlement. Shift its start
+        so the new deadline is now + the remaining service. Return the start of
+        that *remaining* runtime window, not the original plan's virtual start.
+        Compare the previous start under a row lock: retry after a lost commit
+        response must reuse the already rebased deadline, never extend it twice.
+        """
+        if remaining_minutes <= 0:
+            raise ValueError('recovery requires positive remaining time')
+        async with AsyncSessionLocal() as db_session:
+            async with db_session.begin():
+                order = await db_session.get(Order, order_id, with_for_update=True)
+                if not order or order.status != 'running':
+                    return None
+                plan_minutes = int(order.duration_minutes or 0)
+                if remaining_minutes > plan_minutes:
+                    raise ValueError('recovery cannot exceed purchased duration')
+                used = timedelta(minutes=plan_minutes - remaining_minutes)
+                if order.started_at == previous_started_at:
+                    order.started_at = datetime.utcnow() - used
+                if order.started_at is None:
+                    raise RuntimeError('recovery clock changed unexpectedly')
+                return order.started_at + used
+
+    @staticmethod
     async def mark_order_as_running(order_id: int, *, expected_status: str) -> bool:
         """Claim an open order without resurrecting a cancelled/failed one.
 

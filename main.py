@@ -634,7 +634,7 @@ async def _recover_interrupted_orders() -> None:
         oid = order.get("id")
         bot_id = order.get("bot_id", 1)
         duration = int(order.get("duration_minutes") or 0)
-        start = order.get("started_at") or order.get("created_at")
+        start = order.get("started_at")
         app = bot_manager.active_bots.get(bot_id)
         tg_id = None
         try:
@@ -644,9 +644,9 @@ async def _recover_interrupted_orders() -> None:
             tg_id = None
 
         end = (start + timedelta(minutes=duration)) if (start and duration > 0) else None
-        remaining = int((end - now).total_seconds() // 60) if end else 0
+        remaining = int((end - now).total_seconds() // 60) if end else duration
 
-        if end is None or remaining <= 0:
+        if remaining <= 0:
             # زمانی برای تحویل نمانده — ببند و به کاربر بگو.
             try:
                 await DatabaseManager.update_order_status(oid, "stopped")
@@ -671,7 +671,14 @@ async def _recover_interrupted_orders() -> None:
         resume["duration_minutes"] = keep
         logger.warning(f"♻️ Order {oid}: resuming with {keep} minute(s) left (originally {duration})")
         try:
-            await order_executor.submit_order(oid, resume)
+            accepted = await order_executor.submit_order(oid, resume, recovering=True)
+            if not accepted:
+                logger.warning(
+                    "[OrderRecovery] Order %s: submission rejected; no recovery worker "
+                    "started, no success notice sent (busy or status changed)", oid,
+                )
+                continue
+            logger.info("[OrderRecovery] Order %s: recovery worker scheduled (%s minutes)", oid, keep)
         except Exception as e:
             logger.error(f"♻️ Order {oid}: resume failed ({e}) — marking stopped")
             try:
@@ -686,7 +693,7 @@ async def _recover_interrupted_orders() -> None:
                     "♻️ **سرور راه‌اندازی مجدد شد و سفارش شما در حال بازیابی است.**\n"
                     f"🆔 کد سفارش: `{oid}`\n"
                     f"⏳ مدت باقی‌مانده: `{keep}` دقیقه\n"
-                    "اکانت‌ها دوباره وارد ویس‌کال می‌شوند؛ زمان ورود مجدد رایگان "
+                    "تلاش برای ورود مجدد اکانت‌ها آغاز شده است؛ زمان ورود مجدد رایگان "
                     "است و از مدت سفارش کم نمی‌شود."
                 )
             except Exception:

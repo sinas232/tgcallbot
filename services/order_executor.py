@@ -259,7 +259,7 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any], *, recovering: bool = False) -> bool:
 		"""Claim one paid order; concurrent voice orders are unsafe."""
 		# A stale conversation/cancel response must never become the Telegram
 		# target. Legacy permissive link mode accepted arbitrary text, so a
@@ -305,15 +305,22 @@ class OrderExecutor:
 			"swapped_accounts": 0,
 		}
 		try:
-			claimed = await DatabaseManager.mark_order_as_running(
-				order_id, expected_status=(
-					'scheduled' if order_data.get('scheduled_for') else 'pending'))
+			if recovering:
+				# Only startup, under the global instance lock, may reclaim running.
+				claimed = await DatabaseManager.claim_order_recovery(order_id)
+			else:
+				claimed = await DatabaseManager.mark_order_as_running(
+					order_id, expected_status=(
+						'scheduled' if order_data.get('scheduled_for') else 'pending'))
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
 		if not claimed:
 			self.active_orders.pop(order_id, None)
 			return False
+		if recovering:
+			order_data = dict(order_data, _recovering=True)
+			self.active_orders[order_id]["data"] = order_data
 		# 🛡 ضد اسپم: سفارش جدید برای این مقصد → خروج‌های به‌تأخیرافتادهٔ قبلیِ
 		# همین مقصد لغو می‌شود؛ اکانت‌ها عضو باقی می‌مانند (بدون چرخهٔ مضر
 		# leave → rejoin که دلیل اصلی بن شدن اکانت‌هاست).
@@ -466,7 +473,13 @@ class OrderExecutor:
 	            started_at = None
 	            while self._is_order_active(order_id):
 	                try:
-	                    started_at = await DatabaseManager.start_order_duration(order_id)
+	                    if data.get("_recovering"):
+	                        started_at = await DatabaseManager.start_recovered_duration(
+	                            order_id, previous_started_at=data.get("started_at"),
+	                            remaining_minutes=duration,
+	                        )
+	                    else:
+	                        started_at = await DatabaseManager.start_order_duration(order_id)
 	                    break
 	                except asyncio.CancelledError:
 	                    raise
