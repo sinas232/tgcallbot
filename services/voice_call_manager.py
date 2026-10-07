@@ -1370,25 +1370,15 @@ class VoiceCallManager:
         return reserved
 
     def accounts_busy_in_other_orders(self, order_id: Optional[int]) -> Set[int]:
-        """Accounts this order must NOT pick: they belong to another live order.
+        """Allocation policy, separate from transport ownership and cleanup.
 
-        ── Why this exists ──────────────────────────────────────────────
-        A Telegram account can sit in exactly ONE voice chat at a time, and
-        this manager keeps exactly ONE Pyrogram client and ONE PyTgCalls
-        engine per ``account_id`` (NOT per order).  So when two concurrent
-        orders are allocated the same account, the second order's join
-        physically drags the account out of the first order's call — with no
-        error raised anywhere — and the first order's teardown (``leave_call``)
-        kills the second one too.
-
-        Production incident 1405-07-04: orders 859 and 860 were both handed
-        the same 42-account pool and 860's first 10 accounts were 100%
-        already inside 859.
-
-        The result is derived from state that is ALREADY maintained and
-        cleaned up (``active_calls`` + ``_reservations``), so there is no
-        separate lifecycle to leak.
+        Shared mode uses one cached client/engine per account and native
+        bindings keyed by chat. It does not release reservations or permit
+        engine rebuilds that would disrupt other orders. Exclusive mode is
+        retained for deployments that have not validated concurrent media.
         """
+        if order_id is not None and getattr(Config, "VOICE_SHARE_ACCOUNTS_ACROSS_ORDERS", False):
+            return set()
         busy: Set[int] = set()
         for (oid, aid) in self.active_calls.keys():
             if order_id is None or oid != order_id:
@@ -2213,7 +2203,11 @@ class VoiceCallManager:
         # disconnecting it. A new wave could connect to that key while the old
         # transport was still open, even within a single bot process.
         async with self._lock(account_id):
-            if not force and self._account_has_other_calls(account_id, order_id):
+            if (self._account_has_other_calls(account_id, order_id)
+                    or account_id in self.get_reserved_account_ids(exclude_order_id=order_id)
+                    or self._busy_accounts.get(account_id)):
+                # A forced order cleanup is not a global shutdown: another
+                # order may still be in JOINING before it has an active binding.
                 # Monitor bookkeeping can temporarily lose active_calls while
                 # the durable joined slot still exists. Never pop its engine.
                 return
@@ -4348,17 +4342,10 @@ class VoiceCallManager:
         """
         Track which accounts this order has *selected* so far.
 
-        CORRECTION (incident 1405-07-04): the previous docstring claimed
-        "the same account may legitimately participate in multiple orders and
-        multiple Voice Chats simultaneously".  It may NOT.  There is exactly
-        ONE Pyrogram client and ONE PyTgCalls engine per ``account_id`` — not
-        per order — and a Telegram account can only be in one voice chat at a
-        time.  A second order joining an account that a first order is already
-        using silently pulls it out of the first call.
-
-        ``accounts_busy_in_other_orders`` reads this set so the order executor
-        can exclude an account that another live order is holding.  Not calling
-        this leaves the exclusion set empty and re-opens the incident.
+        Reservations remain required in both modes: they protect clients from
+        idle teardown during in-flight joins. Exclusive allocation also uses
+        them to exclude other orders; shared allocation permits reuse of the
+        SAME cached client/engine with distinct chat bindings.
         """
         async with self._reservation_lock:
             self._reservations[order_id] = set(account_ids)

@@ -98,6 +98,9 @@ class Config:
     # Order Settings
     # تنها سقف تجاریِ ربات: تعداد سفارش‌های همزمان. بقیهٔ کنترل‌های هم‌روندی از
     # روی سهمیهٔ واقعی CPU محاسبه می‌شوند نه به‌صورت عدد ثابت.
+    # Opt in to sharing the SAME cached client/engine across distinct chats.
+    # No duplicate MTProto session is ever created per order.
+    VOICE_SHARE_ACCOUNTS_ACROSS_ORDERS = os.getenv('VOICE_SHARE_ACCOUNTS_ACROSS_ORDERS', 'false').lower() == 'true'
     MAX_CONCURRENT_ORDERS = int(os.getenv('MAX_CONCURRENT_ORDERS', '5'))
     if MAX_CONCURRENT_ORDERS < 0:
         raise ValueError('MAX_CONCURRENT_ORDERS must not be negative')

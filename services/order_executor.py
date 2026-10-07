@@ -260,7 +260,7 @@ class OrderExecutor:
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
 	async def submit_order(self, order_id: int, order_data: Dict[str, Any], *, recovering: bool = False) -> bool:
-		"""Claim one paid order; concurrent voice orders are unsafe."""
+		"""Claim one worker slot; account-sharing policy is owned by the voice manager."""
 		# A stale conversation/cancel response must never become the Telegram
 		# target. Legacy permissive link mode accepted arbitrary text, so a
 		# cancellation message could be persisted as target_link and make every
@@ -285,12 +285,10 @@ class OrderExecutor:
 			return False
 		if order_id in self.active_orders:
 			return False
-		if self.active_orders:
-			logger.warning(
-				"Order %s rejected: order %s is already active; "
-				"concurrent voice orders are disabled for MTProto safety",
-				order_id, next(iter(self.active_orders)),
-			)
+		limit = max(0, int(getattr(Config, "MAX_CONCURRENT_ORDERS", 5)))
+		if limit and len(self.active_orders) >= limit:
+			logger.warning("Order %s rejected: executor capacity %s/%s",
+			               order_id, len(self.active_orders), limit)
 			return False
 		self.active_orders[order_id] = {
 			"status": "running",
