@@ -15,7 +15,7 @@ import math
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy import (
-    Column, Integer, String, Boolean, Float, DateTime, Text,
+    Column, Integer, String, Boolean, Float, DateTime, Text, cast,
     BigInteger, func, select, update, delete, desc, text, case, or_, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -966,6 +966,30 @@ class DatabaseManager:
             await db_session.commit()
             await db_session.refresh(order)
             return to_dict(order)
+
+    @staticmethod
+    async def get_pending_paid_orders(limit: int = 100):
+        """Durable retry queue: only purchases with the atomic debit ledger.
+
+        Old/manual pending rows are not proof of payment. The legacy ledger
+        has no order FK; match its canonical order suffix, owner, bot and
+        exact debit. Never select cancelled, completed or scheduled orders.
+        """
+        paid = select(Transaction.id).where(
+            Transaction.type == 'order',
+            Transaction.bot_id == Order.bot_id,
+            Transaction.user_id == Order.user_id,
+            Transaction.amount == -Order.price_paid,
+            Transaction.description.endswith(' | سفارش ' + cast(Order.id, String)),
+        ).exists()
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                select(Order).where(
+                    Order.status == 'pending', Order.scheduled_for.is_(None),
+                    Order.started_at.is_(None), Order.plan_id.is_not(None), paid,
+                ).order_by(Order.created_at, Order.id).limit(limit)
+            )
+            return [to_dict(order) for order in result.scalars().all()]
 
     @staticmethod
     async def get_order(order_id: int):

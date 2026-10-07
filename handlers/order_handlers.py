@@ -19,6 +19,7 @@ from config import Config
 from constants import *
 from helpers.message_utils import send_safe
 from utils.helpers import clean_number, format_jalali_datetime, format_price, get_tehran_time, generate_jalali_calendar, get_jalali_month_name
+from services.pending_orders import submission_notice
 from services.order_executor import order_executor
 from services.anti_spam import anti_spam
 from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
@@ -451,22 +452,14 @@ async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAUL
             except Exception as exc:
                 # The wallet/order transaction already COMMITTED. Never tell
                 # the customer no order exists or silently swallow this. Keep
-                # the pending row for operator review; do not auto-charge or
+                # the paid pending row for the durable retry job; do not charge or
                 # issue an uncoordinated refund from the callback.
                 logger.error('Order %s created but executor submit failed (%s)',
                              order['id'], type(exc).__name__)
-                await query.edit_message_text(
-                    f"⚠️ سفارش `{order['id']}` ثبت و مبلغ آن کسر شد، اما شروع خدمت "
-                    'تأیید نشد. لطفاً با این کد پیگیری به پشتیبانی اطلاع دهید؛ '
-                    'از ثبت دوبارهٔ همین سفارش خودداری کنید.')
+                await query.edit_message_text(await submission_notice(order['id']))
                 return ConversationHandler.END
             if not started:
-                # A concurrent cancellation may have claimed and refunded
-                # the order before its worker could be registered. Never tell
-                # the customer that service started when there is no worker.
-                await query.edit_message_text(
-                    f"ℹ️ سفارش `{order['id']}` ثبت شد اما شروع نشد؛ "
-                    'وضعیت و عودت آن را در سفارش‌ها بررسی کنید. دوباره پرداخت نکنید.')
+                await query.edit_message_text(await submission_notice(order['id']))
                 return ConversationHandler.END
             # دکمه شیشه‌ای لغو سفارش برای سفارشات در حال اجرا
             kb = InlineKeyboardMarkup(

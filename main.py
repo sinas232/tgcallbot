@@ -700,6 +700,11 @@ async def _recover_interrupted_orders() -> None:
                 pass
 
 
+async def check_pending_paid_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    from services.pending_orders import retry_pending_paid_orders
+    await retry_pending_paid_orders(order_executor, bot_manager)
+
+
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         due_orders = await DatabaseManager.get_due_scheduled_orders()
@@ -1766,6 +1771,7 @@ async def main_loop():
     if main_app.job_queue:
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
+        main_app.job_queue.run_repeating(check_pending_paid_orders_job, interval=15, first=15)
         main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
         # 🛡 ضد اسپم: اجرای خروج‌های به‌تأخیرافتادهٔ دونه‌به‌دونه از گروه‌ها
         main_app.job_queue.run_repeating(group_leave_sweeper_job, interval=60, first=45)
