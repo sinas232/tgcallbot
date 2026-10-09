@@ -56,11 +56,10 @@
 ┌──────────────────────── سرور (هاست) ─────────────────────────┐
 │  SSH / شبکهٔ هاست  ← دست‌نخورده، هیچ‌وقت از WARP رد نمی‌شود      │
 │                                                                │
-│  ┌── کانتینر warp ──┐   ┌── کانتینر bot ─────────────────┐    │
-│  │ تونل Cloudflare  │◄──┤ network_mode: service:warp     │    │
-│  │ WARP (WireGuard) │   │ کل ترافیک اینترنتش از warp      │    │
-│  │ پورت 8080 منتشر  │   │ (سیگنالینگ تلگرام + UDP ویس)    │    │
-│  └──────────────────┘   └────────────────────────────────┘    │
+│  ┌── warp + bot ─────┐   ┌── webproxy (HTTP) ─────────────┐   │
+│  │ bot در netnsِ WARP│◄──┤ پورت عمومی 80 و 8080           │   │
+│  │ وب‌سرور داخلی 8080│   │ پاس‌دادن به وب‌سرور روی warp   │   │
+│  └───────────────────┘   └────────────────────────────────┘   │
 │         ▲  شبکهٔ داخلی داکر (db/redis مستقیم، بدون تونل)         │
 │  ┌── db (postgres) ──┐   ┌── redis ──┐                         │
 │  └───────────────────┘   └───────────┘                         │
@@ -71,8 +70,12 @@
 
 - **bot:** خودِ ربات (Pyrogram + PyTgCalls + python-telegram-bot). در فضای
   شبکهٔ کانتینر `warp` اجرا می‌شود.
-- **warp:** سایدکار WARP (تونل WireGuard کلادفلر). پورت `8080` وب‌سرور
-  callback از روی این کانتینر منتشر می‌شود.
+- **warp:** سایدکار WARP (تونل WireGuard کلادفلر)؛ وب‌سرور callback روی
+  پورت داخلی `8080` در همین فضای شبکه اجرا می‌شود.
+- **webproxy:** nginx خارج از WARP؛ درخواست‌های عمومی روی پورت‌های `80` و
+  `8080` را به وب‌سرور callback می‌رساند.
+- **payproxy:** پراکسی خروجیِ داخلی روی `8888` برای تماس ربات با APIهای درگاه؛
+  این پورت برای کاربران اینترنتی نیست و نباید عمومی شود.
 - **db:** PostgreSQL — پایگاه دادهٔ اصلی.
 - **redis:** کش و قفل‌های توزیع‌شده.
 
@@ -135,7 +138,7 @@ docker compose logs -f bot
 | `SESSION_ENCRYPTION_KEY` | کلید رمزنگاری سشن‌ها (Fernet) | `d7sА...z0s=` |
 | `DATABASE_URL` | رشتهٔ اتصال PostgreSQL | `postgresql://user:pass@db:5432/dbname` |
 | `REDIS_URL` | رشتهٔ اتصال Redis | `redis://redis:6379/0` |
-| `SERVER_URL` | **آدرس عمومیِ callback درگاه پرداخت** | `https://bot.liontm.ir` |
+| `SERVER_URL` | **آدرس عمومیِ صفحهٔ پرداخت/callback** | `http://bot.liontm.ir:8080` (HTTPS فقط با TLS فعال) |
 | `PORT` | پورت وب‌سرور callback | `8080` |
 | `ZARINPAL_MERCHANT` | شناسهٔ پذیرندهٔ زرین‌پال | `xxxxxxxx-...` |
 | `AQAYE_PARDAKHT_PIN` | پین آقای پرداخت | `sandbox` |
@@ -171,9 +174,11 @@ docker compose logs -f bot
 
 <div dir="rtl">
 
-**تست سلامت:** پس از استقرار، آدرس `SERVER_URL/health` را در مرورگر باز کنید؛
-دیدن پیام `ok - callback server is reachable` یعنی سرور از اینترنت قابل‌دسترس
-است. جزئیات کامل و عیب‌یابی در [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md).
+**تست سلامت:** در تنظیم پیش‌فرض Compose، `http://bot.example.com:8080/health`
+را از بیرون سرور باز کنید (یا `http://bot.example.com/health` اگر پورت 80 را
+استفاده می‌کنید). دیدن پیام `ok - callback server is reachable` یعنی مسیر
+عمومی باز است. `https://...` فقط وقتی کار می‌کند که TLS روی 443 جداگانه تنظیم
+شده باشد. جزئیات در [`docs/payment-gateway.fa.md`](docs/payment-gateway.fa.md).
 
 ---
 
@@ -266,8 +271,8 @@ docker stats
 # بررسی فعال بودن WARP
 docker compose exec warp curl -s --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp
 
-# تست دسترس‌پذیری وب‌سرور callback
-curl -s http://SERVER_URL:8080/health
+# تست دسترس‌پذیری وب‌سرور callback (دامنه/پورت را مطابق .env وارد کنید)
+curl -s http://bot.example.com:8080/health
 ```
 
 <div dir="rtl">

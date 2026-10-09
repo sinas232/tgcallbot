@@ -124,10 +124,13 @@ TTL:     Auto
 > اسم دیگری مثل `bot.liontm.ir` استفاده کنید. طبق الزام شاپرک، کافی است این
 > زیردامنه زیرمجموعهٔ همان دامنهٔ اصلیِ ثبت‌شده باشد (که هست).
 
-> 🔒 **دربارهٔ Cloudflare Proxy:** اگر پورت `8080` را مستقیم استفاده می‌کنید،
-> حالت proxy (ابر نارنجی) کار نمی‌کند چون Cloudflare فقط پورت‌های استاندارد
-> (80/443) را پروکسی می‌کند. یا `DNS only` بگذارید، یا (توصیه‌شده) از HTTPS
-> روی پورت 443 با nginx استفاده کنید (بخش ۷).
+> 🔒 **نکتهٔ پورت و HTTPS:** در `docker-compose.yml` فعلی، درخواست HTTP روی
+> پورت‌های عمومی `80` و `8080` از nginx عبور می‌کند؛ پورت `443` و TLS به‌صورت
+> پیش‌فرض تنظیم نشده‌اند. برای راه‌اندازی پایه، `SERVER_URL` را روی
+> `http://bot.example.com:8080` بگذارید و DNS را موقتاً `DNS only` کنید.
+> اگر `SERVER_URL` با `https://` شروع می‌شود، باید واقعاً یک سرویس TLS با
+> گواهی معتبر روی پورت `443` داشته باشید؛ باز کردن فایروال به‌تنهایی HTTPS
+> ایجاد نمی‌کند.
 
 ### گام ۲ — merchant_id را در پنل زرین‌پال بگیرید
 از میز کار زرین‌پال، شناسهٔ پذیرندهٔ درگاه خود را کپی کنید (فرمتی شبیه
@@ -140,12 +143,13 @@ TTL:     Auto
 ```bash
 # ═══ Web Server & Payment Gateway ═══
 
-# آدرس عمومیِ callback ربات — باید به سرور خودتان اشاره کند و از اینترنت
-# قابل‌دسترس باشد. با HTTPS توصیه می‌شود.
-SERVER_URL=https://bot.liontm.ir
-# یا برای تست سریع بدون HTTPS (اگر پورت 8080 روی فایروال باز باشد):
-# SERVER_URL=http://bot.liontm.ir:8080
+# آدرس عمومیِ صفحهٔ پرداخت و callback. در Compose فعلی پورت 8080 عمومی
+# از nginx عبور می‌کند؛ اگر پورت 80 را استفاده می‌کنید، :8080 را حذف کنید.
+SERVER_URL=http://bot.liontm.ir:8080
+# فقط اگر TLS واقعی روی 443 تنظیم کرده‌اید از https:// استفاده کنید.
+# SERVER_URL=https://bot.liontm.ir
 
+# پورت داخلی وب‌سرور (با پورت عمومی اشتباه نشود)
 PORT=8080
 
 # شناسهٔ پذیرندهٔ واقعی زرین‌پال (بدون این، لینک پرداخت ساخته نمی‌شود)
@@ -194,9 +198,9 @@ callback درست‌اند:
 
 ```
 ok - callback server is reachable
-SERVER_URL=https://bot.liontm.ir
-zarinpal_callback=https://bot.liontm.ir/payment/callback/zarinpal
-aqayepardakht_callback=https://bot.liontm.ir/payment/callback/aqayepardakht
+SERVER_URL=http://bot.liontm.ir:8080
+zarinpal_callback=http://bot.liontm.ir:8080/payment/callback/zarinpal
+aqayepardakht_callback=http://bot.liontm.ir:8080/payment/callback/aqayepardakht
 ```
 
 <div dir="rtl">
@@ -259,50 +263,39 @@ aqayepardakht_callback=https://bot.liontm.ir/payment/callback/aqayepardakht
 
 ---
 
-## ۷) (توصیه‌شده) HTTPS با nginx
+## ۷) HTTPS (اختیاری؛ نیازمند TLS واقعی)
 
-بسیاری از مرورگرها و درگاه‌ها با `http://...:8080` هنگام بازگشت مشکل دارند.
-بهتر است پشتِ nginx با گواهی رایگان Let's Encrypt، روی پورت 443 قرار دهید:
+`nginx/default.conf` این پروژه در حالت پیش‌فرض فقط HTTP روی پورت 80 را سرو
+می‌کند؛ Compose پورت `8080` را هم برای دسترسی مستقیمِ HTTP به آن نگاشت می‌کند.
+پس اگر `SERVER_URL=https://...` بگذارید ولی TLS جداگانه راه‌اندازی نکرده باشید،
+مرورگر به پورت 443 می‌رود و لینک باز نمی‌شود. باز کردن پورت فایروال به‌تنهایی
+گواهی یا سرویس HTTPS ایجاد نمی‌کند.
+
+برای HTTPS می‌توانید روی خود هاست Nginx/یک TLS proxy با گواهی معتبر اجرا کنید
+و آن را به `http://127.0.0.1:8080` وصل کنید. چون سرویس `webproxy` در Compose
+به‌طور پیش‌فرض پورت هاست 80 را می‌گیرد، اگر Nginx هاست باید روی 80 هم گوش دهد،
+حذف کنید یا کامنت کنید خط `- "80:80"` در `docker-compose.yml` (خط `8080:80` را
+برای upstream نگه دارید)، سپس سرویس‌ها را دوباره بسازید. نمونهٔ upstream در
+Nginx هاست:
 
 </div>
 
 ```nginx
-# /etc/nginx/sites-available/bot.liontm.ir
-server {
-    listen 80;
-    server_name bot.liontm.ir;
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 
-```bash
-# فعال‌سازی + گواهی HTTPS
-ln -s /etc/nginx/sites-available/bot.liontm.ir /etc/nginx/sites-enabled/
-nginx -t && systemctl reload nginx
-apt-get install -y certbot python3-certbot-nginx
-certbot --nginx -d bot.liontm.ir
-```
-
 <div dir="rtl">
 
-سپس در `.env`:
-
-</div>
-
-```bash
-SERVER_URL=https://bot.liontm.ir
-```
-
-<div dir="rtl">
-
-> نکته: در حالت nginx، پورت `8080` فقط روی `127.0.0.1` لازم است و نیازی به باز
-> کردنش روی فایروال عمومی نیست.
+Nginx هاست را با گواهی معتبر روی `443` تنظیم کنید، پورت‌های `80/443` را در
+فایروال باز کنید، و فقط بعد از تست `https://bot.liontm.ir/health`، مقدار `.env`
+را به `SERVER_URL=https://bot.liontm.ir` تغییر دهید و کانتینر ربات را بازسازی
+کنید. اگر TLS ندارید، از آدرس HTTP پورت `8080` در بخش قبل استفاده کنید.
 
 ---
 
@@ -325,6 +318,7 @@ docker compose logs -f bot | grep -iE "ZarinPal create|callback|merchant|SERVER_
 |---|---|---|
 | `callback_url=http://localhost...` | `SERVER_URL` تنظیم نشده | `SERVER_URL` را در `.env` درست کنید |
 | هشدار `ZARINPAL_MERCHANT تنظیم نشده` | merchant_id خالی | merchant_id واقعی را وارد کنید |
+| لینک ساخته می‌شود اما باز نمی‌شود | `SERVER_URL` به پورت منتشرنشده اشاره می‌کند؛ در نسخه‌های قبلی 8080 از `webproxy` منتشر نبود، یا `https://` بدون TLS تنظیم شده | Compose را به‌روز کنید؛ بدون TLS از `http://دامنه:8080` استفاده کنید |
 | `/health` باز نمی‌شود | سرور از اینترنت دیده نمی‌شود | DNS/فایروال/پورت را بررسی کنید |
 | `ZarinPal Verify Failed. Code: -33` | مغایرت مبلغ | (رفع شده) مطمئن شوید آخرین کد را pull کرده‌اید |
 | تراکنش رد می‌شود ولی مبلغ کم شده | نقض الزام Referrer شاپرک | (رفع شده) صفحهٔ میانی `/pay` فعال است |
@@ -337,21 +331,27 @@ docker compose logs -f bot | grep -iE "ZarinPal create|callback|merchant|SERVER_
 # ۱) آیا دامنه به IP درست اشاره می‌کند؟
 nslookup bot.liontm.ir        # باید IP سرور شما را نشان دهد
 
-# ۲) آیا پورت روی فایروال باز است؟ (اگر بدون nginx و مستقیم 8080)
+# ۲) برای SERVER_URL=http://bot.liontm.ir:8080 این پورت را باز کنید:
 sudo ufw allow 8080/tcp
+# اگر SERVER_URL=http://bot.liontm.ir (بدون پورت) است، پورت 80 را هم باز کنید:
+sudo ufw allow 80/tcp
+# برای https فقط پس از تنظیم TLS واقعی:
+sudo ufw allow 443/tcp
 
-# ۳) آیا وب‌سرور داخل کانتینر بالاست؟
-docker compose logs bot | grep "Web Server running"
+# ۳) webproxy باید هر دو پورت را منتشر کرده باشد:
+docker compose ps webproxy
 
-# ۴) تست محلی روی خود سرور
-curl -s http://127.0.0.1:8080/health
+# ۴) تست محلی روی خود سرور (از nginx به aiohttp):
+curl -i http://127.0.0.1:8080/health
 ```
 
 <div dir="rtl">
 
-> یادآوری: چون ربات با `network_mode: service:warp` اجرا می‌شود، پورت `8080`
-> از روی کانتینر **warp** منتشر می‌شود (نه bot). این در `docker-compose.yml`
-> از قبل درست تنظیم شده است.
+> وب‌سرور aiohttp داخل شبکهٔ Docker روی `8080` گوش می‌دهد. درخواست‌های عمومی
+> به `webproxy` می‌رسند: `8080:80` برای لینک‌های `:8080` و `80:80` برای لینک‌های
+> بدون پورت. پورت `8888` فقط برای اتصال خروجیِ ربات به پروکسیِ پرداخت داخل
+> Docker است؛ عمومی نیست و باز کردنش در فایروال، لینک پرداخت را در دسترس
+> نمی‌کند. آن را روی اینترنت منتشر نکنید.
 
 ### ❌ `ZarinPal Connection Error` (پیام خالی) ~۱۵ ثانیه بعد از «create»
 
@@ -417,7 +417,7 @@ docker compose exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> \
 ## ۹) چک‌لیست نهایی
 
 - [ ] رکورد `A` برای `bot.liontm.ir` به IP سرور ساخته شد.
-- [ ] `SERVER_URL` در `.env` روی `https://bot.liontm.ir` (یا `http://...:8080`) است.
+- [ ] اگر TLS ندارید، `SERVER_URL=http://bot.liontm.ir:8080` است؛ اگر `https://` است، TLS واقعی روی 443 فعال است.
 - [ ] `ZARINPAL_MERCHANT` با merchant_id واقعی پر شد.
 - [ ] `docker compose up -d --build` اجرا شد.
 - [ ] `SERVER_URL/health` در مرورگر پیام `ok` می‌دهد.
