@@ -92,7 +92,7 @@ class Config:
     BACKOFF_BASE = float(os.getenv('JOIN_BACKOFF_BASE', '1'))             # exponential backoff base (seconds)
     PRESENCE_CHECK_INTERVAL = int(os.getenv('PRESENCE_CHECK_INTERVAL', '45'))  # shared monitor interval (seconds)
     VOICE_MEDIA_CHECK_INTERVAL = int(os.getenv('VOICE_MEDIA_CHECK_INTERVAL', '7'))  # media health recovery interval
-    OPERATION_TIMEOUT = int(os.getenv('OPERATION_TIMEOUT', '20'))         # per-operation timeout (seconds)
+    OPERATION_TIMEOUT = int(os.getenv('OPERATION_TIMEOUT', '30'))         # per-operation timeout (seconds)
     VOICE_JOIN_PENDING_TIMEOUT = int(os.getenv('VOICE_JOIN_PENDING_TIMEOUT', '30'))  # max wait for Telegram propagation per join attempt
 
     # ═══════════════════════════════════════════════════════════════════
@@ -226,7 +226,7 @@ class Config:
     # HUGE voice chats where the participant listing cannot be paginated.
     # 40s gives the (now staggered, non-flooded) join full head-room before
     # the code falls back to the participant-listing verification.
-    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '40'))
+    VOICE_JOIN_MEDIA_TIMEOUT = int(os.getenv('VOICE_JOIN_MEDIA_TIMEOUT', '60'))
     # Min seconds between two silence re-stream attempts for the SAME account
     # when the engine media binding vanished but the account is still listed
     # inside the call (ghost-media-only). Paced so the re-stream can never
@@ -278,7 +278,7 @@ class Config:
     VOICE_VERIFICATION_GRACE_INTERVAL = float(os.getenv('VOICE_VERIFICATION_GRACE_INTERVAL', '1.0'))
     # Hard deadline per adaptive wave: stragglers are cancelled and deferred
     # to the next wave so one slow/stuck account never freezes the build.
-    VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '120'))
+    VOICE_WAVE_TIMEOUT = int(os.getenv('VOICE_WAVE_TIMEOUT', '300'))
     # Telegram JoinGroupCall supports joining muted; keep the account muted by
     # default while the silent stream maintains the media transport.
     VOICE_JOIN_MUTED = os.getenv('VOICE_JOIN_MUTED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')

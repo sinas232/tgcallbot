@@ -376,7 +376,7 @@ _NON_RELEASING_STATES = {
 _VALID_TRANSITIONS = {
     QUEUED: {STARTING, RATE_LIMITED, FAILED},
     STARTING: {CLIENT_STARTED, FAILED, RATE_LIMITED, RETRY_PENDING},
-    CLIENT_STARTED: {JOINING, FAILED, RATE_LIMITED, RETRY_PENDING},
+    CLIENT_STARTED: {STARTING, JOINING, FAILED, RATE_LIMITED, RETRY_PENDING},
     JOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED, JOINED},
     VERIFYING: {JOINED, TEMPORARILY_UNKNOWN, RATE_LIMITED, RETRY_PENDING, FAILED},
     JOINED: {MONITORING},
@@ -2470,24 +2470,51 @@ class VoiceCallManager:
         return clean
 
     async def _ensure_membership(self, app: Client, chat_id: int, target: str) -> None:
-        try:
-            await app.get_chat_member(chat_id, "me")
-            return
-        except Exception:
-            pass
+        # 1) Already a member? (retry a few times: a transient timeout here
+        #    must NOT be mistaken for "not a member".)
+        for _ in range(3):
+            try:
+                await app.get_chat_member(chat_id, "me")
+                return
+            except Exception as exc:
+                # UserAlreadyParticipant is reported as an error by some
+                # layers; treat it as success.
+                if "already" in str(exc).lower() or "participant" in str(exc).lower():
+                    return
+                last_exc = exc
+                await asyncio.sleep(1.0)
+        # 2) Not a member (or unknown) -> try to join. The RPC can time out
+        #    even when Telegram actually registered the membership, so we
+        #    verify afterwards instead of failing blindly.
         try:
             await app.join_chat(target)
         except UserAlreadyParticipant:
             pass
         except Exception as exc:
-            # Never continue to the voice-call stage when group membership
-            # itself failed; doing so hid the real error and produced 0/N.
-            raise RuntimeError(f"Group join failed: {str(exc)[:100]}") from exc
+            # Give Telegram a moment to propagate, then re-check membership
+            # before declaring failure (avoids false negatives on timeouts).
+            await asyncio.sleep(2.0)
+            try:
+                await app.get_chat_member(chat_id, "me")
+                return
+            except Exception:
+                raise RuntimeError(
+                    f"Group join failed: {type(exc).__name__}: {str(exc)[:100]}"
+                ) from exc
 
-        try:
-            await app.get_chat_member(chat_id, "me")
-        except Exception as exc:
-            raise RuntimeError(f"Group membership not confirmed: {str(exc)[:100]}") from exc
+        # 3) Confirm membership after the join attempt.
+        for _ in range(3):
+            try:
+                await app.get_chat_member(chat_id, "me")
+                return
+            except Exception as exc:
+                if "already" in str(exc).lower() or "participant" in str(exc).lower():
+                    return
+                last_exc = exc
+                await asyncio.sleep(1.0)
+        raise RuntimeError(
+            f"Group membership not confirmed: {type(last_exc).__name__}: {str(last_exc)[:100]}"
+        ) from last_exc
 
     async def _resolve_chat_id(self, app: Client, order_id: int, target: str) -> Optional[int]:
         if order_id in self.order_chat_ids:
