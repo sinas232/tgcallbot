@@ -16,16 +16,23 @@ from database import DatabaseManager
 from security import SecurityManager
 from constants import *
 from helpers.message_utils import send_safe
-from telegram_client import TelegramAccountClient
+from telegram_client import TelegramAccountClient, _account_proxy_config
+from services.session_client import close_pyrogram_client
+from services.session_ownership import session_ownership, SessionInUseError
 
 logger = logging.getLogger(__name__)
 
 async def _cleanup_client(context):
-    c = context.user_data.get('temp_client')
-    if c:
-        try: await c.stop()
-        except: pass
-    context.user_data.pop('temp_client', None)
+    """Phone login uses connect(), not start(): stop() alone leaves it online."""
+    client = context.user_data.get('temp_client')
+    if client is None:
+        return True
+    closed = await close_pyrogram_client(client)
+    if closed:
+        context.user_data.pop('temp_client', None)
+    else:
+        logger.error("Phone-login MTProto client did not disconnect; refusing to expose its session")
+    return closed
 
 
 def _format_account_display(acc):
@@ -92,7 +99,13 @@ async def handle_get_code_input(update: Update, context: ContextTypes.DEFAULT_TY
 
 # --- افزودن اکانت (شماره) ---
 async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await send_safe(context.bot, update.effective_chat.id, "📱 <b>شماره موبایل (مثال: <code>+98...</code>):</b>", reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True), parse_mode=ParseMode.HTML)
+    await send_safe(context.bot, update.effective_chat.id,
+                    "📱 <b>شماره موبایل (مثال: <code>+98...</code>):</b>\n"
+                    "برای احیای اکانت ۴۰۶، همان شمارهٔ ثبت‌شده در کارت آن را "
+                    "وارد کنید؛ شمارهٔ متفاوت می‌تواند ردیف جدیدی بسازد. "
+                    "سشن قدیمی را ایمپورت نکنید.",
+                    reply_markup=ReplyKeyboardMarkup(CANCEL_KB, resize_keyboard=True),
+                    parse_mode=ParseMode.HTML)
     return AWAITING_PHONE_NUMBER
 
 async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -114,7 +127,11 @@ async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         api_id = (reseller and reseller.get('api_id')) or Config.TELEGRAM_API_ID
         api_hash = (reseller and reseller.get('api_hash')) or Config.TELEGRAM_API_HASH
 
-    client = Client(name=f"temp_{update.effective_user.id}", api_id=api_id, api_hash=api_hash, in_memory=True)
+    # Use the same MTProto route as recovery/voice; a direct path may fail on
+    # proxy-only hosts even though existing accounts can connect successfully.
+    proxy = _account_proxy_config()
+    client = Client(name=f"temp_{update.effective_user.id}", api_id=api_id,
+                    api_hash=api_hash, in_memory=True, **({'proxy': proxy} if proxy else {}))
     context.user_data['temp_client'] = client
     
     try:
@@ -182,8 +199,20 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
     api_hash = context.user_data.get('import_api_hash') or Config.TELEGRAM_API_HASH
     
     msg = await send_safe(context.bot, update.effective_chat.id, "⏳ در حال تست اتصال اکانت...")
-    client = Client(name="test_sess", api_id=api_id, api_hash=api_hash, session_string=sess_str, in_memory=True, no_updates=True)
+    # Imported strings may already be stored under another bot_id. Guard the
+    # auth key before even creating a Pyrogram client; DB account IDs alone
+    # cannot protect copies shared with a reseller.
+    probe_id = -int(update.effective_user.id)
+    token = None
+    client = None
+    error = None
+    profile_info = None
+    phone = None
+    closed = True
     try:
+        token = session_ownership.begin_ad_hoc(probe_id, sess_str)
+        client = Client(name="test_sess", api_id=api_id, api_hash=api_hash,
+                        session_string=sess_str, in_memory=True, no_updates=True)
         await client.start()
         me = await client.get_me()
         phone = f"+{me.phone_number}" if me.phone_number else "Unknown"
@@ -192,18 +221,35 @@ async def handle_import_session_string(update: Update, context: ContextTypes.DEF
             'last_name': getattr(me, 'last_name', None),
             'username': getattr(me, 'username', None),
         }
-        await client.stop()
-        return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
-    except Exception as e:
-        logger.error(f"Import Session Error: {e}")
-        try: await client.stop() 
-        except: pass
-        await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{e}")
+    except Exception as exc:
+        logger.warning("Import Session probe failed: %s", type(exc).__name__)
+        error = exc
+    finally:
+        if client is not None:
+            had_transport = bool(getattr(client, 'is_connected', False) or
+                                 getattr(client, 'session', None) is not None)
+            try:
+                closed = await close_pyrogram_client(client)
+            finally:
+                if token and not getattr(client, 'is_connected', False) and getattr(client, 'session', None) is None:
+                    session_ownership.end_ad_hoc(probe_id, token, disconnected=had_transport)
+        elif token:
+            session_ownership.end_ad_hoc(probe_id, token)
+    if not closed:
+        error = RuntimeError("قطع اتصال اکانت تأیید نشد؛ سشن ذخیره نشد.")
+    if error is not None:
+        if msg:
+            await msg.edit_text(f"❌ خطا در اتصال به اکانت:\n{error}")
+        else:
+            await send_safe(context.bot, update.effective_chat.id, f"❌ خطا در اتصال به اکانت: {error}")
         return AWAITING_SESSION_STRING
+    return await finalize_import(update, context, phone, sess_str, profile_info=profile_info)
 
 async def finalize_import(update, context, phone, session_string, profile_info=None):
     try:
         enc_sess = SecurityManager.encrypt_session(session_string)
+        if not enc_sess:
+            raise ValueError("رمزنگاری سشن ناموفق بود؛ اکانت ذخیره نشد")
         bot_id = context.bot_data.get('bot_id', 1)
         api_id = context.user_data.get('import_api_id')
         api_hash = context.user_data.get('import_api_hash')
@@ -236,9 +282,18 @@ async def finalize_import(update, context, phone, session_string, profile_info=N
 async def finalize_session(update, context, client):
     try:
         sess = await client.export_session_string()
-        enc_sess = SecurityManager.encrypt_session(sess)
         me = await client.get_me()
-        phone = f"+{me.phone_number}" if me.phone_number else context.user_data.get('phone', 'Unknown')
+        # Never publish an exported key to the DB while its login connection
+        # is still alive. connect() (used by the phone flow) must be closed
+        # with disconnect(), not stop().
+        if not await _cleanup_client(context):
+            raise RuntimeError("اتصال قبلی قطع نشد؛ سشن ذخیره نشد. کمی بعد دوباره تلاش کنید.")
+        session_ownership.note_login_disconnect(sess)
+        enc_sess = SecurityManager.encrypt_session(sess)
+        if not enc_sess:
+            raise ValueError("رمزنگاری سشن ناموفق بود؛ اکانت ذخیره نشد")
+        phone = ('+' + str(me.phone_number).strip().lstrip('+') if me.phone_number
+                 else context.user_data.get('phone', 'Unknown'))
         bot_id = context.bot_data.get('bot_id', 1)
         tg_user = update.effective_user
         db_user = await DatabaseManager.create_or_update_user({
@@ -261,8 +316,16 @@ async def finalize_session(update, context, client):
         )
         safe_name = html.escape(me.first_name or "Unknown")
         if success:
-            msg = f"✅ **اکانت {safe_name} ({phone}) اضافه شد.**"
-            await send_safe(context.bot, update.effective_chat.id, msg, reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
+            if status == 'updated':
+                msg = (f"✅ سشن تازهٔ <b>{safe_name} ({html.escape(phone)})</b> جایگزین شد؛ "
+                       "شناسهٔ ردیف قبلی حفظ و وضعیت آن فعال شد.")
+            else:
+                msg = (f"✅ <b>{safe_name} ({html.escape(phone)})</b> در ردیف تازه ثبت شد. "
+                       "اگر قصد احیای ردیف ۴۰۶ را داشتید، شماره‌ها را بررسی کنید؛ "
+                       "هیچ ردیف قبلی خودکار حذف نشد.")
+            await send_safe(context.bot, update.effective_chat.id, msg,
+                            reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True),
+                            parse_mode=ParseMode.HTML)
         else:
             await send_safe(context.bot, update.effective_chat.id, "❌ خطا در ذخیره.", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True))
     except Exception as e:
@@ -345,6 +408,10 @@ async def leave_all_chats_callback(update: Update, context: ContextTypes.DEFAULT
 async def process_leave_all_chats(context, chat_id):
     bot_id = context.bot_data.get('bot_id', 1)
     accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
+    # Never bulk-connect a 406 key just because it is still marked active.
+    # Manual single-account recovery is the only safe probing path.
+    accounts = [acc for acc in accounts if not
+                str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:')]
     total_accs = len(accounts)
     total_left = 0
     msg_id = None
@@ -373,52 +440,23 @@ async def process_leave_all_chats(context, chat_id):
 
 # --- مدیریت اکانت‌های دلیت شده ---
 async def show_deleted_accounts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    bot_id = context.bot_data.get('bot_id', 1)
-    # دریافت همه اکانت‌ها برای فیلتر کردن دستی
-    # (در یک سیستم بهینه باید کوئری مستقیم زد، اما اینجا برای سازگاری از متد موجود استفاده می‌کنیم)
-    accounts, _ = await DatabaseManager.get_accounts_paginated(limit=10000, bot_id=bot_id)
-    
-    dead_accounts = [acc for acc in accounts if acc['account_status'] == 'inactive' or acc.get('spam_status') == 'dead']
-    
-    if not dead_accounts:
-        await send_safe(context.bot, update.effective_chat.id, "✅ **هیچ اکانت دلیت شده یا غیرفعالی یافت نشد.**", parse_mode=ParseMode.HTML)
-        return AWAITING_SETTINGS_ACTION
-        
-    txt = f"☠️ <b>لیست اکانت‌های غیرفعال/دلیت شده ({len(dead_accounts)}):</b>\n\n"
-    for i, acc in enumerate(dead_accounts[:50]):
-        name, phone, status, spam_info = _format_account_display(acc)
-        reason = acc.get('spam_check_result') or "Unknown"
-        txt += (
-            f"{i+1}. {name} | 📱 <code>{phone}</code> | ID: <code>{acc['id']}</code>\n"
-            f"   ⚠️ {reason[:30]}...\n"
-        )
-    if len(dead_accounts) > 50: txt += f"\n... و {len(dead_accounts)-50} مورد دیگر."
-        
-    kb = [[InlineKeyboardButton("🗑 حذف همه اکانت‌های دلیت شده", callback_data="confirm_delete_dead")], [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_acc_menu")]]
-    await send_safe(context.bot, update.effective_chat.id, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return AWAITING_SETTINGS_ACTION
+    """Legacy entry point: delegate to the gated, evidence-only superadmin menu.
+
+    Do NOT bring back the old 'inactive OR dead' filter. Those flags can refer
+    to valid sessions, including the 25 historical rows on the live server.
+    """
+    from handlers.admin_handlers import deleted_account_cleanup_handler
+    return await deleted_account_cleanup_handler(update, context)
+
 
 async def handle_dead_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "back_to_acc_menu":
-        await query.delete_message()
-        # اینجا چون کالبک است، نباید هندلر متنی را صدا بزنیم.
-        # پس مستقیماً منو را ارسال می‌کنیم.
-        await send_safe(context.bot, update.effective_chat.id, "👥 <b>مدیریت اکانت‌های ربات</b>\n\nعملیات را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(ACCOUNT_MENU, resize_keyboard=True), parse_mode=ParseMode.HTML)
-        return AWAITING_SETTINGS_ACTION
-    if data == "confirm_delete_dead":
-        bot_id = context.bot_data.get('bot_id', 1)
-        accounts, _ = await DatabaseManager.get_accounts_paginated(limit=10000, bot_id=bot_id)
-        dead_accounts = [acc for acc in accounts if acc['account_status'] == 'inactive' or acc.get('spam_status') == 'dead']
-        count = 0
-        for acc in dead_accounts:
-            await DatabaseManager.delete_account(acc['id'], update.effective_user.id)
-            count += 1
-        await query.edit_message_text(f"✅ **{count} اکانت با موفقیت از دیتابیس حذف شدند.**")
-        return AWAITING_SETTINGS_ACTION
-    return AWAITING_SETTINGS_ACTION
+    """A stale 'confirm_delete_dead' button must NEVER delete on one click."""
+    if update.callback_query and update.callback_query.data == 'back_to_acc_menu':
+        from handlers.menu_handlers import account_management_handler
+        return await account_management_handler(update, context)
+    from handlers.admin_handlers import deleted_account_cleanup_handler
+    return await deleted_account_cleanup_handler(update, context)
+
 
 async def cancel_handler(update, context):
     await _cleanup_client(context)

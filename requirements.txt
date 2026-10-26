@@ -3,7 +3,9 @@
 numpy
 python-dotenv
 cryptography
-sqlalchemy
+sqlalchemy[asyncio]
+# SQLAlchemy asyncio requires greenlet at runtime.
+greenlet
 asyncpg
 redis
 aiohttp

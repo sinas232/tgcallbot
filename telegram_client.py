@@ -23,18 +23,47 @@ from pyrogram.errors import (
 from config import Config
 from security import SecurityManager
 from database import DatabaseManager
-from services.session_ownership import session_ownership, SessionInUseError
+from services.session_ownership import (session_ownership, SessionInUseError,
+                                        is_auth_key_duplicated, is_fatal_auth_error,
+                                        is_account_deleted_rpc, is_invalid_session_rpc)
+from services.session_client import close_pyrogram_client
 
 logger = logging.getLogger(__name__)
+
+
+def _account_proxy_config():
+    """Use the same configured MTProto path as voice clients for ad-hoc checks.
+
+    Previously voice went through the WARP SOCKS5 endpoint when USE_PROXY was
+    enabled, but health/recovery probes ignored it. A failed direct route can
+    look like 25 unusable sessions; a network error is never deletion proof.
+    Do not expose proxy credentials in logs or admin messages.
+    """
+    if not Config.USE_PROXY:
+        return None
+    proxy = {"scheme": "socks5", "hostname": str(Config.SOCKS5_HOST),
+             "port": int(Config.SOCKS5_PORT)}
+    if Config.SOCKS5_USERNAME:
+        proxy['username'] = Config.SOCKS5_USERNAME
+    if Config.SOCKS5_PASSWORD:
+        proxy['password'] = Config.SOCKS5_PASSWORD
+    return proxy
+
 
 class TelegramAccountClient:
     """کلاس مدیریت اکانت‌های تلگرام"""
 
-    def __init__(self, phone_number, session_string, account_id):
+    def __init__(self, phone_number, session_string, account_id, *, allow_recovery_probe=False):
         self.phone_number = phone_number
         self.session_string = session_string
         self.account_id = account_id
+        # Only the explicit, in-bot, single-account confirmation path may
+        # inspect an inactive/quarantined key. Never bypass the ownership lock.
+        self._allow_recovery_probe = bool(allow_recovery_probe)
         self.client = None
+        # 🛡 آی‌دی چتی که در آخرین join موفق وارد شدیم (برای خروج به‌تأخیرافتادهٔ
+        # دقیق — ضد اسپم — تا خروج بعداً با آی‌دی عددی انجام شود، نه حدس لینک).
+        self.last_joined_chat_id = None
 
     async def _get_api_credentials(self):
         """دریافت API ID/HASH اختصاصی یا پیش‌فرض"""
@@ -59,43 +88,86 @@ class TelegramAccountClient:
         دومی باز نمی‌شود. رزروِ انجام‌شده با stop() کلاینت (پایان
         context manager) آزاد می‌شود.
         """
-        # Non-blocking reservation: raises SessionInUseError while the voice
-        # engine (or another ad-hoc op) already holds this session.
-        session_ownership.begin_ad_hoc(self.account_id)
+        # Fetch the current row strictly: a stale ciphertext, a DB outage,
+        # an inactive historical row or a persisted 406 must NEVER silently
+        # launch an automatic ad-hoc probe (health check, profile sync,
+        # scheduled group leave, code retrieval, etc.). The dedicated manual
+        # recovery path opts in after its own cooldown/confirmation checks.
+        row = await DatabaseManager.get_account_by_id(self.account_id)
+        if not row or row.get('session_string') != self.session_string:
+            raise SessionInUseError(self.account_id, 'stale')
+        if not self._allow_recovery_probe:
+            if str(row.get('account_status') or '').lower() != 'active':
+                raise SessionInUseError(self.account_id, 'inactive')
+            if str(row.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'):
+                raise SessionInUseError(self.account_id, 'quarantined')
+
+        decrypted_session = SecurityManager.decrypt_session(self.session_string)
+        if not decrypted_session:
+            raise ValueError(f"Invalid Session for account {self.account_id}")
+
+        # Guard the decrypted AUTH KEY, not the row ID or Fernet ciphertext.
+        # A reseller can have a different account ID for the same key.
+        token = session_ownership.begin_ad_hoc(self.account_id, decrypted_session)
         try:
-            decrypted_session = SecurityManager.decrypt_session(self.session_string)
-            if not decrypted_session:
-                raise ValueError(f"Invalid Session for account {self.account_id}")
-
             api_id, api_hash = await self._get_api_credentials()
-
             client = Client(
                 name=f"client_{self.account_id}",
                 api_id=api_id,
                 api_hash=api_hash,
                 session_string=decrypted_session,
-                no_updates=no_updates,  # برای کاهش مصرف منابع
-                in_memory=True
+                no_updates=no_updates,
+                in_memory=True,
+                proxy=_account_proxy_config(),
             )
-            self._bind_ownership_release(client)
+            self._bind_ownership_release(client, token)
             return client
-        except Exception:
-            # Construction failed (bad session/credentials) — release the
-            # reservation so the account is not left permanently busy.
-            session_ownership.end_ad_hoc(self.account_id)
+        except BaseException:
+            # CancelledError is a BaseException. A cancellation during the
+            # credential DB lookup previously leaked the reservation.
+            session_ownership.end_ad_hoc(self.account_id, token)
             raise
 
-    def _bind_ownership_release(self, client: Client) -> None:
-        """Release the ad-hoc session reservation when the client stops."""
-        original_stop = client.stop
+    def _bind_ownership_release(self, client: Client, token: object) -> None:
+        """Release ONLY when Pyrogram has really disconnected.
 
-        async def stop_and_release(*args, **kwargs):
+        Pyrogram's stop(block=False) schedules the disconnect in the future;
+        releasing at the end of stop() (as before) allows a second client to
+        connect while the first is still live. stop() eventually calls
+        disconnect(), which is the correct place to release the reservation.
+        """
+        original_disconnect = client.disconnect
+        original_start = client.start
+        client._ownership_token = token
+
+        async def start_with_cleanup(*args, **kwargs):
             try:
-                return await original_stop(*args, **kwargs)
-            finally:
-                session_ownership.end_ad_hoc(self.account_id)
+                return await original_start(*args, **kwargs)
+            except BaseException:
+                had_transport = bool(getattr(client, "is_connected", False) or
+                                     getattr(client, "session", None) is not None)
+                try:
+                    await close_pyrogram_client(client)
+                finally:
+                    if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                        session_ownership.end_ad_hoc(
+                            self.account_id, token, disconnected=had_transport)
+                raise
 
-        client.stop = stop_and_release
+        async def disconnect_and_release(*args, **kwargs):
+            was_connected = bool(getattr(client, "is_connected", False) or
+                                 getattr(client, "session", None) is not None)
+            try:
+                return await original_disconnect(*args, **kwargs)
+            finally:
+                if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                    session_ownership.end_ad_hoc(
+                        self.account_id, token, disconnected=was_connected)
+                else:
+                    logger.error("acc=%s disconnect incomplete; keeping session reservation", self.account_id)
+
+        client.start = start_with_cleanup
+        client.disconnect = disconnect_and_release
 
     @staticmethod
     async def preload_all_clients():
@@ -150,6 +222,7 @@ class TelegramAccountClient:
                 joined = getattr(res, 'chat', res)
                 if getattr(joined, 'id', None) is None:
                     return False, f"Join needs approval ({type(res).__name__})"
+                self.last_joined_chat_id = getattr(joined, 'id', None)
                 return True, "Joined"
         except UserAlreadyParticipant:
             return True, "Already Joined"
@@ -229,9 +302,9 @@ class TelegramAccountClient:
     async def check_spambot(self):
         """بررسی وضعیت محدودیت اکانت (SpamBot)"""
         try:
+            # توجه: async with خودش start/stop امن انجام می‌دهد؛ فراخوانی دوبارهٔ
+            # app.start() داخلش (نسخهٔ قبلی) دیسپچر را دوبار بالا می‌آورد.
             async with await self.get_client(no_updates=False) as app:
-                if not app.is_connected: await app.start()
-                
                 # ارسال پیام استارت به بات
                 try:
                     await app.send_message("SpamBot", "/start")
@@ -249,6 +322,10 @@ class TelegramAccountClient:
                     
                     return "limited", text[:100] # بازگرداندن بخشی از متن محدودیت
                     
+        except SessionInUseError:
+            # Auto-health must SKIP a key owned by the voice engine (or a
+            # reseller alias), not overwrite its spam status with an error.
+            raise
         except Exception as e:
             return "error", str(e)
         return "unknown", "No response"
@@ -322,19 +399,84 @@ class TelegramAccountClient:
         except:
             return None
 
+    async def fetch_me_status(self):
+        """(ok: bool, reason: str|None, data: dict|None) — مثل fetch_me ولی
+        دلیل شکست را هم دسته‌بندی می‌کند تا ادمین بفهمد چه باید بکند:
+
+        * ``None`` — موفق (data برمی‌گردد)
+        * ``duplicated_in_use`` — AUTH_KEY_DUPLICATED: همان کلید سشن در بیش از
+          یک اتصال استفاده شده است. این می‌تواند در همین پروسس (کپی نمایندگی)،
+          یا جای دیگر رخ دهد؛ پاسخ تایپ‌شدهٔ تلگرام به معنی ابطال کلید است،
+          اما تطبیق متنِ استثنا به‌تنهایی مدرک کافی نیست. آن کلید را دوباره
+          پروب نکنید؛ سشن تازه را با ورود شماره بسازید، نه ایمپورت کلید قبلی.
+        * ``account_deleted`` — خطای تایپ‌شدهٔ USER_DEACTIVATED (نه BAN).
+        * ``session_revoked`` — خطای تایپ‌شدهٔ ابطال/انقضای همین کلید (401)
+          پس از قطع اتصال تأییدشده؛ حساب تلگرام ممکن است هنوز وجود داشته باشد.
+        * ``relogin_required`` — 401/خطای احراز هویتِ مبهم: لاگین مجدد، نه حذف.
+        * ``timeout`` — شبکه/WARP کند بود؛ بعداً دوباره.
+        * ``disconnect_unconfirmed`` — اتصالِ پروب بسته‌نشد؛ بازگردانی ممنوع.
+        * ``error`` — سایر خطاها.
+
+        SessionInUseError (سشن در اختیار موتور ویس‌کال) بدون بلع به بیرون
+        پرتاب می‌شود تا صداکننده «مشغول بودن» را با «مرده بودن» اشتباه نگیرد.
+        """
+        client = None
+        outcome = (False, "error", None)
+        try:
+            client = await self.get_client()
+            # connect به‌تنهایی برای get_me کافی است؛ start کامل (دیسپچر رخداد)
+            # لازم نیست و سربار/ریسک زامبی هم دارد.
+            await asyncio.wait_for(client.connect(), timeout=40)
+            me = await client.get_me()
+            if not getattr(me, 'id', None):
+                raise ValueError('get_me returned no authenticated user ID')
+            outcome = (True, None, {
+                'first_name': getattr(me, 'first_name', None),
+                'last_name': getattr(me, 'last_name', None),
+                'username': getattr(me, 'username', None),
+            })
+        except SessionInUseError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(f"fetch_me timeout for acc {self.account_id}")
+            outcome = (False, "timeout", None)
+        except Exception as e:
+            if is_auth_key_duplicated(e):
+                reason = "duplicated_in_use"
+            elif is_account_deleted_rpc(e):
+                reason = "account_deleted"
+            elif is_invalid_session_rpc(e):
+                reason = "session_revoked"
+            elif is_fatal_auth_error(e):
+                reason = "relogin_required"
+            else:
+                reason = "error"
+            logger.warning("fetch_me failed for acc %s: %s -> %s",
+                           self.account_id, type(e).__name__, reason)
+            outcome = (False, reason, None)
+        finally:
+            if client is not None:
+                token = getattr(client, "_ownership_token", None)
+                had_transport = bool(getattr(client, "is_connected", False) or
+                                     getattr(client, "session", None) is not None)
+                try:
+                    closed = await close_pyrogram_client(client)
+                finally:
+                    # Even if this probe is cancelled, the shared closer has
+                    # awaited cleanup. Never release if the socket is still
+                    # possibly open (no TTL-based forced unlock either).
+                    if not getattr(client, "is_connected", False) and getattr(client, "session", None) is None:
+                        session_ownership.end_ad_hoc(
+                            self.account_id, token, disconnected=had_transport)
+                if not closed:
+                    logger.error("acc=%s probe disconnect unconfirmed; holding reservation", self.account_id)
+                    outcome = (False, "disconnect_unconfirmed", None)
+        return outcome
+
     async def fetch_me(self):
         """دریافت زندهٔ اطلاعات اکانت (نام/نام‌خانوادگی/یوزرنیم). در صورت خطا None برمی‌گرداند."""
-        try:
-            async with await self.get_client() as app:
-                me = await app.get_me()
-                return {
-                    'first_name': getattr(me, 'first_name', None),
-                    'last_name': getattr(me, 'last_name', None),
-                    'username': getattr(me, 'username', None),
-                }
-        except Exception as e:
-            logger.warning(f"fetch_me failed for acc {self.account_id}: {e}")
-            return None
+        ok, _reason, data = await self.fetch_me_status()
+        return data if ok else None
 
     async def set_privacy(self, key_name, level):
         """

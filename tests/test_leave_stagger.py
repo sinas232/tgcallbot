@@ -91,7 +91,9 @@ class ConfigLeaveKeysTests(unittest.TestCase):
     def test_eject_skips_voice_chat(self):
         src = _read_source("services/order_executor.py")
         start = src.index("async def _eject_all_fast")
-        body = src[start:start + 2500]
+        # Method grew (delayed-leave scheduling block): widen the window so
+        # the paced-fallback region (VOICE_LEAVE_STAGGER) is still covered.
+        body = src[start:start + 5000]
         self.assertIn('order_type == "voice_chat"', body)
         self.assertIn("return", body)
         self.assertIn("VOICE_LEAVE_STAGGER", body)
@@ -111,7 +113,7 @@ class ConfigLeaveKeysTests(unittest.TestCase):
 
     def test_bot_version_bumped(self):
         src = _read_source("constants.py")
-        self.assertIn('BOT_VERSION = "2.2.3"', src)
+        self.assertIn('BOT_VERSION = "2.3.23"', src)
 
 
 class StopAllPacingLogicTests(unittest.TestCase):
@@ -119,7 +121,17 @@ class StopAllPacingLogicTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Stub heavy third-party modules before importing voice_call_manager.
+        # Full unittest discovery imports the real voice module for the other
+        # integration tests BEFORE running this class. Do not replace it (and
+        # its ownership/cooldown singletons) in sys.modules: that made later
+        # order-executor tests call an unpatched, newly imported voice manager.
+        if "services.voice_call_manager" in sys.modules:
+            from config import Config
+            cls.Config = Config
+            cls.vcm_mod = sys.modules["services.voice_call_manager"]
+            cls.VoiceCallManager = cls.vcm_mod.VoiceCallManager
+            return
+        # Standalone stdlib run: stub optional heavy dependencies.
         stubs = {}
 
         def _mod(name, **attrs):
@@ -139,8 +151,8 @@ class StopAllPacingLogicTests(unittest.TestCase):
             pyro.Client = type("Client", (), {})
             err = _mod("pyrogram.errors")
             for name in (
-                "AuthKeyInvalid", "AuthKeyUnregistered", "FloodWait",
-                "GroupCallInvalid", "RPCError", "SessionRevoked",
+                "AuthKeyDuplicated", "AuthKeyInvalid", "AuthKeyUnregistered",
+                "FloodWait", "GroupCallInvalid", "RPCError", "SessionRevoked",
                 "UserAlreadyParticipant",
             ):
                 setattr(err, name, type(name, (Exception,), {}))
@@ -188,7 +200,9 @@ class StopAllPacingLogicTests(unittest.TestCase):
             acquire_voice=lambda *a, **k: None,
             release_voice=lambda *a, **k: None,
             is_voice_held=lambda *a, **k: False,
+            voice_held_accounts=lambda: set(),
         )
+        so.is_auth_key_duplicated = lambda msg: "AUTH_KEY_DUPLICATED" in str(msg)
         so.SessionInUseError = type("SessionInUseError", (Exception,), {})
         so.SessionOwnership = type("SessionOwnership", (), {})
         sys.modules["services.session_ownership"] = so
@@ -341,6 +355,7 @@ class ExecutorVoiceNoDoubleLeaveTests(unittest.TestCase):
             }),
             ("services.session_ownership", {
                 "SessionInUseError": type("SessionInUseError", (Exception,), {}),
+                "is_auth_key_duplicated": lambda msg: "AUTH_KEY_DUPLICATED" in str(msg),
             }),
             ("services.self_healing", {}),
             ("utils.helpers", {"format_jalali_datetime": lambda *a, **k: ""}),

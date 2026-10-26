@@ -8,7 +8,7 @@ import html
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
-from database import DatabaseManager
+from database import CLEANUP_REVIEW_406_HOLD, DatabaseManager
 from telegram_client import TelegramAccountClient
 from constants import *
 from helpers.message_utils import send_safe
@@ -47,11 +47,20 @@ async def edit_account_from_list(update: Update, context: ContextTypes.DEFAULT_T
     if not acc or acc.get('bot_id', 1) != bot_id:
         await send_safe(context.bot, update.effective_chat.id, "❌ اکانت یافت نشد یا متعلق به این ربات نیست.")
         return AWAITING_SETTINGS_ACTION
+    if (acc.get('account_status') == 'inactive' and
+            acc.get('spam_check_result') == CLEANUP_REVIEW_406_HOLD):
+        from services.account_recovery import recovery_message
+        await send_safe(context.bot, update.effective_chat.id,
+                        recovery_message('duplicate_key_relogin_required'))
+        return AWAITING_SETTINGS_ACTION
 
     context.user_data['selected_acc_id'] = aid
 
-    # اگر نام اکانت در دیتابیس کش نشده (اکانت‌های قدیمی)، یک‌بار به‌صورت زنده واکشی و ذخیره می‌کنیم
-    if not (acc.get('first_name') or acc.get('last_name') or acc.get('username')):
+    # A profile view must not turn historical inactive accounts or a 406
+    # quarantine into an implicit Telegram probe.
+    eligible = (str(acc.get('account_status') or '').lower() == 'active' and
+                not str(acc.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:'))
+    if eligible and not (acc.get('first_name') or acc.get('last_name') or acc.get('username')):
         try:
             cl = TelegramAccountClient(acc['phone_number'], acc['session_string'], aid)
             me = await cl.fetch_me()

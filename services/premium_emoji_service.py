@@ -334,11 +334,16 @@ async def sync_from_account(
     account: Optional[Dict[str, Any]] = None
     if account_id:
         account = await DatabaseManager.get_account_by_id(account_id)
-    if not account:
+    else:
         accounts = await DatabaseManager.get_all_active_accounts(bot_id=bot_id)
-        account = accounts[0] if accounts else None
-    if not account:
-        summary["error"] = "اکانت فعالی برای کشف شناسه‌ها یافت نشد."
+        account = next((acc for acc in accounts
+                        if str(acc.get('account_status') or '').lower() == 'active'
+                        and not str(acc.get('spam_check_result') or '').startswith(
+                            'AUTH_KEY_DUPLICATED:')), None)
+    if (not account or int(account.get('bot_id') or 0) != int(bot_id)
+            or str(account.get('account_status') or '').lower() != 'active'
+            or str(account.get('spam_check_result') or '').startswith('AUTH_KEY_DUPLICATED:')):
+        summary["error"] = "اکانت فعالِ بدون قرنطینه برای این ربات یافت نشد."
         return summary
 
     summary["account_id"] = account.get("id")
