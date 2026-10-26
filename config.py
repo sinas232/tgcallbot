@@ -169,6 +169,11 @@ class Config:
     # 🩹 خودترمیم نگه‌داشتن‌های محلی (quarantine heal): اکانتی که قطعِ اتصالش تأیید نشده بوده موقتاً در همین پروسه قفل می‌شود؛ جاروی نگهدار دوباره بررسی می‌کند و قفل را برمی‌دارد. این فاصله (ثانیه) مبنای تلاشِ مجدد در manager و مهلت تأخیرِ executor است. حادثة ۱۴۰۵-۰۷-۱۱: طوفانِ تایم‌اوت ۲۲ از ۴۲ اکانتِ سالم را تا پایانِ پروسه میخکوب کرد و بیلدِ جدید ۰/۲۲ شد.
     VOICE_QUARANTINE_HEAL_SECONDS = int(os.getenv('VOICE_QUARANTINE_HEAL_SECONDS', '180'))
     VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP = int(os.getenv('VOICE_QUARANTINE_HEAL_MAX_PER_SWEEP', '6'))
+    # مهلتِ تأییدِ بسته‌شدنِ کلاینت MTProto. مقدار قدیمی ۵ ثانیه از TCP.TIMEOUT
+    # خودِ kurigram (۱۰ ثانیه) کوتاهتر بود و هر stop() نیمهکاره، کلید سشن را
+    # تا آخر پروسه قفل میکرد (حادثهٔ ۱۴۰۵/۰۸/۰۴). services/session_client.py
+    # مستقیماً از env میخواند تا وابستگی دوری ایجاد نشود.
+    VOICE_SESSION_CLOSE_TIMEOUT = int(os.getenv('VOICE_SESSION_CLOSE_TIMEOUT', '20'))
     # سقف صبر برای آزادشدن استخر وقتی هنوز حتی یک اکانت زنده نداریم (هر راند = VOICE_STARVED_WAIT_SECONDS ثانیه).
     VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE = int(os.getenv('VOICE_STARVED_WAIT_ROUNDS_ZERO_LIVE', '45'))
     VOICE_RAM_SOFT_LIMIT_MB = int(os.getenv('VOICE_RAM_SOFT_LIMIT_MB', '0'))

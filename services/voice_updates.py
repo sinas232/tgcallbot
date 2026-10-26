@@ -98,6 +98,18 @@ class VoiceUpdates:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def resume(self):
+        """Re-open admission after a teardown that FAILED.
+
+        Incident 2026-10-26: a 5s ``stop()`` timeout quarantined the whole
+        client. ``quiesce()`` had already set closing=True; if that client is
+        ever reused (reconnect path) every raw call update would be silently
+        dropped and no join could ever be verified again. Only a *failed*
+        teardown calls this; a client that was actually disconnected is
+        discarded, never resumed.
+        """
+        self.closing = False
+
 
 def configure_voice_updates(client):
     """Install per instance, before start(); never patch global Client behavior."""
