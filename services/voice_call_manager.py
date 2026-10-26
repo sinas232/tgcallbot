@@ -3640,8 +3640,7 @@ class VoiceCallManager:
             app, chat_id, account_id, order_id, target, presence=True)
         self._set_state(order_id, account_id, JOINED, reason,
                         {"voice_chat_id": chat_id})
-        self._inflight_joins.pop(join_key, None)
-        self._join_started_at.pop(join_key, None)
+        self._forget_inflight_join(join_key)
         # A successful join proves the account action is no longer flooded.
         voice_cooldown.clear(account_id)
         self._vc_event_log(order_id, account_id, "joined_media_confirmed", {
@@ -3656,6 +3655,11 @@ class VoiceCallManager:
                 JOIN_MEDIA_CONFIRM_TIMEOUT,
             )
         return True, "Joined"
+
+    def _forget_inflight_join(self, join_key: Tuple[int, int]) -> None:
+        """Drop the in-flight media task AND its diagnostic timestamp."""
+        self._inflight_joins.pop(join_key, None)
+        self._join_started_at.pop(join_key, None)
 
     def _join_diag(
         self, order_id: int, account_id: int, chat_id: int, *,
@@ -3756,20 +3760,20 @@ class VoiceCallManager:
                         operation="play_silence", source="JoinGroupCall",
                     )
                     self._vc_event_log(order_id, account_id, "floodwait", {"wait_s": wait_s})
-                    self._inflight_joins.pop(join_key, None)
+                    self._forget_inflight_join(join_key)
                     return False, f"FloodWait:{wait_s}"
                 except GroupCallInvalid:
                     # GroupCallInvalid might be transient — refresh and retry
                     # once before failing. Don't immediately mark as failed.
                     self._vc_event_log(order_id, account_id, "groupcall_invalid_on_join", {"chat_id": chat_id})
-                    self._inflight_joins.pop(join_key, None)
+                    self._forget_inflight_join(join_key)
                     await self._force_refresh_call(app, chat_id)
                     # Allow retry by returning False instead of permanent failure
                     return False, "GroupCallInvalid (retrying)"
                 except asyncio.CancelledError:
                     if not join_task.done():
                         join_task.cancel()
-                    self._inflight_joins.pop(join_key, None)
+                    self._forget_inflight_join(join_key)
                     raise
                 except asyncio.TimeoutError:
                     # Media join still propagating → Telegram may have already
@@ -3784,7 +3788,7 @@ class VoiceCallManager:
                         # otherwise the failure is logged as "Join error: "
                         # and misclassified as non-retryable UNKNOWN.
                         err_str = type(e).__name__
-                    self._inflight_joins.pop(join_key, None)
+                    self._forget_inflight_join(join_key)
                     # Be lenient with voice call state errors - they may be transient
                     if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
                         self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
@@ -3826,8 +3830,7 @@ class VoiceCallManager:
                                     "chat_id": int(chat_id),
                                     "verdict": "confirmed_joined",
                                 })
-                            self._inflight_joins.pop(join_key, None)
-                            self._join_started_at.pop(join_key, None)
+                            self._forget_inflight_join(join_key)
                             return True, "Joined"
                     # None (unknown) / False → keep waiting until grace expires.
                     if verify_attempt + 1 < VOICE_VERIFICATION_GRACE_CHECKS:
@@ -3858,8 +3861,7 @@ class VoiceCallManager:
                         ),
                     )
                 if verdict in ("failed", "cancelled"):
-                    self._inflight_joins.pop(join_key, None)
-                    self._join_started_at.pop(join_key, None)
+                    self._forget_inflight_join(join_key)
                     self._join_diag(
                         order_id, account_id, chat_id,
                         event="join_transport_" + verdict, verdict=verdict,
@@ -3887,8 +3889,7 @@ class VoiceCallManager:
                                 "chat_id": int(chat_id),
                                 "pending_timeout_s": _JOIN_PENDING_TIMEOUT,
                             })
-                            self._inflight_joins.pop(join_key, None)
-                            self._join_started_at.pop(join_key, None)
+                            self._forget_inflight_join(join_key)
                             return True, "Joined"
                     verdict, detail = self._join_task_verdict(join_task)
                     if verdict == "confirmed":
@@ -3901,8 +3902,7 @@ class VoiceCallManager:
                             ),
                         )
                     if verdict in ("failed", "cancelled"):
-                        self._inflight_joins.pop(join_key, None)
-                        self._join_started_at.pop(join_key, None)
+                        self._forget_inflight_join(join_key)
                         self._join_diag(
                             order_id, account_id, chat_id,
                             event="join_transport_" + verdict + "_while_pending",
@@ -4875,7 +4875,12 @@ class VoiceCallManager:
             trial = self._listener_trials.get(int(chat_id))
             if trial and trial[0] == account_id:
                 self._listener_trials.pop(int(chat_id), None)
-            inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
+            if chat_id:
+                _jkey = (account_id, int(chat_id))
+                inflight = self._inflight_joins.pop(_jkey, None)
+                self._join_started_at.pop(_jkey, None)
+            else:
+                inflight = None
             if inflight and not inflight.done():
                 inflight.cancel()
         if removed is not None:
@@ -5192,6 +5197,7 @@ class VoiceCallManager:
                 pass
         for key in list(self._inflight_joins.keys()):
             inf = self._inflight_joins.pop(key, None)
+            self._join_started_at.pop(key, None)
             try:
                 if inf and not inf.done():
                     inf.cancel()
