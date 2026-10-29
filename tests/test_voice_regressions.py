@@ -831,3 +831,144 @@ warnings.filterwarnings(
     message=r"unclosed <socket\.socket.*",
     category=ResourceWarning,
 )
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ConcurrentCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stopping_shared_call_keeps_other_order_and_transport(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        chat = -100123
+        mgr.active_calls[(1, 7)] = {"chat_id": chat}
+        mgr.active_calls[(2, 7)] = {"chat_id": chat}
+        mgr.joined_accounts_by_order = {1: {7: {"chat_id": chat}}, 2: {7: {"chat_id": chat}}}
+        mgr._group_refcount[(7, chat)] = 2
+        engine = SimpleNamespace(leave_call=AsyncMock())
+        app = SimpleNamespace(leave_chat=AsyncMock())
+        mgr.clients[7] = engine
+        mgr.pyrogram_clients[7] = app
+        mgr._cleanup_client = AsyncMock()
+        pending = asyncio.create_task(asyncio.Event().wait())
+        mgr._inflight_joins[(7, chat)] = pending
+        try:
+            await mgr.stop_call(1, 7, leave_group=True, cleanup_client=True)
+            self.assertIn((2, 7), mgr.active_calls)
+            self.assertIs(mgr._inflight_joins[(7, chat)], pending)
+            self.assertFalse(pending.cancelled())
+            self.assertEqual(mgr._group_refcount[(7, chat)], 1)
+            engine.leave_call.assert_not_awaited()
+            app.leave_chat.assert_not_awaited()
+            mgr._cleanup_client.assert_not_awaited()
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_force_cleanup_does_not_disconnect_other_order(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        mgr.active_calls[(2, 7)] = {"chat_id": -100999}
+        app = SimpleNamespace(disconnect=AsyncMock())
+        mgr.pyrogram_clients[7] = app
+        await mgr._cleanup_client(7, order_id=1, force=True)
+        self.assertIs(mgr.pyrogram_clients[7], app)
+        app.disconnect.assert_not_awaited()
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class ExclusiveOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_atomic_lease_and_release(self):
+        mgr = VoiceCallManager()
+        results = await asyncio.gather(mgr.reserve_accounts(1, {10}), mgr.reserve_accounts(2, {10}))
+        self.assertEqual(sum(10 in r for r in results), 1)
+        owner = 1 if 10 in results[0] else 2
+        other = 3 - owner
+        self.assertEqual(await mgr.reserve_accounts(other, {10}), set())
+        await mgr.release_account_reservation(owner, 10)
+        self.assertEqual(await mgr.reserve_accounts(other, {10}), {10})
+
+    async def test_different_accounts_run_concurrently_and_same_account_is_busy(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        started = {1: asyncio.Event(), 2: asyncio.Event()}
+        finish = asyncio.Event()
+        async def join(order, aid, session, target, duration):
+            started[order].set()
+            await finish.wait()
+            mgr.active_calls[(order, aid)] = {"chat_id": -100 - order}
+            return True, "Joined", -100 - order
+        mgr._start_call_owned = join
+        mgr._cleanup_client = AsyncMock()
+        a = asyncio.create_task(mgr.start_call(1, 10, "s", "one"))
+        b = asyncio.create_task(mgr.start_call(2, 11, "s", "two"))
+        try:
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started.values())), 1)
+            # Same account queues behind the in-progress lifecycle, while
+            # other accounts are already joining concurrently.
+            c = asyncio.create_task(mgr.start_call(2, 10, "s", "two"))
+            finish.set()
+            await asyncio.gather(a, b)
+            ok, msg, _ = await c
+            self.assertFalse(ok)
+            self.assertIn("busy", msg)
+            self.assertEqual(mgr.get_reserved_account_ids(), {10, 11})
+        finally:
+            finish.set()
+            for task in (a, b):
+                if not task.done(): task.cancel()
+            await asyncio.gather(a, b, return_exceptions=True)
+
+    async def test_cancelled_join_cleans_before_releasing_lease(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        entered = asyncio.Event()
+        async def join(*args):
+            entered.set()
+            await asyncio.Event().wait()
+        async def cleanup(aid, order_id=None, force=False):
+            self.assertIn(aid, mgr.get_reserved_account_ids())
+        mgr._start_call_owned = join
+        mgr._cleanup_client = AsyncMock(side_effect=cleanup)
+        task = asyncio.create_task(mgr.start_call(1, 10, "s", "one"))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        mgr._cleanup_client.assert_awaited_once()
+        self.assertNotIn(10, mgr.get_reserved_account_ids())
+
+    async def test_initialized_client_uses_stop(self):
+        from unittest.mock import AsyncMock
+        app = SimpleNamespace(is_initialized=True, is_connected=True,
+                              stop=AsyncMock(), disconnect=AsyncMock())
+        await VoiceCallManager._close_pyrogram_client(app)
+        app.stop.assert_awaited_once()
+        app.disconnect.assert_not_awaited()
+
+    async def test_failed_disconnect_quarantines_account(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        app = SimpleNamespace(is_initialized=True, is_connected=True,
+                              stop=AsyncMock(side_effect=RuntimeError("stop failed")),
+                              disconnect=AsyncMock())
+        mgr.pyrogram_clients[10] = app
+        await mgr._cleanup_client(10, order_id=1)
+        self.assertIs(mgr.pyrogram_clients[10], app)
+        self.assertIn(10, mgr.get_reserved_account_ids())
+        self.assertEqual(await mgr.reserve_accounts(2, {10}), set())
+
+    async def test_stop_waits_for_media_restore_cancellation(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        entered, cancelled = asyncio.Event(), asyncio.Event()
+        async def restore(*args):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        mgr._schedule_media_restore = restore
+        mgr._cleanup_client = AsyncMock()
+        mgr.active_calls[(1, 10)] = {"chat_id": -100123}
+        mgr._start_media_restore(1, 10, -100123)
+        await entered.wait()
+        await mgr.stop_call(1, 10)
+        self.assertTrue(cancelled.is_set())
+        self.assertNotIn((1, 10), mgr._media_restore_tasks)

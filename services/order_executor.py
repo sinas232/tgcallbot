@@ -468,6 +468,8 @@ class OrderExecutor:
 	        aid = acc.get("id")
 	        if not aid:
 	            continue
+	        if vcm is not None and aid in vcm.get_reserved_account_ids(exclude_order_id=order_id):
+	            continue
 	        if aid in banned or aid in joined_ids or aid in in_flight:
 	            continue
 	        if attempts.get(aid, 0) >= attempt_budget:
@@ -569,27 +571,8 @@ class OrderExecutor:
 	        except Exception:
 	            pass
 
-	        # Pipeline: warm the NEXT wave's Pyrogram clients while this wave
-	        # is joining (client start is the slowest single step).
-	        warm_task: Optional[asyncio.Task] = None
-	        if candidates:
-	            in_flight_ids = {c["id"] for c in candidates if c.get("id")}
-	            lookahead = self._voice_candidates(
-	                order_id, max(1, window * 2), joined_ids | in_flight_ids, set(), now,
-	            )
-	            if lookahead:
-	                try:
-	                    warm_task = asyncio.create_task(vcm.warmup_clients(lookahead))
-
-	                    def _consume_warm(_t: asyncio.Task) -> None:
-	                        try:
-	                            _t.exception()
-	                        except (asyncio.CancelledError, Exception):
-	                            pass
-
-	                    warm_task.add_done_callback(_consume_warm)
-	                except Exception:
-	                    warm_task = None
+	        # Do not warm unreserved accounts: another order may already own
+	        # their sessions. Clients are created only after the atomic lease.
 
 	        if not candidates:
 	            # Nothing ready right now — wait for the earliest retry
@@ -599,9 +582,8 @@ class OrderExecutor:
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
-	                # Should not happen (a ready account would have been
-	                # selected); avoid any possibility of a hot spin.
-	                break
+	                # An otherwise-ready account may be leased by another order.
+	                wait = 5.0
 	            logger.info(f"Order {order_id}: no ready candidates; waiting {wait:.0f}s for retry backoff")
 	            await asyncio.sleep(wait)
 	            continue
@@ -631,29 +613,39 @@ class OrderExecutor:
 	        )
 
 	        wave_tasks: List[asyncio.Task] = []
-	        for _i, acc in enumerate(candidates):
-	            if _i > 0:
-	                gap = random.uniform(stagger_min, stagger_max) + random.uniform(jitter_min, jitter_max)
-	                await asyncio.sleep(gap)
-	            wave_tasks.append(asyncio.create_task(
-	                self._join_single_account(order_id, acc, "voice_chat", target, 0)
-	            ))
-	        # Hard wave deadline: ONE stuck account must never freeze the whole
-	        # build.  Stragglers are cancelled and deferred to a later wave —
-	        # the deferral itself does NOT consume their attempt budget.
-	        wave_timeout = max(10.0, float(getattr(Config, "VOICE_WAVE_TIMEOUT", 120)))
-	        done_w, pending_w = await asyncio.wait(
-	            wave_tasks, timeout=wave_timeout, return_when=asyncio.ALL_COMPLETED,
-	        )
-	        if pending_w:
-	            logger.warning(
-	                f"Order {order_id}: wave {wave_no} hit {wave_timeout:.0f}s deadline - "
-	                f"{len(pending_w)} account(s) still joining; deferred to a later wave"
+	        try:
+	            for _i, acc in enumerate(candidates):
+	                if _i > 0:
+	                    gap = random.uniform(stagger_min, stagger_max) + random.uniform(jitter_min, jitter_max)
+	                    await asyncio.sleep(gap)
+	                wave_tasks.append(asyncio.create_task(
+	                    self._join_single_account(order_id, acc, "voice_chat", target, 0)
+	                ))
+	            # Hard wave deadline: ONE stuck account must never freeze the whole
+	            # build.  Stragglers are cancelled and deferred to a later wave —
+	            # the deferral itself does NOT consume their attempt budget.
+	            wave_timeout = max(10.0, float(getattr(Config, "VOICE_WAVE_TIMEOUT", 120)))
+	            done_w, pending_w = await asyncio.wait(
+	                wave_tasks, timeout=wave_timeout, return_when=asyncio.ALL_COMPLETED,
 	            )
-	            for _t in pending_w:
-	                _t.cancel()
-	            # Let cancellation settle so the vcm state machines unwind cleanly.
-	            await asyncio.wait(list(pending_w), timeout=10)
+	            if pending_w:
+	                logger.warning(
+	                    f"Order {order_id}: wave {wave_no} hit {wave_timeout:.0f}s deadline - "
+	                    f"{len(pending_w)} account(s) still joining; deferred to a later wave"
+	                )
+	                for _t in pending_w:
+	                    _t.cancel()
+	                # Let cancellation settle so the vcm state machines unwind cleanly.
+	                await asyncio.gather(*pending_w, return_exceptions=True)
+	        except BaseException:
+	            # Tasks created during staggered starts outlive their parent unless
+	            # explicitly cancelled, including when cancellation hits sleep().
+	            for _t in wave_tasks:
+	                if not _t.done():
+	                    _t.cancel()
+	            if wave_tasks:
+	                await asyncio.gather(*wave_tasks, return_exceptions=True)
+	            raise
 	        results: Dict[asyncio.Task, Any] = {}
 	        for _t in wave_tasks:
 	            if _t in done_w:
@@ -705,7 +697,7 @@ class OrderExecutor:
 	                    pass
 	                status = res.get("status") or "failed"
 
-	                if status == "deferred":
+	                if status == "deferred" or "Account busy in another voice order" in msg:
 	                    # Wave deadline cancelled a still-joining account.  This
 	                    # is a scheduling artifact, NOT an account fault — keep
 	                    # the retry budget and retry soon in the next wave.
@@ -1246,7 +1238,9 @@ class OrderExecutor:
 				task.cancel()
 				try:
 					await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
-				except (asyncio.CancelledError, asyncio.TimeoutError):
+				except asyncio.TimeoutError:
+					return True, "Cancellation requested; account cleanup is still in progress."
+				except asyncio.CancelledError:
 					pass
 				return True, "Order cancelled and accounts left."
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))

@@ -617,6 +617,9 @@ class VoiceCallManager:
         self._session_cache: Dict[int, str] = {}
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._reservation_lock = asyncio.Lock()
+        self._quarantined_accounts: Set[int] = set()
+        self._media_restore_tasks: Dict[Tuple[int, int], Set[asyncio.Task]] = {}
+        self._start_locks: Dict[int, asyncio.Lock] = {}
         self._keepalive_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
 
         # ═══ PERSISTENT PER-ORDER JOINED STATE (source of truth for counting) ═══
@@ -1249,7 +1252,7 @@ class VoiceCallManager:
         return {aid for (oid, aid) in self.active_calls.keys()}
 
     def get_reserved_account_ids(self, exclude_order_id: Optional[int] = None) -> Set[int]:
-        reserved: Set[int] = set()
+        reserved: Set[int] = set(self._quarantined_accounts)
         for oid, account_ids in self._reservations.items():
             if exclude_order_id is None or oid != exclude_order_id:
                 reserved.update(account_ids)
@@ -1825,6 +1828,14 @@ class VoiceCallManager:
 
     # ─── Client management ───
 
+    @staticmethod
+    async def _close_pyrogram_client(app: Client) -> None:
+        """Stop initialized workers before disconnecting a Kurigram client."""
+        if getattr(app, "is_initialized", False):
+            await app.stop()
+        elif getattr(app, "is_connected", True):
+            await app.disconnect()
+
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
         # Database sessions are encrypted. Passing the encrypted value to
         # Pyrogram makes every account fail during client initialisation.
@@ -1848,10 +1859,11 @@ class VoiceCallManager:
                 except Exception as e:
                     logger.warning(f"reconnect pyrogram acc={account_id}: {e}")
                     try:
-                        if hasattr(app, 'disconnect'):
-                            await app.disconnect()
+                        await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
                     except Exception:
-                        pass
+                        self._quarantined_accounts.add(account_id)
+                        logger.exception("Failed to close reconnecting client for account %s", account_id)
+                        raise
                     app = None
                     self.pyrogram_clients.pop(account_id, None)
                     # The session tied to this dead client is gone; release
@@ -1877,21 +1889,22 @@ class VoiceCallManager:
                             **_client_device_fingerprint(account_id),
                         )
                         await asyncio.wait_for(app.start(), timeout=20)
-                    except Exception:
+                    except BaseException:
                         # Best-effort teardown of the half-open client: without
                         # this, our own lingering connection can DUPLICATE the
                         # session key of the next retry and burn a healthy
                         # account (AUTH_KEY_DUPLICATED invalidates the key
                         # server-side, so the session can never be reused).
-                        try:
-                            if app is not None:
-                                try:
-                                    await asyncio.wait_for(app.disconnect(), timeout=5)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        if held:
+                        closed = True
+                        if app is not None:
+                            try:
+                                await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
+                            except Exception:
+                                closed = False
+                                self.pyrogram_clients[account_id] = app
+                                self._quarantined_accounts.add(account_id)
+                                logger.exception("Failed to close partially started client for account %s", account_id)
+                        if held and closed:
                             session_ownership.release_voice(account_id)
                         raise
                     self.pyrogram_clients[account_id] = app
@@ -1939,14 +1952,13 @@ class VoiceCallManager:
 
     async def _cleanup_client(self, account_id: int, order_id: Optional[int] = None, force: bool = False) -> None:
         # Only cleanup if account is not used by any other active call
-        if not force:
-            still_active = any(
-                aid == account_id
-                for (oid, aid) in self.active_calls.keys()
-                if oid != order_id
-            )
-            if still_active:
-                return
+        still_active = any(
+            aid == account_id
+            for (oid, aid) in self.active_calls.keys()
+            if oid != order_id
+        )
+        if still_active:
+            return
 
         pytg = self.clients.pop(account_id, None)
         if pytg:
@@ -1967,17 +1979,21 @@ class VoiceCallManager:
 
         # Only remove pyrogram client if not used by any other order
         if force or not self._account_in_any_order(account_id):
-            app = self.pyrogram_clients.pop(account_id, None)
+            app = self.pyrogram_clients.get(account_id)
             if app:
                 try:
-                    await asyncio.wait_for(app.disconnect(), timeout=5)
+                    await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
                 except Exception:
-                    pass
+                    # Never hand a potentially connected session to a new order.
+                    self._quarantined_accounts.add(account_id)
+                    logger.exception("Voice client teardown failed for account %s; quarantined until restart", account_id)
+                    return
+                self.pyrogram_clients.pop(account_id, None)
+            self._quarantined_accounts.discard(account_id)
             # Session is no longer connected by the voice engine — release
             # the exclusive hold so short-lived clients may use it again.
             session_ownership.release_voice(account_id)
             self._session_cache.pop(account_id, None)
-            self._client_locks.pop(account_id, None)
 
     # ─── Protocol helpers ───
 
@@ -2140,6 +2156,23 @@ class VoiceCallManager:
     def _is_engine_state_error(cls, msg: str) -> bool:
         s = (msg or "").lower()
         return any(m in s for m in cls._ENGINE_STATE_MARKERS)
+
+    def _start_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
+        key = (order_id, account_id)
+        tasks = self._media_restore_tasks.setdefault(key, set())
+        if tasks:
+            return
+        task = asyncio.create_task(self._schedule_media_restore(order_id, account_id, chat_id))
+        tasks.add(task)
+        def done(completed: asyncio.Task) -> None:
+            tasks.discard(completed)
+            if not tasks and self._media_restore_tasks.get(key) is tasks:
+                self._media_restore_tasks.pop(key, None)
+            if not completed.cancelled():
+                exc = completed.exception()
+                if exc:
+                    logger.warning("Voice media restore failed order=%s account=%s: %s", order_id, account_id, exc)
+        task.add_done_callback(done)
 
     async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
         """Re-establish the silent media transport for a GHOST-MEDIA-ONLY slot.
@@ -2789,9 +2822,7 @@ class VoiceCallManager:
                         try:
                             group_calls = await pytg.group_calls
                             if int(chat_id) not in group_calls:
-                                asyncio.create_task(
-                                    self._schedule_media_restore(order_id, account_id, int(chat_id))
-                                )
+                                self._start_media_restore(order_id, account_id, int(chat_id))
                         except Exception:
                             pass
                         return True, "Already in call"
@@ -2850,7 +2881,9 @@ class VoiceCallManager:
                 except asyncio.CancelledError:
                     if not join_task.done():
                         join_task.cancel()
-                    self._inflight_joins.pop(join_key, None)
+                        await asyncio.gather(join_task, return_exceptions=True)
+                    if self._inflight_joins.get(join_key) is join_task:
+                        self._inflight_joins.pop(join_key, None)
                     raise
                 except asyncio.TimeoutError:
                     # Media join still propagating → Telegram may have already
@@ -2909,7 +2942,8 @@ class VoiceCallManager:
                                     "chat_id": int(chat_id),
                                     "verdict": "confirmed_joined",
                                 })
-                            self._inflight_joins.pop(join_key, None)
+                            if join_task.done():
+                                self._inflight_joins.pop(join_key, None)
                             return True, "Joined"
                     # None (unknown) / False → keep waiting until grace expires.
                     if verify_attempt + 1 < VOICE_VERIFICATION_GRACE_CHECKS:
@@ -2935,7 +2969,8 @@ class VoiceCallManager:
                                     "chat_id": int(chat_id),
                                     "pending_timeout_s": _JOIN_PENDING_TIMEOUT,
                                 })
-                                self._inflight_joins.pop(join_key, None)
+                                if join_task.done():
+                                    self._inflight_joins.pop(join_key, None)
                                 return True, "Joined"
                         await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
                     if not join_task.done():
@@ -2957,6 +2992,19 @@ class VoiceCallManager:
                 self._set_state(order_id, account_id, RETRY_PENDING, "presence verification failed (timeout)")
                 return False, "Join verification failed (timeout)"
             except asyncio.CancelledError:
+                # Cancellation may arrive during presence verification, not just
+                # while awaiting play(). Do not leave a shielded native join behind.
+                task = self._inflight_joins.get(lock_key)
+                shared = any(
+                    aid == account_id and oid != order_id
+                    and int(info.get("chat_id") or 0) == int(chat_id)
+                    for (oid, aid), info in self.active_calls.items()
+                )
+                if task and not shared:
+                    self._inflight_joins.pop(lock_key, None)
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
                 raise
             finally:
                 pass
@@ -3316,9 +3364,7 @@ class VoiceCallManager:
                                                       extra={"media_known": media_known,
                                                              "verdict": "media_only_presence_intact"})
                                 try:
-                                    asyncio.create_task(
-                                        self._schedule_media_restore(order_id, acc_id, cid)
-                                    )
+                                    self._start_media_restore(order_id, acc_id, cid)
                                 except RuntimeError:
                                     pass
                             else:
@@ -3493,16 +3539,26 @@ class VoiceCallManager:
 
     # ─── Public API ───
 
-    async def reserve_accounts(self, order_id: int, account_ids: Set[int]) -> None:
-        """
-        Track which accounts this order has *selected* so far.
+    async def reserve_accounts(self, order_id: int, account_ids: Set[int]) -> Set[int]:
+        """Atomically lease available accounts to one voice order at a time.
 
-        The same account may legitimately participate in multiple orders and
-        multiple Voice Chats simultaneously. We only record the set for
-        bookkeeping / de-duplication WITHIN this order.
+        Leases last through the entire join/leave lifecycle, not just the RPC.
+        This is process-local and assumes a single voice executor instance.
         """
         async with self._reservation_lock:
-            self._reservations[order_id] = set(account_ids)
+            busy = self.get_reserved_account_ids(exclude_order_id=order_id)
+            busy.update(aid for (oid, aid) in self.active_calls if oid != order_id)
+            acquired = set(account_ids) - busy
+            self._reservations.setdefault(order_id, set()).update(acquired)
+            return acquired
+
+    async def release_account_reservation(self, order_id: int, account_id: int) -> None:
+        async with self._reservation_lock:
+            accounts = self._reservations.get(order_id)
+            if accounts is not None:
+                accounts.discard(account_id)
+                if not accounts:
+                    self._reservations.pop(order_id, None)
 
     async def warmup_clients(self, accounts: List[Dict], limit: int = 0) -> int:
         """Pre-create Pyrogram clients CONCURRENTLY (bounded) for a wave.
@@ -3550,6 +3606,7 @@ class VoiceCallManager:
                         return
                     async with CLIENT_CREATE_SEMAPHORE:
                         held = await session_ownership.acquire_voice(account_id)
+                        app = None
                         try:
                             helper = TelegramAccountClient("temp", session_string, account_id)
                             api_id, api_hash = await helper._get_api_credentials()
@@ -3566,6 +3623,11 @@ class VoiceCallManager:
                             )
                             await asyncio.wait_for(app.start(), timeout=15)
                         except FloodWait as e:
+                            if app is not None:
+                                try:
+                                    await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
+                                except Exception:
+                                    pass
                             if held:
                                 session_ownership.release_voice(account_id)
                             wait_s = int(getattr(e, "value", 3) or 3)
@@ -3576,7 +3638,12 @@ class VoiceCallManager:
                             self._vc_event_log(None, account_id, "warmup_floodwait",
                                                {"wait_s": wait_s})
                             return
-                        except Exception:
+                        except BaseException:
+                            if app is not None:
+                                try:
+                                    await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
+                                except Exception:
+                                    pass
                             if held:
                                 session_ownership.release_voice(account_id)
                             raise
@@ -3595,6 +3662,30 @@ class VoiceCallManager:
         return warmed
 
     async def start_call(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
+        # Serialize lifecycle for the same account only; unrelated accounts
+        # and orders continue joining in parallel.
+        async with self._start_locks.setdefault(account_id, asyncio.Lock()):
+            return await self._start_call_reserved(order_id, account_id, session_string, chat_link, duration_minutes)
+
+    async def _start_call_reserved(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int) -> Tuple[bool, str, int]:
+        if account_id not in await self.reserve_accounts(order_id, {account_id}):
+            return False, "Account busy in another voice order (retry deferred)", 0
+        try:
+            return await self._start_call_owned(order_id, account_id, session_string, chat_link, duration_minutes)
+        finally:
+            # Failed or cancelled attempts can still have registered remotely.
+            # Clean them before allowing another order to use the session.
+            if (order_id, account_id) not in self.active_calls and account_id not in self.joined_accounts_by_order.get(order_id, {}):
+                try:
+                    chat_id = int(self.order_chat_ids.get(order_id) or 0)
+                    if chat_id:
+                        await self.stop_call(order_id, account_id, leave_group=False)
+                    else:
+                        await self._cleanup_client(account_id, order_id=order_id)
+                finally:
+                    await self.release_account_reservation(order_id, account_id)
+
+    async def _start_call_owned(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
         """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
         key = (order_id, account_id)
 
@@ -3777,6 +3868,11 @@ class VoiceCallManager:
     async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
         """Stop a single account's voice call. leave_group: also leave the Telegram group (refcount-based)."""
         key = (order_id, account_id)
+        restore_tasks = list(self._media_restore_tasks.get(key, ()))
+        for task in restore_tasks:
+            task.cancel()
+        if restore_tasks:
+            await asyncio.gather(*restore_tasks, return_exceptions=True)
         info = self.active_calls.pop(key, None)
         chat_id = int((info or {}).get("chat_id") or 0)
         if not chat_id:
@@ -3786,10 +3882,16 @@ class VoiceCallManager:
             recorder = (self.joined_accounts_by_order.get(order_id) or {}).pop(account_id, None)
             if recorder:
                 chat_id = int(recorder.get("chat_id") or 0)
-        inflight = self._inflight_joins.pop((account_id, int(chat_id)), None) if chat_id else None
+        shared_call = bool(chat_id) and any(
+            aid == account_id and int(other.get("chat_id") or 0) == chat_id
+            for (oid, aid), other in self.active_calls.items() if oid != order_id
+        )
+        inflight = (self._inflight_joins.pop((account_id, int(chat_id)), None)
+                    if chat_id and not shared_call else None)
         if inflight and not inflight.done():
             inflight.cancel()
-        if chat_id <= 0 and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
+            await asyncio.gather(inflight, return_exceptions=True)
+        if not chat_id and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
             return True, "Not active"
 
         # Remove from persistent joined state (order is ending / cancelling).
@@ -3815,14 +3917,14 @@ class VoiceCallManager:
         # Leave the voice call IMMEDIATELY (retry twice, then verify)
         pytg = self.clients.get(account_id)
         app = self.pyrogram_clients.get(account_id)
-        if pytg and chat_id:
+        if pytg and chat_id and not shared_call:
             for _ in range(2):
                 try:
                     await asyncio.wait_for(pytg.leave_call(int(chat_id)), timeout=10)
                     break
                 except Exception:
                     await asyncio.sleep(0.5)
-        if app and chat_id:
+        if app and chat_id and not shared_call:
             try:
                 if await self._is_in_voice_call(app, int(chat_id)) is True:
                     peer = await app.resolve_peer(int(chat_id))
@@ -3836,7 +3938,8 @@ class VoiceCallManager:
                 pass
 
         try:
-            await DatabaseManager.update_voice_call_session(account_id, chat_id, "left")
+            if not shared_call:
+                await DatabaseManager.update_voice_call_session(account_id, chat_id, "left")
         except Exception:
             pass
 
@@ -3844,7 +3947,7 @@ class VoiceCallManager:
         if chat_id:
             ref_key = (account_id, int(chat_id))
             self._group_refcount[ref_key] = self._group_refcount.get(ref_key, 1) - 1
-            if self._group_refcount[ref_key] <= 0:
+            if self._group_refcount[ref_key] <= 0 and not shared_call:
                 self._group_refcount.pop(ref_key, None)
                 if leave_group:
                     app = self.pyrogram_clients.get(account_id)
@@ -3857,7 +3960,9 @@ class VoiceCallManager:
                                 await asyncio.sleep(0.5)
                         self._clear_chat_cache(int(chat_id))
 
-        await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+        if not shared_call:
+            await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+        await self.release_account_reservation(order_id, account_id)
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
         self._record_drop(order_id, account_id, chat_id, "stopped",
                           deliberate=True, reason="order-managed stop")
@@ -3887,7 +3992,10 @@ class VoiceCallManager:
         keys = list(key_set)
 
         # Stop the shared monitor FIRST so it cannot rejoin while we leave.
+        monitor = self._monitor_tasks.get(order_id)
         self._stop_monitor(order_id)
+        if monitor and monitor is not asyncio.current_task():
+            await asyncio.gather(monitor, return_exceptions=True)
 
         if keys:
             gap_min = max(0.0, float(getattr(Config, "VOICE_LEAVE_STAGGER_MIN", 0.8)))
@@ -3928,8 +4036,10 @@ class VoiceCallManager:
                     try:
                         await asyncio.sleep(delay)
                     except asyncio.CancelledError:
-                        # Still finish already-started leaves; cancel the rest.
-                        break
+                        # Do not clear state for accounts that were never stopped.
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        raise
                 tasks.append(asyncio.create_task(_one(oid, aid)))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -4019,7 +4129,7 @@ class VoiceCallManager:
                 app = self.pyrogram_clients.pop(aid, None)
                 if app is not None:
                     try:
-                        await asyncio.wait_for(app.disconnect(), timeout=5)
+                        await asyncio.wait_for(self._close_pyrogram_client(app), timeout=10)
                     except Exception:
                         pass
                 try:
