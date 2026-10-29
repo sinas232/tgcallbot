@@ -1251,7 +1251,11 @@ class OrderExecutor:
 				except asyncio.TimeoutError:
 					return True, "Cancellation requested; account cleanup is still in progress."
 				except asyncio.CancelledError:
-					pass
+					if asyncio.current_task().cancelling():
+						raise
+				vcm = _get_voice_call_manager()
+				if vcm and vcm._reservations.get(order_id):
+					return True, "Cancellation requested; some accounts require cleanup."
 				return True, "Order cancelled and accounts left."
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))
 			await self._fail_order(order_id, "Stopped.")

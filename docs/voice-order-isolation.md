@@ -34,3 +34,16 @@ is not proof that Telegram's media endpoints are reachable. Inspect firewall,
 WARP, NAT and provider routing if the TCP Telegram client connects but the
 WebRTC transport times out. Do not change network mode or expose services
 without reviewing the deployment's security settings.
+
+Repeated stop requests are serialized per account and checked against the
+order's active state or lease, so a stale stop cannot tear down a later order's
+joining client. If native call enumeration/leave or client teardown cannot be
+confirmed, the account remains quarantined and its lease remains held for a
+cleanup retry. A retained completed join future is consumed before issuing any
+new native join, including when the first wait timed out.
+
+The server logs provided for incident 1203 report transport TimeoutError and a
+separately frozen account; they do not identify why the transport timed out.
+The later 1205 logs show joins succeeding, but report deployed commit 2d67ac8
+and staged local changes, not this branch. Preserve those changes and reconcile
+versions before deployment; do not overwrite the production checkout blindly.

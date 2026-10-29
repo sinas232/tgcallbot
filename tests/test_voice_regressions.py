@@ -947,6 +947,9 @@ class ExclusiveOrderTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
         app = SimpleNamespace(is_initialized=True, is_connected=True,
                               stop=AsyncMock(), disconnect=AsyncMock())
+        async def stop():
+            app.is_connected = False
+        app.stop.side_effect = stop
         await VoiceCallManager._close_pyrogram_client(app)
         app.stop.assert_awaited_once()
         app.disconnect.assert_not_awaited()
@@ -1094,3 +1097,204 @@ class FrozenAccountClassificationTests(unittest.TestCase):
         msg = "Telegram says: [420 FROZEN_METHOD_INVALID]"
         self.assertEqual(vcm_mod._classify_error(Exception(msg)), vcm_mod.FAILURE_PERMANENT)
         self.assertEqual(classify_message(msg), OUTCOME_PERMANENT)
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class OrderLifecycleRaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_three_independent_orders_join_concurrently_and_cancel_one(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        entered = {i: asyncio.Event() for i in (1, 2, 3)}
+        proceed = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def join(oid, aid, session, target, duration):
+            entered[oid].set()
+            try:
+                await proceed.wait()
+                mgr.active_calls[(oid, aid)] = {"chat_id": -1000 - oid}
+                return True, "Joined", -1000 - oid
+            finally:
+                if oid == 1:
+                    cancelled.set()
+        mgr._start_call_owned = join
+        mgr._cleanup_client = AsyncMock()
+        tasks = [asyncio.create_task(mgr.start_call(i, i, "s", str(i))) for i in (1, 2, 3)]
+        try:
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in entered.values())), 1)
+            tasks[0].cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await tasks[0]
+            self.assertTrue(cancelled.is_set())
+            self.assertNotIn(1, mgr.get_reserved_account_ids())
+            self.assertFalse(tasks[1].done())
+            self.assertFalse(tasks[2].done())
+            proceed.set()
+            self.assertTrue((await tasks[1])[0])
+            self.assertTrue((await tasks[2])[0])
+            self.assertIn((2, 2), mgr.active_calls)
+            self.assertIn((3, 3), mgr.active_calls)
+        finally:
+            proceed.set()
+            for task in tasks:
+                if not task.done(): task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_stale_repeated_stop_does_not_touch_new_owner(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        mgr.order_chat_ids[1] = -1001
+        await mgr.reserve_accounts(2, {7})
+        # New order is still joining, so it does not yet appear in active_calls.
+        mgr.clients[7] = SimpleNamespace(leave_call=AsyncMock())
+        mgr.pyrogram_clients[7] = SimpleNamespace(disconnect=AsyncMock())
+        mgr._cleanup_client = AsyncMock()
+        ok, _ = await mgr.stop_call(1, 7, leave_group=True, cleanup_client=True)
+        self.assertTrue(ok)
+        mgr.clients[7].leave_call.assert_not_awaited()
+        mgr._cleanup_client.assert_not_awaited()
+        self.assertIn(7, mgr._reservations[2])
+
+    async def test_cancelled_cleanup_quarantines_and_keeps_lease(self):
+        mgr = VoiceCallManager()
+        await mgr.reserve_accounts(1, {7})
+        started = asyncio.Event()
+        async def cleanup(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+        mgr._cleanup_client = cleanup
+        task = asyncio.create_task(mgr.stop_call(1, 7))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIn(7, mgr._quarantined_accounts)
+        self.assertIn(7, mgr._reservations[1])
+        self.assertEqual(await mgr.reserve_accounts(2, {7}), set())
+
+    async def test_partial_client_session_is_closed_before_release(self):
+        from unittest.mock import AsyncMock
+        session = SimpleNamespace(stop=AsyncMock())
+        storage = SimpleNamespace(close=AsyncMock())
+        app = SimpleNamespace(is_initialized=False, is_connected=False, session=session, storage=storage)
+        await VoiceCallManager._close_pyrogram_client(app)
+        session.stop.assert_awaited_once()
+        storage.close.assert_awaited_once()
+        self.assertIsNone(app.session)
+
+    async def test_stop_one_connected_order_keeps_other_untouched(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        for order, aid in ((1, 7), (2, 8)):
+            await mgr.reserve_accounts(order, {aid})
+            mgr.active_calls[(order, aid)] = {"chat_id": -1000 - order}
+            mgr.joined_accounts_by_order[order] = {aid: {"chat_id": -1000 - order}}
+        engine_a = SimpleNamespace(leave_call=AsyncMock())
+        engine_b = SimpleNamespace(leave_call=AsyncMock())
+        app_b = SimpleNamespace(disconnect=AsyncMock())
+        mgr.clients.update({7: engine_a, 8: engine_b})
+        mgr.pyrogram_clients[8] = app_b
+        mgr._cleanup_client = AsyncMock()
+        ok, _ = await mgr.stop_call(1, 7)
+        self.assertTrue(ok)
+        self.assertIn((2, 8), mgr.active_calls)
+        self.assertIn(8, mgr.joined_accounts_by_order[2])
+        self.assertIn(8, mgr._reservations[2])
+        engine_b.leave_call.assert_not_awaited()
+        app_b.disconnect.assert_not_awaited()
+        await mgr.stop_call(1, 7)  # idempotent, no second leave
+        engine_a.leave_call.assert_awaited_once()
+
+    async def test_cleanup_exception_isolated_from_other_order(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        await mgr.reserve_accounts(1, {7})
+        await mgr.reserve_accounts(2, {8})
+        mgr.active_calls[(2, 8)] = {"chat_id": -1002}
+        async def fail(*args, **kwargs):
+            raise RuntimeError("teardown failed")
+        mgr._cleanup_client = fail
+        with self.assertRaises(RuntimeError):
+            await mgr.stop_call(1, 7)
+        self.assertIn(7, mgr._quarantined_accounts)
+        self.assertIn(7, mgr._reservations[1])
+        self.assertIn((2, 8), mgr.active_calls)
+        self.assertIn(8, mgr._reservations[2])
+
+    async def test_late_completed_unresolved_task_is_reused_on_retry(self):
+        from unittest.mock import AsyncMock, patch
+        mgr = VoiceCallManager()
+        mgr._is_in_voice_call = AsyncMock(return_value=False)
+        mgr._verify_and_register_join = AsyncMock(return_value=True)
+        mgr._vc_event_log = lambda *a, **k: None
+        mgr._set_state = lambda *a, **k: None
+        release = asyncio.Event()
+        calls = 0
+        async def play(*args):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+        mgr._play_silence = play
+        with patch.object(vcm_mod, "JOIN_MEDIA_CONFIRM_TIMEOUT", 0.001), \
+             patch.object(vcm_mod, "_JOIN_PENDING_TIMEOUT", 0.001), \
+             patch.object(vcm_mod, "JOIN_DELAY_MIN", 0), \
+             patch.object(vcm_mod, "JOIN_DELAY_MAX", 0):
+            ok, _ = await mgr._join_call(object(), object(), -1001, 7, 1, "chat")
+            self.assertFalse(ok)
+            pending = mgr._inflight_joins[(7, -1001)]
+            release.set()
+            await pending
+            ok, _ = await mgr._join_call(object(), object(), -1001, 7, 1, "chat")
+        self.assertTrue(ok)
+        self.assertEqual(calls, 1)
+        mgr._verify_and_register_join.assert_awaited_once()
+        self.assertNotIn((7, -1001), mgr._inflight_joins)
+
+    async def test_failed_native_leave_keeps_engine_and_quarantines(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        class Engine:
+            @property
+            async def group_calls(self):
+                return {-1001: object()}
+            leave_call = AsyncMock(side_effect=RuntimeError("native leave failed"))
+        engine = Engine()
+        mgr.clients[7] = engine
+        await mgr._cleanup_client(7, order_id=1)
+        self.assertIs(mgr.clients[7], engine)
+        self.assertIn(7, mgr._quarantined_accounts)
+        self.assertEqual(await mgr.reserve_accounts(2, {7}), set())
+
+    async def test_repeated_cancel_requests_do_not_cancel_cleanup_twice(self):
+        from unittest.mock import patch
+        executor = order_executor_mod.OrderExecutor()
+        mgr = VoiceCallManager()
+        cleanup_entered, cleanup_finish = asyncio.Event(), asyncio.Event()
+        cancellations = []
+        async def order_task():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellations.append(1)
+                cleanup_entered.set()
+                await cleanup_finish.wait()
+        task = asyncio.create_task(order_task())
+        executor.active_orders[55] = {"task": task, "cancel_requested": False}
+        await asyncio.sleep(0)
+        with patch.object(order_executor_mod, "_get_voice_call_manager", return_value=mgr):
+            first = asyncio.create_task(executor.stop_active_order(55))
+            await cleanup_entered.wait()
+            second = asyncio.create_task(executor.stop_active_order(55))
+            await asyncio.sleep(0)
+            cleanup_finish.set()
+            await asyncio.gather(first, second)
+        self.assertEqual(len(cancellations), 1)
+        self.assertFalse(task.cancelled())
+
+    async def test_stop_returning_without_closing_is_not_trusted(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        app = SimpleNamespace(is_initialized=True, is_connected=True, session=object(),
+                              stop=AsyncMock(), disconnect=AsyncMock())
+        mgr.pyrogram_clients[7] = app
+        await mgr._cleanup_client(7, order_id=1)
+        self.assertIs(mgr.pyrogram_clients[7], app)
+        self.assertIn(7, mgr._quarantined_accounts)

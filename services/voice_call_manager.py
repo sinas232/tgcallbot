@@ -1839,6 +1839,16 @@ class VoiceCallManager:
             await app.stop()
         elif getattr(app, "is_connected", True):
             await app.disconnect()
+        elif getattr(app, "session", None) is not None:
+            # connect() may have been cancelled after allocating the session
+            # but before is_connected was set. It can still hold a socket.
+            await app.session.stop()
+            storage = getattr(app, "storage", None)
+            if storage is not None:
+                await storage.close()
+            app.session = None
+        if getattr(app, "is_connected", False) or getattr(app, "session", None) is not None:
+            raise RuntimeError("Pyrogram client closure not confirmed")
 
     async def _get_or_create_client(self, order_id: int, account_id: int, session_string: str) -> Optional[PyTgCalls]:
         # Database sessions are encrypted. Passing the encrypted value to
@@ -1964,22 +1974,19 @@ class VoiceCallManager:
         if still_active:
             return
 
-        pytg = self.clients.pop(account_id, None)
+        pytg = self.clients.get(account_id)
         if pytg:
-            # PyTgCalls 2.x has NO stop() method (the old hasattr(pytg,'stop')
-            # check was a silent no-op — engines were NEVER torn down, so
-            # half-dead WebRTC connections outlived their calls and later
-            # caused 'Connection cannot be initialized more than once').
-            # leave_call() = engine stop + LeaveGroupCall, which is exactly
-            # what a real teardown should do.
+            # Do not discard the native handle if call enumeration or leave
+            # fails: the transport may still be alive and needs a later retry.
             try:
-                for _cid in list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {}):
-                    try:
-                        await asyncio.wait_for(pytg.leave_call(int(_cid)), timeout=5)
-                    except Exception:
-                        pass
+                calls = list(await asyncio.wait_for(pytg.group_calls, timeout=3) or {})
+                for cid in calls:
+                    await asyncio.wait_for(pytg.leave_call(int(cid)), timeout=5)
             except Exception:
-                pass
+                self._quarantined_accounts.add(account_id)
+                logger.exception("Voice engine teardown failed for account %s; quarantined", account_id)
+                return
+            self.clients.pop(account_id, None)
 
         # Only remove pyrogram client if not used by any other order
         if force or not self._account_in_any_order(account_id):
@@ -2814,7 +2821,7 @@ class VoiceCallManager:
                 # Reuse only a confirmed local media binding; otherwise establish
                 # a fresh transport rather than counting a presence-only slot.
                 presence = await self._is_in_voice_call(app, chat_id)
-                if presence is True:
+                if presence is True and lock_key not in self._inflight_joins:
                     try:
                         group_calls = await pytg.group_calls
                     except Exception:
@@ -2836,7 +2843,7 @@ class VoiceCallManager:
                 # only a handful ever counted).
                 join_key = (account_id, int(chat_id))
                 join_task = self._inflight_joins.get(join_key)
-                if join_task is None or join_task.done():
+                if join_task is None:
                     join_task = asyncio.create_task(self._play_silence(pytg, int(chat_id)))
                     self._inflight_joins[join_key] = join_task
 
@@ -3577,11 +3584,17 @@ class VoiceCallManager:
                 try:
                     chat_id = int(self.order_chat_ids.get(order_id) or 0)
                     if chat_id:
-                        await self.stop_call(order_id, account_id, leave_group=False)
+                        await self._stop_call_owned(order_id, account_id, leave_group=False)
                     else:
                         await self._cleanup_client(account_id, order_id=order_id)
+                except BaseException:
+                    # Cancellation or an unexpected cleanup failure leaves
+                    # session/native state unknown: never permit reuse.
+                    self._quarantined_accounts.add(account_id)
+                    raise
                 finally:
-                    await self.release_account_reservation(order_id, account_id)
+                    if account_id not in self._quarantined_accounts:
+                        await self.release_account_reservation(order_id, account_id)
 
     async def _start_call_owned(self, order_id: int, account_id: int, session_string: str, chat_link: str, duration_minutes: int = 0) -> Tuple[bool, str, int]:
         """Start a voice call for one account — PARALLEL-safe (per-order adaptive gate)."""
@@ -3764,7 +3777,28 @@ class VoiceCallManager:
                 return False, f"Start call error: {str(e)[:80]}", 0
 
     async def stop_call(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
-        """Stop a single account's voice call. leave_group: also leave the Telegram group (refcount-based)."""
+        # A repeated stop may race with a new order's join for this account.
+        # Serialize only this account, then verify ownership under the lock.
+        async with self._start_locks.setdefault(account_id, asyncio.Lock()):
+            return await self._stop_call_owned(order_id, account_id, leave_group, cleanup_client)
+
+    async def _stop_call_owned(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
+        """Stop only a lifecycle actually owned by this order."""
+        key = (order_id, account_id)
+        owns = (account_id in self._reservations.get(order_id, set()) or
+                key in self.active_calls or
+                account_id in self.joined_accounts_by_order.get(order_id, {}))
+        if not owns:
+            return True, "Not active"
+        try:
+            return await self._stop_call_impl(order_id, account_id, leave_group, cleanup_client)
+        except BaseException:
+            # Native leave/close may be half-finished. Keep the lease and
+            # prevent reuse even if the caller is cancelled a second time.
+            self._quarantined_accounts.add(account_id)
+            raise
+
+    async def _stop_call_impl(self, order_id: int, account_id: int, leave_group: bool = False, cleanup_client: bool = False) -> Tuple[bool, str]:
         key = (order_id, account_id)
         restore_tasks = list(self._media_restore_tasks.get(key, ()))
         for task in restore_tasks:
@@ -3791,6 +3825,8 @@ class VoiceCallManager:
             await asyncio.gather(inflight, return_exceptions=True)
         if not chat_id and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
             await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+            if account_id in self._quarantined_accounts:
+                return False, "Client teardown unconfirmed; account quarantined"
             await self.release_account_reservation(order_id, account_id)
             return True, "Not active"
 
@@ -3811,8 +3847,11 @@ class VoiceCallManager:
             ka.cancel()
             try:
                 await asyncio.wait_for(ka, timeout=3)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            except asyncio.TimeoutError:
+                logger.warning("Keepalive did not stop order=%s account=%s", order_id, account_id)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
 
         # Leave the voice call IMMEDIATELY (retry twice, then verify)
         pytg = self.clients.get(account_id)
@@ -3862,6 +3901,8 @@ class VoiceCallManager:
 
         if not shared_call:
             await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+        if account_id in self._quarantined_accounts:
+            return False, "Client teardown unconfirmed; account quarantined"
         await self.release_account_reservation(order_id, account_id)
         self._vc_event_log(order_id, account_id, "stopped", {"chat_id": chat_id})
         self._record_drop(order_id, account_id, chat_id, "stopped",
@@ -3918,11 +3959,13 @@ class VoiceCallManager:
             async def _one(oid: int, aid: int) -> None:
                 async with sem:
                     try:
-                        await self.stop_call(
+                        ok, msg = await self.stop_call(
                             oid, aid,
                             leave_group=leave_group,
                             cleanup_client=cleanup_client,
                         )
+                        if not ok:
+                            logger.warning("[VoiceLeave] order=%s acc=%s cleanup incomplete: %s", oid, aid, msg)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -3979,6 +4022,7 @@ class VoiceCallManager:
             order_ids.add(oid)
         for oid in list(self.joined_accounts_by_order.keys()):
             order_ids.add(oid)
+        order_ids.update(self._reservations)
         for oid in order_ids:
             try:
                 await self.stop_all_for_order(oid, leave_group=True)
