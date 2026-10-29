@@ -17,3 +17,20 @@ executor for a shared account pool; multiple bot replicas/hosts require a
 shared, crash-safe distributed lease implementation before they are safe.
 This does not guarantee Telegram/WebRTC connectivity; test with real calls in
 the deployment network before production rollout.
+
+## Diagnosing transport timeouts
+
+`play()` completing is required for a new slot to count: a participant entry
+by itself can be a stale ghost. `[VoiceJoinDiag]` logs distinguish a completed
+transport exception from a still-pending join. A timeout is retried with pacing;
+it is not proof of a bad account. Frozen/restricted accounts need attention in
+Telegram and cannot be repaired by retries.
+
+On the deployed server, compare `git rev-parse HEAD` with the deployed image,
+rebuild the image after changing dependencies, and inspect the unfiltered bot
+logs. Run `docker compose exec bot python tools/check_udp.py` and the same
+command on the host to diagnose basic UDP reachability. DNS-over-UDP success
+is not proof that Telegram's media endpoints are reachable. Inspect firewall,
+WARP, NAT and provider routing if the TCP Telegram client connects but the
+WebRTC transport times out. Do not change network mode or expose services
+without reviewing the deployment's security settings.

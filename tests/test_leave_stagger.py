@@ -119,6 +119,24 @@ class StopAllPacingLogicTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Keep stubs and the forced module reload from leaking into the rest
+        # of unittest discovery (which imports its test modules up front).
+        from unittest.mock import patch
+        import services
+        saved_attrs = {name: getattr(services, name, None) for name in (
+            "voice_call_manager", "voice_cooldown", "session_ownership", "presence_reconciler"
+        )}
+        def restore_attrs():
+            for name, value in saved_attrs.items():
+                if value is None:
+                    if hasattr(services, name):
+                        delattr(services, name)
+                else:
+                    setattr(services, name, value)
+        cls.addClassCleanup(restore_attrs)
+        modules_patch = patch.dict(sys.modules)
+        modules_patch.start()
+        cls.addClassCleanup(modules_patch.stop)
         # Stub heavy third-party modules before importing voice_call_manager.
         stubs = {}
 

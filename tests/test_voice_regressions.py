@@ -133,6 +133,10 @@ class SilenceStreamCommandTests(unittest.TestCase):
         self.wav = os.path.join(_TMP, "silence2.wav")
         make_silence_wav(self.wav, seconds=2)
         self.ap = AudioParameters(*AudioQuality.HIGH.value)
+        self._original_silence_path = vcm_mod.SILENT_AUDIO_PATH
+
+    def tearDown(self):
+        vcm_mod.SILENT_AUDIO_PATH = self._original_silence_path
 
     def _raw_cmd(self, params):
         return build_command("ffmpeg", params, self.wav, self.ap)
@@ -143,11 +147,11 @@ class SilenceStreamCommandTests(unittest.TestCase):
         # The single-dash fake flag must be gone.
         self.assertNotIn(" -audio ", f" {joined} ")
         self.assertIn("-stream_loop", cmd)
-        self.assertIn("-1", cmd)
+        self.assertIn("1000000", cmd)
         # -stream_loop is an INPUT option: it must appear before -i.
         self.assertLess(cmd.index("-stream_loop"), cmd.index("-i"), joined)
         # The loop count sits right next to the flag.
-        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "-1", joined)
+        self.assertEqual(cmd[cmd.index("-stream_loop") + 1], "1000000", joined)
         # Output format is the ntgcalls wire format.
         self.assertIn("s16le", joined)
 
@@ -162,10 +166,10 @@ class SilenceStreamCommandTests(unittest.TestCase):
         vcm_mod.SILENT_AUDIO_PATH = path
         vcm_mod._ensure_silence_file()
         with wave.open(path, "rb") as r:
-            self.assertEqual(r.getframerate(), 48000)
-            self.assertEqual(r.getnchannels(), 2)
+            self.assertEqual(r.getframerate(), vcm_mod._SILENCE_RATE)
+            self.assertEqual(r.getnchannels(), vcm_mod._SILENCE_CHANNELS)
             self.assertEqual(r.getsampwidth(), 2)
-            self.assertGreaterEqual(r.getnframes(), 48000 * 30)
+            self.assertGreaterEqual(r.getnframes(), vcm_mod._SILENCE_RATE * vcm_mod._SILENCE_SECONDS)
 
     def test_runtime_ffmpeg_old_dies_new_loops(self):
         """Execute the RAW runtime command (ntgcalls runs it unfiltered).
@@ -205,6 +209,9 @@ class SilenceStreamCommandTests(unittest.TestCase):
                 while _t.monotonic() < end and total < cap:
                     chunk = proc.stdout.read(64 * 1024)
                     if not chunk:
+                        # EOF can be observed just before the OS has reaped
+                        # the exiting process; wait before inspecting poll().
+                        proc.wait(timeout=5)
                         break
                     total += len(chunk)  # COUNT, never retain (pipe is unthrottled)
                 alive_after = proc.poll() is None
@@ -473,7 +480,9 @@ class EngineLifecycleTests(unittest.TestCase):
             self.mgr.clients[1] = engine
             got = await self.mgr._get_or_create_client(901, 1, "fake-session")
             self.assertIsNot(got, engine)
-            self.assertEqual(engine.stopped, 1)
+            # PyTgCalls 2.x does not have stop(); the old engine is
+            # discarded after attempting to leave its active calls.
+            self.assertEqual(engine.stopped, 0)
             self.assertEqual(got.started, 1)
             # stream-end + chat-update handlers attached on the fresh engine
             self.assertEqual(len(got.handlers), 2)
@@ -972,3 +981,116 @@ class ExclusiveOrderTests(unittest.IsolatedAsyncioTestCase):
         await mgr.stop_call(1, 10)
         self.assertTrue(cancelled.is_set())
         self.assertNotIn((1, 10), mgr._media_restore_tasks)
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class TransportConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from unittest.mock import AsyncMock
+        self.mgr = VoiceCallManager()
+        self.mgr._is_in_voice_call = AsyncMock(return_value=False)
+        self.mgr._verify_and_register_join = AsyncMock(return_value=True)
+        self.mgr._vc_event_log = lambda *a, **k: None
+        self.mgr._set_state = lambda *a, **k: None
+        self.pytg = SimpleNamespace()
+
+    async def test_transport_timeout_is_not_counted_as_presence(self):
+        from unittest.mock import AsyncMock
+        self.mgr._play_silence = AsyncMock(side_effect=asyncio.TimeoutError())
+        ok, message = await self.mgr._join_call(self.pytg, object(), -1001, 7, 1, "chat")
+        self.assertFalse(ok)
+        self.assertIn("transport failed", message)
+        self.mgr._verify_and_register_join.assert_not_awaited()
+
+    async def test_late_success_is_counted_when_transport_finishes(self):
+        from unittest.mock import patch
+        async def play(*args):
+            await asyncio.sleep(0.02)
+        self.mgr._play_silence = play
+        with patch.object(vcm_mod, "JOIN_MEDIA_CONFIRM_TIMEOUT", 0.001), \
+             patch.object(vcm_mod, "_JOIN_PENDING_TIMEOUT", 0.2), \
+             patch.object(vcm_mod, "JOIN_DELAY_MIN", 0), \
+             patch.object(vcm_mod, "JOIN_DELAY_MAX", 0):
+            ok, _ = await self.mgr._join_call(self.pytg, object(), -1001, 7, 1, "chat")
+        self.assertTrue(ok)
+        self.mgr._verify_and_register_join.assert_awaited_once()
+        self.assertNotIn((7, -1001), self.mgr._inflight_joins)
+
+    async def test_pending_transport_does_not_register_ghost(self):
+        from unittest.mock import patch
+        async def play(*args):
+            await asyncio.Event().wait()
+        self.mgr._play_silence = play
+        with patch.object(vcm_mod, "JOIN_MEDIA_CONFIRM_TIMEOUT", 0.001), \
+             patch.object(vcm_mod, "_JOIN_PENDING_TIMEOUT", 0.001), \
+             patch.object(vcm_mod, "JOIN_DELAY_MIN", 0), \
+             patch.object(vcm_mod, "JOIN_DELAY_MAX", 0):
+            ok, _ = await self.mgr._join_call(self.pytg, object(), -1001, 7, 1, "chat")
+        self.assertFalse(ok)
+        self.mgr._verify_and_register_join.assert_not_awaited()
+        pending = self.mgr._inflight_joins.pop((7, -1001))
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_ghost_presence_without_media_is_not_accepted(self):
+        from unittest.mock import AsyncMock, patch
+        self.mgr._is_in_voice_call = AsyncMock(return_value=True)
+        async def calls():
+            return {}
+        class Engine:
+            @property
+            def group_calls(self):
+                return calls()
+        self.mgr._play_silence = AsyncMock(side_effect=asyncio.TimeoutError())
+        with patch.object(vcm_mod, "JOIN_DELAY_MIN", 0), patch.object(vcm_mod, "JOIN_DELAY_MAX", 0):
+            ok, _ = await self.mgr._join_call(Engine(), object(), -1001, 7, 1, "chat")
+        self.assertFalse(ok)
+        self.mgr._verify_and_register_join.assert_not_awaited()
+
+    async def test_participant_snapshots_are_independent_per_chat(self):
+        import time
+        now = time.monotonic()
+        self.mgr._participant_snapshot[-1001] = (now, {7})
+        self.mgr._participant_snapshot[-1002] = (now, {8})
+        self.mgr._monitor_cycle_ts = -1  # another order's cycle is irrelevant
+        self.assertTrue(self.mgr._snapshot_contains(-1001, 7))
+        self.assertTrue(self.mgr._snapshot_contains(-1002, 8))
+        self.assertFalse(self.mgr._snapshot_contains(-1001, 8))
+        self.mgr._participant_snapshot[-1001] = (now - 6, {7})
+        self.assertIsNone(self.mgr._snapshot_contains(-1001, 7))
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class WaveCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_during_stagger_cancels_started_joins(self):
+        from unittest.mock import AsyncMock, patch
+        executor = order_executor_mod.OrderExecutor()
+        mgr = VoiceCallManager()
+        executor.active_orders[7788] = {"cancel_requested": False}
+        executor._voice_load_pool = AsyncMock()
+        executor._voice_candidates = lambda *args: [{"id": 1}, {"id": 2}]
+        entered, stopped = asyncio.Event(), asyncio.Event()
+        async def join(*args):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        executor._join_single_account = join
+        with patch.object(order_executor_mod, "_get_voice_call_manager", return_value=mgr), \
+             patch.object(Config, "VOICE_JOIN_START_STAGGER_MIN", 10), \
+             patch.object(Config, "VOICE_JOIN_START_STAGGER_MAX", 10):
+            task = asyncio.create_task(executor._voice_batched_fill(7788, "chat", 1, 2, 2))
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(stopped.is_set())
+        order_executor_mod.join_brain.forget_order(7788)
+
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class FrozenAccountClassificationTests(unittest.TestCase):
+    def test_frozen_420_is_not_a_flood_wait(self):
+        from services.join_brain import classify_message, OUTCOME_PERMANENT
+        msg = "Telegram says: [420 FROZEN_METHOD_INVALID]"
+        self.assertEqual(vcm_mod._classify_error(Exception(msg)), vcm_mod.FAILURE_PERMANENT)
+        self.assertEqual(classify_message(msg), OUTCOME_PERMANENT)

@@ -67,6 +67,8 @@ def classify_message(msg: str) -> str:
         "USER_DEACTIVATED", "ACTIVE USER REQUIRED", "401", "DEAD",
     )):
         return OUTCOME_DEAD
+    if "FROZEN_METHOD_INVALID" in text:
+        return OUTCOME_PERMANENT
     if any(k in text for k in (
         "FLOODWAIT", "FLOOD_WAIT", "FLOOD WAIT", "RETRY AFTER", "420", "SLOW_MODE",
     )):

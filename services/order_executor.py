@@ -697,14 +697,15 @@ class OrderExecutor:
 	                    pass
 	                status = res.get("status") or "failed"
 
-	                if status == "deferred" or "Account busy in another voice order" in msg:
+	                if status == "deferred" or "retry deferred" in msg.lower() or "Account busy in another voice order" in msg:
 	                    # Wave deadline cancelled a still-joining account.  This
 	                    # is a scheduling artifact, NOT an account fault — keep
 	                    # the retry budget and retry soon in the next wave.
-	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + 5
+	                    delay = 15 if "transport" in msg.lower() or "timeout" in msg.lower() else 5
+	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
 	                    logger.info(
-	                        f"Order {order_id}: account {aid} deferred by wave deadline - "
-	                        f"retrying in 5s (budget kept)"
+	                        f"Order {order_id}: account {aid} deferred ({msg[:80]}) - "
+	                        f"retrying in {delay}s (budget kept)"
 	                    )
 	                    wave_fail += 1
 	                    continue
@@ -734,6 +735,13 @@ class OrderExecutor:
 	                    continue
 
 	                outcome = join_brain.classify_message(msg)
+	                if "FROZEN_METHOD_INVALID" in upper:
+	                    self._voice_banned.setdefault(order_id, set()).add(aid)
+	                    self._voice_attempts.setdefault(order_id, {})[aid] = attempt_budget
+	                    join_brain.report_result(order_id, outcome, msg)
+	                    logger.warning("Order %s: account %s is frozen; excluded from this order", order_id, aid)
+	                    wave_fail += 1
+	                    continue
 	                if outcome == OUTCOME_FLOOD:
 	                    # A server-directed FloodWait is system pressure, NOT a
 	                    # faulty account: do NOT spend its attempt budget and do
@@ -1232,10 +1240,12 @@ class OrderExecutor:
 			self._suppress_cancel_log.add(order_id)
 		if order_id in self.active_orders:
 			info = self.active_orders[order_id]
+			was_cancelled = info.get("cancel_requested", False)
 			info["cancel_requested"] = True
 			task = info.get("task")
 			if task and not task.done():
-				task.cancel()
+				if not was_cancelled:
+					task.cancel()
 				try:
 					await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
 				except asyncio.TimeoutError:

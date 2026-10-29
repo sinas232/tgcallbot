@@ -514,6 +514,10 @@ def _classify_error(err: Exception, message: str = "") -> str:
         # carries an EMPTY message, so text matching alone misses it).
         return FAILURE_NETWORK
     s = (message or str(err)).lower()
+    # A frozen account can also be reported as code 420; it is not a
+    # server-directed FloodWait and cannot be fixed by retrying.
+    if "frozen_method_invalid" in s:
+        return FAILURE_PERMANENT
     # Ordered: most specific first.
     if isinstance(err, FloodWait) or "floodwait" in s or "retry after" in s or "420" in s \
        or "flood" in s or "slow_mode" in s:
@@ -2379,9 +2383,6 @@ class VoiceCallManager:
                 ),
             )
         except Exception as e:
-            s = str(e).lower()
-            if "already" in s and ("join" in s or "stream" in s or "call" in s):
-                return
             logger.debug("voice media negotiation failed chat=%s: %s", chat_id, e)
             raise
         # Mute the local microphone (kept muted by default so the account is
@@ -2663,7 +2664,9 @@ class VoiceCallManager:
         if present_ids is None:
             # Non-authoritative snapshot (fetch failed) → unknown.
             return None
-        if cycle_ts != self._monitor_cycle_ts:
+        # Each order has its own monitor cycle. A global cycle marker let
+        # another order invalidate this snapshot while it was being read.
+        if time.monotonic() - cycle_ts > 5.0:
             return None
         return int(my_id) in present_ids
 
@@ -2807,25 +2810,18 @@ class VoiceCallManager:
         lock_key = (account_id, int(chat_id))
         async with self._call_join_locks.setdefault(lock_key, asyncio.Lock()):
             try:
-                # Check if already in call (skip redundant join).
+                # A Telegram participant entry alone may be a stale/ghost join.
+                # Reuse only a confirmed local media binding; otherwise establish
+                # a fresh transport rather than counting a presence-only slot.
                 presence = await self._is_in_voice_call(app, chat_id)
                 if presence is True:
-                    if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True):
-                        # The account is inside the call.  If the engine has
-                        # NO media binding for this chat (a rejoin after the
-                        # transport died), attach the silence stream through
-                        # the PACED restore path — without this, the account
-                        # would stay a "ghost" (present but no media) and the
-                        # monitor would keep flagging it.  _schedule_media_restore
-                        # is rate-limited and non-stacking, so this can never
-                        # create a JoinGroupCall burst.
-                        try:
-                            group_calls = await pytg.group_calls
-                            if int(chat_id) not in group_calls:
-                                self._start_media_restore(order_id, account_id, int(chat_id))
-                        except Exception:
-                            pass
-                        return True, "Already in call"
+                    try:
+                        group_calls = await pytg.group_calls
+                    except Exception:
+                        group_calls = {}
+                    if int(chat_id) in group_calls:
+                        if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True):
+                            return True, "Already in call"
 
                 # Ultra-short delay to avoid rate limits
                 await asyncio.sleep(random.uniform(JOIN_DELAY_MIN, JOIN_DELAY_MAX))
@@ -2852,145 +2848,49 @@ class VoiceCallManager:
 
                 join_task.add_done_callback(_consume_join_task_result)
 
-                media_confirmed = False
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(join_task),
-                        timeout=JOIN_MEDIA_CONFIRM_TIMEOUT,
-                    )
-                    media_confirmed = True
+                    try:
+                        await asyncio.wait_for(asyncio.shield(join_task), timeout=JOIN_MEDIA_CONFIRM_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        # wait_for also propagates TimeoutError raised *by* play.
+                        # Never mistake a completed failed transport for a pending one.
+                        if join_task.done():
+                            join_task.result()
+                        self._vc_event_log(order_id, account_id, "join_in_flight", {"chat_id": chat_id})
+                        try:
+                            await asyncio.wait_for(asyncio.shield(join_task), timeout=_JOIN_PENDING_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            if join_task.done():
+                                join_task.result()
+                            return False, f"Join request unresolved after {_JOIN_PENDING_TIMEOUT}s (retry deferred)"
+                except asyncio.CancelledError:
+                    raise
                 except FloodWait as e:
                     wait_s = int(getattr(e, "value", 3) or 3)
-                    # Persist the server timer even when this path is used
-                    # directly by monitor recovery (no retry wrapper there).
-                    voice_cooldown.record(
-                        account_id, wait_s,
-                        operation="play_silence", source="JoinGroupCall",
-                    )
-                    self._vc_event_log(order_id, account_id, "floodwait", {"wait_s": wait_s})
-                    self._inflight_joins.pop(join_key, None)
+                    voice_cooldown.record(account_id, wait_s, operation="play_silence", source="JoinGroupCall")
                     return False, f"FloodWait:{wait_s}"
                 except GroupCallInvalid:
-                    # GroupCallInvalid might be transient — refresh and retry
-                    # once before failing. Don't immediately mark as failed.
-                    self._vc_event_log(order_id, account_id, "groupcall_invalid_on_join", {"chat_id": chat_id})
-                    self._inflight_joins.pop(join_key, None)
                     await self._force_refresh_call(app, chat_id)
-                    # Allow retry by returning False instead of permanent failure
                     return False, "GroupCallInvalid (retrying)"
-                except asyncio.CancelledError:
-                    if not join_task.done():
-                        join_task.cancel()
-                        await asyncio.gather(join_task, return_exceptions=True)
-                    if self._inflight_joins.get(join_key) is join_task:
+                except Exception as exc:
+                    detail = str(exc) or type(exc).__name__
+                    logger.warning("[VoiceJoinDiag] order=%s acc=%s chat=%s transport_failed=%s: %s",
+                                   order_id, account_id, chat_id, type(exc).__name__, detail[:200])
+                    if _is_transient(exc):
+                        return False, f"Join transport failed: {type(exc).__name__}: {detail[:80]} (retry deferred)"
+                    return False, f"Join error: {type(exc).__name__}: {detail[:80]}"
+                finally:
+                    if join_task.done() and self._inflight_joins.get(join_key) is join_task:
                         self._inflight_joins.pop(join_key, None)
-                    raise
-                except asyncio.TimeoutError:
-                    # Media join still propagating → Telegram may have already
-                    # registered the user.  Fall back to the presence listing
-                    # for a bounded grace window, then give up this attempt.
-                    self._vc_event_log(order_id, account_id, "join_in_flight", {"chat_id": chat_id})
-                except Exception as e:
-                    err_str = str(e)
-                    if not err_str:
-                        # Empty-message exceptions (asyncio.TimeoutError, a bare
-                        # ConnectionError, ...) must expose their type name,
-                        # otherwise the failure is logged as "Join error: "
-                        # and misclassified as non-retryable UNKNOWN.
-                        err_str = type(e).__name__
-                    self._inflight_joins.pop(join_key, None)
-                    # Be lenient with voice call state errors - they may be transient
-                    if "forbidden" in err_str.lower() or "groupcall_forbidden" in err_str.lower():
-                        self._vc_event_log(order_id, account_id, "groupcall_forbidden_on_join", {
-                            "chat_id": chat_id, "error": err_str[:80],
-                        })
-                        # Allow retry instead of immediate failure
-                        return False, f"GroupCall Forbidden (retrying): {err_str[:40]}"
-                    if "already" not in err_str.lower() and not _is_transient(e):
-                        return False, f"Join error: {err_str[:60]}"
-                    # transient → fall through to the presence fallback below
-                    self._vc_event_log(order_id, account_id, "transport_uncertain", {
-                        "chat_id": int(chat_id), "error": err_str[:120],
-                    })
 
-                if media_confirmed:
-                    # play() completed → transport up → account IS in the call.
-                    await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True)
+                # play() completion confirms the transport; presence listing
+                # alone is not enough to prove a stable voice connection.
+                if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=True):
                     self._set_state(order_id, account_id, JOINED, "media transport confirmed", {"voice_chat_id": chat_id})
-                    self._inflight_joins.pop(join_key, None)
-                    # A successful join proves the account action is no
-                    # longer flooded — clear any stale cooldown.
                     voice_cooldown.clear(account_id)
                     self._vc_event_log(order_id, account_id, "joined_media_confirmed", {"chat_id": int(chat_id)})
                     return True, "Joined"
-
-                transport_warning = True
-
-                # Verify presence via Telegram API (grace period). Telegram
-                # propagation can be slow, so while presence is UNKNOWN (None) or
-                # not-yet-propagated (False), we keep waiting. Only a confirmed
-                # True registers the account. On grace expiry the bounded retry
-                # layer recovers with backoff.
-                self._set_state(order_id, account_id, VERIFYING, "verifying presence")
-                for verify_attempt in range(VOICE_VERIFICATION_GRACE_CHECKS):
-                    status = await self._is_in_voice_call(app, chat_id)
-                    if status is True:
-                        if await self._verify_and_register_join(app, chat_id, account_id, order_id, target, presence=status):
-                            self._set_state(order_id, account_id, JOINED, "presence confirmed", {"voice_chat_id": chat_id})
-                            if transport_warning:
-                                self._vc_event_log(order_id, account_id, "confirmed_joined_after_transport_warning", {
-                                    "chat_id": int(chat_id),
-                                    "verdict": "confirmed_joined",
-                                })
-                            if join_task.done():
-                                self._inflight_joins.pop(join_key, None)
-                            return True, "Joined"
-                    # None (unknown) / False → keep waiting until grace expires.
-                    if verify_attempt + 1 < VOICE_VERIFICATION_GRACE_CHECKS:
-                        await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
-
-                # Do not issue a second JoinGroupCall while the first request
-                # is still unresolved. Telegram may register the participant
-                # well after the media future's normal operation timeout.
-                if not join_task.done():
-                    pending_until = time.monotonic() + _JOIN_PENDING_TIMEOUT
-                    while not join_task.done() and time.monotonic() < pending_until:
-                        status = await self._is_in_voice_call(app, chat_id)
-                        if status is True:
-                            if await self._verify_and_register_join(
-                                app, chat_id, account_id, order_id, target, presence=True
-                            ):
-                                self._set_state(
-                                    order_id, account_id, JOINED,
-                                    "presence confirmed while join transport was pending",
-                                    {"voice_chat_id": chat_id},
-                                )
-                                self._vc_event_log(order_id, account_id, "joined_while_transport_pending", {
-                                    "chat_id": int(chat_id),
-                                    "pending_timeout_s": _JOIN_PENDING_TIMEOUT,
-                                })
-                                if join_task.done():
-                                    self._inflight_joins.pop(join_key, None)
-                                return True, "Joined"
-                        await asyncio.sleep(VOICE_VERIFICATION_GRACE_INTERVAL)
-                    if not join_task.done():
-                        return False, (
-                            f"Join request unresolved after {_JOIN_PENDING_TIMEOUT}s "
-                            "(retry deferred)"
-                        )
-                    try:
-                        join_task.result()
-                    except Exception as exc:
-                        exc_str = str(exc)
-                        if not exc_str:
-                            exc_str = type(exc).__name__
-                        if _is_transient(exc):
-                            return False, f"Join transport failed: {exc_str[:80]} (retry deferred)"
-                        return False, f"Join error: {exc_str[:60]} (retry deferred)"
-
-                self._inflight_joins.pop(join_key, None)
-                self._set_state(order_id, account_id, RETRY_PENDING, "presence verification failed (timeout)")
-                return False, "Join verification failed (timeout)"
+                return False, "Join registration failed (retry deferred)"
             except asyncio.CancelledError:
                 # Cancellation may arrive during presence verification, not just
                 # while awaiting play(). Do not leave a shielded native join behind.
@@ -3026,7 +2926,7 @@ class VoiceCallManager:
         base_delay = 1.0
         last_msg = "Join failed"
         attempt = 0
-        wall_timeout = _JOIN_PENDING_TIMEOUT + 30
+        wall_timeout = JOIN_MEDIA_CONFIRM_TIMEOUT + _JOIN_PENDING_TIMEOUT + 15
         while attempt < hard_limit:
             attempt += 1
             # Honor a FloodWait cooldown recorded by ANY code path (a prior
@@ -3248,10 +3148,8 @@ class VoiceCallManager:
                         by_chat.setdefault(chat_id, []).append(acc_id)
                         acc_info[acc_id] = rec
 
-                # New monitor cycle → refresh the shared participant snapshot.
-                self._monitor_cycle_ts = time.time()
-                self._participant_snapshot.clear()
-
+                # Refresh each chat independently; other orders must not
+                # clear or rewrite this monitor's cycle marker.
                 for chat_id, acc_ids in by_chat.items():
                     # Pick one representative app for this chat.
                     rep_app = None
@@ -3264,7 +3162,7 @@ class VoiceCallManager:
 
                     # ONE shared participant fetch per chat per cycle.
                     present_ids = await self._fetch_shared_participants(rep_app, chat_id)
-                    self._participant_snapshot[chat_id] = (self._monitor_cycle_ts, present_ids)
+                    self._participant_snapshot[chat_id] = (time.monotonic(), present_ids)
 
                     for acc_id in acc_ids:
                         if acc_id not in self.joined_accounts_by_order.get(order_id, {}):
@@ -3892,6 +3790,8 @@ class VoiceCallManager:
             inflight.cancel()
             await asyncio.gather(inflight, return_exceptions=True)
         if not chat_id and info is None and not (self.joined_accounts_by_order.get(order_id, {})):
+            await self._cleanup_client(account_id, order_id=order_id, force=cleanup_client)
+            await self.release_account_reservation(order_id, account_id)
             return True, "Not active"
 
         # Remove from persistent joined state (order is ending / cancelling).
@@ -3989,6 +3889,8 @@ class VoiceCallManager:
         key_set = {k for k in self.active_calls.keys() if k[0] == order_id}
         for aid in list((self.joined_accounts_by_order.get(order_id) or {}).keys()):
             key_set.add((order_id, aid))
+        for aid in self._reservations.get(order_id, set()):
+            key_set.add((order_id, aid))
         keys = list(key_set)
 
         # Stop the shared monitor FIRST so it cannot rejoin while we leave.
@@ -4044,6 +3946,11 @@ class VoiceCallManager:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Failed leaves retain their leases and state for an explicit retry;
+        # never release a potentially live session to another order.
+        if self._reservations.get(order_id):
+            logger.error("[VoiceLeave] order=%s has %s accounts still reserved after cleanup", order_id, len(self._reservations[order_id]))
+            return len(keys)
         self._order_accounts.pop(order_id, None)
         self._reservations.pop(order_id, None)
         self.order_chat_ids.pop(order_id, None)
