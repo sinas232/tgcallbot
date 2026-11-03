@@ -62,6 +62,7 @@ class OrderExecutor:
 		self._voice_attempts: Dict[int, Dict[int, int]] = {}  # account_id -> driver attempts
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
+		self._voice_deferred: Dict[int, Dict[int, int]] = {}  # consecutive infra deferrals
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
@@ -400,6 +401,7 @@ class OrderExecutor:
 	    self._voice_attempts.pop(order_id, None)
 	    self._voice_banned.pop(order_id, None)
 	    self._voice_retry_after.pop(order_id, None)
+	    self._voice_deferred.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
 
 	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
@@ -483,6 +485,14 @@ class OrderExecutor:
 	        chosen.append(acc)
 	    self._voice_cursor[order_id] = cursor % n if n else 0
 	    return chosen
+
+	def _voice_defer_delay(self, order_id: int, account_id: int, *, busy: bool = False) -> int:
+	    """Back off repeated infrastructure deferrals without spending account budget."""
+	    if busy:
+	        return 5
+	    counts = self._voice_deferred.setdefault(order_id, {})
+	    counts[account_id] = counts.get(account_id, 0) + 1
+	    return min(180, 15 * (2 ** min(counts[account_id] - 1, 4)))
 
 	def _voice_earliest_retry(self, order_id: int, joined_ids: Set[int]) -> Optional[float]:
 	    """Earliest retry timestamp among pool accounts not yet exhausted."""
@@ -676,6 +686,7 @@ class OrderExecutor:
 	            if isinstance(res, Exception):
 	                res = {"success": False, "status": "error", "msg": str(res)}
 	            if res.get("success"):
+	                self._voice_deferred.get(order_id, {}).pop(aid, None)
 	                if aid not in joined_ids:
 	                    joined_list.append(res)
 	                    joined_ids.add(aid)
@@ -701,7 +712,9 @@ class OrderExecutor:
 	                    # Wave deadline cancelled a still-joining account.  This
 	                    # is a scheduling artifact, NOT an account fault — keep
 	                    # the retry budget and retry soon in the next wave.
-	                    delay = 15 if "transport" in msg.lower() or "timeout" in msg.lower() else 5
+	                    delay = self._voice_defer_delay(
+	                        order_id, aid, busy="Account busy in another voice order" in msg,
+	                    )
 	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
 	                    logger.info(
 	                        f"Order {order_id}: account {aid} deferred ({msg[:80]}) - "

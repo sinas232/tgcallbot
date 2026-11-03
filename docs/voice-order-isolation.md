@@ -47,3 +47,16 @@ separately frozen account; they do not identify why the transport timed out.
 The later 1205 logs show joins succeeding, but report deployed commit 2d67ac8
 and staged local changes, not this branch. Preserve those changes and reconcile
 versions before deployment; do not overwrite the production checkout blindly.
+
+## Repeated control-plane timeouts
+
+Wave deadlines can cancel an attempt before the media join starts. Cancellation
+moves an unjoined account to `RETRY_PENDING` before cleanup and the next attempt.
+Best-effort online status is bounded; client initialization, chat resolution,
+and membership emit `[VoiceStage]` on timeout. Consecutive infrastructure
+ deferrals use per-order/account exponential backoff (15–180 seconds) without
+consuming the account's failure budget; successful joins reset that counter.
+This limits retry pressure, but deliberately does not declare an incomplete paid
+order completed or automatically terminate it. An operator must investigate
+persistent outages. MTProto request timeouts, media transport timeouts and
+account restrictions have different causes and must not be conflated.

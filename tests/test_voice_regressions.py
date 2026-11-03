@@ -1298,3 +1298,67 @@ class OrderLifecycleRaceTests(unittest.IsolatedAsyncioTestCase):
         await mgr._cleanup_client(7, order_id=1)
         self.assertIs(mgr.pyrogram_clients[7], app)
         self.assertIn(7, mgr._quarantined_accounts)
+
+@unittest.skipUnless(HAS_TG, "pytgcalls/pyrogram not installed")
+class WaveTimeoutRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_client_started_retries_via_retry_pending(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        entered = asyncio.Event()
+        async def blocked(*args):
+            mgr._set_state(10, 7, vcm_mod.STARTING)
+            mgr._set_state(10, 7, vcm_mod.CLIENT_STARTED)
+            entered.set()
+            await asyncio.Event().wait()
+        mgr._start_call_owned = blocked
+        mgr._cleanup_client = AsyncMock()
+        task = asyncio.create_task(mgr.start_call(10, 7, "session", "target"))
+        await entered.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(mgr._state(10, 7), vcm_mod.RETRY_PENDING)
+        with self.assertNoLogs(vcm_mod.logger.name, level="WARNING"):
+            mgr._set_state(10, 7, vcm_mod.STARTING, "retry")
+        self.assertNotIn(7, mgr.get_reserved_account_ids())
+
+    async def test_resolve_timeout_is_deferred_without_marking_account_dead(self):
+        from unittest.mock import AsyncMock, patch
+        mgr = VoiceCallManager()
+        mgr._get_or_create_client = AsyncMock(return_value=object())
+        mgr.pyrogram_clients[7] = object()
+        mgr._set_online_status = AsyncMock()
+        mgr._cleanup_client = AsyncMock()
+        async def blocked(*args):
+            await asyncio.Event().wait()
+        mgr._resolve_chat_id = blocked
+        with patch.object(vcm_mod, "_JOIN_ATTEMPT_TIMEOUT", 0.01):
+            ok, msg, _ = await mgr.start_call(10, 7, "session", "target")
+        self.assertFalse(ok)
+        self.assertIn("resolution timeout", msg)
+        self.assertIn("retry deferred", msg)
+        self.assertEqual(mgr._state(10, 7), vcm_mod.RETRY_PENDING)
+        mgr._cleanup_client.assert_awaited_once()
+
+    async def test_deferred_backoff_is_order_scoped_and_budget_is_untouched(self):
+        ex = order_executor_mod.OrderExecutor()
+        ex._voice_state(10)
+        self.assertEqual([ex._voice_defer_delay(10, 7) for _ in range(6)], [15, 30, 60, 120, 180, 180])
+        self.assertEqual(ex._voice_defer_delay(11, 7), 15)
+        self.assertEqual(ex._voice_defer_delay(10, 8, busy=True), 5)
+        self.assertEqual(ex._voice_attempts[10], {})
+        ex._voice_forget_order(10)
+        self.assertNotIn(10, ex._voice_deferred)
+        self.assertIn(11, ex._voice_deferred)
+
+    async def test_client_init_timeout_is_deferred_and_preserves_reason(self):
+        from unittest.mock import AsyncMock
+        mgr = VoiceCallManager()
+        mgr._get_or_create_client = AsyncMock(side_effect=asyncio.TimeoutError())
+        mgr._cleanup_client = AsyncMock()
+        ok, msg, _ = await mgr.start_call(10, 7, "session", "target")
+        self.assertFalse(ok)
+        self.assertIn("TimeoutError", msg)
+        self.assertIn("retry deferred", msg)
+        self.assertEqual(mgr._state(10, 7), vcm_mod.RETRY_PENDING)
+        mgr._cleanup_client.assert_awaited_once()

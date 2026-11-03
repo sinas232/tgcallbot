@@ -385,8 +385,8 @@ _VALID_TRANSITIONS = {
     RECONNECTING: {REJOINING, TEMPORARILY_UNKNOWN, FAILED},
     REJOINING: {VERIFYING, RATE_LIMITED, RETRY_PENDING, FAILED},
     RATE_LIMITED: {RETRY_PENDING, FAILED, LEAVING},
-    RETRY_PENDING: {JOINING, VERIFYING, FAILED, LEAVING},
-    FAILED: {LEAVING, COMPLETED},
+    RETRY_PENDING: {STARTING, JOINING, VERIFYING, FAILED, LEAVING},
+    FAILED: {STARTING, LEAVING, COMPLETED},
     LEAVING: {COMPLETED},
     COMPLETED: set(),
 }
@@ -1933,8 +1933,13 @@ class VoiceCallManager:
                 # engine is reusable as long as that coroutine answers.
                 healthy = False
                 try:
-                    await pytg.group_calls
+                    await asyncio.wait_for(pytg.group_calls, timeout=_JOIN_ATTEMPT_TIMEOUT)
                     healthy = True
+                except asyncio.TimeoutError:
+                    # An unresponsive binding is not proof it is safe to tear
+                    # down or rebuild; defer and let ownership cleanup decide.
+                    logger.warning("[VoiceStage] order=%s acc=%s stage=engine_probe timeout=%ss", order_id, account_id, _JOIN_ATTEMPT_TIMEOUT)
+                    raise
                 except Exception as e:
                     logger.warning(
                         "pytgcalls engine unhealthy acc=%s (%s) — rebuilding",
@@ -3577,6 +3582,16 @@ class VoiceCallManager:
             return False, "Account busy in another voice order (retry deferred)", 0
         try:
             return await self._start_call_owned(order_id, account_id, session_string, chat_link, duration_minutes)
+        except asyncio.CancelledError:
+            # A wave deadline can cancel a pre-join account while it is in
+            # CLIENT_STARTED/JOINING. Mark the retry explicitly before the
+            # next wave starts; a joined slot must never be downgraded here.
+            state = self._state(order_id, account_id)
+            if ((order_id, account_id) not in self.active_calls
+                    and account_id not in self.joined_accounts_by_order.get(order_id, {})
+                    and state in (STARTING, CLIENT_STARTED, JOINING, VERIFYING, RATE_LIMITED)):
+                self._set_state(order_id, account_id, RETRY_PENDING, "join attempt cancelled; cleanup pending")
+            raise
         finally:
             # Failed or cancelled attempts can still have registered remotely.
             # Clean them before allowing another order to use the session.
@@ -3669,6 +3684,11 @@ class VoiceCallManager:
                                       operation="client_init", source="get_or_create_client")
                 self._set_state(order_id, account_id, RATE_LIMITED, f"floodwait during client init", {"flood_wait_seconds": wait_s})
                 return False, f"FloodWait:{wait_s}", 0
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                detail = str(e) or type(e).__name__
+                self._set_state(order_id, account_id, RETRY_PENDING, f"client init temporarily unavailable: {detail}")
+                logger.warning("[VoiceStage] order=%s acc=%s stage=client_init error=%s", order_id, account_id, type(e).__name__)
+                return False, f"Client init network failure: {type(e).__name__} (retry deferred)", 0
             except Exception as e:
                 self._set_state(order_id, account_id, FAILED, f"client init error: {e}")
                 return False, f"Client Init Error: {e}", 0
@@ -3688,13 +3708,23 @@ class VoiceCallManager:
 
                 # STEP 1: Set online
                 try:
-                    await self._set_online_status(app)
+                    # Online status is optional. A stalled update must not
+                    # monopolize the entire wave's 120-second deadline.
+                    await asyncio.wait_for(self._set_online_status(app), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[VoiceStage] order=%s acc=%s stage=online timeout (continuing)", order_id, account_id)
                 except Exception:
                     pass
 
                 # STEP 2: Resolve chat_id
                 try:
-                    chat_id = await self._resolve_chat_id(app, order_id, target)
+                    chat_id = await asyncio.wait_for(
+                        self._resolve_chat_id(app, order_id, target), timeout=_JOIN_ATTEMPT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    self._set_state(order_id, account_id, RETRY_PENDING, "chat resolution timed out")
+                    logger.warning("[VoiceStage] order=%s acc=%s stage=resolve timeout=%ss", order_id, account_id, _JOIN_ATTEMPT_TIMEOUT)
+                    return False, "Chat resolution timeout (retry deferred)", 0
                 except RuntimeError as e:
                     self._set_state(order_id, account_id, FAILED, f"resolve error: {e}")
                     return False, str(e), 0
@@ -3708,7 +3738,13 @@ class VoiceCallManager:
 
                 # STEP 3: Ensure membership
                 try:
-                    await self._ensure_membership(app, int(chat_id), target)
+                    await asyncio.wait_for(
+                        self._ensure_membership(app, int(chat_id), target), timeout=_JOIN_ATTEMPT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    self._set_state(order_id, account_id, RETRY_PENDING, "group membership timed out")
+                    logger.warning("[VoiceStage] order=%s acc=%s stage=membership timeout=%ss", order_id, account_id, _JOIN_ATTEMPT_TIMEOUT)
+                    return False, "Group membership timeout (retry deferred)", int(chat_id)
                 except Exception as e:
                     self._set_state(order_id, account_id, FAILED, f"membership failed: {e}")
                     return False, str(e), int(chat_id)
