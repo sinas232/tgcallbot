@@ -156,12 +156,20 @@ async def _probe(args: argparse.Namespace) -> int:
     from database import DatabaseManager
     from telegram_client import TelegramAccountClient
     from services import media_diagnostics as diag
+    from services import voice_call_manager as vcm_mod
 
     print("=" * 70)
     print("JOIN PROBE (single account, single chat)")
     print("=" * 70)
 
-    host = await diag.collect(timeout=1.5)
+    try:
+        _px = vcm_mod._voice_proxy_config()
+    except Exception:
+        _px = None
+    host = await diag.collect(
+        timeout=1.5,
+        proxy=(str(_px.get("hostname")), int(_px.get("port"))) if _px else None,
+    )
     print(f"  host: {diag.format_report(host)}")
     print(f"  api_id={Config.TELEGRAM_API_ID}")
 
@@ -182,6 +190,11 @@ async def _probe(args: argparse.Namespace) -> int:
     await app.start()
     me = await app.get_me()
     dc_id = getattr(getattr(app, "storage", None), "dc_id", "?")
+    if callable(dc_id):            # pyrogram exposes dc_id as a method
+        try:
+            dc_id = dc_id()
+        except Exception:
+            dc_id = "?"
     print(f"  connected in {time.monotonic() - started:.1f}s as "
           f"id={getattr(me, 'id', '?')} dc={dc_id}")
 
@@ -228,7 +241,6 @@ async def _probe(args: argparse.Namespace) -> int:
     # ── the actual media join, with the exact same silence stream as prod ──
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
-    from services import voice_call_manager as vcm_mod
 
     engine = PyTgCalls(app)
     engine_started = time.monotonic()

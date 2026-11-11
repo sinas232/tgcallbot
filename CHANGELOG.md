@@ -9,6 +9,30 @@
 
 ---
 
+## ویس: علتِ live=0 پیدا شد — پروکسیِ SOCKS5 مُرده (۱۴۰۵/۰۸/۲۰ ب)
+
+<div dir="rtl">
+
+**علت:** در استقرار، `USE_PROXY=true` با `SOCKS5_HOST=payproxy` و
+`SOCKS5_PORT=8888` تنظیم شده بود. `payproxy` کانتینرِ tinyproxy **HTTP** برای
+درگاه‌های پرداخت است، نه SOCKS5. پس هر کلاینتِ ویس تا ۲۰ ثانیه در
+`Connecting ... via SOCKS5Proxy` می‌ماند و `TimeoutError` می‌داد: هیچ اکانتی به
+`play()` نمی‌رسید و سفارش‌ها ساعت‌ها `live=0` می‌ماندند. پروبِ بدون‌پروکسی
+همان چت را در ۱٫۹ ثانیه join کرد؛ پس مسیر مدیا و خودِ کال سالم بودند.
+
+- **فیکسِ فوری (سرور):** `USE_PROXY=false` و `--force-recreate` در پنجرهٔ بی‌سفارش.
+- **فیکسِ کد:** preflight پروکسی قبل از ساختِ کلاینت + fail-open به اتصال مستقیم
+  با خطِ `CRITICAL` (مگر `VOICE_PROXY_REQUIRED=true`)؛ تلاشِ دوباره بدونِ پروکسی
+  وقتی `start()` با خطای اتصال بیفتد (با اثباتِ بسته‌شدنِ کلاینتِ قبلی تا کلید
+  قرنطینه بماند)؛ `proxy=ok|DEAD|off` در `[MediaProbe]` و `tools/media_diag.py`.
+- **ابزار:** `tools/prod_join_probe.py` (مسیرِ واقعیِ `VoiceCallManager`، حالتِ
+  `--presence-only`) و `tools/join_probe.py` (شناسهٔ عددی، `--list-voice-chats`).
+- **تست:** ۸۲۷ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۰ تست).
+
+</div>
+
+---
+
 ## ویس: پایانِ بیلدِ صفر + بریکرِ مسیر مدیا + پروبِ خودکار (۱۴۰۵/۰۸/۲۰)
 
 <div dir="rtl">

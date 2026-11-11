@@ -32,13 +32,25 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from services.media_diagnostics import collect, format_report, verdict  # noqa: E402
 
 
+def _proxy_endpoint():
+    """The SOCKS5 endpoint the voice clients use (None when USE_PROXY is off)."""
+    try:
+        from services import voice_call_manager as vcm
+        proxy = vcm._voice_proxy_config()
+    except Exception:
+        return None
+    if not proxy:
+        return None
+    return (str(proxy.get("hostname")), int(proxy.get("port")))
+
+
 def main() -> int:
-    report = asyncio.run(collect())
+    report = asyncio.run(collect(proxy=_proxy_endpoint()))
     print("=" * 68)
     print("Voice MEDIA path diagnostic (read-only)")
     print("=" * 68)
     for key in ("udp_dns_ok", "udp_replies", "warp_mtu", "zombies",
-                "ffmpeg_children"):
+                "ffmpeg_children", "proxy_target", "proxy_ok"):
         print(f"  {key:<16} = {report.get(key)}")
     print("-" * 68)
     print(verdict(report))
@@ -48,6 +60,8 @@ def main() -> int:
     udp = report.get("udp_dns_ok")
     mtu = report.get("warp_mtu")
     zombies = report.get("zombies")
+    if report.get("proxy_ok") is False:
+        return 1
     if udp is False:
         return 1
     if isinstance(mtu, int) and mtu >= 1420:

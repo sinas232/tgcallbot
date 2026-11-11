@@ -176,12 +176,19 @@ async def _probe(args) -> int:
     print("=" * 70)
     print("PRODUCTION JOIN PROBE (VoiceCallManager path)")
     print("=" * 70)
-    host = await diag.collect(timeout=1.5)
+    try:
+        _px = vcm_mod._voice_proxy_config()
+    except Exception:
+        _px = None
+    host = await diag.collect(
+        timeout=1.5,
+        proxy=(str(_px.get("hostname")), int(_px.get("port"))) if _px else None,
+    )
     print(f"  host: {diag.format_report(host)}")
     print(f"  api_id={Config.TELEGRAM_API_ID} order={order_id} "
           f"silence_mode={getattr(Config, 'VOICE_SILENCE_MODE', '?')} "
           f"join_timeout={getattr(Config, 'VOICE_JOIN_MEDIA_TIMEOUT', '?')}s "
-          f"proxy={'on' if vcm_mod._voice_proxy_config() else 'off'}")
+          f"proxy={('on -> ' + str(_px.get('hostname')) + ':' + str(_px.get('port'))) if _px else 'off'}")
 
     row = await DatabaseManager.get_account_by_id(int(args.account))
     if not row:

@@ -35,6 +35,54 @@
 
 ---
 
+## ۰٫۵) علتِ واقعی (۱۴۰۵-۰۸-۲۰، اجرای پروبِ دوم) — پروکسیِ SOCKS5 مُرده
+
+`tools/prod_join_probe.py` مسیرِ **خودِ ربات** را اجرا کرد و همین‌جا خطِ
+
+```
+INFO services.voice_call_manager: VoiceCallManager SOCKS5 proxy ENABLED for voice clients -> payproxy:8888
+INFO pyrogram.connection.transport.tcp.tcp: Connecting to 91.108.56.130:443 via proxy SOCKS5Proxy(hostname='payproxy', port=8888)
+WARNING pyrogram.connection.connection: Unable to connect due to network issues: Connection timed out
+  CLIENT/ENGINE FAILED: TimeoutError
+```
+
+حقیقت را نشان داد: کلاینتِ ویسِ **هر** اکانت از `payproxy:8888` رد می‌شد و آن
+هندل نمی‌داد. `payproxy` همان کانتینرِ **tinyproxy (HTTP)** برای درگاه‌های پرداخت
+ایرانی است؛ SOCKS5 نیست و در نت‌نمی WARP هم به آن نمی‌رسیم. نتیجه:
+
+- `_create_pyrogram_client_locked` با `TimeoutError` می‌افتاد ⇒ هیچ اکانتی به
+  `play()` نمی‌رسید ⇒ `live=0` برای ساعت‌ها، بدون هیچ `[VoiceJoinDiag]` در لاگ
+  (چون شکست **قبل** از join بود).
+- `tools/join_probe.py` پروکسی ندارد و مستقیم وصل می‌شود؛ به همین دلیل همان چت
+  را در **۱٫۹ ثانیه** join کرد — هم داخلِ WARP، هم بیرونِ آن. مسیرِ مدیا سالم بود.
+
+### فیکسِ سرور (فوری، بدون تغییر کد)
+
+```bash
+cd /opt/tgcallbot
+grep -nE '^(USE_PROXY|SOCKS5_)' .env      # اگر SOCKS5_HOST=payproxy بود ⇒ همین باگ
+sed -i 's/^USE_PROXY=.*/USE_PROXY=false/' .env
+docker compose config --quiet && docker compose up -d --force-recreate bot
+```
+
+اگر واقعاً پروکسی می‌خواهید، فقط SOCKS5 معتبر (پیش‌فرضِ compose: `127.0.0.1:1080`
+داخل نت‌نمِ warp) قابل استفاده است. `payproxy:8888` هرگز گزینهٔ درستی نبود.
+
+### فیکسِ کد (تا دیگر تکرار نشود)
+
+- **پیش‌بررسی (preflight):** قبل از ساختِ کلاینت، یک TCP-connect با تایم‌اوت
+  `VOICE_PROXY_PREFLIGHT_TIMEOUT` (پیش‌فرض ۳s، نتیجه ۶۰s کش) به
+  `SOCKS5_HOST:SOCKS5_PORT` زده می‌شود.
+- **fail-open:** اگر پروکسی جواب نداد، یک خطِ `CRITICAL` با نامِ هدف چاپ می‌شود و
+  کلاینت‌ها **مستقیم** وصل می‌شوند (`_disable_voice_proxy`). با
+  `VOICE_PROXY_REQUIRED=true` رفتار برعکس است: خطای صریح و توقف.
+- اگر با وجودِ preflight سبز، `client.start()` با خطای اتصال بیفتد، یک‌بار
+  **بدون** پروکسی تلاش می‌شود؛ اما کلاینتِ قبلی اول باید *اثباتاً* بسته شود،
+  وگرنه کلید در قرنطینه می‌ماند (همان invariant تست‌های `test_session_safety`).
+- گزارشِ `[MediaProbe]`/`tools/media_diag.py` حالا
+  `proxy=ok|DEAD|off` و `proxy_target=host:port` را هم نشان می‌دهد؛ `proxy=DEAD`
+  در `verdict()` بالاتر از همهٔ علت‌های دیگر می‌آید.
+
 ## ۱) نگاشت لاگ به کد
 
 | خط لاگ | معنی |
@@ -188,7 +236,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۱۷ تست، ۸۱۱ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۲۷ تست، ۸۲۱ موفق، ۶ skip**.
 
 ---
 

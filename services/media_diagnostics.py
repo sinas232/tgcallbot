@@ -139,8 +139,39 @@ def collect_static(proc_root: str = PROC_ROOT,
     return out
 
 
-async def collect(timeout: float = PROBE_TIMEOUT_S, **kwargs: Any) -> Dict[str, Any]:
-    """Full report: UDP egress (3 resolvers) + WARP MTU + zombie/ffmpeg counts."""
+async def probe_tcp(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> Optional[bool]:
+    """Can a TCP connection be opened to ``host:port``?  ``None`` = unknown."""
+    if not host:
+        return None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(str(host), int(port)), max(0.5, float(timeout)))
+    except asyncio.TimeoutError:
+        return False
+    except (OSError, ValueError):
+        return False
+    except Exception as exc:
+        logger.debug("tcp probe %s:%s inconclusive: %r", host, port, exc)
+        return None
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception as exc:
+        logger.debug("tcp probe close failed: %r", exc)
+    return True
+
+
+async def collect(timeout: float = PROBE_TIMEOUT_S,
+                  proxy: Optional[Tuple[str, int]] = None,
+                  **kwargs: Any) -> Dict[str, Any]:
+    """Full report: UDP egress (3 resolvers) + WARP MTU + zombie/ffmpeg counts.
+
+    ``proxy`` is the SOCKS5 endpoint the voice clients use, if any.  A dead
+    proxy is the single most expensive misconfiguration we have seen: every
+    Pyrogram client start times out, no account ever reaches play(), and the
+    order sits at ``live=0`` while the media path is perfectly healthy
+    (incident 2026-11-11), so it is probed here as a first-class signal.
+    """
     report = collect_static(**kwargs)
     per_probe: Dict[str, Optional[bool]] = {}
     try:
@@ -165,6 +196,12 @@ async def collect(timeout: float = PROBE_TIMEOUT_S, **kwargs: Any) -> Dict[str, 
         report["udp_dns_ok"] = False
     else:
         report["udp_dns_ok"] = None
+    if proxy:
+        report["proxy_target"] = f"{proxy[0]}:{proxy[1]}"
+        report["proxy_ok"] = await probe_tcp(proxy[0], proxy[1], timeout=timeout)
+    else:
+        report["proxy_target"] = None
+        report["proxy_ok"] = None
     return report
 
 
@@ -173,6 +210,12 @@ def verdict(report: Dict[str, Any]) -> str:
     udp = report.get("udp_dns_ok")
     mtu = report.get("warp_mtu")
     zombies = report.get("zombies")
+    if report.get("proxy_ok") is False:
+        return (f"the SOCKS5 proxy for voice clients "
+                f"({report.get('proxy_target')}) accepts NO TCP connection -> every "
+                "voice client start times out and no account can join. Point "
+                "USE_PROXY/SOCKS5_HOST/SOCKS5_PORT at a real SOCKS5 proxy or set "
+                "USE_PROXY=false (an HTTP proxy such as payproxy cannot be used).")
     if udp is False:
         return ("UDP egress looks BLOCKED from this container -> WebRTC media "
                 "cannot work; fix the provider/host firewall or the WARP path "
@@ -194,9 +237,14 @@ def verdict(report: Dict[str, Any]) -> str:
 
 def format_report(report: Dict[str, Any]) -> str:
     """Single-line log payload (no secrets, easy to grep)."""
+    proxy_ok = report.get("proxy_ok")
+    proxy_txt = "off" if proxy_ok is None else ("ok" if proxy_ok else "DEAD")
     parts = [f"udp_dns_ok={report.get('udp_dns_ok')}",
              f"udp_replies={report.get('udp_replies')}",
              f"warp_mtu={report.get('warp_mtu')}",
              f"zombies={report.get('zombies')}",
-             f"ffmpeg_children={report.get('ffmpeg_children')}"]
+             f"ffmpeg_children={report.get('ffmpeg_children')}",
+             f"proxy={proxy_txt}"]
+    if report.get("proxy_target"):
+        parts.append(f"proxy_target={report.get('proxy_target')}")
     return " ".join(parts) + " | " + verdict(report)

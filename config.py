@@ -78,6 +78,12 @@ class Config:
     SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', '1080') or 1080)
     SOCKS5_USERNAME = os.getenv('SOCKS5_USERNAME', '') or None
     SOCKS5_PASSWORD = os.getenv('SOCKS5_PASSWORD', '') or None
+    # A dead/incorrect SOCKS5 endpoint must not silently zero out a paid order.
+    # The voice client preflights the endpoint and, unless this is true, falls
+    # back to a DIRECT connection with a critical log line (incident
+    # 2026-11-11: SOCKS5_HOST pointed at the HTTP payproxy ⇒ live=0 for hours).
+    VOICE_PROXY_REQUIRED = os.getenv('VOICE_PROXY_REQUIRED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_PROXY_PREFLIGHT_TIMEOUT = float(os.getenv('VOICE_PROXY_PREFLIGHT_TIMEOUT', '3') or 3)
 
     # Database
     DATABASE_URL = _safe_encode_db_url(os.getenv('DATABASE_URL', ''))

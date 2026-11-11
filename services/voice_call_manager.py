@@ -408,6 +408,121 @@ def _voice_proxy_config() -> Optional[Dict[str, Any]]:
         proxy["password"] = pwd
     return proxy
 
+# ─── VOICE PROXY HEALTH (fail-open) ───────────────────────────────────────
+# Incident 2026-11-11 (orders 1349/1352, live=0/10 and live=0/40 for hours):
+# the deployment had `USE_PROXY=true` with `SOCKS5_HOST=payproxy`,
+# `SOCKS5_PORT=8888`.  `payproxy` is the tinyproxy **HTTP** container that
+# exists for Iranian payment gateways — it does not speak SOCKS5 at all.  Every
+# voice Pyrogram client therefore sat in "Connecting... via SOCKS5Proxy(...)"
+# until the 20s client timeout, so no account ever reached play() and every
+# wave ended at live=0.  The bare `tools/join_probe.py` connected directly and
+# joined in 1.9s, which is what proved the media path itself was fine.
+#
+# A dead proxy must never silently zero out a paid order: it is checked before
+# use and, unless `VOICE_PROXY_REQUIRED=true`, the client falls back to a
+# DIRECT connection with a loud log line naming the target.
+_VOICE_PROXY_STATE: Dict[str, Any] = {
+    "disabled": False,
+    "reason": "",
+    "ok": None,
+    "probed_at": 0.0,
+    "target": "",
+}
+VOICE_PROXY_PREFLIGHT_TTL = 60.0
+
+
+def _voice_proxy_required() -> bool:
+    return bool(getattr(Config, "VOICE_PROXY_REQUIRED", False))
+
+
+def _voice_proxy_target(proxy: Optional[Dict[str, Any]] = None) -> str:
+    proxy = _voice_proxy_config() if proxy is None else proxy
+    if not proxy:
+        return ""
+    return f"{proxy.get('hostname')}:{proxy.get('port')}"
+
+
+def _voice_proxy_circuit_open() -> bool:
+    """True when the proxy was found dead and the process now connects direct."""
+    return bool(_VOICE_PROXY_STATE.get("disabled"))
+
+
+def _disable_voice_proxy(reason: str) -> None:
+    if not _VOICE_PROXY_STATE.get("disabled"):
+        logger.critical(
+            "[VoiceProxy] DISABLED for this process (%s): clients connect DIRECT. "
+            "Fix USE_PROXY/SOCKS5_HOST/SOCKS5_PORT (a SOCKS5 proxy is required; an "
+            "HTTP proxy such as payproxy cannot be used) or set "
+            "VOICE_PROXY_REQUIRED=true to fail closed.", reason,
+        )
+    _VOICE_PROXY_STATE["disabled"] = True
+    _VOICE_PROXY_STATE["reason"] = str(reason)[:200]
+
+
+async def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> Optional[bool]:
+    """``True``/``False`` for a TCP connect attempt, ``None`` when unknown."""
+    try:
+        fut = asyncio.open_connection(host, int(port))
+    except Exception:
+        return False
+    try:
+        _reader, writer = await asyncio.wait_for(fut, timeout=max(0.5, float(timeout)))
+    except asyncio.TimeoutError:
+        return False
+    except (OSError, Exception):
+        return False
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception as exc:  # closing a dead socket is not an error for us
+        logger.debug("proxy preflight close failed: %r", exc)
+    return True
+
+
+def _looks_like_connect_failure(exc: BaseException) -> bool:
+    """Is this exception one that a dead/unreachable proxy produces?"""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(word in text for word in ("socks", "proxy", "timed out", "connect"))
+
+
+async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """The proxy to actually use, after a cached reachability preflight.
+
+    * no proxy configured → ``None`` (direct),
+    * proxy reachable → the proxy dict,
+    * proxy dead and ``VOICE_PROXY_REQUIRED`` off → ``None`` + a one-time
+      critical log (fail-open), so a broken proxy cannot zero out an order,
+    * proxy dead and required → ``RuntimeError`` (fail-closed by choice).
+    """
+    proxy = _voice_proxy_config()
+    if proxy is None:
+        return None
+    target = _voice_proxy_target(proxy)
+    _VOICE_PROXY_STATE["target"] = target
+    if _VOICE_PROXY_STATE["disabled"]:
+        return None
+    now = time.monotonic()
+    probed_at = float(_VOICE_PROXY_STATE.get("probed_at") or 0.0)
+    if probed_at and now - probed_at < VOICE_PROXY_PREFLIGHT_TTL:
+        return proxy if _VOICE_PROXY_STATE.get("ok") else None
+    ok = await _tcp_reachable(
+        str(proxy.get("hostname")), int(proxy.get("port")),
+        timeout=float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0)),
+    )
+    _VOICE_PROXY_STATE["ok"] = ok
+    _VOICE_PROXY_STATE["probed_at"] = now
+    if ok:
+        logger.info("[VoiceProxy] preflight OK acc=%s -> %s (SOCKS5)", account_id, target)
+        return proxy
+    if _voice_proxy_required():
+        raise RuntimeError(
+            f"voice proxy {target} is unreachable and VOICE_PROXY_REQUIRED=true")
+    _disable_voice_proxy(f"preflight failed (no TCP listener on {target})")
+    return None
+
+
 logger.info(
     "VoiceCallManager adapter=native pending_join_timeout=%ss cache_ttl=%ss source=%s",
     _JOIN_PENDING_TIMEOUT,
@@ -416,9 +531,11 @@ logger.info(
 )
 if bool(getattr(Config, "USE_PROXY", False)):
     logger.info(
-        "VoiceCallManager SOCKS5 proxy ENABLED for voice clients -> %s:%s",
+        "VoiceCallManager SOCKS5 proxy ENABLED for voice clients -> %s:%s "
+        "(preflighted before first use; required=%s)",
         getattr(Config, "SOCKS5_HOST", "127.0.0.1"),
         getattr(Config, "SOCKS5_PORT", 4000),
+        bool(getattr(Config, "VOICE_PROXY_REQUIRED", False)),
     )
 if not bool(getattr(Config, "ENABLE_VERBOSE_DIAG", False)):
     logger.info(
@@ -964,7 +1081,10 @@ class VoiceCallManager:
         async def _probe() -> None:
             try:
                 from services import media_diagnostics as diag
-                report = await diag.collect()
+                _px = _voice_proxy_config()
+                report = await diag.collect(
+                    proxy=(str(_px.get("hostname")), int(_px.get("port")))
+                    if _px else None)
                 logger.error("[MediaProbe] chat=%s %s", chat_id,
                              diag.format_report(report))
                 self._vc_event_log(None, None, "media_probe", {
@@ -2264,19 +2384,54 @@ class VoiceCallManager:
                     raise RuntimeError("voice engine shutting down")
                 helper = TelegramAccountClient("temp", session_string, account_id)
                 api_id, api_hash = await helper._get_api_credentials()
-                app = Client(
-                    f"shared_client_{account_id}",
-                    session_string=decrypted_session,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    no_updates=False,  # PyTgCalls needs raw Telegram updates
-                    in_memory=True,
-                    proxy=_voice_proxy_config(),
-                    **_client_device_fingerprint(account_id),
-                )
-                from services.voice_updates import configure_voice_updates
-                configure_voice_updates(app)
-                await asyncio.wait_for(app.start(), timeout=timeout)
+
+                async def _open(proxy: Optional[Dict[str, Any]]):
+                    """Build the production client and start it.
+
+                    ``app`` is assigned BEFORE start() so a start failure still
+                    reaches the teardown path below with its real client: an
+                    unconfirmed disconnect must quarantine the auth key instead
+                    of releasing it (invariant pinned by
+                    tests/test_session_safety.py).
+                    """
+                    nonlocal app
+                    client = Client(
+                        f"shared_client_{account_id}",
+                        session_string=decrypted_session,
+                        api_id=api_id,
+                        api_hash=api_hash,
+                        no_updates=False,  # PyTgCalls needs raw Telegram updates
+                        in_memory=True,
+                        proxy=proxy,
+                        **_client_device_fingerprint(account_id),
+                    )
+                    app = client
+                    from services.voice_updates import configure_voice_updates
+                    configure_voice_updates(client)
+                    await asyncio.wait_for(client.start(), timeout=timeout)
+                    return client
+
+                proxy = await _effective_voice_proxy(account_id)
+                try:
+                    app = await _open(proxy)
+                except BaseException as exc:
+                    # The preflight passed (or no proxy is configured). If a
+                    # proxy-based start still fails the way an unreachable
+                    # proxy fails, retry once DIRECT instead of burning the
+                    # whole build on live=0 (incident 2026-11-11). The stale
+                    # client must be provably closed first, otherwise the auth
+                    # key stays held and the outer handler quarantines it.
+                    if (proxy is None or _voice_proxy_required()
+                            or not _looks_like_connect_failure(exc)):
+                        raise
+                    stale_app = app
+                    if stale_app is not None and not await _disconnect_voice_app(stale_app):
+                        raise
+                    app = None
+                    _disable_voice_proxy(
+                        f"client start failed via {_voice_proxy_target(proxy)}: "
+                        f"{type(exc).__name__}")
+                    app = await _open(None)
                 await asyncio.sleep(random.uniform(0.8, 2.0))
                 if self._shutting_down:
                     raise RuntimeError("voice engine shutting down")
