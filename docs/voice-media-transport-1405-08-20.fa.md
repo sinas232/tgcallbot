@@ -188,7 +188,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۰۸ تست، ۸۰۲ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۱۰ تست، ۸۰۴ موفق، ۶ skip**.
 
 ---
 
@@ -209,6 +209,9 @@ docker exec telegram_bot_container python -m unittest \
 ```bash
 # الف) همان چتِ حادثه، از داخل مسیرِ WARP (همان نت‌نمی که ربات استفاده می‌کند)
 docker compose exec -T bot python tools/join_probe.py     --account 134 --chat -1004473844619 --seconds 15
+
+# پیدا کردنِ چتِ کنترل: گروه‌هایی که همین حالا ویس‌چتِ فعال دارند
+docker compose exec -T bot python tools/join_probe.py --account 134 --list-voice-chats
 
 # ب) یک چتِ دیگر (ترجیحاً همان گروه با یک ویس‌چتِ تازه) برای مقایسه
 docker compose exec -T bot python tools/join_probe.py     --account 134 --chat <CHAT_ID_2> --seconds 15

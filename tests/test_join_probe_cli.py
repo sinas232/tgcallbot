@@ -7,6 +7,7 @@ or the DB, and a missing required argument must fail fast with argparse's
 usage error instead of a half-configured probe.
 """
 
+import contextlib
 import importlib.util
 import io
 import os
@@ -14,6 +15,7 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "join_probe.py"
@@ -83,6 +85,21 @@ class JoinProbeCliTests(unittest.TestCase):
         for text, expected in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(self.mod._normalise_chat_target(text), expected)
+
+    def test_chat_is_required_unless_listing(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.mod._parse_args(["--account", "134"])
+        self.assertEqual(ctx.exception.code, 2)
+
+        args = self.mod._parse_args(["--account", "134", "--list-voice-chats"])
+        self.assertTrue(args.list_voice_chats)
+
+    def test_voice_chat_line(self):
+        chat = SimpleNamespace(id=-1001, title="T", group_call=SimpleNamespace(participants_count=3))
+        self.assertIn("participants=   3", self.mod._voice_chat_line(chat))
+        chat = SimpleNamespace(id=-1001, title="T", group_call=SimpleNamespace(participants_count=None))
+        self.assertIn("participants=   ?", self.mod._voice_chat_line(chat))
 
     def test_tool_is_executable_from_the_repo_root(self):
         # The bot runs with cwd=/app; sys.path[0] insertion must survive that.

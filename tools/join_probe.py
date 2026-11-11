@@ -23,6 +23,10 @@ USAGE (inside the bot container, while the account is NOT used by an order)
     docker compose exec -T bot python tools/join_probe.py --account 134 \
         --chat https://t.me/+AbCdEf
 
+    # find a control chat (groups that already have a voice chat):
+    docker compose exec -T bot python tools/join_probe.py --account 134 \
+        --list-voice-chats
+
     # only inspect the call state, no media join:
     docker compose exec -T bot python tools/join_probe.py --account 134 \
         --chat -1004473844619 --no-join
@@ -50,15 +54,45 @@ def _parse_args(argv=None) -> argparse.Namespace:
         description="Probe one account's JOIN into one voice chat (read-only).")
     parser.add_argument("--account", type=int, required=True,
                         help="telegram_accounts.id (from the admin panel / DB)")
-    parser.add_argument("--chat", required=True,
+    parser.add_argument("--chat", default=None,
                         help="chat id (-100…), @username or https://t.me/+invite")
+    parser.add_argument("--list-voice-chats", action="store_true",
+                        help="list this account's groups that currently have a "
+                             "voice chat (pick a control chat for the A/B test)")
     parser.add_argument("--seconds", type=float, default=20.0,
                         help="how long to stay joined when the join succeeds")
     parser.add_argument("--join-timeout", type=float, default=60.0,
                         help="media join timeout (matches VOICE_JOIN_MEDIA_TIMEOUT+)")
     parser.add_argument("--no-join", action="store_true",
                         help="only read the group-call state (no JoinGroupCall)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.list_voice_chats and not args.chat:
+        parser.error("--chat is required unless --list-voice-chats is used")
+    return args
+
+
+def _voice_chat_line(chat) -> str:
+    """One human-readable line for a dialog that currently has a voice chat."""
+    call = getattr(chat, "group_call", None)
+    count = getattr(call, "participants_count", None)
+    count_text = "?" if count is None else str(int(count))
+    return (f"  {int(chat.id):>16}  participants={count_text:>4}  "
+            f"{getattr(chat, 'title', '') or ''}")
+
+
+async def _list_voice_chats(app) -> int:
+    print("  groups with an ACTIVE voice chat (id / participants / title):")
+    found = 0
+    async for dialog in app.get_dialogs():
+        chat = getattr(dialog, "chat", None)
+        if chat is None or getattr(chat, "group_call", None) is None:
+            continue
+        found += 1
+        print(_voice_chat_line(chat))
+    print(f"  total: {found} chat(s) with a live voice chat")
+    if not found:
+        print("  nothing found — start a voice chat in any group this account is in")
+    return 0
 
 
 def _normalise_chat_target(target: str):
@@ -150,6 +184,13 @@ async def _probe(args: argparse.Namespace) -> int:
     dc_id = getattr(getattr(app, "storage", None), "dc_id", "?")
     print(f"  connected in {time.monotonic() - started:.1f}s as "
           f"id={getattr(me, 'id', '?')} dc={dc_id}")
+
+    if args.list_voice_chats:
+        try:
+            code = await _list_voice_chats(app)
+        finally:
+            await _close(app)
+        return code
 
     try:
         chat_id, chat = await _resolve_chat(app, args.chat)
