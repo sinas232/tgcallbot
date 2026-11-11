@@ -124,7 +124,20 @@
   یا «883 zombies …». اجرای دستی:
   `docker compose exec -T bot python tools/media_diag.py`
 
-### ث) تله‌متریِ بهداشتِ پروسه‌ها
+### ث) جاروی زامبی‌های خودِ ربات (بدون ریبوت)
+`services/host_resources.reap_zombie_children` + حلقهٔ نگهداریِ `voice_call_manager`
+
+- ntgcalls استریمِ سکوت را به‌صورت یک **فرزندِ ffmpeg** اجرا می‌کند و هیچ‌کس در
+  پایتون روی آن `wait()` نمی‌زند؛ بعد از هر joinِ ناموفق، یک زامبی می‌ماند.
+  روی همان هاست، `ps` **۹۵۵** زامبی را زیر **یک** والد (PPID=3625434) نشان داد.
+- حالا هر جاروی ۶۰ ثانیه‌ای (`VOICE_IDLE_SWEEP_INTERVAL`) فقط **فرزندانِ مستقیمِ
+  همین پروسه** با نام `ffmpeg/ffprobe/sh` را با `waitpid(..., WNOHANG)` جمع
+  می‌کند و لاگ `[HostHealth] reaped N zombie child process(es)` می‌دهد.
+- زیرپروسس‌های asyncio (`pg_dump`/`pg_restore`) **دست‌نخورده** می‌مانند
+  (`REAPABLE_CHILDREN`) تا watcherِ خودشان را خراب نکنیم. خاموش‌کردن:
+  `VOICE_ZOMBIE_REAPER=false`.
+
+### ج) تله‌متریِ بهداشتِ پروسه‌ها
 `services/host_resources.py`
 
 - `[HostResources]` حالا `zombies`، `child_processes` و `ffmpeg_children` را هم
@@ -175,7 +188,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۷۹۶ تست، ۷۹۰ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۰۰ تست، ۷۹۴ موفق، ۶ skip**.
 
 ---
 
@@ -194,11 +207,15 @@ docker compose exec -T warp sh -lc \
 # اگر MTU بالاتر از 1420 بود، در یک پنجرهٔ بی‌سفارش امتحان کنید:
 # docker compose exec -T warp ip link set CloudflareWARP mtu 1280
 
-# ۳) زامبی‌ها (در کانتینر و روی هاست)
+# ۳) زامبی‌ها (در کانتینر و روی هاست) — و مهم‌تر: والدشان کیست؟
 docker exec telegram_bot_container sh -lc "ps -eo stat= | grep -c '^Z'"
 ps -eo stat= | grep -c '^Z'          # روی هاست — بنر 883 می‌داد
 ps -eo ppid,stat,comm | awk '$2 ~ /Z/ {print $1}' | sort | uniq -c | sort -rn | head
-docker inspect -f '{{.State.Pid}}' telegram_bot_container   # باید init/python باشد
+# والدِ زامبی‌ها را پیدا کنید (در لاگ سرور: ۹۵۵ زامبی با PPID=3625434):
+ps -o pid,ppid,stat,etime,comm,args -p 3625434
+docker inspect -f '{{.State.Pid}} {{.Name}}' telegram_bot_container warp_container
+# اگر PPID همان PIDِ کانتینرِ bot باشد ⇒ فرزندانِ ntgcalls هستند و رپرِ جدید
+# (VOICE_ZOMBIE_REAPER) آن‌ها را هر ۶۰ ثانیه جمع می‌کند.
 
 # ۴) آیا کالِ همان چت هنوز در تلگرام فعال است؟
 #    (از پنل ادمین: اطلاعات سفارش / وضعیت ویس‌چت)
@@ -247,8 +264,9 @@ VOICE_SYSTEM_PAUSE_MAX_SECONDS=300
 VOICE_BUILD_MAX_ZERO_JOIN_WAVES=8
 # کول‌داونِ طولانی داخل تسکِ join خوابانده نشود
 VOICE_STRATEGY_INLINE_WAIT_MAX=45
-# هشدارِ زامبی
+# هشدار و جاروی زامبی
 VOICE_ZOMBIE_WARN_THRESHOLD=100
+VOICE_ZOMBIE_REAPER=true
 ```
 
 ---

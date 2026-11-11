@@ -326,6 +326,55 @@ def count_child_processes(comm: Optional[str] = None,
         return None
 
 
+# Process names whose zombie children are safe for the bot to reap itself.
+# py-tgcalls/ntgcalls launch the silence stream as ``ffmpeg`` (sometimes via a
+# shell); those children are NOT asyncio subprocesses, so nothing in Python was
+# ever going to ``wait()`` on them — that is exactly how one box accumulated
+# 955 ``Z`` processes. ``pg_dump``/``pg_restore`` are deliberately absent: they
+# ARE asyncio subprocesses and asyncio's child watcher must reap them.
+REAPABLE_CHILDREN = ("ffmpeg", "ffprobe", "sh", "dash", "bash")
+
+
+def reap_zombie_children(
+    comms: Tuple[str, ...] = REAPABLE_CHILDREN,
+    proc_root: str = PROC_ROOT,
+    parent_pid: Optional[int] = None,
+    waitpid: Optional[Any] = None,
+) -> Optional[list]:
+    """Reap our OWN zombie children that nobody else will ever collect.
+
+    A zombie holds a PID slot (not RSS). On the 2026-11-11 box,
+    ``ps -eo stat= | grep -c '^Z'`` reported 955 of them all under ONE parent,
+    which makes process creation fail in ways that surface later as
+    "media transport timeout".
+
+    Only direct children of THIS process whose ``comm`` is in ``comms`` are
+    touched, so an asyncio-managed subprocess (pg_dump/pg_restore, tracked by
+    its own watcher) can never be stolen. Returns the reaped PIDs, or ``None``
+    when /proc is unreadable.
+    """
+    if not os.path.isdir(proc_root):
+        return None
+    parent = str(os.getpid() if parent_pid is None else int(parent_pid))
+    waiter = waitpid or os.waitpid
+    reaped: list = []
+    try:
+        for pid, comm, state, ppid in iter_process_stats(proc_root):
+            if state != "Z" or ppid != parent or comm not in comms:
+                continue
+            try:
+                done, _status = waiter(int(pid), os.WNOHANG)
+            except (ChildProcessError, OSError):
+                # Someone else reaped it first (e.g. asyncio's watcher) or it
+                # is not our child any more: nothing to do, never raise.
+                continue
+            if done:
+                reaped.append(int(pid))
+    except Exception:
+        return reaped
+    return reaped
+
+
 def snapshot(
     prev_usec: Optional[int] = None,
     prev_mono: Optional[float] = None,

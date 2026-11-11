@@ -63,14 +63,21 @@
   `ffmpeg_children` و یک جملهٔ قابل‌اقدام.
 - `[HostResources]` حالا `zombies`، `child_processes` و `ffmpeg_children` هم
   دارد؛ بالای `VOICE_ZOMBIE_WARN_THRESHOLD` (پیش‌فرض ۱۰۰) یک‌بار در ساعت
-  `[HostHealth]` هشدار می‌دهد. (بنر همان سرور: **۸۸۳ زامبی**.)
+  `[HostHealth]` هشدار می‌دهد. (بنر همان سرور: **۸۸۳** و در `ps` واقعی
+  **۹۵۵** زامبی، همه زیر یک PPID.)
+- **جاروی زامبی در خودِ ربات (`VOICE_ZOMBIE_REAPER`, پیش‌فرض روشن):**
+  ntgcalls فرزندِ `ffmpeg` را اجرا می‌کند و هیچ‌کس آن را `wait()` نمی‌کند؛ هر
+  جاروی ۶۰ ثانیه‌ای فقط فرزندانِ مستقیمِ همین پروسه با نام
+  `ffmpeg/ffprobe/sh` را با `waitpid(WNOHANG)` جمع می‌کند و
+  `[HostHealth] reaped N zombie child process(es)` لاگ می‌دهد. زیرپروسس‌های
+  asyncio (`pg_dump`/`pg_restore`) هرگز لمس نمی‌شوند.
 
 ### ۵) تست و استقرار
 
 - تست‌های جدید: `tests/test_media_transport_breaker.py`،
   `tests/test_process_hygiene.py`، `tests/test_media_diagnostics.py` و ۴ تستِ
   تشدید/نگهبان در `tests/test_telegram_system_failures.py`.
-  مجموع: **۷۹۶ تست، ۷۹۰ موفق، ۶ skip**.
+  مجموع: **۸۰۰ تست، ۷۹۴ موفق، ۶ skip**.
 - ⚠️ این پچ **جایگزینِ رفعِ زیرساخت نیست**: اگر UDP/WARP/MTU یا خودِ کال خراب
   باشد، هیچ تغییری در کد اکانت را وارد نمی‌کند — ولی دیگر اکانت‌ها/سفارش‌ها را
   بی‌پایان نمی‌سوزاند، پولِ مصرف‌نشده برمی‌گردد و لاگ دقیقاً می‌گوید کجا خراب است.

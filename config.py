@@ -529,6 +529,12 @@ class Config:
     # per hour above this threshold (host-wide truth still needs `ps` on the
     # host — a container sees only its own PID namespace).
     VOICE_ZOMBIE_WARN_THRESHOLD = int(os.getenv('VOICE_ZOMBIE_WARN_THRESHOLD', '100'))
+    # py-tgcalls spawns one ffmpeg per playing/joining stream and nothing in
+    # Python ever waits on it, so those children turn into zombies (955 were
+    # counted under a single parent on 2026-11-11). The maintenance sweep now
+    # reaps OUR OWN zombie children whose name is ffmpeg/ffprobe/sh and leaves
+    # every asyncio subprocess (pg_dump/pg_restore) alone.
+    VOICE_ZOMBIE_REAPER = os.getenv('VOICE_ZOMBIE_REAPER', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 
     HEALTH_CHECK_INTERVAL = int(os.getenv('HEALTH_CHECK_INTERVAL', '3600') or 3600)
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()

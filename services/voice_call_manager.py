@@ -2661,6 +2661,22 @@ class VoiceCallManager:
                     closed = await self.reap_idle_clients(force=bool(soft and rss > soft))
                     if closed:
                         logger.info("[VoiceReaper] closed %s idle client(s)", closed)
+                    # Reap OUR OWN zombie ffmpeg children. py-tgcalls/ntgcalls
+                    # starts the silence stream as a child process and nothing
+                    # in Python waits on it, so failed joins leave zombies that
+                    # hold PID slots forever (955 on the 2026-11-11 box).
+                    if getattr(Config, "VOICE_ZOMBIE_REAPER", True):
+                        try:
+                            from services.host_resources import reap_zombie_children
+                            reaped_children = reap_zombie_children()
+                            if reaped_children:
+                                logger.warning(
+                                    "[HostHealth] reaped %s zombie child process(es) "
+                                    "left by ffmpeg/ntgcalls (PIDs %s)",
+                                    len(reaped_children), reaped_children[:10],
+                                )
+                        except Exception as _zexc:
+                            logger.debug("zombie reaper skipped: %r", _zexc)
                     # Quarantine holds are recoverable - re-probe them on
                     # every maintenance sweep (see heal_quarantine_holds).
                     healed = await self.heal_quarantine_holds()

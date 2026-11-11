@@ -24,9 +24,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.host_resources import (  # noqa: E402
+    REAPABLE_CHILDREN,
     count_child_processes,
     count_zombie_processes,
     iter_process_stats,
+    reap_zombie_children,
     snapshot,
 )
 
@@ -97,6 +99,59 @@ class ZombieCountingTests(unittest.TestCase):
             count_child_processes("ffmpeg", proc_root=proc.root, parent_pid=10), 2)
         self.assertEqual(
             count_child_processes("unrelated", proc_root=proc.root, parent_pid=10), 0)
+
+
+class ZombieReapingTests(unittest.TestCase):
+    """Nothing in Python ever waits on the ffmpeg children of ntgcalls.
+
+    On 2026-11-11 one box had 955 ``Z`` processes, all under a single parent.
+    The bot can collect its OWN children — and only those: the comm allowlist
+    keeps asyncio-managed subprocesses (pg_dump/pg_restore) out of reach.
+    """
+
+    def _proc(self):
+        me = str(os.getpid())
+        return (FakeProc()
+                .add(100, "ffmpeg", "Z", me)        # ours → reap
+                .add(101, "ffmpeg", "Z", "1")       # another parent → leave
+                .add(102, "ffmpeg", "S", me)        # still running → leave
+                .add(103, "pg_dump", "Z", me)       # asyncio owns it → leave
+                .add(104, "sh", "Z", me))           # ffmpeg via shell → reap
+
+    def test_reaps_only_our_zombie_media_children(self):
+        proc = self._proc()
+        calls = []
+
+        def fake_waitpid(pid, options):
+            calls.append((pid, options))
+            return pid, 0
+
+        reaped = reap_zombie_children(proc_root=proc.root, waitpid=fake_waitpid)
+
+        self.assertEqual(sorted(reaped), [100, 104])
+        self.assertEqual(sorted(pid for pid, _ in calls), [100, 104])
+        self.assertTrue(all(options == os.WNOHANG for _, options in calls),
+                        "reaping must never block the event loop")
+
+    def test_asyncio_subprocesses_are_never_stolen(self):
+        proc = self._proc()
+        calls = []
+        reap_zombie_children(proc_root=proc.root,
+                             waitpid=lambda pid, opts: (calls.append(pid) or (0, 0)))
+        self.assertNotIn(103, calls)
+        self.assertNotIn("pg_dump", REAPABLE_CHILDREN)
+
+    def test_a_child_that_vanished_first_is_skipped_silently(self):
+        proc = self._proc()
+
+        def racing_waitpid(pid, options):
+            raise ChildProcessError("already reaped")
+
+        self.assertEqual(reap_zombie_children(proc_root=proc.root,
+                                              waitpid=racing_waitpid), [])
+
+    def test_unreadable_proc_returns_none(self):
+        self.assertIsNone(reap_zombie_children(proc_root="/nonexistent-proc"))
 
 
 class SnapshotExposesHygieneTests(unittest.TestCase):
