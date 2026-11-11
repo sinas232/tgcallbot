@@ -61,7 +61,11 @@
   `up -d --force-recreate warp routefix bot`. علاوه بر آن اتصالِ
   `instance_lock` حالا ۱۲ بار × ۵ ثانیه تکرار می‌شود تا یک netns تازه ربات را
   نکشد.
-- **تست:** ۸۶۲ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
+- **قفلِ تک‌نمونه‌ای و بک‌اندِ جامانده:** `InstanceAlreadyRunning` بعد از recreate
+  از یک session با `state=idle` می‌آمد که پستگرس هنوز زنده می‌پنداشت. حالا خطِ
+  CRITICAL هویتِ نگه‌دارنده را می‌گوید و `tools/instance_lock_doctor.py
+  --release-stale` فقط همان بک‌اندِ idle را می‌بندد (بک‌اندِ active را هرگز).
+- **تست:** ۸۶۸ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
   `tests/test_fix_env_proxy.py` (۱۰)، `tests/test_net_check_and_egress.py` (۱۱).
 
 </div>

@@ -70,6 +70,31 @@ WARNING pyrogram.connection.connection: Unable to connect due to network issues:
    احوال‌پرسیِ واقعیِ SOCKS5 می‌فرستد (`05 01 00`) و پاسخِ `0x05` را می‌خواهد؛
    یک پروکسی HTTP با `HT` جواب می‌دهد و همان‌جا رد می‌شود.
 
+### مرحلهٔ ششم: قفلِ تک‌نمونه‌ای که «روح» گرفته بود (۲۲:۲۴)
+
+```
+CRITICAL - 🔒 Another tgcallbot instance holds the same DATABASE_URL
+services.instance_lock.InstanceAlreadyRunning
+```
+
+هیچ ربات دیگری در حال اجرا نبود. قفلِ advisory در PostgreSQL را یک **بک‌اندِ
+جامانده** نگه داشته بود: کانتینری که هنگامِ recreate هنوز اتصالِ TCP باز داشت، یک
+session با `state=idle` جا می‌گذارد و پستگرس تا تایم‌اوتِ TCP (پیش‌فرض ~۲ ساعت)
+متوجه نمی‌شود. نتیجه: ربات تا ابد بالا نمی‌آمد.
+
+- `services/instance_lock.py` حالا هنگامِ رد شدنِ قفل، **هویتِ نگه‌دارنده** را در
+  همان خطِ CRITICAL می‌نویسد (pid / state / since / client).
+- ابزارِ `tools/instance_lock_doctor.py`: فهرستِ بک‌اندها + نگه‌دارندهٔ قفل؛ با
+  `--release-stale` فقط بک‌اندِ `idle` را می‌بندد و هرگز بک‌اندِ `active` (رباتِ
+  واقعاً در حال اجرا) را نمی‌کشد.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.voicefix.yml \
+  exec -T bot python tools/instance_lock_doctor.py --release-stale
+docker compose -f docker-compose.yml -f docker-compose.voicefix.yml \
+  up -d --force-recreate bot
+```
+
 ### مرحلهٔ پنجم: «تونل مرده بود» — و دامِ ری‌استارتِ تنها
 
 `tools/net_check.py` قبل از هر کاری: **هر پنج DC هم مستقیم و هم از پروکسی
@@ -398,7 +423,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۶۲ تست، ۸۵۶ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۶۸ تست، ۸۶۲ موفق، ۶ skip**.
 
 ---
 

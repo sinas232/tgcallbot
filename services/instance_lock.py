@@ -65,9 +65,11 @@ class InstanceDatabaseLock:
                 timeout=10,
             )
             if ok is not True:
+                holder = await self._describe_holder(conn)
                 raise InstanceAlreadyRunning(
                     "Another tgcallbot instance holds the same DATABASE_URL; "
-                    "refusing to reuse account sessions. Stop the other bot first."
+                    "refusing to reuse account sessions. Stop the other bot first. "
+                    f"Lock holder: {holder}"
                 )
         except BaseException:
             await conn.close()
@@ -76,6 +78,37 @@ class InstanceDatabaseLock:
         self.lost = False
         self.monitor = asyncio.create_task(self._watch(on_lost))
         logger.info("Instance database lock acquired (shared across checkouts/servers)")
+
+    @staticmethod
+    async def _describe_holder(conn) -> str:
+        """Who holds the advisory lock right now? (stale backends are common)
+
+        A container that is recreated while its TCP connection is still open
+        leaves an ``idle`` postgres backend holding the session-level lock; the
+        new container then refuses to start forever with
+        "Another tgcallbot instance holds the same DATABASE_URL". Naming the
+        holder (pid, state, age, client) turns that into a one-liner fix
+        instead of a mystery: `python tools/instance_lock_doctor.py --release-stale`.
+        """
+        try:
+            row = await asyncio.wait_for(conn.fetchrow(
+                """
+                SELECT a.pid, a.application_name, a.state,
+                       a.backend_start, a.client_addr
+                FROM pg_locks l
+                JOIN pg_stat_activity a ON a.pid = l.pid
+                WHERE l.locktype = 'advisory'
+                  AND l.classid = $1 AND l.objid = $2
+                  AND l.granted
+                LIMIT 1
+                """, LOCK_NAMESPACE, LOCK_ID), timeout=5)
+        except Exception as exc:
+            return f"unknown ({type(exc).__name__})"
+        if row is None:
+            return "unknown (no pg_locks row; lock may belong to a backend that just exited)"
+        return (f"pid={row['pid']} app={row['application_name']} "
+                f"state={row['state']} since={row['backend_start']} "
+                f"client={row['client_addr']}")
 
     async def _connect_with_retries(self) -> asyncpg.Connection:
         """Connect to PostgreSQL, tolerating a briefly missing docker route."""
