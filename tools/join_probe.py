@@ -290,10 +290,12 @@ async def _probe(args: argparse.Namespace) -> int:
             print("  left the call cleanly")
     except Exception as exc:
         print(f"  leave failed (non-fatal): {_fmt(exc)}")
-    try:
-        await engine.stop()
-    except Exception as exc:
-        print(f"  engine stop failed (non-fatal): {_fmt(exc)}")
+    stopper = getattr(engine, "stop", None)   # PyTgCalls 2.x has no stop()
+    if callable(stopper):
+        try:
+            await stopper()
+        except Exception as exc:
+            print(f"  engine stop failed (non-fatal): {_fmt(exc)}")
     await _close(app)
 
     print("-" * 70)
