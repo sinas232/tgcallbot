@@ -3304,7 +3304,8 @@ class VoiceCallManager:
         s = (msg or "").lower()
         return any(m in s for m in cls._ENGINE_STATE_MARKERS)
 
-    async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int) -> None:
+    async def _schedule_media_restore(self, order_id: int, account_id: int, chat_id: int,
+                                     presence_unknown: bool = False) -> None:
         """Re-establish the silent media transport for a GHOST-MEDIA-ONLY slot.
 
         The participant listing says the account is STILL inside the call,
@@ -3337,6 +3338,13 @@ class VoiceCallManager:
           * after VOICE_MEDIA_RESTORE_MAX_FAILS consecutive failures the slot
             is paused (VOICE_MEDIA_RESTORE_PAUSE_SECONDS) — no infinite retry
             loops on invalid client instances
+          * ``presence_unknown=True`` (media binding gone AND the participant
+            listing could not be read): the FIRST attempt for the slot is
+            L1-only.  We have no proof the account is still inside the call,
+            so no LeaveGroupCall is sent while the answer is unknown; the
+            recorded failure makes the next paced attempt take the full
+            ladder, which also restores presence if the account had truly
+            dropped.
         """
         key = (order_id, account_id)
         if not self._media_restore_due(key):
@@ -3356,6 +3364,10 @@ class VoiceCallManager:
         lock_key = (account_id, cid)
         result = "failed"
         last_tb = ""
+        # Presence unverified + first attempt for this slot → L1 only (never
+        # send LeaveGroupCall while we cannot prove the account is still in
+        # the call; see docstring).
+        l1_only = bool(presence_unknown) and self._media_restore_failures.get(key, 0) == 0
         try:
             await asyncio.sleep(random.uniform(0.5, 3.0))
             # Slot may have been released while we waited.
@@ -3378,53 +3390,69 @@ class VoiceCallManager:
                     # ── L2: explicit WebRTC session cleanup, then rejoin ──
                     # This sends LeaveGroupCall for the target if bound. Do
                     # NOT do it while this same MTProto account serves another
-                    # order (including another order in this chat).
-                    if self._account_has_other_calls(account_id, order_id):
+                    # order (including another order in this chat), and do NOT
+                    # do it while presence itself is unverified (first attempt
+                    # of a presence-unknown slot → L1 only).
+                    if l1_only:
+                        result = "l1_only_failed:presence_unknown"
+                        self._vc_event_log(order_id, account_id,
+                                           "media_restore_l1_only_failed", {
+                                               "chat_id": cid,
+                                               "reason": msg1[:120],
+                                           })
+                        logger.info(
+                            "[VoiceMedia] L1-only restore failed acc=%s chat=%s while presence "
+                            "is unverified — no LeaveGroupCall sent; next paced attempt takes "
+                            "the full ladder (%s)",
+                            account_id, cid, msg1[:80],
+                        )
+                    elif self._account_has_other_calls(account_id, order_id):
                         self._vc_event_log(order_id, account_id, "media_restore_deferred", {
                             "chat_id": cid, "reason": "other_active_order",
                         })
                         return
-                    try:
-                        await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
-                    except Exception as e_leave:
-                        logger.debug(
-                            "[VoiceMedia] leave_call cleanup skipped acc=%s chat=%s: %s",
-                            account_id, cid,
-                            str(e_leave)[:80] or type(e_leave).__name__,
-                        )
-                    try:
-                        await self._play_silence(pytg, cid)
-                        result = "restored_after_leave"
-                    except Exception:
-                        _e2 = sys.exc_info()[1]
-                        msg2 = str(_e2) or type(_e2).__name__
-                        last_tb = traceback.format_exc(limit=8)
-                        if not self._is_engine_state_error(msg2):
-                            result = f"play_failed:{msg2[:70]}"
-                        else:
-                            # ── L3: unrecoverable engine state — REBUILD ──
-                            # No per-chat stop/leave can clear a half-dead
-                            # WebRTC peer connection; only a fresh PyTgCalls
-                            # instance (fresh NTgCalls binding) can.
-                            logger.warning(
-                                "[VoiceEngine] unrecoverable engine state acc=%s chat=%s (%s) — "
-                                "tearing down and building fresh PyTgCalls instance",
-                                account_id, cid, msg2[:80],
+                    else:
+                        try:
+                            await asyncio.wait_for(pytg.leave_call(cid), timeout=10)
+                        except Exception as e_leave:
+                            logger.debug(
+                                "[VoiceMedia] leave_call cleanup skipped acc=%s chat=%s: %s",
+                                account_id, cid,
+                                str(e_leave)[:80] or type(e_leave).__name__,
                             )
-                            self._vc_event_log(order_id, account_id, "engine_rebuild", {
-                                "chat_id": cid, "reason": msg2[:120],
-                            })
-                            try:
-                                fresh = await self._rebuild_engine_for_account(order_id, account_id, cid)
-                                if fresh is None:
-                                    result = "rebuild_failed:no_client"
-                                else:
-                                    await self._play_silence(fresh, cid)
-                                    result = "restored_after_engine_rebuild"
-                            except Exception:
-                                _e3 = sys.exc_info()[1]
-                                result = f"rebuild_failed:{(str(_e3) or type(_e3).__name__)[:70]}"
-                                last_tb = traceback.format_exc(limit=8)
+                        try:
+                            await self._play_silence(pytg, cid)
+                            result = "restored_after_leave"
+                        except Exception:
+                            _e2 = sys.exc_info()[1]
+                            msg2 = str(_e2) or type(_e2).__name__
+                            last_tb = traceback.format_exc(limit=8)
+                            if not self._is_engine_state_error(msg2):
+                                result = f"play_failed:{msg2[:70]}"
+                            else:
+                                # ── L3: unrecoverable engine state — REBUILD ──
+                                # No per-chat stop/leave can clear a half-dead
+                                # WebRTC peer connection; only a fresh PyTgCalls
+                                # instance (fresh NTgCalls binding) can.
+                                logger.warning(
+                                    "[VoiceEngine] unrecoverable engine state acc=%s chat=%s (%s) — "
+                                    "tearing down and building fresh PyTgCalls instance",
+                                    account_id, cid, msg2[:80],
+                                )
+                                self._vc_event_log(order_id, account_id, "engine_rebuild", {
+                                    "chat_id": cid, "reason": msg2[:120],
+                                })
+                                try:
+                                    fresh = await self._rebuild_engine_for_account(order_id, account_id, cid)
+                                    if fresh is None:
+                                        result = "rebuild_failed:no_client"
+                                    else:
+                                        await self._play_silence(fresh, cid)
+                                        result = "restored_after_engine_rebuild"
+                                except Exception:
+                                    _e3 = sys.exc_info()[1]
+                                    result = f"rebuild_failed:{(str(_e3) or type(_e3).__name__)[:70]}"
+                                    last_tb = traceback.format_exc(limit=8)
 
             # ── result handling ─────────────────────────────────────────
             if result.startswith("restored"):
@@ -4833,9 +4861,37 @@ class VoiceCallManager:
                                 # based on an ambiguous snapshot. Report it
                                 # so the stable paid count is not mistaken for
                                 # confirmed, continuous media presence.
+                                #
+                                # BUT the engine already gave us one HARD
+                                # negative (media_alive is False): the media
+                                # binding is gone. Leaving that unrepaired is
+                                # what made order 1357 sit at
+                                # native_binding missing=2 for the whole call
+                                # (47 × media_presence_unknown, 0 ×
+                                # media_restored): the old code only logged
+                                # here and never attached the silence stream
+                                # back. So run the SAME paced restore ladder,
+                                # but with presence_unknown=True → the first
+                                # attempt is play()-only (L1) and only a later
+                                # paced attempt is allowed to send
+                                # LeaveGroupCall + rejoin. Presence is never
+                                # downgraded by this path.
+                                _restore_scheduled = False
+                                if self._media_restore_due((order_id, acc_id)):
+                                    _restore_scheduled = True
+                                    try:
+                                        asyncio.create_task(
+                                            self._schedule_media_restore(
+                                                order_id, acc_id, cid,
+                                                presence_unknown=True,
+                                            )
+                                        )
+                                    except RuntimeError:
+                                        pass
                                 self._vc_event_log(order_id, acc_id, "media_presence_unknown", {
                                     "chat_id": cid,
                                     "reason": "media_binding_lost_and_participant_query_unknown",
+                                    "restore": "scheduled" if _restore_scheduled else "paced",
                                 })
 
                         # ── DL HOLD-RISK (online deep-learning model) ───

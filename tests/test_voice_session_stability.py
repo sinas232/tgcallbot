@@ -88,7 +88,16 @@ class MonitorUnknownPresenceTests(unittest.IsolatedAsyncioTestCase):
                              {'present': 1, 'missing': 1, 'unknown': 1})
         self.assertEqual(len(self.manager.get_joined_accounts(846)), 3)
 
-    async def test_monitor_does_not_rejoin_when_listing_unknown_and_binding_lost(self):
+    async def test_monitor_repairs_media_when_listing_unknown_and_binding_lost(self):
+        """Order 1357: media gone + listing unreadable used to be log-only.
+
+        Production evidence: ``media_presence_unknown=47`` and
+        ``media_restored=0`` while ``native_binding`` sat at
+        ``missing=2`` for the whole call — nothing was ever re-attached.
+        The hard negative from the engine must now trigger the paced
+        restore ladder (L1-only first, because presence is unverified),
+        and presence must never be downgraded or force-left.
+        """
         import services.voice_call_manager as module
         order_id, account_id, chat_id = 846, 112, -100123
         self.manager.joined_accounts_by_order[order_id] = {
@@ -121,11 +130,55 @@ class MonitorUnknownPresenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.manager.joined_accounts_by_order[order_id][account_id]['status'],
                                  'TEMPORARILY_UNKNOWN')
                 self.assertEqual(self.manager.get_binding_status_counts(order_id)['missing'], 1)
+                # Still never a rejoin/leave from an ambiguous listing ...
                 rejoin.assert_not_awaited()
-                restore.assert_not_awaited()
+                # ... but the dead media binding IS repaired now.
+                restore.assert_awaited()
+                self.assertTrue(restore.await_args.kwargs.get('presence_unknown'))
             finally:
                 task.cancel()
                 await task
+
+    async def test_media_restore_first_attempt_is_l1_only_while_presence_unknown(self):
+        """No LeaveGroupCall while presence is unverified; escalate later."""
+        oid, aid, cid = 846, 112, -100123
+        self.manager.active_calls[(oid, aid)] = {'chat_id': cid}
+        engine = SimpleNamespace(leave_call=AsyncMock(), play=AsyncMock())
+        self.manager.clients[aid] = engine
+
+        with patch.object(self.manager, '_play_silence', new_callable=AsyncMock,
+                          side_effect=RuntimeError('chat_id not in group_calls')) as play, \
+             patch.object(self.manager, '_account_has_other_calls', return_value=False), \
+             patch('services.voice_call_manager.random.uniform', return_value=0):
+            await self.manager._schedule_media_restore(oid, aid, cid, presence_unknown=True)
+            play.assert_awaited()
+            engine.leave_call.assert_not_awaited()
+            self.assertEqual(self.manager._media_restore_failures[(oid, aid)], 1)
+
+            # Second paced attempt: failures > 0 → full ladder, leave is allowed.
+            self.manager._media_restore_last[(oid, aid)] = 0.0
+            await self.manager._schedule_media_restore(oid, aid, cid, presence_unknown=True)
+            self.assertEqual(self.manager._media_restore_failures[(oid, aid)], 2)
+
+    async def test_ghost_present_restore_still_escalates_immediately_without_presence_unknown(self):
+        oid, aid, cid = 846, 112, -100123
+        self.manager.active_calls[(oid, aid)] = {'chat_id': cid}
+        self.manager.clients[aid] = SimpleNamespace(leave_call=AsyncMock())
+        calls = {'n': 0}
+
+        async def play(_pytg, _cid):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('boom')
+            return None
+
+        with patch.object(self.manager, '_play_silence', side_effect=play), \
+             patch.object(self.manager, '_account_has_other_calls', return_value=False), \
+             patch('services.voice_call_manager.random.uniform', return_value=0), \
+             patch.object(self.manager, '_is_engine_state_error', return_value=False):
+            await self.manager._schedule_media_restore(oid, aid, cid)
+        # present=True path keeps the old behaviour: L1 fail → L2 leave+play.
+        self.assertEqual(calls['n'], 2)
 
     async def test_ghost_present_but_media_binding_missing_is_not_reported_joined(self):
         import services.voice_call_manager as module

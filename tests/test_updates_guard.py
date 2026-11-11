@@ -457,7 +457,11 @@ class GuardTestCase(unittest.IsolatedAsyncioTestCase):
         root = logging.getLogger()
         root.addHandler(handler)
         try:
-            self.assertEqual(guard.install_repeat_warning_filter(window=5.0), 1)
+            # The exact count is environment-dependent: a test runner (pytest's
+            # logging plugin) attaches its own root handlers, so the function
+            # legitimately reports more than one. The contract that matters is
+            # "our fresh handler gets exactly one filter" + idempotency.
+            self.assertGreaterEqual(guard.install_repeat_warning_filter(window=5.0), 1)
             self.assertEqual(guard.install_repeat_warning_filter(window=5.0), 0)
             filters = [f for f in handler.filters if isinstance(f, guard.RepeatWarningFilter)]
             self.assertEqual(len(filters), 1)
