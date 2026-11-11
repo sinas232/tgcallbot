@@ -49,7 +49,9 @@ def format_jalali_datetime(dt_obj):
 def format_price(amount):
     """فرمت‌دهی قیمت به تومان"""
     try:
-        return f"{int(amount):,}"
+        from services.billing import money
+        value = money(amount)
+        return format(value, ',.2f').rstrip('0').rstrip('.')
     except:
         return str(amount)
 

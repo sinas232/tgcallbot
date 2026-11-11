@@ -1,10 +1,15 @@
 import asyncio
 import logging
 import math
+import json
+from telegram.error import BadRequest
+from services.billing import ActiveClock, money, prorate
+from services import deferred_leave
 import random
 import re
 import time
 import uuid
+import weakref
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -18,6 +23,9 @@ from services.session_ownership import SessionInUseError
 from services import self_healing
 
 logger = logging.getLogger(__name__)
+
+# Bound reporting, not service duration. Never queue stale starts for later replay.
+ORDER_REPORT_TIMEOUT_SECONDS = 8.0
 
 
 def _format_timer(seconds: float) -> str:
@@ -54,6 +62,8 @@ class OrderExecutor:
 	def __init__(self):
 		self.active_orders: Dict[int, Dict[str, Any]] = {}
 		self.app = None
+		self.shutting_down = False
+		self._report_locks = weakref.WeakValueDictionary()
 
 		# ─── Join Brain per-order scratch state (voice_chat) ───
 		# Kept OUTSIDE `active_orders` so it survives across build →
@@ -63,6 +73,10 @@ class OrderExecutor:
 		self._voice_banned: Dict[int, Set[int]] = {}          # account_id -> permanently dropped
 		self._voice_retry_after: Dict[int, Dict[int, float]] = {}  # account_id -> retry timestamp
 		self._voice_cursor: Dict[int, int] = {}               # round-robin cursor over the pool
+		# زمانِ «تلاش بعدی برای تکمیل تعداد» در فاز زمان خریداری‌شده. اگر استخر
+		# اکانت کوچک‌تر از سفارش باشد، تلاش‌ها با فاصله انجام می‌شوند تا نه لاگ
+		# پر شود و نه دیتابیس بی‌دلیل زیر بار برود (بدون هیچ سقف تعداد اکانت).
+		self._voice_refill_cooldown: Dict[int, float] = {}
 		# سفارش‌هایی که لغوشان از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و
 		# گزارش کاملِ «لغو» را خودِ همان مسیر می‌فرستد؛ پس executor نباید گزارش
 		# «cancelled» تکراری/ناقص بفرستد. flag یک‌بارمصرف است.
@@ -80,7 +94,7 @@ class OrderExecutor:
 
 	def _is_order_active(self, order_id: int) -> bool:
 		info = self.active_orders.get(order_id)
-		return bool(info) and not info.get("cancel_requested")
+		return bool(info) and not info.get("cancel_requested") and not info.get("terminal_committed")
 
 	def _live_count(self, order_id: int, order_type: str, joined_list: List[Dict]) -> int:
 		if order_type == "voice_chat":
@@ -129,9 +143,9 @@ class OrderExecutor:
 		# fallback: fixed safe ceiling
 		return max(1, int(getattr(Config, "VOICE_JOIN_MAX_CONCURRENCY", 10))), 0.0
 
-	async def submit_order(self, order_id: int, order_data: Dict[str, Any]):
-		if order_id in self.active_orders:
-			return
+	async def submit_order(self, order_id: int, order_data: Dict[str, Any]) -> bool:
+		if self.shutting_down or order_id in self.active_orders:
+			return False
 		self.active_orders[order_id] = {
 			"status": "running",
 			"data": order_data,
@@ -145,12 +159,198 @@ class OrderExecutor:
 			"swapped_accounts": 0,
 		}
 		try:
-			await DatabaseManager.mark_order_as_running(order_id)
+			claimed = await DatabaseManager.mark_order_as_running(order_id)
+			if not claimed:
+				self.active_orders.pop(order_id, None)
+				return False
 		except Exception:
 			self.active_orders.pop(order_id, None)
 			raise
-		task = asyncio.create_task(self._execute_order_logic(order_id, order_data))
+		if not self._is_order_active(order_id):
+			return False  # cancelled while the database claim was in flight
+		info = self.active_orders[order_id]
+		info.update(clock=ActiveClock(), serving=False, storage_ok=True, children=set(), delivered_ids=set())
+		try:
+			if not await DatabaseManager.checkpoint_order_billing(order_id, 0):
+				self.active_orders.pop(order_id, None)
+				return False
+		except Exception:
+			self.active_orders.pop(order_id, None)
+			await DatabaseManager.finalize_order_status(order_id, order_data.get('status') or 'pending', ('running',))
+			raise
+		task = asyncio.create_task(self._run_with_billing(order_id, order_data))
+		def consume_result(done):
+			try:
+				done.result()
+			except asyncio.CancelledError:
+				pass
+			except Exception:
+				logger.exception("Order %s worker ended; financial reconciliation will retry", order_id)
+		task.add_done_callback(consume_result)
 		self.active_orders[order_id]["task"] = task
+		return True
+
+	async def _run_with_billing(self, order_id, data):
+	    heartbeat = asyncio.create_task(self._billing_heartbeat(order_id))
+	    try:
+	        await self._execute_order_logic(order_id, data)
+	    finally:
+	        heartbeat.cancel()
+	        await asyncio.gather(heartbeat, return_exceptions=True)
+	        await self._drain_children(order_id)
+	        info = self.active_orders.get(order_id) or {}
+	        self._freeze_billing(order_id)
+	        if info.get('terminal_committed') or self.shutting_down:
+	            self.active_orders.pop(order_id, None)
+	        else:
+	            info['execution_done'] = True  # retry failed DB settlement, never bill this wait
+	        self._suppress_cancel_log.discard(order_id)
+
+	def _present_ids(self, order_id):
+	    """Accounts verified present right now — health/replacement only, no money."""
+	    info = self.active_orders.get(order_id) or {}
+	    data = info.get('data') or {}
+	    if data.get('order_type') == 'voice_chat':
+	        vcm = _get_voice_call_manager()
+	        if not vcm:
+	            return set()
+	        states = getattr(vcm, '_account_states_by_order', {}).get(order_id, {})
+	        return {aid for aid, state in states.items()
+	                if state == 'JOINED' and (order_id, aid) in vcm.active_calls}
+	    return {(e.get('acc') or {}).get('id') for e in info.get('joined_accounts') or []
+	            if (e.get('acc') or {}).get('id') is not None}
+
+	def _delivery_ok(self, order_id):
+	    info = self.active_orders.get(order_id) or {}
+	    required = int((info.get('data') or {}).get('accounts_count') or 0)
+	    return len(self._present_ids(order_id)) >= required > 0
+
+	def _sample_billing(self, order_id):
+	    """Billable seconds of a timed order = its active wall-clock window."""
+	    info = self.active_orders.get(order_id) or {}
+	    clock = info.get('clock')
+	    if not clock:
+	        return None
+	    total = int((info.get('data') or {}).get('duration_minutes') or 0) * 60
+	    if total <= 0:
+	        return 0.  # volume plans are priced per delivered account, not per minute
+	    return min(total, clock.served)
+
+	def _start_billing(self, order_id):
+	    """The order is live: minutes start counting regardless of fill rate."""
+	    info = self.active_orders.get(order_id) or {}
+	    clock = info.get('clock')
+	    if not clock:
+	        return None
+	    info['billing_started'] = True
+	    clock.start()
+	    return clock.served
+
+	def _freeze_billing(self, order_id):
+	    info = self.active_orders.get(order_id) or {}
+	    clock = info.get('clock')
+	    if clock:
+	        clock.freeze()
+	    info['serving'] = False
+	    info['billing_started'] = False
+
+	async def _persist_billing(self, order_id):
+	    info = self.active_orders.get(order_id) or {}
+	    clock = info.get('clock')
+	    if not clock:
+	        return True
+	    # Whole seconds only: a partial second at a checkpoint boundary is gifted
+	    # instead of turning a fast cancel into a 0.01 toman charge.
+	    return await DatabaseManager.checkpoint_order_billing(
+	        order_id, math.floor(clock.served), info.get('delivered_ids') or ())
+
+	async def _checkpoint_billing(self, order_id):
+	    info = self.active_orders.get(order_id) or {}
+	    try:
+	        ok = await asyncio.wait_for(self._persist_billing(order_id), timeout=5)
+	        info['storage_ok'] = True
+	        return ok
+	    except Exception:
+	        info['storage_ok'] = False
+	        # Keep sampling actual delivery in RAM while storage is unavailable.
+	        # A crash may lose the unpersisted tail; never invent it on restart.
+	        logger.exception('Order %s: checkpoint failed; observed usage retained in memory', order_id)
+	        return True
+
+	async def _billing_heartbeat(self, order_id):
+	    ticks = 0
+	    writer = None
+	    try:
+	        while order_id in self.active_orders:
+	            self._sample_billing(order_id)
+	            ticks += 1
+	            if writer and writer.done():
+	                if not writer.result():
+	                    return
+	                writer = None
+	            if ticks % 5 == 0 and writer is None:
+	                # At most one coalesced writer. A slow DB cannot block sampling.
+	                writer = asyncio.create_task(self._checkpoint_billing(order_id))
+	            await asyncio.sleep(1)
+	    finally:
+	        if writer:
+	            writer.cancel()
+	            await asyncio.gather(writer, return_exceptions=True)
+
+	async def _run_paid_duration(self, order_id, data):
+	    total = int(data.get('duration_minutes') or 0) * 60
+	    tick = 0
+	    while self._is_order_active(order_id):
+	        served = self._sample_billing(order_id) or 0
+	        remaining = max(0, total - served)
+	        info = self.active_orders[order_id]
+	        info['remaining_seconds'] = remaining
+	        info['end_time'] = datetime.utcnow() + timedelta(seconds=remaining)
+	        if remaining <= 0:
+	            self._freeze_billing(order_id)
+	            await self._persist_billing(order_id)
+	            return
+	        if tick and tick % max(5, int(getattr(Config, 'VOICE_DURATION_CHECK_INTERVAL', 20))) == 0:
+	            if data.get('order_type') == 'voice_chat':
+	                # A paused short remainder still needs replacement; never strand it
+	                # behind the old 60-second replacement cutoff.
+	                try:
+	                    await self._voice_duration_maintenance(order_id, data, info['end_time'])
+	                except asyncio.CancelledError:
+	                    raise
+	                except Exception:
+	                    logger.exception('Order %s replacement failed; remaining service is preserved', order_id)
+	        await asyncio.sleep(min(1, remaining))
+	        tick += 1
+	    raise asyncio.CancelledError()
+
+	def _spawn_child(self, order_id, coroutine):
+	    task = asyncio.create_task(coroutine)
+	    children = (self.active_orders.get(order_id) or {}).setdefault('children', set())
+	    children.add(task)
+	    task.add_done_callback(children.discard)
+	    return task
+
+	async def _drain_children(self, order_id):
+	    children = list((self.active_orders.get(order_id) or {}).get('children') or ())
+	    for task in children:
+	        task.cancel()
+	    if children:
+	        await asyncio.gather(*children, return_exceptions=True)
+
+	async def _record_delivery(self, order_id, acc, chat_id):
+	    if not self._is_order_active(order_id):
+	        return None
+	    info = self.active_orders[order_id]
+	    info.setdefault('delivered_ids', set()).add(acc['id'])
+	    entry = {'success': True, 'acc': acc, 'chat_id': chat_id}
+	    # Publish before the await so cancellation cleanup sees every joined member.
+	    joined = info.setdefault('joined_accounts', [])
+	    if not any((e.get('acc') or {}).get('id') == acc['id'] for e in joined):
+	        joined.append(entry)
+	    if info.get('clock') and not await self._persist_billing(order_id):
+	        return None
+	    return entry
 
 	async def _execute_order_logic(self, order_id: int, data: Dict[str, Any]):
 	    joined_list: List[Dict[str, Any]] = []
@@ -163,9 +363,32 @@ class OrderExecutor:
 	        duration = int(data.get("duration_minutes") or 0)
 	        order_type = data["order_type"]
 
+	        if not self._is_order_active(order_id):
+	            raise asyncio.CancelledError()
+	        data['_execution_started_at'] = datetime.utcnow()
+	        logger.info('Order %s: execution starting; reporting before build (bot=%s)', order_id, bot_id)
+	        await self._announce_order_start(order_id, data)
+	        if not self._is_order_active(order_id):
+	            raise asyncio.CancelledError()
+	        # The order is live from here on: its active window — and with it the
+	        # billable base — starts now, however slowly the slots fill in. Time
+	        # spent notifying about the start is never part of the service window.
+	        self._start_billing(order_id)
+	        try:
+	            await DatabaseManager.start_order_duration(order_id)
+	        except Exception:
+	            logger.exception('Order %s: service-start stamp failed; billing clock unaffected', order_id)
+	        # ⚠️ هدفِ سفارش هرگز با تعداد اکانت موجود «کوچک» نمی‌شود: اگر استخر کوچک‌تر از
+	        # سفارش باشد، ربات با همهٔ اکانت‌های موجود کار می‌کند و تا پایان زمان
+	        # خریداری‌شده برای تکمیل تعداد تلاش می‌کند (بدون سقف تعداد اکانت / CPU).
+	        # عدد Eligible فقط برای شفافیت لاگ است.
 	        eligible_count = await DatabaseManager.count_active_accounts(bot_id=bot_id)
-	        exact = min(requested, eligible_count)
-	        logger.info(f"Order {order_id}: Requested={requested}, Eligible={eligible_count}, Target={exact}")
+	        exact = requested if eligible_count else 0
+	        logger.info(
+	            f"Order {order_id}: Requested={requested}, Eligible(active in DB)={eligible_count}, "
+	            f"Target={exact} — target is NOT capped by the pool; every usable account is used "
+	            f"and top-up retries continue for the whole order"
+	        )
 
 	        if exact <= 0:
 	            await self._fail_order(order_id, "No eligible active accounts available.")
@@ -174,10 +397,9 @@ class OrderExecutor:
 	        if order_id in self.active_orders:
 	            self.active_orders[order_id]["target_count"] = exact
 
-	        await self._log_to_channel("started", order_id, data, bot_id=bot_id)
-
 	        # ────────────────────────────────────────────────────────────
-	        # BUILD PHASE — join time is NEVER part of the purchased window.
+	        # BUILD PHASE — the order is already live and billable; this loop
+	        # only decides when every requested slot is finally present.
 	        # Voice orders: ADAPTIVE BATCH fill — waves of N accounts join &
 	        # get verified CONCURRENTLY; N adapts to FloodWait/failure rates
 	        # (Join Brain); failed accounts are retried (bounded) and then
@@ -209,10 +431,7 @@ class OrderExecutor:
 	            )
 
 	        if not self._is_order_active(order_id):
-	            await self._cleanup_order(order_id, joined_list, data)
-	            await DatabaseManager.update_order_status(order_id, "stopped")
-	            self.active_orders.pop(order_id, None)
-	            return
+	            raise asyncio.CancelledError()
 
 	        joined_list = self._prune_joined(order_id, order_type, joined_list)
 	        live = self._live_count(order_id, order_type, joined_list)
@@ -248,135 +467,63 @@ class OrderExecutor:
 	            joined_list = self._prune_joined(order_id, order_type, joined_list)
 	            live = self._live_count(order_id, order_type, joined_list)
 
-	        if order_id in self.active_orders:
-	            self.active_orders[order_id]["live_count"] = live
+	        # 🛡 v2.2.17 — پایانِ فاز ورود هرگز باعث لغو خودکار سفارش نمی‌شود.
+	        # دلیل: تشخیص «حضور» روی شبکهٔ بی‌ثبات (مثلاً عبور ترافیک از WARP)
+	        # می‌تواند موقتاً کمتر از واقعیت گزارش کند. قبلاً همین شرط
+	        # (`live < requested`) سفارش را چند دقیقه بعد از شروع می‌بست و
+	        # اکانت‌ها را از تماس و گروه بیرون می‌انداخت. حالا:
+	        #   • هر تعداد اکانتِ واقعاً وارد‌شده ⇒ سفارش تا پایان زمان
+	        #     خریداری‌شده ادامه می‌یابد (تکمیل/جایگزینی هم ادامه دارد).
+	        #   • فقط وقتی هیچ اکانتی وارد نشده باشد، سفارش تسویه و عودت می‌شود.
+	        delivered = set()
+	        for _entry in (joined_list or []):
+	            if not isinstance(_entry, dict):
+	                continue  # شکل‌های قدیمی/غیرمنتظره هرگز باعث خطا نمی‌شوند
+	            _acc = _entry.get("acc")
+	            _aid = _acc.get("id") if isinstance(_acc, dict) else _acc
+	            if _aid is not None:
+	                delivered.add(_aid)
+	        effective_live = max(int(live or 0), len(delivered))
 
-	        if live == 0:
-	            await self._fail_order(order_id, "All accounts failed to join.")
+	        if order_id in self.active_orders:
+	            self.active_orders[order_id]["live_count"] = effective_live
+
+	        if effective_live <= 0:
+	            # هیچ اکانتی وارد نشد ⇒ خدمتی ارائه نشده؛ تسویه با عودت کامل.
+	            await self._fail_order(order_id, "No account could be delivered.")
 	            return
 
-	        # ────────────────────────────────────────────────────────────
-	        # DURATION PHASE — the billable timer starts ONLY NOW that the
-	        # required accounts are present (join/build time is free).
-	        # ────────────────────────────────────────────────────────────
+	        if effective_live < requested:
+	            # تعداد کمتر از سفارش هیچ مشکلی نیست: همان اکانت‌های قابل استفاده
+	            # سرویس می‌دهند، سفارش تا پایان زمان خریداری‌شده کامل اجرا می‌شود
+	            # و هزینه فقط زمانی است. به مشتری هیچ پیامی بابت «کمبود» فرستاده
+	            # نمی‌شود — این یک وضعیت عادی است، نه خطا.
+	            logger.info(
+	                f"Order {order_id}: {effective_live}/{requested} account(s) present after build — "
+	                "all usable accounts are serving; order runs the full purchased duration "
+	                "(no auto-cancel, price is time-only, account count does not affect cost)"
+	            )
+
 	        if duration > 0:
-	            try:
-	                started_at = await DatabaseManager.start_order_duration(order_id)
-	            except Exception as exc:
-	                logger.warning(f"Order {order_id}: could not persist duration start: {exc}")
-	                started_at = None
-	            started_at = started_at or datetime.utcnow()
-	            end_time = started_at + timedelta(minutes=duration)
-	            total_secs = duration * 60
-	            logger.info(
-	                f"Order {order_id}: BUILD completed in {time.time() - build_started_wall:.0f}s "
-	                f"(live={live}/{exact}). Billable timer NOW STARTING — "
-	                f"{_format_timer(total_secs)} | deadline={end_time.strftime('%H:%M:%S')} UTC"
-	            )
-
-	            if order_id in self.active_orders:
-	                self.active_orders[order_id]["end_time"] = end_time
-	                self.active_orders[order_id]["remaining_seconds"] = float(total_secs)
-
-	            _tick = 0
-	            _check_interval = max(5, int(getattr(Config, "VOICE_DURATION_CHECK_INTERVAL", 20)))
-	            _log_interval = 10
-
-	            while True:
-	                now_utc = datetime.utcnow()
-	                remaining_now = (end_time - now_utc).total_seconds()
-
-	                if not self._is_order_active(order_id):
-	                    logger.info(f"Order {order_id}: cancelled - ejecting all accounts NOW")
-	                    await self._cleanup_order(order_id, joined_list, data)
-	                    await DatabaseManager.update_order_status(order_id, "stopped")
-	                    if not self._consume_cancel_log_suppression(order_id):
-	                        try:
-	                            await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id, reason="User cancelled")
-	                        except Exception:
-	                            pass
-	                    self.active_orders.pop(order_id, None)
-	                    return
-
-	                if remaining_now <= 0:
-	                    break
-
-	                if order_id in self.active_orders:
-	                    self.active_orders[order_id]["remaining_seconds"] = remaining_now
-
-	                if _tick % _log_interval == 0:
-	                    logger.info(
-	                        f"Order {order_id}: {_format_timer(remaining_now)} "
-	                        f"| live={live}/{exact}"
-	                    )
-
-	                if _tick % _check_interval == 0 and _tick > 0:
-	                    if not self._is_order_active(order_id):
-	                        logger.info(f"Order {order_id}: cancelled — ejecting all accounts")
-	                        await self._cleanup_order(order_id, joined_list, data)
-	                        await DatabaseManager.update_order_status(order_id, "stopped")
-	                        if not self._consume_cancel_log_suppression(order_id):
-	                            try:
-	                                await self._log_to_channel(
-	                                    "cancelled", order_id, data,
-	                                success_cnt=self._live_count(order_id, order_type, joined_list), bot_id=bot_id,
-	                                reason="User cancelled",
-	                                )
-	                            except Exception:
-	                                pass
-	                        self.active_orders.pop(order_id, None)
-	                        return
-
-	                    # Update live count from PERSISTENT per-order state.
-	                    # This NEVER decreases on temporary verification
-	                    # failures.  Disconnects are re-joined by the monitor
-	                    # (SAME account, never re-counted); slots the monitor
-	                    # proved UNRECOVERABLE are REPLACED with fresh
-	                    # accounts so presence stays at target until the real
-	                    # deadline.
-	                    joined_list = self._prune_joined(order_id, order_type, joined_list)
-	                    live = self._live_count(order_id, order_type, joined_list)
-	                    if order_type == "voice_chat":
-	                        try:
-	                            await self._voice_duration_maintenance(order_id, data, end_time)
-	                        except asyncio.CancelledError:
-	                            raise
-	                        except Exception as exc:
-	                            logger.warning(f"Order {order_id}: duration maintenance error: {exc}")
-	                        order_info = self.active_orders.get(order_id)
-	                        if order_info:
-	                            joined_list = order_info.get("joined_accounts") or joined_list
-	                            live = self._live_count(order_id, order_type, joined_list)
-	                    if order_id in self.active_orders:
-	                        self.active_orders[order_id]["live_count"] = live
-	                        self.active_orders[order_id]["joined_accounts"] = joined_list
-	                    logger.info(
-	                        f"Order {order_id}: stable live={live}/{exact} "
-	                        f"(rejoin by monitor; unrecoverable slots replaced)"
-	                    )
-
-	                await asyncio.sleep(min(1.0, max(0.0, remaining_now)))
-	                _tick += 1
-
-	            logger.info(
-	                f"Order {order_id}: timer ended after {_format_timer(total_secs)} "
-	                f"— ejecting all accounts"
-	            )
-	            await self._finish_order(order_id, data, joined_list, dead_count)
-	        else:
-	            await self._finish_order(order_id, data, joined_list, dead_count)
-
+	            await self._persist_billing(order_id)
+	            started_at = await DatabaseManager.start_order_duration(order_id)
+	            if not started_at:
+	                raise asyncio.CancelledError()
+	            self.active_orders[order_id]["serving"] = True
+	            await self._run_paid_duration(order_id, data)
+	        await self._finish_order(order_id, data, joined_list, dead_count)
 	    except asyncio.CancelledError:
+	        self._freeze_billing(order_id)
+	        await self._drain_children(order_id)
+	        if not self.shutting_down:
+	            await self.settle_and_refund_order(order_id, bot_id=data.get("bot_id", 1),
+	                                               canceled_by_role="سیستم", cancellation_reason="توقف اجرا")
+	        else:
+	            await self._persist_billing(order_id)
 	        await self._cleanup_order(order_id, joined_list, data)
-	        await DatabaseManager.update_order_status(order_id, "stopped")
-	        if not self._consume_cancel_log_suppression(order_id):
-	            try: await self._log_to_channel("cancelled", order_id, data, success_cnt=self._live_count(order_id, data.get("order_type"), joined_list), bot_id=data.get("bot_id", 1))
-	            except: pass
-	        self.active_orders.pop(order_id, None)
-	    except Exception as e:
-	        logger.error(f"Critical error order {order_id}: {e}", exc_info=True)
-	        await self._cleanup_order(order_id, joined_list, data)
-	        await self._fail_order(order_id, f"System Error: {e}")
+	    except Exception as exc:
+	        logger.exception("Order %s execution failed", order_id)
+	        await self._fail_order(order_id, f"System Error: {exc}")
 
 	# ═══════════════════════════════════════════════════════════════════
 	# JOIN BRAIN — ADAPTIVE BATCH FILL (voice_chat)
@@ -390,17 +537,25 @@ class OrderExecutor:
 	    self._voice_retry_after.setdefault(order_id, {})
 	    self._voice_cursor.setdefault(order_id, 0)
 
-	def _voice_forget_order(self, order_id: int) -> None:
-	    """Release all Join-Brain scratch state for an order (idempotent)."""
+	def _voice_forget_order(self, order_id: int, *, keep_excluded: bool = False) -> None:
+	    """Release all Join-Brain scratch state for an order (idempotent).
+
+	    ``keep_excluded`` فقط استخر/شمارنده‌ها را پاک می‌کند و فهرست
+	    «اکانت‌های باطل‌شده» و زمان‌های retry را نگه می‌دارد؛ در فاز زمان
+	    خریداری‌شده استفاده می‌شود تا هر چرخه، سشن‌های مردهٔ تلگرام دوباره
+	    تلاش نشوند (هزینهٔ بی‌مورد) ولی اکانت‌های سالم دوباره وارد چرخه شوند.
+	    """
 	    try:
 	        join_brain.forget_order(order_id)
 	    except Exception:
 	        pass
 	    self._voice_pool.pop(order_id, None)
 	    self._voice_attempts.pop(order_id, None)
-	    self._voice_banned.pop(order_id, None)
-	    self._voice_retry_after.pop(order_id, None)
 	    self._voice_cursor.pop(order_id, None)
+	    if not keep_excluded:
+	        self._voice_banned.pop(order_id, None)
+	        self._voice_retry_after.pop(order_id, None)
+	        self._voice_refill_cooldown.pop(order_id, None)
 
 	async def _voice_load_pool(self, bot_id: int, order_id: int) -> None:
 	    """Load (or refresh) the eligible-account pool for an order.
@@ -446,6 +601,21 @@ class OrderExecutor:
 	        seen.add(aid)
 	    self._voice_pool[order_id] = merged
 
+	def _voice_attempt_budget(self) -> int:
+	    """سقف تلاش هر اکانت در یک سفارش؛ ۰ یا منفی یعنی «بدون سقف».
+
+	    طبق قرارداد ادمین، تعداد اکانت و توان پردازنده هیچ محدودیتی برای تکمیل
+	    سفارش ایجاد نمی‌کنند: هر اکانتِ قابل استفاده تا رسیدن به تعداد
+	    خریداری‌شده (با فاصلهٔ کوتاه) دوباره تلاش می‌شود. تنها استثنا اکانت‌هایی
+	    هستند که خود تلگرام باطل کرده (SESSION_REVOKED / AUTH_KEY_* /
+	    USER_DEACTIVATED) و FloodWait سروری.
+	    """
+	    try:
+	        raw = int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 0))
+	    except (TypeError, ValueError):
+	        raw = 0
+	    return raw if raw > 0 else 0
+
 	def _voice_candidates(self, order_id: int, window: int, joined_ids: Set[int],
 	                    in_flight: Set[int], now: float) -> List[Dict]:
 	    """Pick up to `window` pool accounts that are ready to try now."""
@@ -456,7 +626,7 @@ class OrderExecutor:
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    chosen: List[Dict] = []
 	    cursor = self._voice_cursor.get(order_id, 0)
 	    n = len(pool)
@@ -470,7 +640,7 @@ class OrderExecutor:
 	            continue
 	        if aid in banned or aid in joined_ids or aid in in_flight:
 	            continue
-	        if attempts.get(aid, 0) >= attempt_budget:
+	        if attempt_budget and attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        if retry_after.get(aid, 0) > now:
 	            continue
@@ -490,13 +660,13 @@ class OrderExecutor:
 	    attempts = self._voice_attempts.get(order_id, {})
 	    banned = self._voice_banned.get(order_id, set())
 	    retry_after = self._voice_retry_after.get(order_id, {})
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    best: Optional[float] = None
 	    for acc in pool:
 	        aid = acc.get("id")
 	        if not aid or aid in banned or aid in joined_ids:
 	            continue
-	        if attempts.get(aid, 0) >= attempt_budget:
+	        if attempt_budget and attempts.get(aid, 0) >= attempt_budget:
 	            continue
 	        when = retry_after.get(aid, 0.0)
 	        # Mirror the persisted FloodWait timer in scheduling so waves
@@ -547,7 +717,7 @@ class OrderExecutor:
 	        fixed = max(1, int(getattr(Config, "VOICE_JOIN_INITIAL_CONCURRENCY", 5)))
 	        join_brain.register_order(order_id, initial=fixed, min_window=fixed, max_window=fixed)
 
-	    attempt_budget = max(1, int(getattr(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 2)))
+	    attempt_budget = self._voice_attempt_budget()
 	    backoff_base = max(1.0, float(getattr(Config, "VOICE_RETRY_BACKOFF_BASE", 8)))
 	    wave_no = 0
 	    live = int(vcm.get_active_count(order_id))
@@ -579,7 +749,7 @@ class OrderExecutor:
 	            )
 	            if lookahead:
 	                try:
-	                    warm_task = asyncio.create_task(vcm.warmup_clients(lookahead))
+	                    warm_task = self._spawn_child(order_id, vcm.warmup_clients(lookahead))
 
 	                    def _consume_warm(_t: asyncio.Task) -> None:
 	                        try:
@@ -596,6 +766,26 @@ class OrderExecutor:
 	            # backoff, or end the fill if the pool is exhausted.
 	            earliest = self._voice_earliest_retry(order_id, joined_ids)
 	            if earliest is None:
+	                # استخر تمام شد: هیچ اکانتِ قابل‌استفاده‌ای باقی نمانده (یا
+	                # همه وارد شده‌اند، یا سشن‌ها باطل/غیرقابل‌استفاده‌اند).
+	                # این «سقف تعداد اکانت» نیست؛ در طول فاز زمان خریداری‌شده
+	                # استخر دوباره بارگذاری و تکمیل ادامه پیدا می‌کند.
+	                _pool = self._voice_pool.get(order_id) or []
+	                _banned = self._voice_banned.get(order_id) or ()
+	                usable = max(0, len(_pool) - len(_banned))
+	                if usable and live >= min(usable, target_count):
+	                    logger.info(
+	                        f"Order {order_id}: all {usable} usable account(s) are already in "
+	                        f"(live={live}/{target_count}) — order keeps running for the full duration "
+	                        f"(price is time-only, account count does not affect cost)"
+	                    )
+	                else:
+	                    logger.warning(
+	                        f"Order {order_id}: no usable account left to try right now "
+	                        f"(pool={len(_pool)}, excluded={len(_banned)}, "
+	                        f"joined={len(joined_ids)}, live={live}/{target_count}) — "
+	                        f"order keeps running; top-up retries continue for the whole duration"
+	                    )
 	                break
 	            wait = max(0.0, min(earliest - now, 30.0))
 	            if wait <= 0:
@@ -635,7 +825,7 @@ class OrderExecutor:
 	            if _i > 0:
 	                gap = random.uniform(stagger_min, stagger_max) + random.uniform(jitter_min, jitter_max)
 	                await asyncio.sleep(gap)
-	            wave_tasks.append(asyncio.create_task(
+	            wave_tasks.append(self._spawn_child(order_id,
 	                self._join_single_account(order_id, acc, "voice_chat", target, 0)
 	            ))
 	        # Hard wave deadline: ONE stuck account must never freeze the whole
@@ -653,7 +843,7 @@ class OrderExecutor:
 	            for _t in pending_w:
 	                _t.cancel()
 	            # Let cancellation settle so the vcm state machines unwind cleanly.
-	            await asyncio.wait(list(pending_w), timeout=10)
+	            await asyncio.gather(*pending_w, return_exceptions=True)
 	        results: Dict[asyncio.Task, Any] = {}
 	        for _t in wave_tasks:
 	            if _t in done_w:
@@ -765,9 +955,10 @@ class OrderExecutor:
 	                attempts = self._voice_attempts.setdefault(order_id, {})
 	                n_att = attempts.get(aid, 0) + 1
 	                attempts[aid] = n_att
-	                if n_att >= attempt_budget:
-	                    # Retry budget exhausted → give up on this account; the
-	                    # next wave replaces it with a fresh pool member.
+	                if attempt_budget and n_att >= attempt_budget:
+	                    # فقط وقتی ادمین صریحاً یک سقف تلاش تعیین کرده باشد
+	                    # (VOICE_ACCOUNT_ATTEMPT_LIMIT>0) اکانت کنار گذاشته
+	                    # می‌شود؛ پیش‌فرض ۰ = بدون سقف.
 	                    self._voice_banned.setdefault(order_id, set()).add(aid)
 	                    logger.warning(
 	                        f"Order {order_id}: account {aid} gave up after {n_att} "
@@ -780,10 +971,15 @@ class OrderExecutor:
 	                        delay = min(max(delay * _fac, 1.0), 300.0)
 	                    except Exception:
 	                        pass
+	                    if not attempt_budget:
+	                        # بدون سقف تلاش: حداکثر ۲ دقیقه فاصله، سپس دوباره —
+	                        # تا سفارش با همهٔ اکانت‌های موجود کامل شود.
+	                        delay = min(delay, 120.0)
 	                    self._voice_retry_after.setdefault(order_id, {})[aid] = time.time() + delay
 	                    logger.info(
 	                        f"Order {order_id}: account {aid} attempt {n_att} failed "
 	                        f"({msg[:60]}); retry in {delay:.0f}s"
+	                        + (" [unlimited attempts]" if not attempt_budget else "")
 	                    )
 	                join_brain.report_result(order_id, outcome, msg)
 	                wave_fail += 1
@@ -841,17 +1037,64 @@ class OrderExecutor:
 	        return 0
 	    remaining = (end_time - datetime.utcnow()).total_seconds()
 	    grace = max(0, int(getattr(Config, "VOICE_REPLACEMENT_GRACE_SECONDS", 60)))
-	    if remaining < grace:
-	        return 0
+	    target = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
+	    delivered = len(self._present_ids(order_id))
+	    if remaining < grace and delivered >= target > 0:
+	        return 0  # every slot still healthy: a late replacement would be pointless
 	    if not self._is_order_active(order_id):
 	        return 0
 
 	    slots = vcm.get_unrecoverable_slots(order_id)
-	    if not slots:
+	    exact = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
+	    shortfall = int(vcm.get_active_count(order_id)) < exact
+	    if not slots and not shortfall:
 	        return 0
 
+	    if not slots and shortfall:
+	        # استخر کوچک‌تر از سفارش است (مثلاً ۳۰ اکانت برای سفارش ۵۰ تایی):
+	        # هیچ مشکلی نیست — همان اکانت‌ها سرویس می‌دهند. JoinBrain را
+	        # فراموش نمی‌کنیم (قبلاً هر چرخه window را به ۱ برمی‌گرداند و
+	        # لاگ forgotten/registered می‌نوشت). استخر را فقط refresh می‌کنیم
+	        # تا اگر اکانت جدیدی فعال شد، تکمیل ادامه یابد.
+	        _now_ts = time.time()
+	        if _now_ts < float(self._voice_refill_cooldown.get(order_id) or 0.0):
+	            return 0
+	        try:
+	            await self._voice_load_pool(int((data or {}).get("bot_id", 1)), order_id)
+	        except Exception:
+	            pass
+	        joined_now = set(vcm.get_active_account_ids(order_id))
+	        banned_now = self._voice_banned.get(order_id) or set()
+	        usable_now = {
+	            acc.get("id") for acc in (self._voice_pool.get(order_id) or [])
+	            if acc.get("id") and acc.get("id") not in banned_now
+	        }
+	        if usable_now and usable_now.issubset(joined_now):
+	            logger.info(
+	                f"Order {order_id}: all {len(usable_now)} usable account(s) are in "
+	                f"(requested {exact}) — serving the full purchased duration "
+	                f"(price/time unchanged)"
+	            )
+	            self._voice_refill_cooldown[order_id] = time.time() + max(
+	                30, int(getattr(Config, "VOICE_REFILL_RETRY_SECONDS", 90))
+	            )
+	            return 0
+	        _before_fill = len(self._present_ids(order_id))
+	    else:
+	        _before_fill = None
+
 	    released = 0
+	    # 🛡 v2.2.17: رهاسازی اسلات‌ها «قطره‌ای» انجام می‌شود تا در قطعی شبکه
+	    # (WARP) اکانت‌ها پشت‌سرهم از تماس بیرون نیفتند؛ بقیه در چرخهٔ بعد.
+	    max_releases = max(1, int(getattr(Config, "VOICE_MAX_RELEASES_PER_CYCLE", 2)))
+	    if len(slots) > max_releases:
+	        logger.warning(
+	            f"Order {order_id}: {len(slots)} slot(s) flagged unrecoverable at once — "
+	            f"releasing at most {max_releases} this cycle (possible network incident)"
+	        )
 	    for aid in list(slots.keys()):
+	        if released >= max_releases:
+	            break
 	        try:
 	            ok, _m = await vcm.release_unrecoverable_slot(order_id, aid, leave_group=False)
 	            if ok:
@@ -861,9 +1104,8 @@ class OrderExecutor:
 	        except Exception as exc:
 	            logger.warning(f"Order {order_id}: failed releasing slot {aid}: {exc}")
 
-	    if released <= 0:
+	    if released <= 0 and not shortfall:
 	        return 0
-
 	    # Track how many slots were hot-swapped over the order's lifetime so the
 	    # completion/cancellation report can show {swapped_accounts}. Counted at
 	    # the moment unrecoverable slots are released for replacement.
@@ -874,10 +1116,17 @@ class OrderExecutor:
 	    exact = int((self.active_orders.get(order_id) or {}).get("target_count") or 0)
 	    if exact <= 0:
 	        return 0
-	    logger.warning(
-	        f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
-	        f"replacing to keep presence until deadline"
-	    )
+	    if released:
+	        logger.warning(
+	            f"Order {order_id}: releasing {released} unrecoverable slot(s) — "
+	            f"replacing to keep presence until deadline"
+	        )
+	    else:
+	        logger.info(
+	            f"Order {order_id}: topping up from remaining pool "
+	            f"({len(self._present_ids(order_id))} of {exact} in; "
+	            f"order keeps running, price/time unchanged)"
+	        )
 	    more, _d2 = await self._voice_batched_fill(
 	        order_id=order_id,
 	        target=str((data or {}).get("target_link") or ""),
@@ -896,6 +1145,13 @@ class OrderExecutor:
 	                have.add(acc_id)
 	        info["joined_accounts"] = current
 	        info["live_count"] = self._live_count(order_id, "voice_chat", current)
+	    if _before_fill is not None:
+	        _after_fill = len(self._present_ids(order_id))
+	        _cooldown = max(30, int(getattr(Config, "VOICE_REFILL_RETRY_SECONDS", 90)))
+	        # اگر چیزی اضافه نشد، مدتی صبر می‌کنیم (اکانت‌های سالمِ آزادشده یا
+	        # اکانت‌های تازه‌فعال‌شده بعداً دوباره امتحان می‌شوند).
+	        self._voice_refill_cooldown[order_id] = 0.0 if _after_fill > _before_fill \
+	            else time.time() + _cooldown
 	    return released
 
 	async def _progressive_fill(
@@ -1141,7 +1397,7 @@ class OrderExecutor:
 				vcm = _get_voice_call_manager()
 				if vcm:
 					ok, msg, cid = await vcm.start_call(order_id, acc["id"], acc["session_string"], target, duration_minutes)
-					if ok: return {"success": True, "acc": acc, "chat_id": cid}
+					if ok: return await self._record_delivery(order_id, acc, cid)
 					if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 						await self._mark_account_dead(acc["id"])
 						return {"success": False, "status": "dead"}
@@ -1150,7 +1406,7 @@ class OrderExecutor:
 			if order_type in ["group_join", "channel_join"]:
 				client = TelegramAccountClient(acc["phone_number"], acc["session_string"], acc["id"])
 				ok, msg = await client.join_chat(target)
-				if ok: return {"success": True, "acc": acc, "chat_id": None}
+				if ok: return await self._record_delivery(order_id, acc, None)
 				if any(x in str(msg).upper() for x in ["SESSION_REVOKED", "AUTH_KEY_INVALID", "USER_DEACTIVATED", "401"]):
 					await self._mark_account_dead(acc["id"])
 					return {"success": False, "status": "dead"}
@@ -1170,9 +1426,16 @@ class OrderExecutor:
 	async def _finish_order(self, order_id, data, joined_accounts, dead_count):
 		# 1) IMMEDIATE exit from voice chat + group
 		final_live = self._live_count(order_id, data.get("order_type"), joined_accounts)
+		self._sample_billing(order_id)
+		await self._persist_billing(order_id)
+		if not await DatabaseManager.complete_order(order_id):
+			return False
+		self._freeze_billing(order_id)
+		if order_id in self.active_orders:
+			self.active_orders[order_id]['terminal_committed'] = True
+		await self._drain_children(order_id)
 		await self._cleanup_order(order_id, joined_accounts, data)
-		# 2) mark completed + send channel report
-		await DatabaseManager.complete_order(order_id)
+		# Only the database transition winner reports completion.
 		await self._log_to_channel("completed", order_id, data, success_cnt=final_live, bot_id=data.get("bot_id", 1))
 		# 3) notify the customer
 		try:
@@ -1184,18 +1447,35 @@ class OrderExecutor:
 					duration_min = int(data.get("duration_minutes") or 0)
 					timer_str = _format_timer(duration_min * 60) if duration_min else "-"
 					msg = (
-						f"Order #{order_id} completed successfully.\n"
-						f"Duration: {timer_str}\n"
-						f"Successful accounts: {final_live}\n"
-						f"Link: {data.get('target_link', '-')}\n"
-						f"\nAccounts have left the voice chat and group."
+						f"✅ سفارش #{order_id} تکمیل شد.\n"
+						f"مدت خدمت خریداری‌شده: {timer_str}\n"
+						f"اکانت‌های داخل تماس: {final_live}\n"
+						f"هزینهٔ کل از پیش پرداخت شده (مبنای محاسبه فقط زمان فعال سفارش است؛ "
+						f"تعداد اکانت روی مبلغ هیچ اثری ندارد).\n"
+						"🔒 اکانت‌ها از تماس خارج شدند و برای جلوگیری از ریسک محدودیت، فعلاً در گروه می‌مانند؛ "
+						"اگر سفارش دیگری برای همین گروه نباشد، یک هفته بعد خارج می‌شوند."
 					)
-					await app.bot.send_message(user["telegram_id"], msg)
+					if await DatabaseManager.claim_order_report(order_id, "customer", "completed"):
+						await app.bot.send_message(user["telegram_id"], msg)
+						await DatabaseManager.mark_order_report(order_id, "customer", "completed", "sent")
 		except Exception:
 			pass
-		self.active_orders.pop(order_id, None)
+		return True
 
 	async def _cleanup_order(self, order_id, joined_accounts, data):
+		info = self.active_orders.get(order_id)
+		if info is None:
+			return await self._cleanup_order_impl(order_id, joined_accounts, data)
+		async with info.setdefault('cleanup_lock', asyncio.Lock()):
+			if info.get('cleanup_done'):
+				return
+			await self._cleanup_order_impl(order_id, joined_accounts, data)
+			info['cleanup_done'] = True
+
+	async def _cleanup_order_impl(self, order_id, joined_accounts, data):
+		await self._drain_children(order_id)
+		entries = (self.active_orders.get(order_id) or {}).get('joined_accounts') or []
+		joined_accounts = list({(e.get('acc') or {}).get('id'): e for e in list(joined_accounts or []) + list(entries)}.values())
 		# Release Join Brain scratch state (idempotent).
 		self._voice_forget_order(order_id)
 		order_type = (data or {}).get("order_type")
@@ -1207,15 +1487,48 @@ class OrderExecutor:
 			vcm = _get_voice_call_manager()
 			if vcm:
 				try:
-					n = await vcm.stop_all_for_order(order_id, leave_group=True)
-					logger.info(f"Order {order_id}: paced voice leave finished ({n} accounts)")
+					# تماس قطع می‌شود، ولی عضویت گروه حفظ می‌شود (ضد بن/حذف اکانت).
+					n = await vcm.stop_all_for_order(order_id, leave_group=False)
+					logger.info(f"Order {order_id}: paced voice stop finished ({n} accounts); group kept")
 				except Exception as exc:
 					logger.warning(f"Order {order_id}: vcm cleanup failed: {exc}")
-		else:
-			try:
-				await self._eject_all_fast(order_id, joined_accounts, data)
-			except Exception as exc:
-				logger.exception(f"Order {order_id}: cleanup failed: {exc}")
+		# 🚪 خروج از گروه فوری نیست: به صف «خروج تأخیری» می‌رود تا اکانت‌ها به
+		# خاطر join/leave پشت‌سرهم بن/حذف نشوند.
+		try:
+			await self._defer_group_leave(order_id, joined_accounts, data)
+		except Exception as exc:
+			logger.exception(f"Order {order_id}: deferred leave scheduling failed: {exc}")
+
+	async def _defer_group_leave(self, order_id, entries, data):
+		"""خروج اکانت‌ها از گروه را به تعویق می‌اندازد (پیش‌فرض: یک هفته).
+
+		خروج فوری فقط وقتی انجام می‌شود که ادمین صریحاً
+		``GROUP_LEAVE_DELAY_MINUTES=0`` گذاشته باشد. در حالت عادی، عضویت اکانت
+		در گروه/کانال حفظ می‌شود و اگر سفارش دیگری برای همان گروه نباشد، پس از
+		پایان مهلت یکی‌یکی و با فاصله خارج می‌شود.
+		"""
+		order_type = (data or {}).get("order_type")
+		bot_id = int((data or {}).get("bot_id") or 1)
+		delay = await deferred_leave.resolved_leave_delay_minutes(bot_id)
+		accounts = deferred_leave.accounts_from_entries(entries)
+		if delay <= 0:
+			if order_type == "voice_chat":
+				vcm = _get_voice_call_manager()
+				if vcm:
+					try:
+						await vcm.stop_all_for_order(order_id, leave_group=True)
+					except Exception as exc:
+						logger.warning(f"Order {order_id}: immediate voice leave failed: {exc}")
+			else:
+				await self._eject_all_fast(order_id, entries, data)
+			return 0
+		if not accounts:
+			return 0
+		return await deferred_leave.schedule_for_order(
+			bot_id=int((data or {}).get("bot_id") or 1),
+			target=(data or {}).get("target_link") or "",
+			accounts=accounts, order_id=order_id, delay_minutes=delay,
+		)
 
 	async def _leave_single(self, entry, order_id, order_type, target, sem):
 		async with sem:
@@ -1234,31 +1547,74 @@ class OrderExecutor:
 
 	async def stop_active_order(self, order_id: int, is_expired: bool = False, reason: Optional[str] = None,
 	                            suppress_cancel_log: bool = False):
+		if not suppress_cancel_log:
+			if is_expired:
+				info = self.active_orders.get(order_id) or {}
+				if not info:
+					return False, "No active service timer"
+				ok = await self._finish_order(order_id, info['data'], info.get('joined_accounts', []), 0)
+				return bool(ok), "Completion checked"
+			order = await DatabaseManager.get_order(order_id) or {}
+			result = await self.settle_and_refund_order(order_id, bot_id=order.get('bot_id', 1),
+			                                          cancellation_reason=reason or "توقف سفارش")
+			return bool(result.get('claimed') or result.get('already_settled')), "Settlement checked"
 		# اگر لغو از بیرون (هندلر کاربر/ادمین) مدیریت می‌شود و خودش گزارش کامل
 		# می‌فرستد، جلوی گزارش «cancelled» تکراری/ناقصِ executor را بگیر.
 		if suppress_cancel_log:
 			self._suppress_cancel_log.add(order_id)
 		if order_id in self.active_orders:
 			info = self.active_orders[order_id]
+			was_requested = info.get("cancel_requested", False)
 			info["cancel_requested"] = True
 			task = info.get("task")
-			if task and not task.done():
-				task.cancel()
+			self._freeze_billing(order_id)
+			if task and task is not asyncio.current_task() and not task.done():
+				if not was_requested:
+					task.cancel()
 				try:
 					await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
 				except (asyncio.CancelledError, asyncio.TimeoutError):
 					pass
 				return True, "Order cancelled and accounts left."
 			await self._cleanup_order(order_id, info.get("joined_accounts", []), info.get("data", {}))
-			await self._fail_order(order_id, "Stopped.")
+			await DatabaseManager.finalize_order_status(order_id, "stopped")
 			return True, "Stopped"
 		vcm = _get_voice_call_manager()
+		n = 0
 		if vcm:
-			n = await vcm.stop_all_for_order(order_id, leave_group=True)
-			if n > 0:
-				await DatabaseManager.update_order_status(order_id, "stopped")
-				return True, f"{n} accounts left."
-		return False, "Not found."
+			n = await vcm.stop_all_for_order(order_id, leave_group=False)
+		# 🚪 بدون خروج فوری از گروه: خروج به صف تأخیری می‌رود.
+		try:
+			order_row = await DatabaseManager.get_order(order_id) or {}
+			entries = []
+			if vcm:
+				for aid, rec in (vcm.joined_accounts_by_order.get(order_id) or {}).items():
+					entries.append({"acc": {"id": aid}, "chat_id": (rec or {}).get("chat_id")})
+			await self._defer_group_leave(order_id, entries, {
+				"bot_id": order_row.get("bot_id", 1),
+				"target_link": order_row.get("target_link"),
+				"order_type": order_row.get("order_type"),
+			})
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: deferred leave scheduling failed: {exc}")
+		# 🐛 فیکس حیاتی: وضعیت باید همیشه بسته شود، نه فقط وقتی که VCM کالی پیدا کند.
+		# قبلاً اگر سفارش در حافظه نبود (مثلاً سفارش زمان‌بندی‌شده یا
+		# بعد از ری‌استارت) و کالی هم فعال نبود، هیچ UPDATEای روی دیتابیس
+		# نمی‌خورد → سفارش لغوشده همچنان scheduled/pending/running
+		# می‌ماند؛ یعنی جاب زمان‌بندی همان سفارش عودت‌داده‌شده را بعداً اجرا
+		# می‌کرد و Capacity Guard هم ظرفیتش را برای همیشه اشغال می‌دید.
+		closed = False
+		try:
+			closed = await DatabaseManager.finalize_order_status(
+				order_id, "stopped", ("pending", "running", "scheduled")
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order_id}: finalize status failed: {exc}")
+		if n > 0:
+			return True, f"{n} accounts left."
+		if closed:
+			return True, "Closed without active calls."
+		return False, "Not found / already closed."
 
 	async def _eject_all_fast(self, order_id, accounts_list, data):
 		"""Pace mass-exit so N accounts never leave in the same millisecond.
@@ -1306,27 +1662,90 @@ class OrderExecutor:
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
+	async def _notify_underfill(self, order_id, data, live, requested):
+	    """عمداً هیچ پیامی به مشتری نمی‌فرستد.
+
+	    تعداد اکانت کمتر از سفارش یک وضعیت عادی است (استخر کوچک‌تر)، نه خطا.
+	    سفارش تا پایان زمان خریداری‌شده اجرا می‌شود و هزینه فقط زمانی است.
+	    متد برای سازگاری با تست‌های قدیمی باقی مانده و no-op است.
+	    """
+	    logger.info(
+	        "Order %s: underfill notice suppressed (live=%s requested=%s) — "
+	        "account count is not a customer-facing problem",
+	        order_id, live, requested,
+	    )
+
 	async def _fail_order(self, order_id, reason):
-		info = self.active_orders.get(order_id)
-		data = (info or {}).get("data", {}) if info else {}
-		order_type = data.get("order_type") if info else None
-		# Single leave path: voice → paced VCM only; else paced eject.
-		# stop_all_for_order is idempotent if cleanup already ran.
-		if order_type == "voice_chat" or not info:
-			vcm = _get_voice_call_manager()
-			if vcm:
-				try:
-					await vcm.stop_all_for_order(order_id, leave_group=True)
-				except Exception as exc:
-					logger.warning(f"Order {order_id}: fail-path vcm leave: {exc}")
-		elif info:
+	    info = self.active_orders.get(order_id) or {}
+	    data = info.get('data') or await DatabaseManager.get_order(order_id) or {}
+	    self._freeze_billing(order_id)
+	    result = await self.settle_and_refund_order(order_id, bot_id=data.get('bot_id', 1),
+	        canceled_by_role='سیستم', cancellation_reason=reason)
+	    if result.get('claimed'):
+	        await self._notify_automatic_refund(order_id, data, result)
+
+	async def _notify_automatic_refund(self, order_id, data, result):
+	    try:
+	        from services.bot_manager import bot_manager
+	        from utils.helpers import format_price
+	        app = bot_manager.active_bots.get(data.get('bot_id', 1))
+	        user = await DatabaseManager.get_user_by_id(data.get('user_id'))
+	        if app and user and await DatabaseManager.claim_order_report(order_id, 'customer', 'cancelled'):
+	            await app.bot.send_message(user['telegram_id'],
+	                f"سفارش #{order_id} متوقف و تسویه شد.\n"
+	                f"مصرف: {format_price(result['used_cost'])} تومان\n"
+	                f"عودت: {format_price(result['refund_amount'])} تومان\n"
+	                f"موجودی پس از تسویه: {format_price(result['user_wallet_balance'])} تومان\n"
+	                f"کد عودت: {result.get('refund_tx_id') or '—'}", parse_mode=None)
+	            await DatabaseManager.mark_order_report(order_id, 'customer', 'cancelled', 'sent')
+	    except Exception:
+	        logger.exception('Order %s automatic receipt delivery uncertain; not resent', order_id)
+
+	async def refund_interrupted_order(self, order, full=False):
+	    # The persisted checkpoint, NOT restart time, is authoritative here.
+	    result = await self.settle_and_refund_order(order['id'], bot_id=order.get('bot_id', 1),
+	        canceled_by_role='سیستم', cancellation_reason='تسویهٔ خدمت ارائه‌نشده پس از توقف اجرا')
+	    if result.get('claimed'):
+	        await self._notify_automatic_refund(order['id'], order, result)
+	    # 🚪 اکانت‌های سفارش متوقف‌شده هم فوراً از گروه خارج نمی‌شوند؛ به صف تأخیری می‌روند.
+	    await self._schedule_interrupted_leave(order)
+	    return result
+
+	async def _schedule_interrupted_leave(self, order):
+		"""اکانت‌های سفارش نیمه‌کاره (بعد از ری‌استارت/کرش) را به صف خروج تأخیری می‌فرستد.
+
+		اگر در زمان اجرا اکانتی وارد گروه شده باشد و اجرا متوقف شود، بدون این کار
+		عضویت آن اکانت هرگز پاک نمی‌شد. خروج هم مثل حالت عادی یک هفته بعد و فقط
+		وقتی اتفاق می‌افتد که سفارش دیگری برای همان گروه باز نباشد.
+		"""
+		order = order or {}
+		bot_id = int((order or {}).get('bot_id') or 1)
+		try:
+			delay = await deferred_leave.resolved_leave_delay_minutes(bot_id)
+		except Exception:
+			delay = deferred_leave.leave_delay_minutes()
+		if delay <= 0:
+			return 0
+		try:
+			row = await DatabaseManager.get_order(order.get('id'))
+			row = row or order
 			try:
-				await self._eject_all_fast(order_id, info.get("joined_accounts", []), data)
-			except Exception as exc:
-				logger.warning(f"Order {order_id}: fail-path eject: {exc}")
-		self._voice_forget_order(order_id)
-		await DatabaseManager.update_order_status(order_id, "failed")
-		self.active_orders.pop(order_id, None)
+				delivered = json.loads(((row.get('_billing') or {}).get('delivered_ids')) or '[]')
+			except Exception:
+				delivered = []
+			accounts = [{'account_id': int(a), 'chat_id': 0} for a in delivered if a is not None]
+			if not accounts:
+				return 0
+			return await deferred_leave.schedule_for_order(
+				bot_id=int(row.get('bot_id') or bot_id or 1),
+				target=row.get('target_link') or '',
+				accounts=accounts,
+				order_id=row.get('id'),
+				delay_minutes=delay,
+			)
+		except Exception as exc:
+			logger.warning(f"Order {order.get('id')}: interrupted-leave scheduling failed: {exc}")
+			return 0
 
 	async def report_scheduled_order(self, order_id: int, order_data: Dict[str, Any]):
 		await self._log_to_channel("scheduled", order_id, order_data, bot_id=order_data.get("bot_id", 1))
@@ -1339,66 +1758,56 @@ class OrderExecutor:
 		return name, user.get("telegram_id", "---")
 
 	@staticmethod
-	def compute_order_settlement(order) -> Tuple[float, float, float]:
-		""" تنها مرجع محاسبهٔ تسویه هنگام لغو (خروجی: used، refund، elapsed).
-
-		هر سه مسیر لغو (کاربر، پیش‌نمایش ادمین، اجرای ادمین) باید از همین
-		تابع استفاده کنند تا «پیش‌نمایش» و «اجرا» هیچ‌وقت با هم اختلاف نداشته باشند:
-		- scheduled → هنوز مصرفی نشده: عودت کامل.
-		- حجمی (بدون مدت) → سهم مصرف از روی پیشرفت واقعی (progress/target).
-		- مدتی → ثانیه‌ای دقیق؛ اگر started_at خالی است (گیرکرده در فاز build)
-		  مبنا created_at است تا عودت کاملِ اشتباه رخ ندهد.
-		"""
-		order = order or {}
-		total_price = float(order.get("price_paid") or 0)
-		duration_minutes = int(order.get("duration_minutes") or 0)
-		status = (order.get("status") or "").lower()
-		started_at = order.get("started_at")
-		if status == "scheduled":
-			return 0.0, total_price, 0.0
-		if duration_minutes <= 0:
-			target = int(order.get("target_count") or 0)
-			progress = int(order.get("progress") or 0)
-			if target > 0 and progress > 0:
-				used = min(float(math.ceil(total_price * progress / target)), total_price)
-			else:
-				used = 0.0
-			return used, max(0.0, total_price - used), 0.0
-		if not started_at:
-			started_at = order.get("created_at")
-		return OrderExecutor.compute_prorated_settlement(total_price, duration_minutes, started_at)
+	def compute_order_settlement(order):
+	    order = order or {}
+	    total = float(money(order.get('price_paid')))
+	    duration = int(order.get('duration_minutes') or 0) * 60
+	    billing = order.get('_billing')
+	    if order.get('status') in ('pending', 'scheduled') and not order.get('started_at'):
+	        return 0., total, 0.
+	    if duration <= 0:
+	        # پلن «بدون مدت» (حجمی) مدل قیمت‌گذاری خودش را دارد: قیمت برای تعداد
+	        # اکانتِ پلن تعیین شده و در لغو، به‌نسبت تحویل محاسبه می‌شود.
+	        # ⚠️ سفارش‌های زمان‌دار (مثل سفارش ۸۱۲) ۱۰۰٪ زمانی محاسبه می‌شوند و
+	        # تعداد اکانت هیچ اثری روی مبلغ آن‌ها ندارد (شاخهٔ بالا).
+	        progress = int(order.get('progress') or 0)
+	        if billing:
+	            progress = max(progress, len(json.loads(billing.get('delivered_ids') or '[]')))
+	        used, refund, _ = prorate(total, progress, int(order.get('accounts_count') or 0))
+	        return used, refund, 0.
+	    if billing is not None:
+	        return prorate(total, billing.get('served_seconds') or 0, duration)
+	    # Legacy rows have no crash checkpoint. For an inactive executor, callers
+	    # supply conservative zero below rather than billing unknown downtime.
+	    started = order.get('started_at')
+	    ended = order.get('_settled_at') or order.get('completed_at') or datetime.utcnow()
+	    elapsed = max(0., (ended - started).total_seconds()) if started else 0
+	    return prorate(total, elapsed, duration)
 
 	@staticmethod
 	def compute_prorated_settlement(total_price, duration_minutes, started_at):
-		"""تسویهٔ ثانیه‌ای دقیق (Precision Pro-Rated Billing).
+	    elapsed = max(0., (datetime.utcnow() - started_at).total_seconds()) if started_at else 0
+	    return prorate(total_price, elapsed, int(duration_minutes or 0) * 60)
 
-		خروجی: (used_cost, refund_amount, elapsed_seconds)
-		  Rs = total_price / (duration_minutes*60)         نرخ ثانیه‌ای
-		  C_used = RoundUp(Δt × Rs)  ← سقف = total_price، کف = 0
-		  refund = total_price − C_used
-		اگر started_at موجود نباشد یا مدت ۰ باشد، هیچ زمان قابل‌محاسبه‌ای
-		مصرف نشده و کل مبلغ عودت می‌شود.
-		"""
-		try:
-			total_price = float(total_price or 0)
-		except Exception:
-			total_price = 0.0
-		duration_minutes = int(duration_minutes or 0)
-		if duration_minutes <= 0 or not started_at:
-			return 0.0, total_price, 0.0
-		elapsed_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
-		total_seconds = duration_minutes * 60
-		if elapsed_seconds >= total_seconds:
-			used = total_price
-		else:
-			rate_per_second = total_price / total_seconds
-			used = min(float(math.ceil(elapsed_seconds * rate_per_second)), total_price)
-		refund = max(0.0, total_price - used)
-		return used, refund, elapsed_seconds
+	def preview_order_settlement(self, order):
+	    snapshot = dict(order or {})
+	    oid = snapshot.get('id')
+	    info = self.active_orders.get(oid) or {}
+	    if info.get('clock'):
+	        served = max(self._sample_billing(oid) or 0,
+	                     (snapshot.get('_billing') or {}).get('served_seconds') or 0)
+	        snapshot['_billing'] = dict(snapshot.get('_billing') or {}, served_seconds=served,
+	                                    delivered_ids=json.dumps(sorted(info.get('delivered_ids') or ())))
+	    elif snapshot.get('status') == 'running' and not info and '_billing' not in snapshot:
+	        # Pre-upgrade interrupted orders: exact history cannot be invented.
+	        snapshot['_billing'] = {'served_seconds': 0, 'delivered_ids': '[]'}
+	    if not int(snapshot.get('duration_minutes') or 0) and info:
+	        snapshot['progress'] = self._live_count(oid, snapshot.get('order_type'), info.get('joined_accounts') or [])
+	    return self.compute_order_settlement(snapshot)
 
 	async def settle_and_refund_order(
 		self, order_id, *, do_refund=True, canceled_by_role="کاربر",
-		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1,
+		canceled_by_name=None, cancellation_reason="لغو دستی", bot_id=1, expected_user_id=None,
 	):
 		"""مسیر واحد لغو + تسویه + عودت + گزارش شکیل.
 
@@ -1409,24 +1818,21 @@ class OrderExecutor:
 		        user_wallet_balance برای نمایش به تماس‌گیرنده.
 		"""
 		order = await DatabaseManager.get_order(order_id) or {}
-		user = await DatabaseManager.get_user_by_id(order.get("user_id")) if order.get("user_id") else None
-		total_price = float(order.get("price_paid") or 0)
-		used_cost, refund_amount, _elapsed = self.compute_order_settlement(order)
-		if not do_refund:
-			# لغو بدون عودت: کل مبلغ به‌عنوان مصرف‌شده در نظر گرفته می‌شود.
-			used_cost = total_price
-			refund_amount = 0.0
 
-		refund_tx_id = f"TX-{uuid.uuid4().hex[:6].upper()}"
-		new_balance = None
-		if do_refund and refund_amount > 0 and user:
-			ok, new_balance = await DatabaseManager.update_user_credit(
-				user["id"], refund_amount, "order_refund",
-				f"عودت لغو سفارش {order_id} | {refund_tx_id}", bot_id=bot_id,
-			)
-		if new_balance is None and user:
-			fresh = await DatabaseManager.get_user_by_id(user["id"])
-			new_balance = (fresh or {}).get("credit", (user or {}).get("credit", 0))
+		result = await DatabaseManager.settle_order_atomic(
+			order_id, self.preview_order_settlement, bot_id=bot_id, do_refund=do_refund,
+			expected_user_id=expected_user_id,
+		)
+		if not result.get("claimed") and not result.get("already_settled"):
+			return result
+		if order_id in self.active_orders:
+			self.active_orders[order_id]['terminal_committed'] = True
+		user = None
+		total_price = result["total_cost"]
+		used_cost = result["used_cost"]
+		refund_amount = result["refund_amount"]
+		refund_tx_id = result["refund_tx_id"]
+		new_balance = result["user_wallet_balance"]
 
 		# توقف واقعی سفارش/اکانت‌ها — گزارش کامل را همین تابع پایین‌تر می‌فرستد،
 		# پس جلوی گزارش «cancelled» تکراری/ناقصِ حلقهٔ executor را بگیر.
@@ -1436,6 +1842,14 @@ class OrderExecutor:
 			                             suppress_cancel_log=True)
 		except Exception as exc:
 			logger.warning(f"Order {order_id}: stop during settlement failed: {exc}")
+
+		if not result.get("claimed"):
+			return result  # retried cleanup, but never duplicate the financial log
+
+		try:
+			user = await DatabaseManager.get_user_by_id(order.get("user_id"))
+		except Exception:
+			logger.warning("Order %s: receipt committed; user lookup failed", order_id)
 
 		if not canceled_by_name:
 			canceled_by_name = self._user_display(user)[0] if user else "—"
@@ -1449,7 +1863,10 @@ class OrderExecutor:
 					"canceled_by_name": canceled_by_name,
 					"cancellation_reason": cancellation_reason,
 					"total_cost": total_price,
-					"used_cost": used_cost,
+					"used_cost": result.get('service_used_cost', used_cost),
+					"withheld_unused_cost": result.get('withheld_unused_cost', 0),
+					"do_refund": result.get('do_refund', do_refund),
+					"elapsed_seconds": result["elapsed_seconds"],
 					"refund_amount": refund_amount,
 					"user_wallet_balance": new_balance,
 					"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else "—",
@@ -1458,13 +1875,7 @@ class OrderExecutor:
 		except Exception:
 			pass
 
-		return {
-			"total_cost": total_price,
-			"used_cost": used_cost,
-			"refund_amount": refund_amount,
-			"refund_tx_id": refund_tx_id if (do_refund and refund_amount > 0) else None,
-			"user_wallet_balance": new_balance,
-		}
+		return result
 
 	# نگاشت نوع سرویس به فارسی برای گزارش‌ها ({order_type_fa})
 	_ORDER_TYPE_FA = {
@@ -1475,20 +1886,20 @@ class OrderExecutor:
 
 	@staticmethod
 	def _fmt_duration_fa(total_seconds) -> str:
-		"""مدت کارکرد واقعی را به «X دقیقه و Y ثانیه» تبدیل می‌کند."""
+		"""Consistent receipt display to milliseconds (not whole-minute billing)."""
 		try:
-			total_seconds = max(0, int(round(total_seconds)))
-		except Exception:
-			total_seconds = 0
-		h = total_seconds // 3600
-		m = (total_seconds % 3600) // 60
-		s = total_seconds % 60
+			millis = max(0, int(round(float(total_seconds) * 1000)))
+		except (TypeError, ValueError, OverflowError):
+			millis = 0
+		hours, rest = divmod(millis, 3600000)
+		minutes, rest = divmod(rest, 60000)
+		seconds = f"{rest / 1000:.3f}".rstrip('0').rstrip('.')
 		parts = []
-		if h > 0:
-			parts.append(f"{h} ساعت")
-		if m > 0 or h > 0:
-			parts.append(f"{m} دقیقه")
-		parts.append(f"{s} ثانیه")
+		if hours:
+			parts.append(f"{hours} ساعت")
+		if minutes or hours:
+			parts.append(f"{minutes} دقیقه")
+		parts.append(f"{seconds} ثانیه")
 		return " و ".join(parts)
 
 	def _stability_rate(self, target_count, success_cnt, swapped) -> str:
@@ -1523,7 +1934,7 @@ class OrderExecutor:
 		plan_minutes = int(data.get("duration_minutes") or order_rec.get("duration_minutes") or 0)
 
 		created_at = order_rec.get("created_at")
-		started_at = order_rec.get("started_at") or created_at or datetime.utcnow()
+		started_at = order_rec.get("started_at")
 		ended_at = order_rec.get("completed_at") or datetime.utcnow()
 
 		# متغیرهای کارنامهٔ عملکرد (swap / stability)
@@ -1535,7 +1946,9 @@ class OrderExecutor:
 
 		# ── گزارش شروع سفارش ──
 		if kind in ("started", "scheduled"):
-			head = "🟢 **سفارش جدید فعال شد**" if kind == "started" else "🗓️ **سفارش زمان‌بندی‌شده ثبت شد**"
+			head = "🟢 **سفارش جدید — شروع اجرا**" if kind == "started" else "🗓️ **سفارش زمان‌بندی‌شده ثبت شد**"
+			event_time = (data.get('_execution_started_at') or datetime.utcnow()) if kind == 'started' else order_rec.get('scheduled_for')
+			time_label = "آغاز عملیات ورود" if kind == 'started' else "زمان اجرای رزرو"
 			lines = [
 				f"┌ {head}",
 				"│",
@@ -1548,17 +1961,23 @@ class OrderExecutor:
 				f"├ 🔢 **تعداد اکانت:** `{count}` عدد",
 				f"├ ⏳ **مدت پلن:** `{plan_minutes}` دقیقه",
 				f"├ 📅 **زمان ثبت:** `{format_jalali_datetime(created_at)}`",
-				f"└ 🚀 **زمان شروع عملیات:** `{format_jalali_datetime(started_at)}`",
+				f"└ 🚀 **{time_label}:** `{format_jalali_datetime(event_time)}`",
 				sep,
-				"🛡️ *سیستم مانیتورینگ لحظه‌ای و خودکار فعال است.*",
+				(("⏳ *زمان فعال سفارش از همین حالا نسبت به مدت پلن محاسبه می‌شود؛ در لغو فقط زمان فعال کسر و ماندهٔ مصرف‌نشده عودت می‌شود.*"
+				  if plan_minutes else "⏳ *عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود.*")
+				 if kind == 'started' else "📅 *این پیام ثبت رزرو است، نه شروع اجرا.*"),
 			]
 			return "\n".join(lines)
 
-		# مدت کارکرد واقعی (ثانیه‌ای دقیق)
+		# زمان فعال سفارش — مبنای مالی تسویه
 		try:
 			real_seconds = max(0, (ended_at - started_at).total_seconds()) if (started_at and ended_at) else 0
 		except Exception:
 			real_seconds = 0
+		if order_rec.get('_billing'):
+			real_seconds = order_rec['_billing'].get('served_seconds', 0)
+		if kind == "cancelled" and "elapsed_seconds" in extra:
+			real_seconds = extra["elapsed_seconds"]
 		actual_duration_formatted = self._fmt_duration_fa(real_seconds)
 
 		# ── گزارش لغو سفارش و تسویه مالی ──
@@ -1574,7 +1993,8 @@ class OrderExecutor:
 
 			def _p(v):
 				try:
-					return f"{int(round(float(v))):,}"
+					from utils.helpers import format_price
+					return format_price(v)
 				except Exception:
 					return "—"
 
@@ -1588,18 +2008,25 @@ class OrderExecutor:
 				"│",
 				f"├ 🚫 **لغو شده توسط:** `{canceled_by_role}` ({canceled_by_name})",
 				f"├ 📝 **علت لغو:** `{cancellation_reason}`",
-				f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
-				f"├ ⏱️ **زمان کارکرد واقعی:** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
+				f"├ 🚀 **شروع خدمت ثبت‌شده:** `{format_jalali_datetime(started_at)}`",
+				f"├ ⏱️ **زمان فعال سفارش (مبنای محاسبه):** `{actual_duration_formatted}` (از `{plan_minutes}` دقیقه)",
 				"│",
 				"├ 💳 **جزئیات مالی و عودت وجه:**",
+				("│  مبنا: زمان فعال سفارش از آغاز خدمت تا لغو، نسبت به مدت پلن"
+				 if plan_minutes else "│  مبنا: تعداد ورودهای موفق"),
 				f"│  ├ 💰 **هزینه کل پلن:** `{_p(total_cost)}` تومان",
 				f"│  ├ 📉 **هزینه مدت کارکرد:** `{_p(used_cost)}` تومان",
 				f"│  └ 🔄 **مبلغ عودت‌شده:** `{_p(refund_amount)}` تومان",
 				"│",
 				f"├ 🧾 **کد پیگیری عودت:** `{refund_tx_id}`",
-				f"└ 👛 **موجودی فعلی کیف‌پول:** `{_p(wallet_balance)}` تومان",
+				f"└ 👛 **موجودی کیف‌پول پس از تسویه:** `{_p(wallet_balance)}` تومان",
 				sep,
-				"⚡ *مبلغ باقی‌مانده بلافاصله و بدون کسر کارمزد به کیف پول حساب شما اضافه شد.*",
+				# 🚪 ضد بن/حذف اکانت: خروج از گروه فوری نیست (پیش‌فرض: یک هفته بعد، فقط اگر سفارشی برای
+				# همین گروه نباشد). مقدار GROUP_LEAVE_DELAY_MINUTES=0 رفتار قدیمی را برمی‌گرداند.
+				("🚪 *اکانت‌های این سفارش فوراً از گروه خارج نمی‌شوند؛ بدون سفارش دیگر برای همین گروه، "
+				 "یک هفته بعد یکی‌یکی با فاصله خارج می‌شوند (ضد بن/حذف اکانت).*"),
+				("⚡ *ماندهٔ قابل‌عودت بدون کارمزد به کیف پول اضافه شد.*" if extra.get('do_refund', True)
+				 else f"⚠️ *لغو بدون عودت توسط ادمین؛ مبلغ خدمت ارائه‌نشدهٔ نگه‌داشته‌شده: {_p(extra.get('withheld_unused_cost', 0))} تومان.*"),
 			]
 			return "\n".join(lines)
 
@@ -1620,7 +2047,7 @@ class OrderExecutor:
 			f"├ 🔗 **لینک مقصد:** `{link}`",
 			"│",
 			f"├ ⏳ **پلن درخواستی:** `{plan_minutes}` دقیقه",
-			f"├ 🚀 **زمان شروع:** `{format_jalali_datetime(started_at)}`",
+			f"├ 🚀 **شروع خدمت ثبت‌شده:** `{format_jalali_datetime(started_at)}`",
 			f"├ 🏁 **زمان پایان:** `{format_jalali_datetime(ended_at)}`",
 			f"├ ⏱️ **مدت اجرای واقعی:** `{actual_duration_formatted}`",
 			"│",
@@ -1635,15 +2062,87 @@ class OrderExecutor:
 			lines += [f"📝 دلیل: {reason}"]
 		return "\n".join(lines)
 
+	def _report_lock(self, order_id):
+	    lock = self._report_locks.get(order_id)
+	    if lock is None:
+	        lock = asyncio.Lock()
+	        self._report_locks[order_id] = lock
+	    return lock
+
+	async def _announce_order_start(self, order_id, data):
+	    # This is an awaited pre-build barrier. No account work or paid timer runs
+	    # before these attempts resolve. The scheduler never sends a late start.
+	    await self._log_to_channel('started', order_id, data, bot_id=data.get('bot_id', 1))
+	    if data.get('scheduled_for') and self._is_order_active(order_id):
+	        async with self._report_lock(order_id):
+	            try:
+	                await asyncio.wait_for(self._send_scheduled_start(order_id, data),
+	                                       timeout=ORDER_REPORT_TIMEOUT_SECONDS)
+	            except asyncio.TimeoutError:
+	                logger.warning('Order %s: scheduled start notification timed out; not queued for replay', order_id)
+
+	async def _send_scheduled_start(self, order_id, data):
+	    from services.bot_manager import bot_manager
+	    app = bot_manager.active_bots.get(data.get('bot_id', 1))
+	    if not app:
+	        return
+	    claimed = False
+	    try:
+	        user = await DatabaseManager.get_user_by_id(data['user_id'])
+	        if not user or not user.get('telegram_id'):
+	            return
+	        claimed = await DatabaseManager.claim_order_report(order_id, 'customer', 'started')
+	        if not claimed:
+	            return
+	        # Recheck after all preparation/claim awaits, before issuing the RPC.
+	        order = await DatabaseManager.get_order(order_id)
+	        if not order or order.get('status') != 'running' or not self._is_order_active(order_id):
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'skipped')
+	            return
+	        await app.bot.send_message(user['telegram_id'],
+	            f"⏰ اجرای سفارش زمان‌بندی‌شده #{order_id} آغاز شد.\n"
+	            + ("اکانت‌ها در حال ورود هستند؛ زمان فعال سفارش نسبت به مدت پلن محاسبه می‌شود و در لغو، فقط زمان فعال کسر و ماندهٔ مصرف‌نشده عودت می‌گردد."
+               if data.get('duration_minutes') else "عملیات ورود آغاز می‌شود؛ هزینه بر اساس ورودهای موفق محاسبه می‌شود."),
+	            parse_mode=None, connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
+	        await DatabaseManager.mark_order_report(order_id, 'customer', 'started', 'sent')
+	        logger.info('Order %s: report sent kind=started audience=customer', order_id)
+	    except asyncio.CancelledError:
+	        if claimed:
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'uncertain')
+	        raise
+	    except Exception:
+	        if claimed:
+	            await self._mark_report_safely(order_id, 'customer', 'started', 'uncertain')
+	        logger.exception('Order %s: scheduled start notification failed; not replayed', order_id)
+
+	async def _mark_report_safely(self, order_id, audience, kind, state):
+	    try:
+	        await asyncio.wait_for(DatabaseManager.mark_order_report(order_id, audience, kind, state), timeout=2)
+	    except Exception:
+	        # The durable sending claim still prevents a duplicate if storage is down.
+	        logger.warning('Order %s: could not record report outcome %s/%s', order_id, kind, state)
+
 	async def _log_to_channel(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
+	    # Cancellation may race a slow start report. Finish its send/cancellation
+	    # before any terminal report; no fire-and-forget send survives this barrier.
+	    async with self._report_lock(order_id):
+	        try:
+	            await asyncio.wait_for(self._send_channel_report(type, order_id, data, user=user,
+	                success_cnt=success_cnt, reason=reason, bot_id=bot_id, extra=extra),
+	                timeout=ORDER_REPORT_TIMEOUT_SECONDS)
+	        except asyncio.TimeoutError:
+	            logger.warning('Order %s: %s report deadline exceeded; no delayed replay', order_id, type)
+
+	async def _send_channel_report(self, type, order_id, data, user=None, success_cnt=0, reason=None, bot_id=1, extra=None):
 		from services.bot_manager import bot_manager
 		app = bot_manager.active_bots.get(bot_id)
 		if not app:
 			return
-		channel_id = await DatabaseManager.get_setting("log_channel_orders", bot_id=bot_id)
-		if not channel_id:
-			return
+		claimed_report = False
 		try:
+			channel_id = await DatabaseManager.get_setting("log_channel_orders", bot_id=bot_id)
+			if not channel_id:
+				return
 			order_rec = await DatabaseManager.get_order(order_id) or {}
 			if not user and order_rec:
 				user = await DatabaseManager.get_user_by_id(order_rec["user_id"])
@@ -1654,11 +2153,37 @@ class OrderExecutor:
 			# first so the report renders nicely; user-controlled names/links can
 			# contain characters that break Markdown, so on ANY formatting error
 			# fall back to a plain-text send (logging must never be lost).
+			if not await DatabaseManager.claim_order_report(order_id, "channel", type):
+				return
+			claimed_report = True
+			if type in ('started', 'scheduled'):
+				latest = await DatabaseManager.get_order(order_id)
+				expected = 'running' if type == 'started' else 'scheduled'
+				if not latest or latest.get('status') != expected:
+					await self._mark_report_safely(order_id, "channel", type, "skipped")
+					return
 			try:
-				await app.bot.send_message(channel_id, txt, parse_mode="Markdown")
-			except Exception:
-				await app.bot.send_message(channel_id, txt)
+				await app.bot.send_message(channel_id, txt, parse_mode="Markdown",
+				                           connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
+			except BadRequest as exc:
+				if "parse entities" not in str(exc).lower():
+					raise
+				if type in ('started', 'scheduled'):
+					latest = await DatabaseManager.get_order(order_id)
+					if not latest or latest.get('status') != ('running' if type == 'started' else 'scheduled'):
+						await self._mark_report_safely(order_id, "channel", type, "skipped")
+						return
+				await app.bot.send_message(channel_id, txt, parse_mode=None,
+				                           connect_timeout=3, pool_timeout=3, write_timeout=3, read_timeout=5)
+			await DatabaseManager.mark_order_report(order_id, "channel", type, "sent")
+			logger.info('Order %s: report sent kind=%s audience=channel', order_id, type)
+		except asyncio.CancelledError:
+			if claimed_report:
+				await self._mark_report_safely(order_id, "channel", type, "uncertain")
+			raise
 		except Exception as exc:
-			logger.warning(f"Order {order_id}: report send failed: {exc}")
+			logger.warning(f"Order {order_id}: report send failed/uncertain: {exc}")
+			if claimed_report:
+				await self._mark_report_safely(order_id, "channel", type, "uncertain")
 
 order_executor = OrderExecutor()

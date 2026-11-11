@@ -62,10 +62,12 @@ from telegram.request import HTTPXRequest
 
 from config import Config
 from database import DatabaseManager
+from services import deferred_leave
 from services.order_executor import order_executor
 from services.payment_service import payment_service
 from services.health_checker import health_checker_service
 from services.bot_manager import bot_manager
+from services.maintenance import (maintenance, maintenance_enabled, enforce_maintenance, initialize_bot_runtime)
 from aiohttp import web 
 
 # هندلرها
@@ -516,70 +518,98 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Auto backup job error: {e}")
 
 async def check_scheduled_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    """اجرای سفارش‌های زمان‌بندی‌شدهٔ سررسید.
+
+    🛠 آگاه به «حالت تعمیرات»: در زمان بروزرسانی/تعمیرات
+    هیچ سفارش جدیدی استارت نمی‌خورد (قبلاً درمیانٔ آپدیت
+    اجرا می‌شدند و نیمه‌کاره می‌ماندند). بعد از خاموش
+    شدن تعمیرات، سفارش‌ها در نوبت اجرا می‌شوند — با سقف
+    تعداد در هر دوره تا یک‌باره ده‌ها سفارش روی هم
+    ریخته نشود (همان سناریوی «همهٔ سفارشات لغو شدن»).
+    """
     try:
+        if maintenance_enabled(context.bot_data):
+            return
         due_orders = await DatabaseManager.get_due_scheduled_orders()
         if not due_orders: return
+        max_per_cycle = 3
+        started = 0
         for order in due_orders:
+            if started >= max_per_cycle:
+                logger.info(
+                    "scheduled orders: %s order(s) postponed to the next cycle (throttle)",
+                    len(due_orders) - started,
+                )
+                break
             bot_id = order.get('bot_id', 1)
-            await DatabaseManager.update_order_status(order['id'], 'running')
-            await order_executor.submit_order(order['id'], order)
+            oid = order['id']
             try:
-                app = bot_manager.active_bots.get(bot_id)
-                if app:
-                    user = await DatabaseManager.get_user_by_id(order['user_id'])
-                    if user and user.get('telegram_id'):
-                        await app.bot.send_message(
-                            user['telegram_id'],
-                            f"⏰ **سفارش زمان‌بندی شده شما شروع شد!**\n🆔 کد سفارش: `{order['id']}`\n🚀 نوع: {order['order_type']}"
-                        )
-            except: pass
+                # برعکس قبل: اول submit (که خودش وضعیت را running می‌کند) و
+                # در صورت خطا سفارش دست‌نخورده باقی می‌ماند تا
+                # در دورهٔ بعد دوباره تلاش شود (قبلاً وضعیت را
+                # اول running می‌کردند و با خطا سفارش برای همیشه running
+                # می‌ماند).
+                async with maintenance.lock:
+                    # A toggle may have happened while fetching due orders.
+                    if maintenance_enabled(context.bot_data):
+                        return
+                    launched = await order_executor.submit_order(oid, order)
+                    if not launched:
+                        continue
+            except Exception as exc:
+                logger.error("Order %s: failed to launch scheduled order: %s", oid, exc)
+                continue
+            started += 1
+            # The executor owns the pre-build start announcement. Sending here
+            # races short orders and can announce a start AFTER completion.
     except Exception as e:
         logger.error(f"Scheduled orders check error: {e}")
 
-async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
-    """بررسی سفارشات منقضی شده"""
+# سفارش‌هایی که با ری‌استارتِ ربات نیمه‌کاره مانده‌اند (برای عودت خودکار)
+_STARTUP_INTERRUPTED_ORDERS: list = []
+
+
+async def startup_recovery_job(context: ContextTypes.DEFAULT_TYPE):
+    """Interrupted and stale work uses the SAME durable atomic settlement receipt."""
+    for oid, info in list(order_executor.active_orders.items()):
+        if info.get('execution_done'):
+            try:
+                await order_executor._fail_order(oid, "تسویهٔ اجرای متوقف‌شده")
+                if info.get('terminal_committed'):
+                    order_executor.active_orders.pop(oid, None)
+            except Exception:
+                logger.exception("Order %s settlement still unavailable; retrying later", oid)
+    for order in list(_STARTUP_INTERRUPTED_ORDERS):
+        try:
+            await order_executor.refund_interrupted_order(order)
+            _STARTUP_INTERRUPTED_ORDERS.remove(order)
+        except Exception:
+            logger.exception("startup settlement failed for order %s; will retry", order.get('id'))
     try:
-        for bot_id, app in bot_manager.active_bots.items():
-            active_orders = await DatabaseManager.get_all_orders_extended(limit=100, offset=0, status_filter='active', bot_id=bot_id)
-            if not active_orders: continue
-            now = datetime.utcnow()
-            for item in active_orders:
-                order = item['order']
-                duration = order.get('duration_minutes', 0)
-                if duration <= 0: continue
-                # مبنای انقضا: شروع قابل‌محاسبه (started_at) و در صورت نبود آن
-                # (سفارش گیرکرده در فاز ساخت) زمان ثبت سفارش. بدون این fallback،
-                # سفارش‌های بدون started_at هیچ‌وقت منقضی نمی‌شدند و برای همیشه
-                # running می‌ماندند.
-                start_time = order.get('started_at') or order.get('created_at')
-                if not start_time: continue
-                end_time = start_time + timedelta(minutes=duration)
-                
-                if now > end_time:
-                    logger.info(f"⏳ Order {order['id']} (Bot {bot_id}) expired. Finishing...")
-                    
-                    # توقف سفارش + خروج از کال/گروه
-                    await order_executor.stop_active_order(order['id'], is_expired=True, reason="Order expired")
-                    try:
-                        from services.voice_call_manager import voice_call_manager as _vcm
-                        if _vcm:
-                            await _vcm.stop_all_for_order(order['id'], leave_group=True)
-                    except Exception:
-                        pass
-                    await DatabaseManager.complete_order(order['id'])
-                    
-                    # لاگ
-                    try:
-                         await order_executor._log_to_channel("completed", order['id'], order, success_cnt=order['accounts_count'], bot_id=bot_id)
-                    except: pass
-                    
-                    # اطلاع به کاربر
-                    try:
-                        user = item['user']
-                        await app.bot.send_message(user['telegram_id'], f"✅ **سفارش شما تکمیل شد.**\n🆔 کد: `{order['id']}`\n⏰ مدت زمان: {duration} دقیقه")
-                    except: pass
-    except Exception as e:
-        logger.error(f"Expired orders check error: {e}")
+        stale = await DatabaseManager.get_stale_pending_orders(minutes=10)
+        for order in stale:
+            await order_executor.refund_interrupted_order(order, full=True)
+    except Exception:
+        logger.exception("stale pending settlement failed; will retry")
+
+
+async def process_deferred_leaves_job(context: ContextTypes.DEFAULT_TYPE):
+    """🚪 خروج تأخیری اکانت‌ها از گروه‌هایی که دیگر سفارشی ندارند."""
+    try:
+        summary = await deferred_leave.process_due_leaves()
+        if summary.get("due"):
+            logger.info("🚪 deferred group leave: %s", summary)
+    except Exception:
+        logger.exception("deferred group leave job failed; retrying next tick")
+
+
+async def check_expired_orders_job(context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility no-op: only the executor's observed-service timer may finish.
+
+    created_at/started_at wall time cannot expire building or paused service.
+    A second task must never cancel a worker and then report it completed.
+    """
+    return
 
 # ---------------------------------------------------------
 # راه‌اندازی و هندلرها
@@ -590,7 +620,7 @@ def register_handlers(application: Application) -> None:
     application.add_error_handler(error_handler)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛡 ضداسپم — اولین هندلر group=-1 (قبل از همه، حتی نگهبان تعمیرات).
+    # 🛡 ضداسپم — اولین هندلر group=-4 (قبل از همه، حتی نگهبان تعمیرات).
     #
     # اگر کاربری در پنجرهٔ کوتاه (۲ ثانیه) بیش از سقف آپدیت بفرستد
     # (چرخیدن دیوانه‌وار در منوها)، ۶۰ ثانیه محدود می‌شود: همهٔ
@@ -652,10 +682,10 @@ def register_handlers(application: Application) -> None:
     _spam_guard._hits = _spam_hits
     _spam_guard._muted = _spam_muted_until
     _spam_guard._limits = (_SPAM_WINDOW_SEC, _SPAM_MAX_HITS, _SPAM_MUTE_SEC)
-    application.add_handler(TypeHandler(Update, _spam_guard), group=-1)
+    application.add_handler(TypeHandler(Update, _spam_guard), group=-4)
 
     # ─────────────────────────────────────────────────────────────
-    # 🛠 نگهبان «حالت تعمیرات» — group=-1 (بعد از ضداسپم، قبل از همهٔ بقیه).
+    # 🛠 نگهبان «حالت تعمیرات» — group=-3 (بعد از ضداسپم، قبل از همهٔ بقیه).
     #
     # وقتی سوپرادمین حالت تعمیرات را روشن کرده، هیچ‌کس (حتی ادمین عادی)
     # نمی‌تواند با ربات کار کند یا سفارش بزند؛ فقط سوپرادمین رد می‌شود.
@@ -663,102 +693,24 @@ def register_handlers(application: Application) -> None:
     # می‌شود. پرچم در دیتابیس ذخیره و در bot_data کش می‌شود تا با ری‌استارت
     # (حین آپدیت) از بین نرود.
     # ─────────────────────────────────────────────────────────────
-    _MAINT_MSG = (
-        "🔧 ربات در حال بروزرسانی است...\n\n"
-        "لطفاً چند دقیقهٔ دیگر تلاش کنید. 🙏"
-    )
-
-    async def _is_super_admin_user(update, context) -> bool:
-        try:
-            user = update.effective_user
-            if not user:
-                return False
-            if user.id in Config.ADMIN_IDS:
-                return True
-            bot_id = context.bot_data.get('bot_id', 1)
-            try:
-                db_user = await asyncio.wait_for(
-                    DatabaseManager.get_user(user.id, bot_id=bot_id), timeout=10)
-            except Exception:
-                return False
-            return bool(db_user and db_user.get('admin_role') == 'super_admin')
-        except Exception:
-            return False
-
     async def _maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user:
-            return
-        # TODO-DEBUG (موقت): ثبت همهٔ کال‌بک‌ها برای عیب‌یابی دکمه لغو — بعد از تشخیص حذف شود.
-        try:
-            _q0 = update.callback_query
-            if _q0 is not None:
-                _u0 = update.effective_user
-                logger.info("callback seen: data=%r user=%s", _q0.data, _u0.id if _u0 else None)
-        except Exception:
-            pass
-        try:
-            # فقط از کش خوانده می‌شود (fail-open): هیچ await دیتابیسی روی
-            # مسیر داغ همهٔ آپدیت‌ها مجاز نیست — یک‌بار گیرکردن همین await
-            # کل ربات را ساکت کرد. پرچم در استارت‌آپ لود و با تاگل به‌روز می‌شود.
-            flag = context.bot_data.get('maintenance_mode', False)
-            if not flag:
-                return
-            if await _is_super_admin_user(update, context):
-                return
-            # کاربر غیرسوپر در حالت تعمیرات → پیام (تراتل ۶۰ ثانیه‌ای) + توقف انتشار.
-            now = time.time()
-            try:
-                last = float((context.user_data or {}).get('maint_notice_ts', 0))
-            except Exception:
-                last = 0.0
-            fresh = (now - last) >= 60
-            query = update.callback_query
-            if query:
-                try:
-                    if fresh:
-                        await asyncio.wait_for(query.answer(_MAINT_MSG, show_alert=True), timeout=35)
-                    else:
-                        await asyncio.wait_for(query.answer(), timeout=35)
-                except Exception:
-                    pass
-            elif update.message:
-                if fresh:
-                    try:
-                        await update.message.reply_text(_MAINT_MSG)
-                    except Exception:
-                        pass
-            if fresh:
-                try:
-                    context.user_data['maint_notice_ts'] = now
-                except Exception:
-                    pass
-            try:
-                _gu = update.effective_user
-                logger.warning("maintenance guard BLOCKED user=%s kind=%s ref=%s",
-                               _gu.id if _gu else None,
-                               "callback" if query else "message",
-                               str(query.data if query else (update.message.text if update.message else ''))[:64])
-            except Exception:
-                pass
-            raise ApplicationHandlerStop
-        except ApplicationHandlerStop:
-            raise
-        except Exception:
-            # نگهبان هیچ‌وقت نباید ربات را بشکند؛ در خطا اجازهٔ عبور می‌دهد.
-            return
+        # Every Update: text, commands, callbacks, contact, photo, document,
+        # edited messages, etc. Notification failure must never permit access.
+        await enforce_maintenance(update, context)
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _maintenance_guard),
-        group=-1,
-    )
-    application.add_handler(CommandHandler("start", _maintenance_guard), group=-1)
-    application.add_handler(CallbackQueryHandler(_maintenance_guard), group=-1)
+    application.add_handler(TypeHandler(Update, _maintenance_guard), group=-3)
 
 
     # 🔝 هندلر سراسری لغو سفارش کاربر (اولویت بالا برای پاسخگویی آنی)
+    # PTB executes only ONE matching handler per group. Keep guards and
+    # cancellation separate, and stop propagation after a terminal callback.
+    async def _cancel_order_dispatch(update, context):
+        await cancel_order_callback(update, context)
+        raise ApplicationHandlerStop
+
     application.add_handler(
-        CallbackQueryHandler(cancel_order_callback, pattern=r"^cancel_order_\d+$"),
-        group=-1,
+        CallbackQueryHandler(_cancel_order_dispatch, pattern=r"^cancel_order_\d+$"),
+        group=-2,
     )
 
     # ─────────────────────────────────────────────────────────────
@@ -790,11 +742,16 @@ def register_handlers(application: Application) -> None:
     _WALLET_SUBMENU_EXACT = {"💳 شارژ حساب", "📈 تراکنش‌های اخیر"}
     _SUPPORT_SUBMENU_EXACT = {"➕ ثبت تیکت جدید", "📂 تیکت‌های من"}
     _BUY_CATEGORY_EXACT = {"🎙 ویس‌کال", "👥 عضویت گروه", "📢 عضویت کانال"}
+    from utils.premium_emoji import premium_emoji
+    premium_emoji.seed_menu_aliases(
+        _TOPLEVEL_EXACT | _WALLET_SUBMENU_EXACT | _SUPPORT_SUBMENU_EXACT
+    )
     _ADMIN_SUBMENU_RE = (
         r"^(🤖 مدیریت نمایندگی‌ها|➕ افزودن نماینده جدید|📋 لیست نمایندگان"
         r"|📩 مدیریت تیکت‌ها|📦 مدیریت سفارشات کاربران"
         r"|⚙️ تنظیمات سیستم|💳 مدیریت درگاه پرداخت|🔒 تنظیمات امنیتی"
         r"|🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت"
+        r"|🛡 ضد بن تلگرام|ضد بن"
         r"|📝 تنظیم متن پشتیبانی|📝 تنظیم متن استارت"
         r"|💾 پشتیبان‌گیری و بازیابی|💎 ایموجی پریمیوم|ایموجی پریمیوم"
         r"|➕ ایجاد پلن جدید|✏️ ویرایش پلن|📋 مدیریت پلن‌ها|📋 لیست پلن‌ها|❌ حذف پلن"
@@ -832,7 +789,7 @@ def register_handlers(application: Application) -> None:
             return
         # ۱) دکمه‌های سطح بالا → پاک کردن همهٔ stateها (شروع تمیز)
         if text in _TOPLEVEL_EXACT:
-            clear_conversations(update)
+            clear_conversations(update, context)
             try:
                 context.user_data.clear()
             except Exception:
@@ -840,26 +797,26 @@ def register_handlers(application: Application) -> None:
             return
         # ۲) زیرمنوهای کیف پول → فقط مکالمهٔ کیف پول در state پایه
         if text in _WALLET_SUBMENU_EXACT:
-            clear_conversations(update, except_names={"wallet"})
-            set_conversation_state(update, "wallet", AWAITING_WALLET_ACTION)
+            clear_conversations(update, context, except_names={"wallet"})
+            set_conversation_state(update, "wallet", AWAITING_WALLET_ACTION, context=context)
             return
         # ۳) زیرمنوهای پشتیبانی → فقط مکالمهٔ تیکت در state پایه
         if text in _SUPPORT_SUBMENU_EXACT:
-            clear_conversations(update, except_names={"support_ticket"})
-            set_conversation_state(update, "support_ticket", AWAITING_TICKET_MESSAGE)
+            clear_conversations(update, context, except_names={"support_ticket"})
+            set_conversation_state(update, "support_ticket", AWAITING_TICKET_MESSAGE, context=context)
             return
         # ۴) دسته‌بندی خرید → فقط مکالمهٔ خرید در state پایه
         if text in _BUY_CATEGORY_EXACT:
-            clear_conversations(update, except_names={"buy"})
-            set_conversation_state(update, "buy", AWAITING_SELECT_PLAN)
+            clear_conversations(update, context, except_names={"buy"})
+            set_conversation_state(update, "buy", AWAITING_SELECT_PLAN, context=context)
             return
         # ۵) زیرمنوهای ادمین/اکانت → فقط مکالمهٔ ادمین در state پایه
         # (تا از هر زیر-state عمیقی هم این دکمه‌ها کار کنند و مکالمه‌های
         #  کاربریِ کهنه، دکمه را نبلعند)
         if _re.match(_ADMIN_SUBMENU_RE, text) or _re.match(_ACCOUNT_SUBMENU_RE, text):
             if await _is_admin_user(update, context):
-                clear_conversations(update, except_names={"admin"})
-                set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+                clear_conversations(update, context, except_names={"admin"})
+                set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION, context=context)
             return
 
     application.add_handler(
@@ -873,9 +830,21 @@ def register_handlers(application: Application) -> None:
     # کالبک‌های ادمین (KYC)
     application.add_handler(CallbackQueryHandler(kyc_admin_callback, pattern="^admin_kyc_"))
 
+    # 🧩 «دکمه‌های بی‌عمل» (مثل شمارهٔ صفحه): هیچ کاری نمی‌کنند ولی باید پاسخ
+    # بگیرند؛ وگرنه تلگرام تا ۶۰ ثانیه آیکون لودینگ نشان می‌دهد و کاربر فکر
+    # می‌کند ربات هنگ کرده (یکی از مصادیق «دکمه‌ها کار نمی‌کنند»).
+    async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"), group=-1)
+
     # تابع بازگشت عمومی
     async def global_cancel_and_restart(update: Update, context):
-        clear_conversations(update)
+        clear_conversations(update, context)
         context.user_data.clear()
         await start_command(update, context)
         return ConversationHandler.END
@@ -901,7 +870,7 @@ def register_handlers(application: Application) -> None:
 
         # بازگشت صریح به منوی اصلی / خروج از پنل ادمین
         if BTN_BACK_MAIN in text or "منوی اصلی" in text or BTN_EXIT_ADMIN in text:
-            clear_conversations(update)
+            clear_conversations(update, context)
             context.user_data.clear()
             return await start_command(update, context)
 
@@ -919,9 +888,9 @@ def register_handlers(application: Application) -> None:
             from handlers.admin_handlers import admin_panel_start
             result = await admin_panel_start(update, context)
             # ست صریح state پایهٔ ادمین (return هندلر ساده، state را ست نمی‌کند)
-            set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION)
+            set_conversation_state(update, "admin", AWAITING_SETTINGS_ACTION, context=context)
             return result
-        clear_conversations(update)
+        clear_conversations(update, context)
         context.user_data.clear()
         return await start_command(update, context)
 
@@ -953,7 +922,7 @@ def register_handlers(application: Application) -> None:
         # button-driven conversations — see the PTBUserWarning note above).
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(support_conv))
+    application.add_handler(register_conversation(support_conv, application))
 
     # --- 2. احراز هویت (KYC) ---
     application.add_handler(CallbackQueryHandler(kyc_menu_callback, pattern="^kyc_back$|^kyc_add_card$|^kyc_send_video$"))
@@ -969,7 +938,7 @@ def register_handlers(application: Application) -> None:
         name="kyc", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(kyc_conv))
+    application.add_handler(register_conversation(kyc_conv, application))
 
     # --- 3. پنل ادمین (ادغام‌شده با مدیریت اکانت و پروفایل) ---
     # قبلاً acc و prof مکالمه‌های جدا بودند؛ account_management با return END،
@@ -987,7 +956,7 @@ def register_handlers(application: Application) -> None:
             MessageHandler(filters.Regex("^🔐 پنل مدیریت \\(ادمین\\)$"), admin_panel_start),
             # دکمه‌های شیشه‌ای کهنهٔ پنل (بعد از /start یا ری‌استارت) هم باید
             # وارد مکالمه شوند؛ وگرنه هیچ handlerای آن‌ها را نمی‌گیرد.
-            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+            CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_|^back_to_reseller_(menu|list)$"),
             CallbackQueryHandler(admin_ticket_actions, pattern="^adm_|^exit_ticket_list"),
             CallbackQueryHandler(admin_orders_list_handler, pattern="^admin_orders_|^admin_search_user_orders"),
             CallbackQueryHandler(admin_orders_back_callback, pattern="^back_to_admin_orders"),
@@ -999,6 +968,7 @@ def register_handlers(application: Application) -> None:
             CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
             CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
             CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+            CallbackQueryHandler(antiban_settings_callback, pattern="^antiban_"),
             CallbackQueryHandler(backup_action_callback, pattern="^bkp_"),
             CallbackQueryHandler(premium_emoji_callback, pattern="^premoji_"),
             CallbackQueryHandler(account_pagination_callback, pattern="^acc_page_"),
@@ -1010,7 +980,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SETTINGS_ACTION: [
                 # نمایندگی
                 MessageHandler(filters.Regex("^🤖 مدیریت نمایندگی‌ها$"), reseller_management_menu),
-                CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_"),
+                CallbackQueryHandler(handle_reseller_action, pattern="^reseller_|^res_edt_|^back_to_reseller_(menu|list)$"),
                 MessageHandler(filters.Regex("^➕ افزودن نماینده جدید$"), add_reseller_start),
                 MessageHandler(filters.Regex("^📋 لیست نمایندگان$"), list_resellers_handler),
 
@@ -1040,10 +1010,12 @@ def register_handlers(application: Application) -> None:
                 CallbackQueryHandler(handle_security_toggle, pattern="^sec_toggle_|^back_to_settings$"),
 
                 # لاگ و متن
-                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت)"), settings_menu_handler),
+                MessageHandler(filters.Regex("^(🆔 تنظیم کانال‌های لاگ|🆔 متن احراز هویت|🛠 مدیریت سرویس‌ها|🛠 حالت تعمیرات|🩺 تنظیمات بررسی سلامت|🛡 ضد بن تلگرام)"), settings_menu_handler),
                 CallbackQueryHandler(set_log_channel_start, pattern="^setlog_"),
                 CallbackQueryHandler(service_toggle_callback, pattern="^toggle_srv_"),
                 CallbackQueryHandler(spam_settings_callback, pattern="^toggle_spam_check$|^set_spam_interval$"),
+                MessageHandler(filters.Regex(f"^{BTN_ANTIBAN}$"), antiban_settings_menu),
+                CallbackQueryHandler(antiban_settings_callback, pattern="^antiban_"),
                 MessageHandler(filters.Regex("^📝 تنظیم متن پشتیبانی$"), set_support_text_start),
                 MessageHandler(filters.Regex("^📝 تنظیم متن استارت$"), set_start_text_start),
 
@@ -1079,6 +1051,9 @@ def register_handlers(application: Application) -> None:
                 MessageHandler(filters.Regex("^🚑 گزارش سلامت اکانت‌ها$"), health_report_handler),
                 # دکمه‌های شیشه‌ای گزارش سلامت (اکانت‌های سوخته/محدود/بازگشت)
                 CallbackQueryHandler(health_report_handler, pattern="^(view_dead_accounts|view_limited_accounts|health_back|dead_del_all|dead_del_yes)$"),
+                # ☠️ لیست اکانت‌های دلیت‌شده: «حذف همه» و «بازگشت» قبلاً ثبت
+                # نشده بودند → دکمه‌ها هیچ واکنشی نشان نمی‌دادند.
+                CallbackQueryHandler(handle_dead_accounts_callback, pattern="^(confirm_delete_dead|back_to_acc_menu)$"),
                 CallbackQueryHandler(maintenance_toggle_callback, pattern="^maint_(on|off)$"),
                 MessageHandler(filters.Regex("^📅 وضعیت اعتبار ربات$"), show_bot_credit_handler),
 
@@ -1142,6 +1117,7 @@ def register_handlers(application: Application) -> None:
             AWAITING_SET_LOG_CHANNEL: [MessageHandler(STD_TEXT, set_log_channel_finish)],
             AWAITING_KYC_TEXT: [MessageHandler(STD_TEXT, set_kyc_text_finish)],
             AWAITING_SPAM_INTERVAL: [MessageHandler(STD_TEXT, set_spam_interval_handler)],
+            AWAITING_ANTIBAN_VALUE: [MessageHandler(STD_TEXT, set_antiban_value_handler)],
 
             # 💾 پشتیبان‌گیری و بازیابی
             AWAITING_RESTORE_FILE: [MessageHandler((filters.Document.ALL | STD_TEXT) & ~filters.COMMAND, receive_restore_file)],
@@ -1194,7 +1170,7 @@ def register_handlers(application: Application) -> None:
         name="admin", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(admin_conv))
+    application.add_handler(register_conversation(admin_conv, application))
 
     # --- 4. کیف پول ---
     # نکته: stateهای احراز هویت (KYC) هم اینجا تکرار شده‌اند، چون فلوی «ثبت
@@ -1222,7 +1198,7 @@ def register_handlers(application: Application) -> None:
         name="wallet", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(wallet_conv))
+    application.add_handler(register_conversation(wallet_conv, application))
 
     # --- 5. مرکز چت/ری‌اکشن درون ویس‌کال (قابلیت جدید تلگرام، مخصوص مشتری) ---
     # فقط مرحلهٔ دریافت متن پیام حالت‌دار است؛ انتخاب سفارش/اکانت‌ها و ری‌اکشن‌ها
@@ -1241,7 +1217,7 @@ def register_handlers(application: Application) -> None:
         name="incall", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(incall_conv))
+    application.add_handler(register_conversation(incall_conv, application))
 
     # ورود به مرکز (دکمهٔ منو) + کالبک‌های بدون‌حالت
     application.add_handler(MessageHandler(filters.Regex(r"^💬 چت در ویس‌کال$"), incall_center_start), group=0)
@@ -1284,7 +1260,7 @@ def register_handlers(application: Application) -> None:
         name="buy", persistent=True,
         per_chat=True, per_user=True, per_message=False
     )
-    application.add_handler(register_conversation(buy_conv))
+    application.add_handler(register_conversation(buy_conv, application))
 
     # هندلرهای عمومی خارج از Conversation
     application.add_handler(CommandHandler("start", start_command))
@@ -1329,7 +1305,13 @@ async def main_loop():
         pass
     await DatabaseManager.init_db()
     try:
-        await DatabaseManager.reset_stuck_orders()
+        # 🐞 فیکس عدالت مالی: لیست سفارش‌های در حال اجرا قبل از بستن گرفته
+        # می‌شود تا بعد از بالا آمدن ربات، ماندهٔ مبلغ به کاربران عودت گردد
+        # (قبلاً با هر ری‌استارت، پولِ استفاده‌نشده‌ی مشتری سوخت می‌شد).
+        _stuck = await DatabaseManager.reset_stuck_orders() or []
+        _STARTUP_INTERRUPTED_ORDERS.extend(_stuck)
+        if _stuck:
+            logger.warning("startup recovery: %s interrupted order(s) queued for refund", len(_stuck))
         from telegram_client import TelegramAccountClient
         await TelegramAccountClient.preload_all_clients()
     except: pass
@@ -1377,18 +1359,10 @@ async def main_loop():
         .build()
     )
     
-    main_app.bot_data['bot_id'] = 1
-    main_app.bot_data['owner_id'] = 0
-    # پرچم حالت تعمیرات با سقف زمانی (گیرکردن دیتابیس نباید استارت را قفل کند).
-    try:
-        main_app.bot_data['maintenance_mode'] = await asyncio.wait_for(
-            DatabaseManager.get_setting("maintenance_mode", "0", bot_id=1), timeout=10) == "1"
-    except Exception as e:
-        logger.warning(f"maintenance flag load failed ({e}) — defaulting to OFF")
-        main_app.bot_data['maintenance_mode'] = False
-    
     register_handlers(main_app)
-    await main_app.initialize()
+    # initialize() REPLACES bot_data from pickle. Runtime identity and the DB
+    # maintenance flag must be loaded AFTER it, before starting updates/jobs.
+    await initialize_bot_runtime(main_app, bot_id=1, owner_id=0)
     await main_app.start()
 
     # 💎 ایموجی پریمیوم: خواندن تنظیمات از دیتابیس + اعتبارسنجی شناسه‌ها
@@ -1421,7 +1395,13 @@ async def main_loop():
     if main_app.job_queue:
         main_app.job_queue.run_repeating(auto_spam_check_job, interval=600, first=60)
         main_app.job_queue.run_repeating(check_scheduled_orders_job, interval=60, first=10)
-        main_app.job_queue.run_repeating(check_expired_orders_job, interval=60, first=30)
+        # بازیابی مالیِ سفارش‌های نیمه‌کاره (اندکی بعد از بالا آمدن ربات‌ها)
+        main_app.job_queue.run_repeating(startup_recovery_job, interval=60, first=20)
+        # 🚪 خروج تأخیری اکانت‌ها از گروه (پیش‌فرض: بعد از یک هفته، یکی‌یکی، بدون سفارش فعال)
+        main_app.job_queue.run_repeating(
+            process_deferred_leaves_job,
+            interval=max(60, deferred_leave.poll_minutes() * 60), first=45,
+        )
         main_app.job_queue.run_repeating(lambda ctx: bot_manager.check_expiries_job(), interval=3600, first=60)
         main_app.job_queue.run_repeating(auto_backup_job, interval=1800, first=120)
         # بستن خودکار تیکت‌های بی‌فعالیت (هر ۱ ساعت بررسی می‌شود).
@@ -1448,6 +1428,9 @@ async def main_loop():
     await stop_event.wait()
 
     logger.info("🛑 Shutdown signal received — stopping gracefully...")
+    order_executor.shutting_down = True
+    for _oid in list(order_executor.active_orders):
+        order_executor._freeze_billing(_oid)
     # ۱) اول جلوی آپدیت‌های جدید تلگرام را بگیر (اصلی + نماینده‌ها).
     try:
         if main_app.updater.running:
@@ -1471,6 +1454,12 @@ async def main_loop():
                 pass
     except Exception:
         pass
+    _order_tasks = [info.get("task") for info in list(order_executor.active_orders.values()) if info.get("task")]
+    if _order_tasks:
+        try:
+            await asyncio.wait_for(asyncio.gather(*_order_tasks, return_exceptions=True), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("Some shutdown cleanup is still pending; persisted billing checkpoint is authoritative")
     # ۳) قطع سریع همهٔ کلاینت‌های ویس (بدون leave مودبانهٔ کند — خود
     # disconnect تمیز، سشن را روی سرور تلگرام آزاد می‌کند و جلوی
     # AUTH_KEY_DUPLICATED در استارت بعدی را می‌گیرد).

@@ -58,10 +58,11 @@ def build_balance_change_report(
     is_increase = amount_val >= 0
     action_icon = "📈" if is_increase else "📉"
     action_word = "افزایش (شارژ)" if is_increase else "کاهش"
-    amount_str = f"{abs(int(amount_val)):,}"
+    from utils.helpers import format_price
+    amount_str = format_price(abs(amount_val))
 
     try:
-        balance_str = f"{int(float(new_balance or 0)):,}"
+        balance_str = format_price(new_balance)
     except Exception:
         balance_str = str(new_balance)
 

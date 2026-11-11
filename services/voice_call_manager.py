@@ -191,10 +191,18 @@ _SILENCE_AUDIO_PARAMS = AudioParameters(
 # drops unknown ones — including the "-1" VALUE of -stream_loop. The result
 # was instant EOF ("Reached end of the file") + an endless StreamEnded loop.
 # A huge positive loop count behaves as infinite without a negative value.
-_SILENCE_FFMPEG_LOOP_PARAMS = "--audio ---start -threads 1 -stream_loop 1000000"
+# Decoder -threads alone does NOT cap the filter pool (defaults to CPU count).
+# Bound input decoder, filter pool and output encoder independently. Keep the
+# exact audio format, continuous loop, mute and recovery behaviour unchanged.
+_SILENCE_FFMPEG_LOOP_PARAMS = (
+    "--audio ---start -threads 1 -filter_threads 1 -stream_loop 1000000 "
+    "---end -threads 1"
+)
 
 # Same single-thread cap for the non-looping fallback (short file, plays once).
-_SILENCE_FFMPEG_THREADS_PARAMS = "--audio ---start -threads 1"
+_SILENCE_FFMPEG_THREADS_PARAMS = (
+    "--audio ---start -threads 1 -filter_threads 1 ---end -threads 1"
+)
 
 # Server-directed FloodWait at or below this many seconds is slept inside
 # the join attempt (where it survives cancellation as a persisted deadline);
@@ -230,9 +238,10 @@ MAX_REJOIN_ATTEMPTS = max(1, int(getattr(Config, 'RETRY_LIMIT', 3)))
 REJOIN_BACKOFF_BASE = max(1.0, float(getattr(Config, 'BACKOFF_BASE', 1)))
 
 # How many consecutive confirmed-absent checks before we call it a genuine
-# disconnect and move that account to CONFIRMED_DISCONNECTED. Default to 5
-# to be VERY conservative and avoid false positives on temporary API failures.
-CONFIRMED_DISCONNECT_THRESHOLD = max(2, int(getattr(Config, 'CONFIRMED_DISCONNECT_THRESHOLD', 5)))
+# disconnect and move that account to CONFIRMED_DISCONNECTED.  Default 8
+# (~1 minute of consecutive confirmed absence) to be VERY conservative and to
+# avoid false positives on temporary API failures / WARP network flaps.
+CONFIRMED_DISCONNECT_THRESHOLD = max(2, int(getattr(Config, 'CONFIRMED_DISCONNECT_THRESHOLD', 8)))
 
 # ─── JOIN RETRY / FLOOD-WAIT / VERIFICATION TUNING ────────────────────
 # Each WAVE joins up to `window` accounts CONCURRENTLY and every account is
@@ -665,6 +674,10 @@ class VoiceCallManager:
         # marked UNRECOVERABLE so the executor can REPLACE it (instead of
         # keeping a ghost that can never be brought back).
         self._rejoin_failures: Dict[Tuple[int, int], int] = {}
+        # 🛡 v2.2.17: زمان آخرین بازبینیِ اسلات‌های «جایگزینی‌درانتظار».
+        # اگر شبکه (WARP) برگشته باشد، همان اکانت دوباره سالم شناخته می‌شود
+        # و از خروج/جایگزینی نجات می‌یابد.
+        self._unrecoverable_recheck: Dict[Tuple[int, int], float] = {}
 
         self._chat_refresh_cache: Dict[int, float] = {}
         self._input_group_call_cache: Dict[int, types.InputGroupCall] = {}
@@ -829,6 +842,25 @@ class VoiceCallManager:
         except Exception:
             pass
 
+        # 📣 رویدادهای «بازیابی/سلامت» روی کنسول هم دیده می‌شوند تا با
+        # `docker logs` بتوان دقیقاً دید سفارش چطور حاضر نگه داشته می‌شود.
+        try:
+            if order_id and event in (
+                "confirmed_disconnect", "unrecoverable_drop", "rejoin_failed",
+            ):
+                logger.warning(
+                    "[VoiceRecovery] order=%s acc=%s event=%s details=%s",
+                    order_id, account_id, event, details or {},
+                )
+            elif order_id and event in ("media_restored", "engine_rebuild",
+                                        "confirmed_joined_after_transport_warning"):
+                logger.info(
+                    "[VoiceRecovery] order=%s acc=%s event=%s details=%s",
+                    order_id, account_id, event, details or {},
+                )
+        except Exception:
+            pass
+
         try:
             if event in (
                 "transient_join_error", "join_timeout", "floodwait", "join_failed_final",
@@ -861,6 +893,24 @@ class VoiceCallManager:
         try:
             if not bool(getattr(Config, "VOICE_DROP_LEDGER", True)):
                 return
+        except Exception:
+            pass
+        # 🔁 یک رویدادِ یکسان برای یک اکانت (مثلاً CLOSED_VOICE_CHAT موتور
+        # ntgcalls که هر ۱۵ ثانیه دوباره تحویل می‌شود) نباید لاگ و دفترِ
+        # drop را پر کند؛ فقط یک‌بار در هر بازهٔ کوتاه ثبت می‌شود.
+        try:
+            dedupe_key = (order_id, account_id, int(chat_id or 0), str(event))
+            now_ts = time.time()
+            last = getattr(self, "_drop_dedupe", None)
+            if last is None:
+                last = self._drop_dedupe = {}
+            window = max(0.0, float(getattr(Config, "VOICE_DROP_DEDUPE_SECONDS", 120)))
+            if window and now_ts - float(last.get(dedupe_key) or 0.0) < window:
+                return
+            last[dedupe_key] = now_ts
+            if len(last) > 4000:
+                for key in sorted(last, key=lambda k: last[k])[:1000]:
+                    last.pop(key, None)
         except Exception:
             pass
         try:
@@ -1988,6 +2038,25 @@ class VoiceCallManager:
             pass
 
     # ─── Engine event handlers (stream-end / kicked observability) ───
+    def _closed_chat_is_engine_local(self, order_id: Optional[int], account_id: int,
+                                     status: object) -> bool:
+        """True when CLOSED_VOICE_CHAT is local ntgcalls noise, not a real end.
+
+        If other accounts of the same order are still JOINED in that chat, the
+        voice chat is open — ntgcalls just dropped this account's local call
+        object. Treating that as a real drop used to spam VoiceDrop every ~15s
+        (order 812) while the rest of the accounts kept joining successfully.
+        """
+        if "CLOSED_VOICE_CHAT" not in str(status).upper():
+            return False
+        if not order_id:
+            return False
+        states = self._account_states_by_order.get(int(order_id)) or {}
+        return any(
+            aid != account_id and st in ("JOINED", "MONITORING", "TEMPORARILY_UNKNOWN")
+            for aid, st in states.items()
+        )
+
     def _order_id_for_account(self, account_id: int, chat_id: int = 0) -> Optional[int]:
         """Find the order this account is serving right now (if any)."""
         for (oid, aid), info in self.active_calls.items():
@@ -2031,6 +2100,25 @@ class VoiceCallManager:
                 cid = int(getattr(update, "chat_id", 0) or 0)
                 order_id = self._order_id_for_account(account_id, cid)
                 status = getattr(update, "status", "?")
+                # CLOSED_VOICE_CHAT از ntgcalls اغلب نویز محلی موتور است:
+                # بقیهٔ اکانت‌های همان سفارش همچنان در همان چت join می‌شوند.
+                # اگر خواهرها هنوز JOINED باشند تماس واقعاً بسته نشده؛ media را
+                # بازمی‌گردانیم و به‌عنوان افت واقعی لاگ نمی‌کنیم (قبلاً هر ۱۵ث
+                # VoiceDrop می‌نوشت و سفارش «خراب» دیده می‌شد).
+                if self._closed_chat_is_engine_local(order_id, account_id, status):
+                    logger.debug(
+                        "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s "
+                        "(engine-local; siblings still in the same chat — restoring media)",
+                        order_id, account_id, cid, status,
+                    )
+                    if order_id and cid:
+                        try:
+                            asyncio.create_task(
+                                self._schedule_media_restore(order_id, account_id, cid)
+                            )
+                        except Exception:
+                            pass
+                    return
                 logger.warning(
                     "[VoiceChatUpdate] order=%s acc=%s chat=%s status=%s",
                     order_id, account_id, cid, status,
@@ -2330,6 +2418,9 @@ class VoiceCallManager:
         # Always cap ffmpeg at a single decode thread (CPU). When looping is on
         # we also add ``-stream_loop -1``; otherwise fall back to the
         # threads-only input options so the non-loop path is still bounded.
+        if getattr(Config, "VOICE_FFMPEG_COMMAND_CACHE", True):
+            from services.ffmpeg_cache import install_silence_command_cache
+            install_silence_command_cache(SILENT_AUDIO_PATH)
         loop_flag = (
             _SILENCE_FFMPEG_LOOP_PARAMS
             if getattr(Config, "VOICE_SILENCE_LOOP", True)
@@ -3223,9 +3314,16 @@ class VoiceCallManager:
                             continue
                         rec = acc_info.get(acc_id) or {}
                         # Slot already proven unrecoverable → executor will
-                        # replace it; don't keep retrying it forever.
+                        # replace it.  BUT: re-verify it every few cycles so a
+                        # network recovery (WARP flap ending) keeps the same
+                        # healthy account in the call instead of ejecting it.
                         if rec.get("unrecoverable") or rec.get("status") == "UNRECOVERABLE":
-                            continue
+                            _key = (order_id, acc_id)
+                            _every = max(1, int(getattr(Config, "VOICE_UNRECOVERABLE_RECHECK_CYCLES", 3)))
+                            _last = float(self._unrecoverable_recheck.get(_key) or 0.0)
+                            if time.time() - _last < _every * KEEPALIVE_INTERVAL:
+                                continue
+                            self._unrecoverable_recheck[_key] = time.time()
                         tgt = rec.get("target") or ""
                         cid = int(rec.get("chat_id") or chat_id)
                         app = self.pyrogram_clients.get(acc_id)
@@ -3379,6 +3477,7 @@ class VoiceCallManager:
                             self._account_states_by_order.setdefault(order_id, {})[acc_id] = "JOINED"
                             fail_cycles.pop(acc_id, None)
                             self._rejoin_failures.pop((order_id, acc_id), None)
+                            self._unrecoverable_recheck.pop((order_id, acc_id), None)
                             rec.pop("unrecoverable", None)
                             rec["status"] = "JOINED"
                             rec["last_ok"] = time.time()
@@ -3802,6 +3901,7 @@ class VoiceCallManager:
                 acc_states.pop(account_id, None)
             self._account_meta_by_order.get(order_id, {}).pop(account_id, None)
             self._rejoin_failures.pop((order_id, account_id), None)
+            self._unrecoverable_recheck.pop((order_id, account_id), None)
 
         # Cancel keepalive
         ka = self._keepalive_tasks.pop(key, None)
@@ -3945,6 +4045,8 @@ class VoiceCallManager:
         self._presence_reconcilers.pop(order_id, None)
         for key in [k for k in self._rejoin_failures if k[0] == order_id]:
             self._rejoin_failures.pop(key, None)
+        for key in [k for k in list(self._unrecoverable_recheck) if k[0] == order_id]:
+            self._unrecoverable_recheck.pop(key, None)
         for key in [k for k in self._media_restore_inflight if k[0] == order_id]:
             self._media_restore_inflight.discard(key)
         for key in [k for k in list(self._media_restore_last) if k[0] == order_id]:
@@ -3956,7 +4058,12 @@ class VoiceCallManager:
         return len(keys)
 
     async def cleanup_all(self) -> None:
-        """Cleanup everything — for shutdown (also paced, not a burst)."""
+        """Cleanup everything — for shutdown (also paced, not a burst).
+
+        Group membership is deliberately NOT dropped here: the deferred-leave
+        queue decides later (default 24h, and only when no order needs the
+        group), because join/leave churn is what gets accounts banned.
+        """
         order_ids = set()
         for oid, _aid in list(self.active_calls.keys()):
             order_ids.add(oid)
@@ -3964,7 +4071,7 @@ class VoiceCallManager:
             order_ids.add(oid)
         for oid in order_ids:
             try:
-                await self.stop_all_for_order(oid, leave_group=True)
+                await self.stop_all_for_order(oid, leave_group=False)
             except Exception as exc:
                 logger.warning("[VoiceLeave] cleanup_all order=%s failed: %s", oid, exc)
 
