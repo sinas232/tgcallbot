@@ -188,9 +188,40 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۰۰ تست، ۷۹۴ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۰۶ تست، ۸۰۰ موفق، ۶ skip**.
 
 ---
+
+## ۴٫۵) آزمونِ A/B با `tools/join_probe.py` — «مسیر مدیا» یا «خودِ کال»؟
+
+بعد از اینکه سه چکِ هاست سبز شد (UDP 3/3، MTU 1300، صفر زامبی)، فقط یک
+سؤال می‌ماند و این ابزار جوابش را می‌دهد. **فقط وقتی اکانت در سفارشِ فعال نیست**
+اجرایش کنید (قفلِ مالکیتِ سشن رعایت می‌شود و اگر اکانت مشغول باشد خطا می‌دهد).
+
+```bash
+# الف) همان چتِ حادثه، از داخل مسیرِ WARP (همان نت‌نمی که ربات استفاده می‌کند)
+docker compose exec -T bot python tools/join_probe.py     --account 134 --chat -1004473844619 --seconds 15
+
+# ب) یک چتِ دیگر (ترجیحاً همان گروه با یک ویس‌چتِ تازه) برای مقایسه
+docker compose exec -T bot python tools/join_probe.py     --account 134 --chat <CHAT_ID_2> --seconds 15
+
+# ج) همان تست، ولی بیرون از تونل WARP (شبکهٔ bridge) برای اثباتِ نقشِ WARP
+IMG=$(docker inspect -f '{{.Config.Image}}' telegram_bot_container)
+NET=$(docker network ls --format '{{.Name}}' | grep -Ei 'tgcallbot|callmanager' | head -1)
+docker run --rm -it --network "$NET"     --add-host db:172.28.0.2 --add-host redis:172.28.0.3     -v /opt/tgcallbot:/app -w /app --env-file /opt/tgcallbot/.env     "$IMG" python tools/join_probe.py     --account 134 --chat -1004473844619 --seconds 15
+```
+
+تفسیر:
+
+| نتیجه | معنی | کار بعدی |
+|---|---|---|
+| (الف) شکست، (ب) موفق | آن **کال/چت** مشکل دارد | از مشتری بخواهید ویس‌چت را ببندد و دوباره بسازد؛ سفارش را روی همان کالِ کهنه ادامه ندهید |
+| (الف) و (ب) هر دو شکست، (ج) موفق | **WARP** مقصر است (مسیر UDP مدیا) | یا WARP را برای ربات بردارید (اگر IP سرور از سمت تلگرام سالم است)، یا فقط مسیرِ مدیا را از تونل خارج کنید |
+| هر سه شکست | مسیرِ UDP/مدیا از این هاست به DCِ مدیای تلگرام بسته است | با ارائه‌دهنده/فایروال یا تغییرِ لوکیشن سرور |
+| هر سه موفق | مشکل گذرا بوده | لاگِ `[MediaTransport]`/`[MediaProbe]` خودش زمان و علت را نشان می‌دهد |
+
+> ابزار هیچ سفارشی نمی‌سازد، وضعیتِ اکانت را تغییر نمی‌دهد و بعد از تست از کال
+> خارج می‌شود. `--no-join` فقط وضعیتِ `phone.GetFullChannel.call` را می‌خواند.
 
 ## ۵) عیب‌یابیِ سرور (این بخش علت را پیدا می‌کند، نه کد)
 
@@ -230,6 +261,7 @@ docker compose exec -T db psql -U $DB_USER -d $DB_NAME -c \
 پس از رفعِ مورد ۱/۲/۳، انتظارِ لاگِ سالم:
 
 ```
+[VoicePatch] active: media-transport breaker + escalating infra pause + zero-join watchdog + zombie reaper
 [MediaTransport] chat=...: join succeeded again — media transport breaker cleared
 [VoiceScheduler] Order 1352: account 124 joined successfully
 Order 1352: wave 16 done (ok=1 fail=0 in 34s) | live=1/40

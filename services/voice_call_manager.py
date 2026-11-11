@@ -871,6 +871,15 @@ class VoiceCallManager:
         self._recent_issues = deque()
         self._recent_issues_lock = asyncio.Lock()
 
+        # Deployment fingerprint. The server's `git rev-parse HEAD` is NOT proof
+        # that the mounted tree carries the voice patch (the hotfix is applied
+        # as working-tree files), so log the active features once. Grep for
+        # `[VoicePatch]` after a deploy.
+        logger.info(
+            "[VoicePatch] active: media-transport breaker + escalating infra "
+            "pause + zero-join watchdog + zombie reaper (voice-2026-11-11)"
+        )
+
     def _load_strategy_cache(self) -> None:
         try:
             with open(self._strategy_cache_path, "r", encoding="utf-8") as handle:
