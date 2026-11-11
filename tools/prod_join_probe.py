@@ -96,6 +96,17 @@ def match_accounts(participant_ids, accounts):
     return sorted(present), sorted(missing)
 
 
+def _proxy_line(vcm_mod, proxy) -> str:
+    """One honest line about the proxy: configured, and whether it is in use."""
+    if not proxy:
+        return "off"
+    target = f"{proxy.get('hostname')}:{proxy.get('port')}"
+    check = getattr(vcm_mod, "_voice_proxy_circuit_open", None)
+    if callable(check) and check():
+        return f"configured={target} circuit=OPEN -> clients connect DIRECT"
+    return f"configured={target} (preflight decides at first use)"
+
+
 def _fmt(exc: BaseException) -> str:
     text = str(exc)
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
@@ -188,7 +199,7 @@ async def _probe(args) -> int:
     print(f"  api_id={Config.TELEGRAM_API_ID} order={order_id} "
           f"silence_mode={getattr(Config, 'VOICE_SILENCE_MODE', '?')} "
           f"join_timeout={getattr(Config, 'VOICE_JOIN_MEDIA_TIMEOUT', '?')}s "
-          f"proxy={('on -> ' + str(_px.get('hostname')) + ':' + str(_px.get('port'))) if _px else 'off'}")
+          f"proxy={_proxy_line(vcm_mod, _px)}")
 
     row = await DatabaseManager.get_account_by_id(int(args.account))
     if not row:

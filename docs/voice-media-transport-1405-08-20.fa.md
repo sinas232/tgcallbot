@@ -236,7 +236,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۲۷ تست، ۸۲۱ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۲۸ تست، ۸۲۲ موفق، ۶ skip**.
 
 ---
 

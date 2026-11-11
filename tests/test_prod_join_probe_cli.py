@@ -88,6 +88,19 @@ class ProdJoinProbeTests(unittest.TestCase):
         self.assertEqual(self.mod.match_accounts([], None), ([], []))
         self.assertEqual(self.mod.match_accounts(None, []), ([], []))
 
+    def test_proxy_line_reports_the_circuit_state(self):
+        class FakeVcm:
+            def __init__(self, open_):
+                self._open = open_
+
+            def _voice_proxy_circuit_open(self):
+                return self._open
+
+        proxy = {"hostname": "payproxy", "port": 8888}
+        self.assertEqual(self.mod._proxy_line(FakeVcm(False), None), "off")
+        self.assertIn("preflight decides", self.mod._proxy_line(FakeVcm(False), proxy))
+        self.assertIn("circuit=OPEN", self.mod._proxy_line(FakeVcm(True), proxy))
+
     def test_tool_is_executable_from_the_repo_root(self):
         self.assertTrue(os.access(MODULE_PATH, os.R_OK))
         text = MODULE_PATH.read_text(encoding="utf-8")
