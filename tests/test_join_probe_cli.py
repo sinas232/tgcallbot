@@ -62,6 +62,28 @@ class JoinProbeCliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn("--account", out.getvalue())
 
+    def test_numeric_chat_ids_become_int_not_a_phone_number(self):
+        # Regression from the 2026-11-11 run: passing "-1004473844619" as a str
+        # made Pyrogram call contacts.ResolvePhone and fail with
+        # 400 PHONE_NOT_OCCUPIED.
+        kind, value = self.mod._normalise_chat_target("-1004473844619")
+        self.assertEqual((kind, value), ("id", -1004473844619))
+        self.assertIsInstance(value, int)
+
+    def test_username_and_link_forms(self):
+        cases = {
+            "@mygroup": ("username", "mygroup"),
+            "mygroup": ("invalid", "mygroup"),
+            "https://t.me/mygroup": ("username", "mygroup"),
+            "t.me/mygroup": ("username", "mygroup"),
+            "https://t.me/+AbCdEf_123": ("invite", "AbCdEf_123"),
+            "https://t.me/joinchat/AbCdEf_123": ("invite", "AbCdEf_123"),
+            "": ("invalid", ""),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(self.mod._normalise_chat_target(text), expected)
+
     def test_tool_is_executable_from_the_repo_root(self):
         # The bot runs with cwd=/app; sys.path[0] insertion must survive that.
         self.assertTrue(os.path.isdir(ROOT / "services"))

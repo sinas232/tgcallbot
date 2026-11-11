@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 import time
 
@@ -60,6 +61,57 @@ def _parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _normalise_chat_target(target: str):
+    """Classify what the operator typed: ``("id"|"username"|"invite"|"invalid", value)``.
+
+    Pyrogram treats a *string* of digits as a PHONE NUMBER: passing
+    ``"-1004473844619"`` as a str made it call ``contacts.ResolvePhone`` and fail
+    with ``400 PHONE_NOT_OCCUPIED``. A numeric chat id must therefore be handed
+    over as an int, and an invite link must go through CheckChatInvite.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "invalid", text
+    if re.fullmatch(r"-?\d+", text):
+        return "id", int(text)
+    match = re.match(r"(?i)^(?:https?://)?t(?:elegram)?\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)",
+                     text)
+    if match:
+        return "invite", match.group(1)
+    match = re.match(r"(?i)^(?:https?://)?t(?:elegram)?\.me/([A-Za-z0-9_]+)", text)
+    if match:
+        return "username", match.group(1)
+    if text.startswith("@"):
+        return "username", text[1:]
+    return "invalid", text
+
+
+async def _resolve_chat(app, target: str):
+    """Resolve a chat id / @username / invite link into ``(chat_id, chat)``."""
+    from pyrogram import raw
+
+    kind, value = _normalise_chat_target(target)
+    if kind == "id":
+        chat = await app.get_chat(int(value))
+    elif kind == "username":
+        chat = await app.get_chat(str(value))
+    elif kind == "invite":
+        invite = await app.invoke(raw.functions.messages.CheckChatInvite(hash=value))
+        chat = getattr(invite, "chat", None)
+        if chat is None:
+            raise RuntimeError(
+                "this account is NOT a member of that invite link "
+                f"(CheckChatInvite -> {type(invite).__name__}); the bot must join "
+                "the group first, or pass the numeric chat id once it is a member."
+            )
+    else:
+        raise RuntimeError(
+            f"cannot understand --chat {target!r}; pass a numeric id, @username "
+            "or https://t.me/+invite link"
+        )
+    return int(chat.id), chat
+
+
 def _fmt(exc: BaseException) -> str:
     text = str(exc)
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
@@ -75,9 +127,9 @@ async def _probe(args: argparse.Namespace) -> int:
     print("JOIN PROBE (single account, single chat)")
     print("=" * 70)
 
-    host = diag.collect_static()
-    print(f"  host: {diag.format_report({**host, 'udp_dns_ok': None})}")
-    print(f"  api_id={Config.TELEGRAM_API_ID} connected_dc=unknown")
+    host = await diag.collect(timeout=1.5)
+    print(f"  host: {diag.format_report(host)}")
+    print(f"  api_id={Config.TELEGRAM_API_ID}")
 
     row = await DatabaseManager.get_account_by_id(int(args.account))
     if not row:
@@ -95,13 +147,12 @@ async def _probe(args: argparse.Namespace) -> int:
     started = time.monotonic()
     await app.start()
     me = await app.get_me()
+    dc_id = getattr(getattr(app, "storage", None), "dc_id", "?")
     print(f"  connected in {time.monotonic() - started:.1f}s as "
-          f"id={getattr(me, 'id', '?')} dc={getattr(app, 'dc_id', '?')}")
+          f"id={getattr(me, 'id', '?')} dc={dc_id}")
 
-    chat_id = None
     try:
-        chat = await app.get_chat(args.chat)
-        chat_id = int(chat.id)
+        chat_id, chat = await _resolve_chat(app, args.chat)
         print(f"  chat resolved: id={chat_id} type={getattr(chat, 'type', '?')} "
               f"title={getattr(chat, 'title', '')!r}")
     except Exception as exc:
@@ -184,8 +235,7 @@ async def _probe(args: argparse.Namespace) -> int:
                 ids.append(int(uid))
         mine = int(getattr(me, "id", 0) or 0)
         print(f"  participants returned={len(ids)} "
-              f"self_present={'yes' if mine in ids else 'NO'} "
-              f"self_left={getattr(res, 'participants', None) is None}")
+              f"self_present={'yes' if mine in ids else 'NO'}")
     except Exception as exc:
         print(f"  participant check FAILED: {_fmt(exc)}")
 
