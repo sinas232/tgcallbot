@@ -121,7 +121,7 @@ class EffectiveProxyTests(unittest.IsolatedAsyncioTestCase):
                 await vcm._effective_voice_proxy(134)
         message = str(ctx.exception)
         self.assertIn("[VoiceNet]", message)
-        self.assertIn("restart the warp container", message)
+        self.assertIn("warp bot", message)
         self.assertFalse(vcm._voice_proxy_circuit_open(),
                          "a dead tunnel must not be remembered as 'direct works'")
 
@@ -142,7 +142,7 @@ class NetCheckVerdictTests(unittest.TestCase):
         text = self.mod.verdict({"DC5": "TimeoutError"}, {"DC5": "unreachable"},
                                 "127.0.0.1:1080")
         self.assertIn("NO path to Telegram", text)
-        self.assertIn("restart the warp container", text)
+        self.assertIn("warp bot", text)
 
     def test_direct_only(self):
         self.assertIn("USE_PROXY=false",

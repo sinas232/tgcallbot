@@ -70,6 +70,33 @@ WARNING pyrogram.connection.connection: Unable to connect due to network issues:
    احوال‌پرسیِ واقعیِ SOCKS5 می‌فرستد (`05 01 00`) و پاسخِ `0x05` را می‌خواهد؛
    یک پروکسی HTTP با `HT` جواب می‌دهد و همان‌جا رد می‌شود.
 
+### مرحلهٔ پنجم: «تونل مرده بود» — و دامِ ری‌استارتِ تنها
+
+`tools/net_check.py` قبل از هر کاری: **هر پنج DC هم مستقیم و هم از پروکسی
+`unreachable`**. بعد از `docker compose restart warp` همان ابزار:
+
+```
+  direct:
+    DC1  ok      DC2  ok      DC3  ok      DC4  ok      DC5  ok
+```
+
+یعنی تونل با یک ثبتِ مجدد سالم شد. **اما** بلافاصله بعدش
+`docker compose up -d --force-recreate warp` (تنها) ربات را کشت:
+
+```
+OSError: [Errno 101] Network is unreachable   (asyncpg -> postgres)
+service "bot" is not running
+```
+
+چون ربات `network_mode: service:warp` است و **netns مشترک** دارد؛ recreate
+تنهای warp، netns ربات را از بین می‌برد. قاعدهٔ ثابت:
+
+> هر بار warp عوض/ری‌استارت می‌شود، ربات باید **همان لحظه** با آن recreate شود:
+> `docker compose -f docker-compose.yml -f docker-compose.voicefix.yml up -d --force-recreate warp bot`
+
+`tools/deploy_voice_fix.sh --restart-warp` همین کار را می‌کند (و بعدش
+`net_check` را هم اجرا می‌کند).
+
 ### مرحلهٔ چهارم: تونل، نه اکانت (لاگِ ۲۱:۳۳)
 
 ```

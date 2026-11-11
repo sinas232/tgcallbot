@@ -116,8 +116,10 @@ def verdict(direct: dict, proxy: dict | None, proxy_target: str | None) -> str:
         return ("no proxy configured and DIRECT cannot reach Telegram — the "
                 "WARP tunnel / host egress is broken")
     return (f"NO path to Telegram: proxy {proxy_target} cannot CONNECT to a DC and "
-            "DIRECT times out. The tunnel is broken, not the accounts: restart the "
-            "warp container (`docker compose restart warp`) and re-run this check.")
+            "DIRECT times out. The tunnel is broken, not the accounts. Recreate the "
+            "tunnel AND the bot together (the bot shares warp's network namespace, "
+            "so a lone warp restart leaves the bot with a dead netns): "
+            "`docker compose up -d --force-recreate warp bot`, then re-run this check.")
 
 
 async def _run(args) -> int:

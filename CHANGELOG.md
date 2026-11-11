@@ -51,6 +51,10 @@
   می‌رود؛ اگر هیچ‌کدام نرسند، پیامِ `[VoiceNet] no egress path to Telegram …
   restart the warp container` می‌دهد. ابزارِ `tools/net_check.py` وضعیتِ
   DC1…DC5 را هم مستقیم و هم از پروکسی نشان می‌دهد.
+- **دامِ ری‌استارتِ warp:** ربات و warp یک netns مشترک دارند؛ ری‌استارت/ری‌کریتِ
+  تنهای warp ربات را با `OSError: [Errno 101] Network is unreachable` می‌کشد.
+  همیشه با هم: `up -d --force-recreate warp bot`
+  (`tools/deploy_voice_fix.sh --restart-warp`).
 - **تست:** ۸۵۸ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
   `tests/test_fix_env_proxy.py` (۱۰)، `tests/test_net_check_and_egress.py` (۱۱).
 

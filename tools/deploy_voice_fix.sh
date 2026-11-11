@@ -41,6 +41,13 @@
 #   bash tools/deploy_voice_fix.sh --apply               # write files, no restart
 #   bash tools/deploy_voice_fix.sh --apply --recreate    # apply + restart bot
 #   bash tools/deploy_voice_fix.sh --apply --recreate --use-proxy false  # DIRECT
+#   bash tools/deploy_voice_fix.sh --apply --restart-warp                # fresh tunnel
+#
+# ⚠️  NEVER restart or recreate the `warp` container on its own: the bot runs
+#     with `network_mode: service:warp`, so it shares that network namespace.
+#     A lone warp restart leaves the bot with a dead netns and it dies with
+#     `OSError: [Errno 101] Network is unreachable` while connecting to
+#     postgres (seen 2026-11-11 22:10). Always recreate them together.
 #
 # ROLLBACK
 #   rm docker-compose.voicefix.yml && docker compose up -d --force-recreate bot
@@ -57,10 +64,12 @@ SOCKS_HOST_VALUE="127.0.0.1"
 SOCKS_PORT_VALUE="1080"
 APPLY=0
 RECREATE=0
+RESTART_WARP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
     --recreate) APPLY=1; RECREATE=1 ;;
+    --restart-warp) APPLY=1; RECREATE=1; RESTART_WARP=1 ;;
     --use-proxy) USE_PROXY_VALUE="${2:?--use-proxy needs true|false}"; shift ;;
     --socks-host) SOCKS_HOST_VALUE="${2:?}"; shift ;;
     --socks-port) SOCKS_PORT_VALUE="${2:?}"; shift ;;
@@ -184,9 +193,15 @@ EOT
 fi
 
 echo
-echo "=== 5/5 recreating bot (this drops live voice sessions) ================"
-docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate bot
-sleep 10
+echo "=== 5/5 recreating containers (this drops live voice sessions) ========="
+if [ "$RESTART_WARP" = "1" ]; then
+  echo "  recreating warp AND bot together (shared network namespace)"
+  docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate warp bot
+  sleep 20
+else
+  docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate bot
+  sleep 10
+fi
 
 echo
 echo "--- proof that the container really got the values ----------------------"
@@ -211,6 +226,11 @@ Then re-run this script (it writes the overlay that outranks all of them).
 EOT
   exit 3
 fi
+
+echo
+echo "--- egress check (direct TCP + SOCKS5 CONNECT to DC1..DC5) --------------"
+docker compose "${COMPOSE_ARGS[@]}" exec -T bot python tools/net_check.py 2>/dev/null \
+  | sed -n '1,25p' || echo "  (bot not ready yet — re-run: python tools/net_check.py)"
 
 echo
 echo "--- startup fingerprint -------------------------------------------------"
