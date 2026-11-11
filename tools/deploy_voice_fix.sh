@@ -42,6 +42,7 @@
 #   bash tools/deploy_voice_fix.sh --apply --recreate    # apply + restart bot
 #   bash tools/deploy_voice_fix.sh --apply --recreate --use-proxy false  # DIRECT
 #   bash tools/deploy_voice_fix.sh --apply --restart-warp                # fresh tunnel
+#   bash tools/deploy_voice_fix.sh --apply --wait-idle 3600               # queue for an idle window
 #
 # ⚠️  NEVER restart or recreate the `warp` container on its own: the bot runs
 #     with `network_mode: service:warp`, so it shares that network namespace.
@@ -67,11 +68,15 @@ SOCKS_PORT_VALUE="1080"
 APPLY=0
 RECREATE=0
 RESTART_WARP=0
+WAIT_IDLE=-1
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
     --recreate) APPLY=1; RECREATE=1 ;;
     --restart-warp) APPLY=1; RECREATE=1; RESTART_WARP=1 ;;
+    --wait-idle)
+      APPLY=1; RECREATE=1
+      if [ $# -ge 2 ] && [ "${2#--}" = "$2" ]; then WAIT_IDLE="$2"; shift; else WAIT_IDLE=1800; fi ;;
     --use-proxy) USE_PROXY_VALUE="${2:?--use-proxy needs true|false}"; shift ;;
     --socks-host) SOCKS_HOST_VALUE="${2:?}"; shift ;;
     --socks-port) SOCKS_PORT_VALUE="${2:?}"; shift ;;
@@ -92,6 +97,7 @@ FILES=(
   tools/prod_join_probe.py
   tools/media_diag.py
   tools/fix_env_proxy.py
+  tools/voice_idle_gate.py
 )
 BACKUP="$REPO/.voice-fix-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP"
@@ -192,6 +198,25 @@ Then verify:
         | grep -E 'VoiceProxy|VoiceClient|SOCKS5 proxy|preflight'
 EOT
   exit 0
+fi
+
+if [ "$WAIT_IDLE" -ge 0 ]; then
+  echo
+  echo "=== idle gate: is any paid order running right now? ==================="
+  # The ONLY durable answer: the orders table. docker logs guessing is not
+  # proof, and recreating the bot kills every live voice session.
+  if ! docker compose "${COMPOSE_ARGS[@]}" exec -T bot "$PYBIN" \
+        tools/voice_idle_gate.py --wait "$WAIT_IDLE"; then
+    cat <<EOT
+
+*** STILL BUSY — nothing was restarted (that would have killed a live order).
+*** Re-run with a longer window, e.g.:
+
+    bash tools/deploy_voice_fix.sh --apply --wait-idle 7200
+
+EOT
+    exit 3
+  fi
 fi
 
 echo
