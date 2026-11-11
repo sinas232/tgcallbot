@@ -33,7 +33,12 @@
   (`probe_socks5`) انجام می‌شود و `proxy=ok` دیگر دروغ نمی‌گوید.
 - **استقرار یک‌مرحله‌ای:** `tools/deploy_voice_fix.sh` (dry-run پیش‌فرض،
   `--apply`، `--recreate` فقط در پنجرهٔ بی‌سفارش) + `tools/fix_env_proxy.py`.
-- **تست:** ۸۴۳ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۶ تست) و
+- **چرا هنوز `live=0` بود:** پیش‌بررسیِ TCP پروکسیِ HTTP را سالم می‌دید،
+  `.env` چند خط `USE_PROXY` داشت، و گیتِ «اثباتِ بسته‌شدن» تلاشِ دوبارهٔ مستقیم را
+  برای کلاینتی که هرگز وصل نشده بود **بلاک** می‌کرد (`client init error:
+  TimeoutError` در ۲۱:۴۳). هر سه رفع شد؛ هر ساختِ کلاینت حالا خطِ
+  `[VoiceClient] acc=… opening via …` دارد.
+- **تست:** ۸۴۵ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸ تست) و
   `tests/test_fix_env_proxy.py` (۸ تست).
 
 </div>

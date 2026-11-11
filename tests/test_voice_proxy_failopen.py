@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 # ── environment must exist BEFORE project imports ──────────────────────
@@ -174,6 +175,138 @@ class Socks5GreetingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(
             await diag.probe_socks5("127.0.0.1", port, timeout=2,
                                     username="u", password="pwd"), True)
+
+
+class FailOpenRetryTests(unittest.IsolatedAsyncioTestCase):
+    """The direct retry must happen even when the dead client never connected.
+
+    Live log 2026-11-11 21:43 (order 1355, account 137): the proxy attempt died
+    after 20s with a bare TimeoutError and the account was marked FAILED without
+    ever trying DIRECT — because the "prove the old client is closed" gate ran
+    `_disconnect_voice_app()` on a client whose ``start()`` never established a
+    transport (``is_connected`` False but ``session`` set), got False, and gave
+    up. Every account repeated it, so the order stayed at live=0.
+    """
+
+    def _patches(self, fake_client, owners):
+        import services.session_client as session_client
+        import services.voice_updates as voice_updates
+
+        return [
+            mock.patch.object(vcm, "session_ownership", owners),
+            mock.patch.object(vcm.DatabaseManager, "get_account_by_id",
+                             new=mock.AsyncMock(return_value={
+                                 "session_string": "enc", "account_status": "active"})),
+            mock.patch.object(vcm.SecurityManager, "decrypt_session",
+                             return_value="auth-key"),
+            mock.patch.object(vcm.TelegramAccountClient, "_get_api_credentials",
+                             new=mock.AsyncMock(return_value=(1, "h"))),
+            mock.patch.object(vcm, "Client", fake_client),
+            mock.patch.object(vcm, "PyTgCalls", FakeEngine),
+            mock.patch.object(session_client, "_close_timeout", lambda _t: 0.1),
+            mock.patch.object(voice_updates, "configure_voice_updates", lambda _c: None),
+            mock.patch.object(vcm, "_proxy_reachable",
+                             new=mock.AsyncMock(return_value=True)),
+            mock.patch.object(Config, "VOICE_PROXY_REQUIRED", False),
+            mock.patch.object(Config, "USE_PROXY", True),
+            mock.patch.object(Config, "SOCKS5_HOST", "payproxy"),
+            mock.patch.object(Config, "SOCKS5_PORT", 8888),
+        ]
+
+    async def test_retries_direct_when_the_proxy_client_never_connected(self):
+        from services.session_ownership import SessionOwnership
+
+        owners = SessionOwnership()
+        opened = []
+
+        class NeverConnected:
+            def __init__(self, *_a, **_kw):
+                opened.append(_kw.get("proxy"))
+                self.name = "fake-voice"
+                self.dispatcher = SimpleNamespace(update_parsers={})
+                self.is_initialized = False
+                self.is_connected = False
+                self.session = object()          # start() got far enough to build one
+
+            async def start(self):
+                raise asyncio.TimeoutError()
+
+            async def disconnect(self):
+                raise TimeoutError("teardown unconfirmed")
+
+            async def stop(self):
+                raise TimeoutError("teardown unconfirmed")
+
+        class GoodClient(NeverConnected):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.is_initialized = True
+                self.is_connected = True
+
+            async def start(self):
+                self.is_connected = True
+
+        calls = {"n": 0}
+
+        def factory(*a, **kw):
+            calls["n"] += 1
+            return NeverConnected(*a, **kw) if calls["n"] == 1 else GoodClient(*a, **kw)
+
+        mgr = vcm.VoiceCallManager()
+        for patcher in self._patches(factory, owners):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        pytg = await mgr._get_or_create_client(1, 900, "enc")
+        self.assertIsNotNone(pytg)
+        self.assertEqual(calls["n"], 2, "the DIRECT retry never ran")
+        self.assertIsNone(opened[-1], "the retry must not reuse the proxy")
+        self.assertTrue(vcm._voice_proxy_circuit_open())
+        self.assertIsNotNone(mgr.pyrogram_clients.get(900))
+
+    async def test_quarantines_when_a_connected_client_cannot_be_closed(self):
+        from services.session_ownership import SessionOwnership
+
+        owners = SessionOwnership()
+
+        class Connected:
+            def __init__(self, *_a, **_kw):
+                self.name = "fake-voice"
+                self.dispatcher = SimpleNamespace(update_parsers={})
+                self.is_initialized = True
+                self.is_connected = True
+                self.session = object()
+
+            async def start(self):
+                raise asyncio.TimeoutError()
+
+            async def disconnect(self):
+                raise TimeoutError("teardown unconfirmed")
+
+            async def stop(self):
+                raise TimeoutError("teardown unconfirmed")
+
+        mgr = vcm.VoiceCallManager()
+        for patcher in self._patches(Connected, owners):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        with self.assertRaises(BaseException):
+            await mgr._get_or_create_client(1, 901, "enc")
+        self.assertIn(901, mgr._quarantined_accounts)
+
+
+class FakeEngine:
+    """Stand-in for PyTgCalls: start() succeeds, no bindings."""
+
+    def __init__(self, *_a, **_kw):
+        self.group_calls = {}
+
+    async def start(self):
+        return None
+
+    async def stop(self):
+        return None
 
 
 class MediaDiagnosticsProxyTests(unittest.IsolatedAsyncioTestCase):

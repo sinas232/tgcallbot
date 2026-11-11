@@ -2435,26 +2435,48 @@ class VoiceCallManager:
                     return client
 
                 proxy = await _effective_voice_proxy(account_id)
+                # The single most useful line of the whole incident: WHICH path
+                # (proxy or direct) each client opened through. Without it a
+                # silent 20s timeout says nothing about the cause.
+                logger.info("[VoiceClient] acc=%s opening via %s", account_id,
+                            _voice_proxy_target(proxy) if proxy else "DIRECT (no proxy)")
                 try:
                     app = await _open(proxy)
                 except BaseException as exc:
                     # The preflight passed (or no proxy is configured). If a
                     # proxy-based start still fails the way an unreachable
                     # proxy fails, retry once DIRECT instead of burning the
-                    # whole build on live=0 (incident 2026-11-11). The stale
-                    # client must be provably closed first, otherwise the auth
-                    # key stays held and the outer handler quarantines it.
+                    # whole build on live=0 (incident 2026-11-11).
+                    logger.warning(
+                        "[VoiceClient] acc=%s start failed via %s: %s",
+                        account_id,
+                        _voice_proxy_target(proxy) if proxy else "DIRECT",
+                        type(exc).__name__)
                     if (proxy is None or _voice_proxy_required()
                             or not _looks_like_connect_failure(exc)):
                         raise
+                    # Teardown of the failed attempt must be proven before a
+                    # second connection on the same auth key... EXCEPT when the
+                    # client never got a transport at all (is_connected False):
+                    # then nothing reached Telegram and there is no key to
+                    # race. Requiring that proof here silently skipped the
+                    # direct retry for every account and left orders at live=0
+                    # (2026-11-11 21:43, accounts 137/130).
                     stale_app = app
                     if stale_app is not None and not await _disconnect_voice_app(stale_app):
-                        raise
+                        if bool(getattr(stale_app, "is_connected", False)):
+                            raise
+                        logger.warning(
+                            "[VoiceClient] acc=%s never connected (no transport "
+                            "established); retrying DIRECT without a confirmed "
+                            "teardown", account_id)
                     app = None
                     _disable_voice_proxy(
                         f"client start failed via {_voice_proxy_target(proxy)}: "
                         f"{type(exc).__name__}")
                     app = await _open(None)
+                    logger.info("[VoiceClient] acc=%s connected DIRECT after the "
+                                "proxy failed", account_id)
                 await asyncio.sleep(random.uniform(0.8, 2.0))
                 if self._shutting_down:
                     raise RuntimeError("voice engine shutting down")

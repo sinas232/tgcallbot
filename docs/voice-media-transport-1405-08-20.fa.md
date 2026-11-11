@@ -88,6 +88,39 @@ bash tools/deploy_voice_fix.sh --apply --recreate    # در پنجرهٔ بی‌
 اگر واقعاً پروکسی می‌خواهید، فقط SOCKS5 معتبر (پیش‌فرضِ compose: `127.0.0.1:1080`
 داخل نت‌نمِ warp) قابل استفاده است. `payproxy:8888` هرگز گزینهٔ درستی نبود.
 
+### چرا بعد از نصبِ پچِ اول باز هم `live=0` بود (لاگِ ۲۱:۴۳، سفارش ۱۳۵۵)
+
+```
+21:43:39 [VoiceScheduler] Order 1355: creating Pyrogram client for account 137
+21:43:49 Unable to connect due to network issues: Connection timed out
+21:43:59 state STARTING -> FAILED   reason="client init error: TimeoutError"
+```
+
+سه واقعیتِ پشتِ این سه خط:
+
+1. **پچِ دوم روی سرور نبود.** نسخهٔ اول (`d976597`) پیش‌بررسیِ *TCP* دارد و
+   `payproxy` اتصالِ TCP را قبول می‌کند ⇒ «سالم» گزارش می‌شد و هر کلاینت ۲۰
+   ثانیه در هندشیکِ SOCKS5 می‌ماند. نسخهٔ `82d917a` احوال‌پرسیِ واقعیِ SOCKS5
+   می‌فرستد و در چند میلی‌ثانیه رد می‌کند.
+2. **`.env` چند خط `USE_PROXY` دارد** (یک `false` دستی + یک `export …=true`) و
+   compose آخری را می‌گیرد؛ پس `docker compose config` هنوز `true` می‌داد و
+   `sed` تک‌خطی کافی نبود.
+3. **تلاشِ دوبارهٔ مستقیم گاهی اصلاً اجرا نمی‌شد.** گیتِ «اثباتِ بسته‌شدنِ
+   کلاینتِ قبلی» روی کلاینتی که `start()` هرگز ترنسپورت نگرفته (`is_connected=
+   False` ولی `session` ساخته‌شده) `False` برمی‌گرداند ⇒ `raise` ⇒ بدون هیچ
+   تلاشِ مستقیم، اکانت FAILED می‌شد. حالا در همین حالت (هیچ ترنسپورتی به
+   تلگرام نرسیده) تلاشِ مستقیم انجام می‌شود و فقط اگر کلاینت **وصل بوده** باشد
+   قرنطینه می‌شود.
+
+همچنین هر بار ساختِ کلاینت یک خطِ گویا دارد:
+
+```
+[VoiceClient] acc=137 opening via payproxy:8888      # یا DIRECT (no proxy)
+[VoiceClient] acc=137 start failed via payproxy:8888: TimeoutError
+[VoiceProxy] DISABLED for this process (...)
+[VoiceClient] acc=137 connected DIRECT after the proxy failed
+```
+
 ### فیکسِ کد (تا دیگر تکرار نشود)
 
 - **پیش‌بررسی (preflight):** قبل از ساختِ کلاینت، یک TCP-connect با تایم‌اوت
@@ -256,7 +289,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۴۳ تست، ۸۳۷ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۴۵ تست، ۸۳۹ موفق، ۶ skip**.
 
 ---
 
