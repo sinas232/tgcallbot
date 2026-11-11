@@ -3,11 +3,20 @@
 
 Why
 ===
-On 2026-11-11 `/opt/tgcallbot/.env` had **more than one** ``USE_PROXY`` line
-(one that the operator edited to ``false`` and a later ``export USE_PROXY=true``
-that dotenv/compose still honoured), so ``docker compose config`` kept
-rendering ``USE_PROXY: "true"`` and every voice client rode the HTTP
-``payproxy:8888`` until it timed out — ``live=0`` for hours.
+Two facts from 2026-11-11 shape the defaults below:
+
+* the deployment's intended topology is ``USE_PROXY=true`` with the WARP
+  container's own SOCKS5 (``127.0.0.1:1080`` inside the shared netns) — with
+  ``USE_PROXY=false`` the voice clients went DIRECT through the WARP TUN and
+  every one of them timed out (``[VoiceClient] acc=142 start failed via
+  DIRECT: TimeoutError``);
+* ``payproxy:8888`` is the tinyproxy **HTTP** container for Iranian payment
+  gateways. It accepts TCP but never answers a SOCKS5 greeting, so pointing
+  SOCKS5_* at it stalls every client until its 20s timeout.
+
+The file also had more than one ``USE_PROXY`` line (one edited by hand to
+``false`` plus a later ``export USE_PROXY=true``), and dotenv/compose keeps the
+LAST one — a single-line ``sed`` can never fix that.
 
 Nothing here needs a running stack: it edits one file, keeps a timestamped
 backup, and prints every change it makes.  It never touches payment keys or
@@ -18,6 +27,7 @@ USAGE
     python tools/fix_env_proxy.py                     # /opt/tgcallbot/.env
     python tools/fix_env_proxy.py --env .env --dry-run
     python tools/fix_env_proxy.py --keep-socks        # only fix USE_PROXY
+    python tools/fix_env_proxy.py --use-proxy false   # deliberately DIRECT
 """
 
 from __future__ import annotations
@@ -39,7 +49,7 @@ DEFAULT_SOCKS_HOST = "127.0.0.1"
 DEFAULT_SOCKS_PORT = "1080"
 
 
-def plan_changes(lines, use_proxy="false", socks_host=DEFAULT_SOCKS_HOST,
+def plan_changes(lines, use_proxy="true", socks_host=DEFAULT_SOCKS_HOST,
                  socks_port=DEFAULT_SOCKS_PORT):
     """Return ``(new_lines, changes)`` without touching the filesystem."""
     wanted = {"USE_PROXY": use_proxy, "VOICE_PROXY_REQUIRED": "false"}
@@ -83,7 +93,7 @@ def plan_changes(lines, use_proxy="false", socks_host=DEFAULT_SOCKS_HOST,
     return out, changes
 
 
-def fix_env(path, *, use_proxy="false", socks_host=None, socks_port=None,
+def fix_env(path, *, use_proxy="true", socks_host=None, socks_port=None,
             dry_run=False):
     with open(path, "r", encoding="utf-8") as handle:
         lines = handle.readlines()
@@ -101,6 +111,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Fix the voice-proxy keys in .env")
     parser.add_argument("--env", default=os.environ.get("ENV_FILE", "/opt/tgcallbot/.env"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--use-proxy", choices=("true", "false"), default="true",
+                        help="voice clients go through the SOCKS5 proxy "
+                             "(default true: the WARP SOCKS5)")
     parser.add_argument("--keep-socks", action="store_true",
                         help="leave SOCKS5_HOST/SOCKS5_PORT untouched")
     parser.add_argument("--socks-host", default=None)
@@ -112,12 +125,13 @@ def main(argv=None) -> int:
         return 2
     changes = fix_env(
         args.env,
+        use_proxy=args.use_proxy,
         socks_host=None if args.keep_socks else (args.socks_host or DEFAULT_SOCKS_HOST),
         socks_port=None if args.keep_socks else (args.socks_port or DEFAULT_SOCKS_PORT),
         dry_run=args.dry_run,
     )
     if not changes:
-        print(f"{args.env}: already correct (USE_PROXY=false) — nothing to do")
+        print(f"{args.env}: already correct (USE_PROXY={args.use_proxy}) — nothing to do")
         return 0
     print(f"{args.env}: {'would change' if args.dry_run else 'changed'}:")
     for change in changes:

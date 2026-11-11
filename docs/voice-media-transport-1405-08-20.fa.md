@@ -70,6 +70,51 @@ WARNING pyrogram.connection.connection: Unable to connect due to network issues:
    احوال‌پرسیِ واقعیِ SOCKS5 می‌فرستد (`05 01 00`) و پاسخِ `0x05` را می‌خواهد؛
    یک پروکسی HTTP با `HT` جواب می‌دهد و همان‌جا رد می‌شود.
 
+### ۲۴ ساعتِ سوم: چرا `USE_PROXY=false` هم جواب نداد
+
+بعد از خاموش‌کردنِ پروکسی، لاگِ سفارش ۱۳۵۶ این شد:
+
+```
+[VoiceClient] acc=142 opening via DIRECT (no proxy)
+[VoiceClient] acc=142 start failed via DIRECT: TimeoutError
+```
+
+یعنی عبورِ **مستقیم** از تونل WARP روی این هاست TCP تلگرام را حمل نمی‌کند؛
+به همین دلیل هم `docker-compose.yml` از اول مسیرِ ویس را از پروکسیِ SOCKS5
+همان کانتینر `warp` (`127.0.0.1:1080`) می‌فرستد. پس مقدارِ درست:
+
+```
+USE_PROXY=true
+SOCKS5_HOST=127.0.0.1
+SOCKS5_PORT=1080
+```
+
+و `payproxy:8888` (HTTP، برای درگاه‌های پرداخت) هرگز نباید اینجا بیاید.
+
+نکتهٔ مهم: بعد از درست‌کردنِ `.env` هم کانتینر باز `USE_PROXY=true` و
+`SOCKS5_HOST=payproxy` می‌گرفت — یعنی مقدارِ مؤثر از `.env` نمی‌آمد (یکی از
+`env_file`های compose یا خودِ `docker-compose*.yml`). راهِ قطعی، یک **override**
+است که همیشه بر فایلِ پایه و بر `env_file` اولویت دارد:
+
+```yaml
+# docker-compose.voicefix.yml
+services:
+  bot:
+    environment:
+      - USE_PROXY=true
+      - SOCKS5_HOST=127.0.0.1
+      - SOCKS5_PORT=1080
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.voicefix.yml up -d --force-recreate bot
+```
+
+`tools/deploy_voice_fix.sh` همین را می‌سازد، `env_file`های compose را هم
+نرمال می‌کند، و **بعد از ری‌استارت با `printenv` داخل کانتینر اثبات می‌کند** که
+مقدارها اعمال شده‌اند (در غیر این صورت با کدِ خطای ۳ و دستورهای عیب‌یابی متوقف
+می‌شود — نه پیامِ «DONE»ِ دروغین).
+
 ### فیکسِ سرور (فوری، بدون تغییر کد)
 
 ```bash
@@ -289,7 +334,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۴۵ تست، ۸۳۹ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۴۷ تست، ۸۴۱ موفق، ۶ skip**.
 
 ---
 

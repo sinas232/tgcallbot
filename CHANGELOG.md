@@ -38,8 +38,16 @@
   برای کلاینتی که هرگز وصل نشده بود **بلاک** می‌کرد (`client init error:
   TimeoutError` در ۲۱:۴۳). هر سه رفع شد؛ هر ساختِ کلاینت حالا خطِ
   `[VoiceClient] acc=… opening via …` دارد.
-- **تست:** ۸۴۵ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸ تست) و
-  `tests/test_fix_env_proxy.py` (۸ تست).
+- **مقدارِ درست `USE_PROXY=true` + `127.0.0.1:1080` است، نه `false`.** با
+  `false` کلاینت‌ها از تونل WARP مستقیم می‌روند و همان‌جا هم timeout می‌دهند
+  (`[VoiceClient] acc=142 start failed via DIRECT: TimeoutError`). مسیرِ ویس در
+  این استقرار از SOCKS5 خودِ کانتینر warp می‌گذرد.
+- **override قطعی:** چون مقدارِ مؤثر از `.env` نمی‌آمد، اسکریپت
+  `docker-compose.voicefix.yml` را می‌سازد (بر فایل پایه و `env_file` اولویت
+  دارد) و بعد از ری‌استارت با `printenv` داخل کانتینر **اثبات** می‌کند؛ مغایرت
+  ⇒ خروج با کد ۳ و دستورهای عیب‌یابی.
+- **تست:** ۸۴۷ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸ تست) و
+  `tests/test_fix_env_proxy.py` (۱۰ تست).
 
 </div>
 

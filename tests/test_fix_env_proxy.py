@@ -33,12 +33,13 @@ class FixEnvProxyTests(unittest.TestCase):
         cls.mod = _load_module()
 
     def test_every_duplicate_is_rewritten(self):
-        lines = ["TZ=Asia/Tehran\n", "USE_PROXY=false\n", "SOCKS5_HOST=payproxy\n",
+        lines = ["TZ=Asia/Tehran\n", "USE_PROXY=true\n", "SOCKS5_HOST=payproxy\n",
                  "SOCKS5_PORT=8888\n", "export USE_PROXY=true\n", "  USE_PROXY = true\n"]
         new, changes = self.mod.plan_changes(lines)
         text = "".join(new)
-        self.assertEqual(text.count("USE_PROXY=false"), 3)
-        self.assertNotIn("true", text)
+        self.assertEqual(text.count("USE_PROXY=true"), 3)
+        self.assertNotIn("payproxy", text)
+        self.assertNotIn("8888", text)
         self.assertIn("SOCKS5_HOST=127.0.0.1", text)
         self.assertIn("SOCKS5_PORT=1080", text)
         self.assertTrue(any("duplicate" in c for c in changes))
@@ -53,16 +54,16 @@ class FixEnvProxyTests(unittest.TestCase):
         self.assertIn("PAYMENT_HTTP_PROXY=http://payproxy:8888", text)
 
     def test_keep_socks_leaves_the_endpoint_alone(self):
-        lines = ["SOCKS5_HOST=payproxy\n", "SOCKS5_PORT=8888\n", "USE_PROXY=true\n"]
+        lines = ["SOCKS5_HOST=payproxy\n", "SOCKS5_PORT=8888\n", "USE_PROXY=false\n"]
         new, _ = self.mod.plan_changes(lines, socks_host=None, socks_port=None)
         text = "".join(new)
         self.assertIn("SOCKS5_HOST=payproxy", text)
-        self.assertIn("USE_PROXY=false", text)
+        self.assertIn("USE_PROXY=true", text)
 
     def test_missing_keys_are_appended(self):
         new, changes = self.mod.plan_changes(["TZ=UTC\n"])
         text = "".join(new)
-        self.assertIn("USE_PROXY=false", text)
+        self.assertIn("USE_PROXY=true", text)
         self.assertIn("VOICE_PROXY_REQUIRED=false", text)
         self.assertTrue(all(any(key in c for c in changes)
                             for key in ("USE_PROXY", "VOICE_PROXY_REQUIRED")))
@@ -70,10 +71,10 @@ class FixEnvProxyTests(unittest.TestCase):
     def test_file_is_written_once_with_a_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = Path(tmp) / ".env"
-            env.write_text("A=1\nUSE_PROXY=true\nexport USE_PROXY=true\n", encoding="utf-8")
+            env.write_text("A=1\nUSE_PROXY=false\nexport USE_PROXY=false\n", encoding="utf-8")
             changes = self.mod.fix_env(str(env))
             self.assertTrue(any("backup" in c for c in changes))
-            self.assertEqual(env.read_text(encoding="utf-8").count("USE_PROXY=false"), 2)
+            self.assertEqual(env.read_text(encoding="utf-8").count("USE_PROXY=true"), 2)
             backups = list(Path(tmp).glob(".env.bak-*"))
             self.assertEqual(len(backups), 1)
             # idempotent: a second run changes nothing
@@ -82,23 +83,36 @@ class FixEnvProxyTests(unittest.TestCase):
     def test_dry_run_does_not_touch_the_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = Path(tmp) / ".env"
-            env.write_text("USE_PROXY=true\n", encoding="utf-8")
+            env.write_text("USE_PROXY=false\n", encoding="utf-8")
             self.mod.fix_env(str(env), dry_run=True)
-            self.assertIn("USE_PROXY=true", env.read_text(encoding="utf-8"))
+            self.assertIn("USE_PROXY=false", env.read_text(encoding="utf-8"))
 
     def test_cli_reports_and_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = Path(tmp) / ".env"
-            env.write_text("USE_PROXY=true\n", encoding="utf-8")
+            env.write_text("USE_PROXY=false\n", encoding="utf-8")
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = self.mod.main(["--env", str(env)])
             self.assertEqual(code, 0)
             self.assertIn("USE_PROXY", buf.getvalue())
-            self.assertIn("USE_PROXY=false", env.read_text(encoding="utf-8"))
+            self.assertIn("USE_PROXY=true", env.read_text(encoding="utf-8"))
 
     def test_missing_file_is_an_error(self):
         self.assertEqual(self.mod.main(["--env", "/nonexistent/.env"]), 2)
+
+    def test_warp_socks5_is_the_default_target(self):
+        # The deployment's own topology: voice clients ride the WARP container's
+        # SOCKS5 at 127.0.0.1:1080 (not the HTTP payproxy).
+        new, _ = self.mod.plan_changes(["USE_PROXY=false\n"])
+        text = "".join(new)
+        self.assertIn("USE_PROXY=true", text)
+        self.assertIn("SOCKS5_HOST=127.0.0.1", text)
+        self.assertIn("SOCKS5_PORT=1080", text)
+
+    def test_use_proxy_false_is_available_for_deliberate_direct_runs(self):
+        new, _ = self.mod.plan_changes(["USE_PROXY=true\n"], use_proxy="false")
+        self.assertIn("USE_PROXY=false", "".join(new))
 
 
 if __name__ == "__main__":
