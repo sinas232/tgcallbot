@@ -47,7 +47,9 @@
 #     with `network_mode: service:warp`, so it shares that network namespace.
 #     A lone warp restart leaves the bot with a dead netns and it dies with
 #     `OSError: [Errno 101] Network is unreachable` while connecting to
-#     postgres (seen 2026-11-11 22:10). Always recreate them together.
+#     postgres (seen 2026-11-11 22:10). The `routefix` sidecar also lives in that
+#     netns and installs the docker-subnet ip rule, so it must be recreated with
+#     them. Always: warp + routefix + bot together.
 #
 # ROLLBACK
 #   rm docker-compose.voicefix.yml && docker compose up -d --force-recreate bot
@@ -195,8 +197,11 @@ fi
 echo
 echo "=== 5/5 recreating containers (this drops live voice sessions) ========="
 if [ "$RESTART_WARP" = "1" ]; then
-  echo "  recreating warp AND bot together (shared network namespace)"
-  docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate warp bot
+  echo "  recreating warp + routefix + bot together (shared network namespace)"
+  # routefix installs the docker-subnet ip rule INSIDE the warp netns; without
+  # it the bot cannot reach postgres/redis and dies with
+  # 'OSError: [Errno 101] Network is unreachable'.
+  docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate warp routefix bot
   sleep 20
 else
   docker compose "${COMPOSE_ARGS[@]}" up -d --force-recreate bot

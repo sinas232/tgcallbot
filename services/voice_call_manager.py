@@ -575,7 +575,7 @@ async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[D
         "to any DC and DIRECT TCP to every DC times out. The WARP tunnel / host "
         "egress is broken; recreate the tunnel AND the bot together, because the "
         "bot shares the warp container's network namespace: "
-        "`docker compose up -d --force-recreate warp bot`. This is NOT an "
+        "`docker compose up -d --force-recreate warp routefix bot`. This is NOT an "
         "account problem.")
 
 

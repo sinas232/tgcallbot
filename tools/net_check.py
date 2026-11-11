@@ -119,7 +119,7 @@ def verdict(direct: dict, proxy: dict | None, proxy_target: str | None) -> str:
             "DIRECT times out. The tunnel is broken, not the accounts. Recreate the "
             "tunnel AND the bot together (the bot shares warp's network namespace, "
             "so a lone warp restart leaves the bot with a dead netns): "
-            "`docker compose up -d --force-recreate warp bot`, then re-run this check.")
+            "`docker compose up -d --force-recreate warp routefix bot`, then re-run this check.")
 
 
 async def _run(args) -> int:

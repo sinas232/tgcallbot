@@ -91,8 +91,19 @@ service "bot" is not running
 چون ربات `network_mode: service:warp` است و **netns مشترک** دارد؛ recreate
 تنهای warp، netns ربات را از بین می‌برد. قاعدهٔ ثابت:
 
-> هر بار warp عوض/ری‌استارت می‌شود، ربات باید **همان لحظه** با آن recreate شود:
-> `docker compose -f docker-compose.yml -f docker-compose.voicefix.yml up -d --force-recreate warp bot`
+> هر بار warp عوض/ری‌استارت می‌شود، ربات **و routefix** باید همان لحظه با آن
+> recreate شوند:
+> `docker compose -f docker-compose.yml -f docker-compose.voicefix.yml up -d --force-recreate warp routefix bot`
+
+چرا `routefix` هم؟ آن sidecar داخلِ همان netns با `ip rule add to
+172.28.0.0/16 lookup main` مسیرِ زیرشبکهٔ داکر (postgres/redis) را برمی‌گرداند.
+با recreate تنهای warp، آن قانون در netns جدید نیست و ربات با
+`OSError: [Errno 101] Network is unreachable` هنگام اتصال به postgres می‌افتد و
+در حلقهٔ ری‌استارت می‌ماند — یعنی «ربات کلاً بالا نمی‌آید».
+
+فیکسِ کد: `services/instance_lock.py` حالا اتصال را با تأخیر تکرار می‌کند
+(پیش‌فرض ۱۲ تلاش × ۵ ثانیه) و فقط پس از آن fail-closed می‌شود؛ پس یک netns تازه
+ربات را نمی‌کشد و لاگ هم دقیقاً می‌گوید منتظرِ چه چیزی است.
 
 `tools/deploy_voice_fix.sh --restart-warp` همین کار را می‌کند (و بعدش
 `net_check` را هم اجرا می‌کند).
@@ -387,7 +398,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۵۸ تست، ۸۵۲ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۶۲ تست، ۸۵۶ موفق، ۶ skip**.
 
 ---
 

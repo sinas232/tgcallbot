@@ -55,7 +55,13 @@
   تنهای warp ربات را با `OSError: [Errno 101] Network is unreachable` می‌کشد.
   همیشه با هم: `up -d --force-recreate warp bot`
   (`tools/deploy_voice_fix.sh --restart-warp`).
-- **تست:** ۸۵۸ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
+- **علتِ «ربات بالا نمی‌آید»:** `routefix` هم در netns مشترکِ warp است و قانونِ
+  مسیرِ زیرشبکهٔ داکر را می‌گذارد؛ با recreate تنهای warp آن قانون نیست و ربات با
+  `OSError: [Errno 101] Network is unreachable` روی postgres می‌افتد. همیشه:
+  `up -d --force-recreate warp routefix bot`. علاوه بر آن اتصالِ
+  `instance_lock` حالا ۱۲ بار × ۵ ثانیه تکرار می‌شود تا یک netns تازه ربات را
+  نکشد.
+- **تست:** ۸۶۲ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
   `tests/test_fix_env_proxy.py` (۱۰)، `tests/test_net_check_and_egress.py` (۱۱).
 
 </div>
