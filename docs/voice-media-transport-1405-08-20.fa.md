@@ -70,6 +70,32 @@ WARNING pyrogram.connection.connection: Unable to connect due to network issues:
    احوال‌پرسیِ واقعیِ SOCKS5 می‌فرستد (`05 01 00`) و پاسخِ `0x05` را می‌خواهد؛
    یک پروکسی HTTP با `HT` جواب می‌دهد و همان‌جا رد می‌شود.
 
+### مرحلهٔ چهارم: تونل، نه اکانت (لاگِ ۲۱:۳۳)
+
+```
+[VoiceProxy] preflight OK acc=134 -> 127.0.0.1:1080 (SOCKS5 greeting accepted)
+ERROR pyrogram...: Proxy connection failed: ProxyError Host unreachable
+[VoiceProxy] DISABLED ... clients connect DIRECT
+WARNING Unable to connect due to network issues: Connection timed out
+```
+
+یعنی **پروکسیِ SOCKS5 زنده است** (احوال‌پرسی را جواب می‌دهد) ولی نمی‌تواند به
+DC تلگرام وصل شود، و مسیرِ مستقیم هم داخلِ netns تونل timeout می‌دهد. پس
+مشکل دیگر «تنظیمات» نیست: **هیچ مسیری به تلگرام از این کانتینر زنده نیست.**
+
+- ابزارِ `tools/net_check.py` همین را در یک نگاه می‌گوید: TCP مستقیم به DC1…DC5
+  و همین‌ها از طریق SOCKS5 (با CONNECT واقعی، نه فقط greeting).
+- پچِ کد: پیش‌بررسیِ پروکسی حالا **CONNECT به یک DC واقعی** می‌زند؛ اگر
+  پروکسی نتواند و مسیرِ مستقیم بتواند، خودکار مستقیم می‌رود
+  (`[VoiceNet] proxy=… cannot reach Telegram, DIRECT does`); و اگر **هیچ‌کدام**
+  نتوانند، بلافاصله با پیامِ صریح
+  `[VoiceNet] no egress path to Telegram … restart the warp container`
+  رد می‌شود — نه ۲۰ ثانیه سکوت برای هر اکانت.
+
+درمانِ عملیاتی در این حالت: `docker compose restart warp` (ثبتِ مجددِ تونل) و
+اگر باز هم هر دو مسیر مرده بودند، حالتِ شبکهٔ هاست
+(`docker-compose.host.yml`) یا تغییرِ خروجیِ WARP.
+
 ### ۲۴ ساعتِ سوم: چرا `USE_PROXY=false` هم جواب نداد
 
 بعد از خاموش‌کردنِ پروکسی، لاگِ سفارش ۱۳۵۶ این شد:
@@ -334,7 +360,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۴۷ تست، ۸۴۱ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۵۸ تست، ۸۵۲ موفق، ۶ skip**.
 
 ---
 

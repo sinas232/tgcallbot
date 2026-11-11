@@ -46,8 +46,13 @@
   `docker-compose.voicefix.yml` را می‌سازد (بر فایل پایه و `env_file` اولویت
   دارد) و بعد از ری‌استارت با `printenv` داخل کانتینر **اثبات** می‌کند؛ مغایرت
   ⇒ خروج با کد ۳ و دستورهای عیب‌یابی.
-- **تست:** ۸۴۷ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸ تست) و
-  `tests/test_fix_env_proxy.py` (۱۰ تست).
+- **تشخیصِ قطعیِ مسیر:** پیش‌بررسیِ پروکسی حالا CONNECT واقعی به یک DC تلگرام
+  می‌زند (نه فقط greeting)؛ اگر پروکسی نرسد و مستقیم برسد، خودکار مستقیم
+  می‌رود؛ اگر هیچ‌کدام نرسند، پیامِ `[VoiceNet] no egress path to Telegram …
+  restart the warp container` می‌دهد. ابزارِ `tools/net_check.py` وضعیتِ
+  DC1…DC5 را هم مستقیم و هم از پروکسی نشان می‌دهد.
+- **تست:** ۸۵۸ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
+  `tests/test_fix_env_proxy.py` (۱۰)، `tests/test_net_check_and_egress.py` (۱۱).
 
 </div>
 

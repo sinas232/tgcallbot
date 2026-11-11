@@ -487,6 +487,16 @@ def _looks_like_connect_failure(exc: BaseException) -> bool:
     return any(word in text for word in ("socks", "proxy", "timed out", "connect"))
 
 
+async def _direct_reachable(timeout: float = 3.0) -> Optional[bool]:
+    """Can this netns reach a Telegram DC without any proxy?"""
+    try:
+        from services import media_diagnostics as _diag
+        return await _diag.telegram_reachable_direct(timeout=timeout)
+    except Exception as exc:
+        logger.warning("[VoiceNet] direct reachability probe failed: %r", exc)
+        return None
+
+
 async def _proxy_reachable(proxy: Dict[str, Any], timeout: float) -> Optional[bool]:
     """Reachability of the configured proxy with the RIGHT protocol.
 
@@ -500,7 +510,9 @@ async def _proxy_reachable(proxy: Dict[str, Any], timeout: float) -> Optional[bo
     if str(proxy.get("scheme", "socks5")).lower() == "socks5":
         try:
             from services import media_diagnostics as _diag
-            return await _diag.probe_socks5(
+            # CONNECT to a real Telegram DC: a proxy that greets nicely but
+            # answers "host unreachable" is not a working voice path.
+            return await _diag.telegram_reachable_via_proxy(
                 host, port, timeout=timeout,
                 username=proxy.get("username"), password=proxy.get("password"))
         except Exception as exc:
@@ -512,11 +524,17 @@ async def _proxy_reachable(proxy: Dict[str, Any], timeout: float) -> Optional[bo
 async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """The proxy to actually use, after a cached reachability preflight.
 
-    * no proxy configured → ``None`` (direct),
-    * proxy reachable → the proxy dict,
-    * proxy dead and ``VOICE_PROXY_REQUIRED`` off → ``None`` + a one-time
-      critical log (fail-open), so a broken proxy cannot zero out an order,
-    * proxy dead and required → ``RuntimeError`` (fail-closed by choice).
+    The proxy must be able to *reach a Telegram DC*, not merely greet us.
+    2026-11-11 21:33 proved the difference: `127.0.0.1:1080` answered the SOCKS5
+    greeting (`preflight OK`) and then Pyrogram died with
+    `ProxyError Host unreachable` for DC5 — and DIRECT timed out too, because
+    the WARP tunnel itself could not carry Telegram traffic. Twenty seconds of
+    silence per account is the worst possible way to learn that.
+
+    * proxy CONNECTs to a Telegram DC → use the proxy,
+    * proxy cannot reach Telegram but DIRECT can → `None` + a critical log,
+    * neither works → ``RuntimeError`` naming the egress fault (fail loud),
+    * ``VOICE_PROXY_REQUIRED=true`` → never silently go direct.
     """
     proxy = _voice_proxy_config()
     if proxy is None:
@@ -525,25 +543,38 @@ async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[D
     _VOICE_PROXY_STATE["target"] = target
     if _VOICE_PROXY_STATE["disabled"]:
         return None
+    timeout = float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0))
     now = time.monotonic()
     probed_at = float(_VOICE_PROXY_STATE.get("probed_at") or 0.0)
     if probed_at and now - probed_at < VOICE_PROXY_PREFLIGHT_TTL:
         return proxy if _VOICE_PROXY_STATE.get("ok") else None
-    ok = await _proxy_reachable(
-        proxy, timeout=float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0)))
-    _VOICE_PROXY_STATE["ok"] = ok
+    ok = await _proxy_reachable(proxy, timeout=timeout)
     _VOICE_PROXY_STATE["probed_at"] = now
+    _VOICE_PROXY_STATE["ok"] = ok
     if ok:
-        logger.info("[VoiceProxy] preflight OK acc=%s -> %s (SOCKS5 greeting accepted)",
-                    account_id, target)
+        logger.info(
+            "[VoiceNet] proxy=%s reaches Telegram (SOCKS5 CONNECT ok) acc=%s",
+            target, account_id)
         return proxy
     if _voice_proxy_required():
         raise RuntimeError(
-            f"voice proxy {target} is unreachable and VOICE_PROXY_REQUIRED=true")
-    _disable_voice_proxy(
-        f"preflight failed (no SOCKS5 service on {target}; an HTTP proxy "
-        "accepts TCP but never answers the greeting)")
-    return None
+            f"voice proxy {target} cannot reach Telegram and "
+            "VOICE_PROXY_REQUIRED=true")
+    direct_ok = await _direct_reachable(timeout)
+    if direct_ok:
+        _disable_voice_proxy(
+            f"preflight failed (proxy {target} cannot CONNECT to any Telegram DC)")
+        logger.warning(
+            "[VoiceNet] proxy=%s cannot reach Telegram, DIRECT does — "
+            "voice clients will connect DIRECT", target)
+        return None
+    _VOICE_PROXY_STATE["ok"] = False
+    _VOICE_PROXY_STATE["probed_at"] = 0.0        # re-probe on the next attempt
+    raise RuntimeError(
+        f"[VoiceNet] no egress path to Telegram: proxy {target} cannot CONNECT "
+        "to any DC and DIRECT TCP to every DC times out. The WARP tunnel / host "
+        "egress is broken (restart the warp container: `docker compose restart "
+        "warp`), this is NOT an account problem.")
 
 
 logger.info(

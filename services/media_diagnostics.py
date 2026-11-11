@@ -161,10 +161,23 @@ async def probe_tcp(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> O
     return True
 
 
+# Telegram data-centre endpoints. A proxy that answers a SOCKS5 greeting is
+# still useless if it cannot reach these: the 2026-11-11 21:33 run showed
+# "[VoiceProxy] preflight OK" and then "ProxyError Host unreachable" for DC5.
+TELEGRAM_DC_ENDPOINTS = (
+    ("149.154.175.53", 443, "DC1"),
+    ("149.154.167.51", 443, "DC2"),
+    ("149.154.175.100", 443, "DC3"),
+    ("149.154.167.91", 443, "DC4"),
+    ("91.108.56.130", 443, "DC5"),
+)
+
+
 async def probe_socks5(host: str, port: int,
                        timeout: float = PROBE_TIMEOUT_S,
                        username: Optional[str] = None,
-                       password: Optional[str] = None) -> Optional[bool]:
+                       password: Optional[str] = None,
+                       target: Optional[Tuple[str, int]] = None) -> Optional[bool]:
     """A REAL SOCKS5 greeting, not just a TCP connect.
 
     Why this matters (2026-11-11): `payproxy:8888` is tinyproxy — an **HTTP**
@@ -199,8 +212,24 @@ async def probe_socks5(host: str, port: int,
             writer.write(bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd)
             await writer.drain()
             auth = await asyncio.wait_for(reader.readexactly(2), max(0.5, float(timeout)))
-            return bool(auth) and auth[1] == 0x00
-        return method in (0x00, 0x02)
+            if not auth or auth[1] != 0x00:
+                return False
+        elif method not in (0x00, 0x02):
+            return False
+        if target is None:
+            return True
+        # Full CONNECT: a SOCKS5 server that cannot reach Telegram is not a
+        # usable media path, no matter how cleanly it greets us.
+        ip = str(target[0])
+        port_no = int(target[1])
+        try:
+            packed = socket.inet_aton(ip)
+        except OSError:
+            return False
+        writer.write(b"\x05\x01\x00\x01" + packed + struct.pack(">H", port_no))
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.readexactly(10), max(0.5, float(timeout)))
+        return bool(reply) and reply[0] == 0x05 and reply[1] == 0x00
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError):
         return False
     except Exception as exc:
@@ -212,6 +241,36 @@ async def probe_socks5(host: str, port: int,
             await writer.wait_closed()
         except Exception as exc:
             logger.debug("socks5 probe close failed: %r", exc)
+
+
+async def telegram_reachable_direct(timeout: float = 2.0) -> Optional[bool]:
+    """Can this netns open a TCP connection to ANY Telegram DC, without a proxy?"""
+    for ip, port, _label in TELEGRAM_DC_ENDPOINTS:
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), max(0.5, float(timeout)))
+        except Exception:
+            continue
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception as exc:
+            logger.debug("direct probe close failed: %r", exc)
+        return True
+    return False
+
+
+async def telegram_reachable_via_proxy(host: str, port: int,
+                                       timeout: float = 3.0,
+                                       username: Optional[str] = None,
+                                       password: Optional[str] = None) -> Optional[bool]:
+    """Can the SOCKS5 proxy actually CONNECT to a Telegram DC?"""
+    for ip, dc_port, _label in TELEGRAM_DC_ENDPOINTS:
+        ok = await probe_socks5(host, port, timeout=timeout, username=username,
+                                password=password, target=(ip, dc_port))
+        if ok:
+            return True
+    return False
 
 
 async def collect(timeout: float = PROBE_TIMEOUT_S,
