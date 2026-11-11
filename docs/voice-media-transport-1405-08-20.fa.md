@@ -84,6 +84,11 @@ session با `state=idle` جا می‌گذارد و پستگرس تا تایم�
 
 - `services/instance_lock.py` حالا هنگامِ رد شدنِ قفل، **هویتِ نگه‌دارنده** را در
   همان خطِ CRITICAL می‌نویسد (pid / state / since / client).
+- **خوددرمانی (پیش‌فرض روشن):** اگر نگه‌دارنده `idle` باشد **و** اتصالش قبل از
+  شروعِ همین پروسه برقرار شده باشد، همان «روح» است و یک‌بار بسته و قفل دوباره
+  گرفته می‌شود (`[InstanceLock] cleared a STALE holder …`). نگه‌دارندهٔ `active`
+  یا نگه‌دارنده‌ای که بعد از ما وصل شده هرگز کشته نمی‌شود؛ با
+  `INSTANCE_LOCK_AUTOCLEAR=false` می‌توان این رفتار را خاموش کرد.
 - ابزارِ `tools/instance_lock_doctor.py`: فهرستِ بک‌اندها + نگه‌دارندهٔ قفل؛ با
   `--release-stale` فقط بک‌اندِ `idle` را می‌بندد و هرگز بک‌اندِ `active` (رباتِ
   واقعاً در حال اجرا) را نمی‌کشد.
@@ -423,7 +428,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۶۸ تست، ۸۶۲ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۷۳ تست، ۸۶۷ موفق، ۶ skip**.
 
 ---
 

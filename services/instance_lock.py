@@ -11,12 +11,19 @@ clients immediately: PostgreSQL has already released the lock.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import logging
+import os
 from typing import Callable, Optional
 
 import asyncpg
 
 logger = logging.getLogger(__name__)
+
+# When this process started: a lock holder that was already `idle` before we
+# existed cannot be us, and on this deployment it is usually a ghost left by a
+# container whose warp netns was recreated under it (see _clear_stale_holder).
+PROCESS_STARTED_AT = _dt.datetime.now(_dt.timezone.utc)
 
 # Two int32 keys in the default PostgreSQL advisory-lock namespace.
 LOCK_NAMESPACE = 0x74676362  # "tgcb"
@@ -65,12 +72,20 @@ class InstanceDatabaseLock:
                 timeout=10,
             )
             if ok is not True:
-                holder = await self._describe_holder(conn)
-                raise InstanceAlreadyRunning(
-                    "Another tgcallbot instance holds the same DATABASE_URL; "
-                    "refusing to reuse account sessions. Stop the other bot first. "
-                    f"Lock holder: {holder}"
-                )
+                holder = await self._holder_row(conn)
+                cleared = await self._clear_stale_holder(conn, holder)
+                if cleared:
+                    ok = await asyncio.wait_for(
+                        conn.fetchval("SELECT pg_try_advisory_lock($1, $2)",
+                                      LOCK_NAMESPACE, LOCK_ID),
+                        timeout=10,
+                    )
+                if ok is not True:
+                    raise InstanceAlreadyRunning(
+                        "Another tgcallbot instance holds the same DATABASE_URL; "
+                        "refusing to reuse account sessions. Stop the other bot "
+                        f"first. Lock holder: {self._describe(holder)}"
+                    )
         except BaseException:
             await conn.close()
             raise
@@ -80,7 +95,79 @@ class InstanceDatabaseLock:
         logger.info("Instance database lock acquired (shared across checkouts/servers)")
 
     @staticmethod
-    async def _describe_holder(conn) -> str:
+    def auto_clear_enabled() -> bool:
+        return str(os.getenv("INSTANCE_LOCK_AUTOCLEAR", "true")).strip().lower() in (
+            "1", "true", "yes", "on")
+
+    @staticmethod
+    def _describe(row) -> str:
+        if row is None:
+            return "unknown (no pg_locks row)"
+        return (f"pid={row['pid']} app={row['application_name']} "
+                f"state={row['state']} since={row['backend_start']} "
+                f"client={row['client_addr']}")
+
+    async def _holder_row(self, conn):
+        """The pg_stat_activity row of the advisory-lock holder, if visible."""
+        try:
+            return await asyncio.wait_for(conn.fetchrow(
+                """
+                SELECT a.pid, a.application_name, a.state,
+                       a.backend_start, a.client_addr
+                FROM pg_locks l
+                JOIN pg_stat_activity a ON a.pid = l.pid
+                WHERE l.locktype = 'advisory'
+                  AND l.classid = $1 AND l.objid = $2
+                  AND l.granted
+                LIMIT 1
+                """, LOCK_NAMESPACE, LOCK_ID), timeout=5)
+        except Exception:
+            return None
+
+    async def _clear_stale_holder(self, conn, holder) -> bool:
+        """Terminate a GHOST lock holder so the bot can start.
+
+        A container recreated while its TCP connection was open (exactly what
+        recreating `warp` does to the bot that shares its netns) leaves an
+        `idle` postgres backend holding the session-level advisory lock.
+        PostgreSQL only notices the client is gone when TCP keepalive fires
+        (~2 hours), so the bot crash-looped with `InstanceAlreadyRunning` at
+        2026-11-11 22:24 while nothing else was running.
+
+        Safety rules — a REAL bot is never killed:
+          * the holder must be in state `idle`,
+          * it must have been connected BEFORE this process started,
+          * `INSTANCE_LOCK_AUTOCLEAR` must not be disabled.
+        Anything else keeps the strict "stop the other bot first" behaviour.
+        """
+        if holder is None or not self.auto_clear_enabled():
+            return False
+        if str(holder["state"]) != "idle":
+            return False
+        started = holder["backend_start"]
+        try:
+            if started is not None and started.tzinfo is None:
+                started = started.replace(tzinfo=_dt.timezone.utc)
+            if started is not None and started >= PROCESS_STARTED_AT:
+                return False
+        except TypeError:
+            return False
+        try:
+            terminated = await asyncio.wait_for(
+                conn.fetchval("SELECT pg_terminate_backend($1)", holder["pid"]),
+                timeout=5)
+        except Exception as exc:
+            logger.warning("Instance lock: could not clear the stale holder (%s)",
+                           type(exc).__name__)
+            return False
+        logger.critical(
+            "Instance lock: cleared a STALE holder (%s) that predates this "
+            "process; it was left by a container whose network namespace was "
+            "recreated. Set INSTANCE_LOCK_AUTOCLEAR=false to disable.",
+            self._describe(holder))
+        return bool(terminated)
+
+    async def _describe_holder(self, conn) -> str:
         """Who holds the advisory lock right now? (stale backends are common)
 
         A container that is recreated while its TCP connection is still open

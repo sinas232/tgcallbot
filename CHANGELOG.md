@@ -65,7 +65,11 @@
   از یک session با `state=idle` می‌آمد که پستگرس هنوز زنده می‌پنداشت. حالا خطِ
   CRITICAL هویتِ نگه‌دارنده را می‌گوید و `tools/instance_lock_doctor.py
   --release-stale` فقط همان بک‌اندِ idle را می‌بندد (بک‌اندِ active را هرگز).
-- **تست:** ۸۶۸ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
+- **خوددرمانیِ قفل:** نگه‌دارندهٔ `idle` که اتصالش **قبل از** شروعِ پروسهٔ فعلی
+  بوده، همان بک‌اندِ جامانده است و یک‌بار بسته می‌شود
+  (`INSTANCE_LOCK_AUTOCLEAR=false` برای خاموش‌کردن). نگه‌دارندهٔ `active` یا
+  تازه‌تر از ما هرگز لمس نمی‌شود.
+- **تست:** ۸۷۳ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۸)،
   `tests/test_fix_env_proxy.py` (۱۰)، `tests/test_net_check_and_egress.py` (۱۱).
 
 </div>

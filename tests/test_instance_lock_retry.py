@@ -23,6 +23,83 @@ from unittest import mock
 from services import instance_lock as il
 
 
+class StaleHolderAutoClearTests(unittest.IsolatedAsyncioTestCase):
+    """A ghost lock holder must not keep the bot dead forever (22:24 incident)."""
+
+    def setUp(self):
+        import datetime as dt
+        self.dt = dt
+        self.lock = il.InstanceDatabaseLock("postgresql+asyncpg://u:p@db:5432/x")
+        self.lock.connect_attempts = 1
+        self.lock.connect_retry_seconds = 0.0
+        self._old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        self._new = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+
+    def _conn(self, holder, lock_ok_after_clear=True):
+        calls = {"try": 0, "terminated": []}
+        fake = mock.MagicMock()
+        fake.close = mock.AsyncMock()
+
+        async def fetchval(sql, *args):
+            if "pg_try_advisory_lock" in sql:
+                calls["try"] += 1
+                return False if calls["try"] == 1 else lock_ok_after_clear
+            if "pg_terminate_backend" in sql:
+                calls["terminated"].append(args[0])
+                return True
+            return None
+
+        async def fetchrow(sql, *args):
+            return holder
+
+        fake.fetchval = mock.AsyncMock(side_effect=fetchval)
+        fake.fetchrow = mock.AsyncMock(side_effect=fetchrow)
+        return fake, calls
+
+    def _holder(self, state, started):
+        return {"pid": 999, "application_name": "tgcallbot-instance-lock",
+                "state": state, "backend_start": started, "client_addr": "172.28.0.9"}
+
+    async def test_old_idle_ghost_is_cleared_and_the_lock_retaken(self):
+        fake, calls = self._conn(self._holder("idle", self._old))
+        with mock.patch.object(il.asyncpg, "connect", mock.AsyncMock(return_value=fake)):
+            await self.lock.acquire(on_lost=lambda: None)
+        self.assertEqual(calls["terminated"], [999])
+        self.assertEqual(calls["try"], 2)
+        self.assertIs(self.lock.connection, fake)
+        if self.lock.monitor is not None:
+            self.lock.monitor.cancel()
+
+    async def test_a_holder_that_started_after_us_is_never_killed(self):
+        fake, calls = self._conn(self._holder("idle", self._new))
+        with mock.patch.object(il.asyncpg, "connect", mock.AsyncMock(return_value=fake)):
+            with self.assertRaises(il.InstanceAlreadyRunning):
+                await self.lock.acquire(on_lost=lambda: None)
+        self.assertEqual(calls["terminated"], [])
+
+    async def test_an_active_holder_is_never_killed(self):
+        fake, calls = self._conn(self._holder("active", self._old))
+        with mock.patch.object(il.asyncpg, "connect", mock.AsyncMock(return_value=fake)):
+            with self.assertRaises(il.InstanceAlreadyRunning):
+                await self.lock.acquire(on_lost=lambda: None)
+        self.assertEqual(calls["terminated"], [])
+
+    async def test_auto_clear_can_be_disabled(self):
+        fake, calls = self._conn(self._holder("idle", self._old))
+        with mock.patch.dict("os.environ", {"INSTANCE_LOCK_AUTOCLEAR": "false"}), \
+             mock.patch.object(il.asyncpg, "connect", mock.AsyncMock(return_value=fake)):
+            with self.assertRaises(il.InstanceAlreadyRunning):
+                await self.lock.acquire(on_lost=lambda: None)
+        self.assertEqual(calls["terminated"], [])
+
+    async def test_the_error_names_the_holder(self):
+        fake, _ = self._conn(self._holder("idle", self._new))
+        with mock.patch.object(il.asyncpg, "connect", mock.AsyncMock(return_value=fake)):
+            with self.assertRaises(il.InstanceAlreadyRunning) as ctx:
+                await self.lock.acquire(on_lost=lambda: None)
+        self.assertIn("pid=999", str(ctx.exception))
+
+
 class InstanceLockRetryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.lock = il.InstanceDatabaseLock("postgresql+asyncpg://u:p@db:5432/x")
