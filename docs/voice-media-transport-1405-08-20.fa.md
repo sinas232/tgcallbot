@@ -188,7 +188,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۱۰ تست، ۸۰۴ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۱۷ تست، ۸۱۱ موفق، ۶ skip**.
 
 ---
 
@@ -234,9 +234,42 @@ docker run --rm -it --network "$NET"     --add-host db:172.28.0.2 --add-host red
 > ابزار هیچ سفارشی نمی‌سازد، وضعیتِ اکانت را تغییر نمی‌دهد و بعد از تست از کال
 > خارج می‌شود. `--no-join` فقط وضعیتِ `phone.GetFullChannel.call` را می‌خواند.
 
+## ۴٫۶) `tools/prod_join_probe.py` — آزمونِ **مسیرِ خودِ ربات**
+
+درسِ ۱۴۰۵-۰۸-۲۰: `join_probe` روی چتِ حادثه **JOIN OK در ۱٫۹ ثانیه** داد
+(هم داخلِ WARP، هم بیرونِ آن) ولی سفارش‌ها همان‌جا `live=0/10` و `live=0/40`
+داشتند. یعنی `PyTgCalls.play()` خالی مشکل نیست؛ مسیرِ **مدیر** (`VoiceCallManager`)
+فرق دارد: اثرانگشتِ دستگاه، `voice_updates`، قواعدِ silence/listener،
+`_is_in_voice_call()` و `_finish_media_join()`.
+
+این ابزار یک نمونهٔ **خصوصی** از `VoiceCallManager` می‌سازد (به رباتِ در حالِ اجرا
+دست نمی‌زند) و همان `_join_call` را صدا می‌زند، پس پیامِ دقیقِ شکست را می‌دهد.
+
+```bash
+# الف) امن‌ترین حالت: هیچ‌چیز join نمی‌شود؛ فقط می‌گوید تلگرام چند اکانتِ ما را
+#     همین حالا داخلِ کال می‌بیند (حساب‌داری غلط vs. مشکلِ مدیا را جدا می‌کند)
+docker compose exec -T bot python tools/prod_join_probe.py \
+  --account 134 --chat -1004473844619 --presence-only
+
+# ب) مسیرِ واقعیِ ربات برای یک اکانت
+docker compose exec -T bot python tools/prod_join_probe.py \
+  --account 134 --chat -1004473844619 --order 1352 --seconds 20
+```
+
+تفسیر:
+
+| خروجی | معنی | قدمِ بعد |
+|---|---|---|
+| `--presence-only`: «OUR accounts inside» > 0 ولی `live=0` | اکانت‌ها **داخل** هستند و شمارشِ ما غلط است | باگِ حسابداری؛ `get_active_count`/`_finish_media_join` را اصلاح کنید |
+| `--presence-only`: صفر، و `_join_call` هم FAILED | مسیرِ ربات واقعاً join نمی‌کند | پیامِ `msg=` و خطِ `[VoiceJoinDiag]` را بفرستید |
+| `_join_call` → `MANAGER JOIN OK` | مسیرِ ربات سالم است؛ مشکل در هم‌زمانیِ موج/سفارش است | لاگِ موج (`[JoinBrain]`) + `GLOBAL_JOIN_CONCURRENCY` |
+
 ## ۵) عیب‌یابیِ سرور (این بخش علت را پیدا می‌کند، نه کد)
 
 ```bash
+# ۰) هر خطِ تشخیصیِ join در لاگِ ربات (بدون هیچ تغییری روی سرویس)
+docker compose logs --since 2h bot | grep -E '\[VoiceJoinDiag\]|\[VoiceListener\]|join_attempt_verdict|\[MediaTransport\]|\[MediaProbe\]' | tail -60
+
 # ۰) یک‌شات: UDP + MTU + زامبی با هم (همان چیزی که ربات هم موقع بریکر لاگ می‌کند)
 docker compose exec -T bot python tools/media_diag.py
 
