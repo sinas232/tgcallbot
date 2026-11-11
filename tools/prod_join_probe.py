@@ -49,11 +49,11 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -74,6 +74,56 @@ def _parse_args(argv=None) -> argparse.Namespace:
                         help="log level for the manager's own diagnostics")
     return parser.parse_args(argv)
 
+
+def _normalise_chat_target(target: str):
+    """Classify what the operator typed: ``("id"|"username"|"invite"|"invalid", value)``.
+
+    Pyrogram treats a *string* of digits as a PHONE NUMBER: passing
+    ``"-1004473844619"`` as a str made it call ``contacts.ResolvePhone`` and fail
+    with ``400 PHONE_NOT_OCCUPIED``. A numeric chat id must therefore be handed
+    over as an int, and an invite link must go through CheckChatInvite.
+    """
+    text = (target or "").strip()
+    if not text:
+        return "invalid", text
+    if re.fullmatch(r"-?\d+", text):
+        return "id", int(text)
+    match = re.match(r"(?i)^(?:https?://)?t(?:elegram)?\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)",
+                     text)
+    if match:
+        return "invite", match.group(1)
+    match = re.match(r"(?i)^(?:https?://)?t(?:elegram)?\.me/([A-Za-z0-9_]+)", text)
+    if match:
+        return "username", match.group(1)
+    if text.startswith("@"):
+        return "username", text[1:]
+    return "invalid", text
+
+
+async def _resolve_chat(app, target: str):
+    """Resolve a chat id / @username / invite link into ``(chat_id, chat)``."""
+    from pyrogram import raw
+
+    kind, value = _normalise_chat_target(target)
+    if kind == "id":
+        chat = await app.get_chat(int(value))
+    elif kind == "username":
+        chat = await app.get_chat(str(value))
+    elif kind == "invite":
+        invite = await app.invoke(raw.functions.messages.CheckChatInvite(hash=value))
+        chat = getattr(invite, "chat", None)
+        if chat is None:
+            raise RuntimeError(
+                "this account is NOT a member of that invite link "
+                f"(CheckChatInvite -> {type(invite).__name__}); the bot must join "
+                "the group first, or pass the numeric chat id once it is a member."
+            )
+    else:
+        raise RuntimeError(
+            f"cannot understand --chat {target!r}; pass a numeric id, @username "
+            "or https://t.me/+invite link"
+        )
+    return int(chat.id), chat
 
 def match_accounts(participant_ids, accounts):
     """Return ``(present, missing)`` account ids of ``accounts`` reallisted ids.
@@ -170,7 +220,6 @@ async def _probe(args) -> int:
         format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stdout, force=True,
     )
-    import join_probe as jp
     try:
         from config import Config
         from database import DatabaseManager
@@ -222,7 +271,7 @@ async def _probe(args) -> int:
         return 1
 
     try:
-        chat_id, chat = await jp._resolve_chat(app, args.chat)
+        chat_id, chat = await _resolve_chat(app, args.chat)
         print(f"  chat resolved: id={chat_id} type={getattr(chat, 'type', '?')}")
     except Exception as exc:
         print(f"  chat resolve FAILED: {_fmt(exc)}")

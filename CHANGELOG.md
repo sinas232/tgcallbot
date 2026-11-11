@@ -27,7 +27,14 @@
   قرنطینه بماند)؛ `proxy=ok|DEAD|off` در `[MediaProbe]` و `tools/media_diag.py`.
 - **ابزار:** `tools/prod_join_probe.py` (مسیرِ واقعیِ `VoiceCallManager`، حالتِ
   `--presence-only`) و `tools/join_probe.py` (شناسهٔ عددی، `--list-voice-chats`).
-- **تست:** ۸۲۷ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۰ تست).
+- **دو دامِ باقی‌مانده:** `.env` چند خطِ `USE_PROXY` داشت (`export USE_PROXY=true`
+  بعد از خطِ `false`) ⇒ `tools/fix_env_proxy.py` همه را نرمال می‌کند؛ و
+  پیش‌بررسیِ TCP پروکسیِ HTTP را «سالم» می‌دید ⇒ حالا احوال‌پرسیِ واقعیِ SOCKS5
+  (`probe_socks5`) انجام می‌شود و `proxy=ok` دیگر دروغ نمی‌گوید.
+- **استقرار یک‌مرحله‌ای:** `tools/deploy_voice_fix.sh` (dry-run پیش‌فرض،
+  `--apply`، `--recreate` فقط در پنجرهٔ بی‌سفارش) + `tools/fix_env_proxy.py`.
+- **تست:** ۸۴۳ تست (۶ skip) — `tests/test_voice_proxy_failopen.py` (۱۶ تست) و
+  `tests/test_fix_env_proxy.py` (۸ تست).
 
 </div>
 

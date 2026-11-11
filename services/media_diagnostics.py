@@ -161,6 +161,59 @@ async def probe_tcp(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> O
     return True
 
 
+async def probe_socks5(host: str, port: int,
+                       timeout: float = PROBE_TIMEOUT_S,
+                       username: Optional[str] = None,
+                       password: Optional[str] = None) -> Optional[bool]:
+    """A REAL SOCKS5 greeting, not just a TCP connect.
+
+    Why this matters (2026-11-11): `payproxy:8888` is tinyproxy — an **HTTP**
+    proxy — and it happily accepts a TCP connection.  A TCP-only preflight
+    therefore reported "proxy ok" while Pyrogram hung in the SOCKS5 handshake
+    until its 20s timeout, so every voice client start failed.  Greeting the
+    endpoint with ``05 01 00`` (SOCKS5, one method, no-auth) and checking that
+    the answer starts with ``0x05`` tells a SOCKS5 server apart from an HTTP
+    one, a closed port and a black hole.
+    """
+    if not host:
+        return None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(str(host), int(port)), max(0.5, float(timeout)))
+    except (asyncio.TimeoutError, OSError, ValueError):
+        return False
+    except Exception as exc:
+        logger.debug("socks5 probe %s:%s inconclusive: %r", host, port, exc)
+        return None
+    try:
+        greeting = b"\x05\x02\x00\x02" if username else b"\x05\x01\x00"
+        writer.write(greeting)
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.readexactly(2), max(0.5, float(timeout)))
+        if not reply or reply[0] != 0x05:
+            return False          # an HTTP proxy answers "HT" (0x48 0x54) or nothing
+        method = reply[1]
+        if method == 0x02 and username:
+            user = (username or "").encode()[:255]
+            pwd = (password or "").encode()[:255]
+            writer.write(bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd)
+            await writer.drain()
+            auth = await asyncio.wait_for(reader.readexactly(2), max(0.5, float(timeout)))
+            return bool(auth) and auth[1] == 0x00
+        return method in (0x00, 0x02)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError):
+        return False
+    except Exception as exc:
+        logger.debug("socks5 probe %s:%s failed: %r", host, port, exc)
+        return False
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception as exc:
+            logger.debug("socks5 probe close failed: %r", exc)
+
+
 async def collect(timeout: float = PROBE_TIMEOUT_S,
                   proxy: Optional[Tuple[str, int]] = None,
                   **kwargs: Any) -> Dict[str, Any]:
@@ -198,7 +251,7 @@ async def collect(timeout: float = PROBE_TIMEOUT_S,
         report["udp_dns_ok"] = None
     if proxy:
         report["proxy_target"] = f"{proxy[0]}:{proxy[1]}"
-        report["proxy_ok"] = await probe_tcp(proxy[0], proxy[1], timeout=timeout)
+        report["proxy_ok"] = await probe_socks5(proxy[0], proxy[1], timeout=timeout)
     else:
         report["proxy_target"] = None
         report["proxy_ok"] = None
@@ -212,10 +265,10 @@ def verdict(report: Dict[str, Any]) -> str:
     zombies = report.get("zombies")
     if report.get("proxy_ok") is False:
         return (f"the SOCKS5 proxy for voice clients "
-                f"({report.get('proxy_target')}) accepts NO TCP connection -> every "
-                "voice client start times out and no account can join. Point "
-                "USE_PROXY/SOCKS5_HOST/SOCKS5_PORT at a real SOCKS5 proxy or set "
-                "USE_PROXY=false (an HTTP proxy such as payproxy cannot be used).")
+                f"({report.get('proxy_target')}) does not answer a SOCKS5 greeting "
+                "-> every voice client start times out and no account can join. "
+                "Point USE_PROXY/SOCKS5_HOST/SOCKS5_PORT at a real SOCKS5 proxy or "
+                "set USE_PROXY=false (an HTTP proxy such as payproxy cannot be used).")
     if udp is False:
         return ("UDP egress looks BLOCKED from this container -> WebRTC media "
                 "cannot work; fix the provider/host firewall or the WARP path "

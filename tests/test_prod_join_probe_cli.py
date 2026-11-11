@@ -50,6 +50,18 @@ class ProdJoinProbeTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
+    def test_chat_target_helpers_are_self_contained(self):
+        # The deployed tools/join_probe.py may be an older copy, so this tool
+        # must not import it (2026-11-11: AttributeError: module 'join_probe'
+        # has no attribute '_resolve_chat' broke the probe mid-run).
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("import join_probe", source)
+        self.assertEqual(self.mod._normalise_chat_target("-1004473844619"),
+                         ("id", -1004473844619))
+        self.assertEqual(self.mod._normalise_chat_target("https://t.me/+AbC"),
+                         ("invite", "AbC"))
+        self.assertEqual(self.mod._normalise_chat_target("@grp"), ("username", "grp"))
+
     def test_arguments(self):
         args = self.mod._parse_args(["--account", "134", "--chat", "-1004473844619"])
         self.assertEqual(args.account, 134)

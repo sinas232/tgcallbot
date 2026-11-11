@@ -56,14 +56,34 @@ WARNING pyrogram.connection.connection: Unable to connect due to network issues:
 - `tools/join_probe.py` پروکسی ندارد و مستقیم وصل می‌شود؛ به همین دلیل همان چت
   را در **۱٫۹ ثانیه** join کرد — هم داخلِ WARP، هم بیرونِ آن. مسیرِ مدیا سالم بود.
 
+### دو نکتهٔ ریز که همان باگ را پنهان می‌کردند
+
+1. **`.env` چند خط `USE_PROXY` داشت.** یک خط `USE_PROXY=false` (که اپراتور
+   ویرایش کرده بود) و یک `export USE_PROXY=true` در ادامه؛ dotenv/compose
+   آخری را می‌گیرد، پس `docker compose config` هنوز
+   `USE_PROXY: "true"` می‌داد و `sed 's/^USE_PROXY=/'` کافی نبود. ابزارِ
+   `tools/fix_env_proxy.py` **همهٔ** خط‌ها (با `export`، فاصلهٔ اضافه و تکرار)
+   را نرمال می‌کند، بکاپ می‌گیرد و idempotent است.
+2. **پیش‌بررسیِ TCP دروغ می‌گفت.** `payproxy:8888` اتصال TCP را قبول می‌کند
+   (tinyproxy گوش می‌دهد) و همان‌جا می‌ماند؛ پس preflight «سالم» گزارش می‌داد و
+   کلاینت تازه بعد از ۲۰ ثانیه می‌مرد. حالا `media_diagnostics.probe_socks5()`
+   احوال‌پرسیِ واقعیِ SOCKS5 می‌فرستد (`05 01 00`) و پاسخِ `0x05` را می‌خواهد؛
+   یک پروکسی HTTP با `HT` جواب می‌دهد و همان‌جا رد می‌شود.
+
 ### فیکسِ سرور (فوری، بدون تغییر کد)
 
 ```bash
 cd /opt/tgcallbot
-grep -nE '^(USE_PROXY|SOCKS5_)' .env      # اگر SOCKS5_HOST=payproxy بود ⇒ همین باگ
-sed -i 's/^USE_PROXY=.*/USE_PROXY=false/' .env
-docker compose config --quiet && docker compose up -d --force-recreate bot
+git fetch origin arena/09c2b04d-tgcallbot
+git show origin/arena/09c2b04d-tgcallbot:tools/deploy_voice_fix.sh > tools/deploy_voice_fix.sh
+bash tools/deploy_voice_fix.sh                # dry run: فقط نشان می‌دهد چه چیزی عوض می‌شود
+bash tools/deploy_voice_fix.sh --apply --recreate    # در پنجرهٔ بی‌سفارش
 ```
+
+اسکریپت خودش `.env` را نرمال می‌کند (همهٔ خطوط)، فایل‌های ویس را از شاخه
+به‌روز می‌کند، بکاپ می‌گذارد، سینتکس را چک می‌کند و فقط با `--recreate` ربات را
+دوباره می‌سازد (که سشن‌های ویسِ زنده را قطع می‌کند). بدون `--recreate` هیچ
+ری‌استارتی نمی‌کند.
 
 اگر واقعاً پروکسی می‌خواهید، فقط SOCKS5 معتبر (پیش‌فرضِ compose: `127.0.0.1:1080`
 داخل نت‌نمِ warp) قابل استفاده است. `payproxy:8888` هرگز گزینهٔ درستی نبود.
@@ -236,7 +256,7 @@ docker exec telegram_bot_container python -m unittest \
   tests.test_media_diagnostics tests.test_telegram_system_failures -q
 ```
 
-روی درختِ این شاخه: **۸۲۸ تست، ۸۲۲ موفق، ۶ skip**.
+روی درختِ این شاخه: **۸۴۳ تست، ۸۳۷ موفق، ۶ skip**.
 
 ---
 

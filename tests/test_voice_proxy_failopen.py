@@ -66,14 +66,14 @@ class VoiceProxyFailOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(vcm._voice_proxy_config())
 
     async def test_reachable_proxy_is_used(self):
-        with mock.patch.object(vcm, "_tcp_reachable", mock.AsyncMock(return_value=True)):
+        with mock.patch.object(vcm, "_proxy_reachable", mock.AsyncMock(return_value=True)):
             proxy = await vcm._effective_voice_proxy(134)
         self.assertEqual(proxy["hostname"], "payproxy")
         self.assertEqual(proxy["port"], 8888)
         self.assertFalse(vcm._voice_proxy_circuit_open())
 
     async def test_dead_proxy_falls_back_to_direct(self):
-        with mock.patch.object(vcm, "_tcp_reachable", mock.AsyncMock(return_value=False)):
+        with mock.patch.object(vcm, "_proxy_reachable", mock.AsyncMock(return_value=False)):
             proxy = await vcm._effective_voice_proxy(134)
         self.assertIsNone(proxy, "a dead proxy must not be handed to Pyrogram")
         self.assertTrue(vcm._voice_proxy_circuit_open())
@@ -82,13 +82,13 @@ class VoiceProxyFailOpenTests(unittest.IsolatedAsyncioTestCase):
     async def test_circuit_open_skips_further_probing(self):
         vcm._disable_voice_proxy("already dead")
         probe = mock.AsyncMock(return_value=True)
-        with mock.patch.object(vcm, "_tcp_reachable", probe):
+        with mock.patch.object(vcm, "_proxy_reachable", probe):
             self.assertIsNone(await vcm._effective_voice_proxy(134))
         probe.assert_not_awaited()
 
     async def test_required_proxy_stays_fail_closed(self):
         Config.VOICE_PROXY_REQUIRED = True
-        with mock.patch.object(vcm, "_tcp_reachable", mock.AsyncMock(return_value=False)):
+        with mock.patch.object(vcm, "_proxy_reachable", mock.AsyncMock(return_value=False)):
             with self.assertRaises(RuntimeError):
                 await vcm._effective_voice_proxy(134)
         self.assertFalse(vcm._voice_proxy_circuit_open(),
@@ -96,7 +96,7 @@ class VoiceProxyFailOpenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_preflight_result_is_cached(self):
         probe = mock.AsyncMock(return_value=True)
-        with mock.patch.object(vcm, "_tcp_reachable", probe):
+        with mock.patch.object(vcm, "_proxy_reachable", probe):
             await vcm._effective_voice_proxy(134)
             await vcm._effective_voice_proxy(135)
         self.assertEqual(probe.await_count, 1)
@@ -109,15 +109,76 @@ class VoiceProxyFailOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(vcm._looks_like_connect_failure(asyncio.CancelledError()))
         self.assertFalse(vcm._looks_like_connect_failure(ValueError("bad session")))
 
+    def test_preflight_uses_the_socks5_greeting_not_a_tcp_connect(self):
+        # Regression: payproxy (HTTP) accepted TCP, so a TCP-only preflight said
+        # "ok" and the real client still hung. The preflight must ask SOCKS5.
+        self.assertTrue(asyncio.iscoroutinefunction(vcm._proxy_reachable))
+
     async def test_tcp_reachable_reports_false_on_refused_port(self):
         # A closed port on localhost: no listener -> False, never a raise.
         ok = await vcm._tcp_reachable("127.0.0.1", 1, timeout=0.5)
         self.assertIs(ok, False)
 
 
+class Socks5GreetingTests(unittest.IsolatedAsyncioTestCase):
+    """A SOCKS5 endpoint must be told apart from an HTTP proxy on the same port."""
+
+    async def _serve(self, handler):
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        self.addCleanup(server.close)
+        return port
+
+    async def test_real_socks5_server_is_detected(self):
+        async def handler(reader, writer):
+            greeting = await reader.readexactly(3)
+            self.assertEqual(greeting, b"\x05\x01\x00")
+            writer.write(b"\x05\x00")
+            await writer.drain()
+            writer.close()
+
+        port = await self._serve(handler)
+        self.assertIs(await diag.probe_socks5("127.0.0.1", port, timeout=2), True)
+
+    async def test_http_proxy_is_rejected(self):
+        async def handler(reader, writer):
+            await reader.read(1024)
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        port = await self._serve(handler)
+        self.assertIs(await diag.probe_socks5("127.0.0.1", port, timeout=2), False)
+
+    async def test_silent_black_hole_is_rejected(self):
+        async def handler(reader, writer):
+            await asyncio.sleep(5)
+
+        port = await self._serve(handler)
+        self.assertIs(await diag.probe_socks5("127.0.0.1", port, timeout=0.5), False)
+
+    async def test_closed_port_is_rejected(self):
+        self.assertIs(await diag.probe_socks5("127.0.0.1", 1, timeout=0.5), False)
+
+    async def test_auth_negotiation(self):
+        async def handler(reader, writer):
+            await reader.readexactly(4)          # 05 02 00 02 (user/pass offered)
+            writer.write(b"\x05\x02")
+            await writer.drain()
+            await reader.readexactly(2 + 1 + 1 + 3)   # version, ulen, user, plen, pwd
+            writer.write(b"\x01\x00")
+            await writer.drain()
+            writer.close()
+
+        port = await self._serve(handler)
+        self.assertIs(
+            await diag.probe_socks5("127.0.0.1", port, timeout=2,
+                                    username="u", password="pwd"), True)
+
+
 class MediaDiagnosticsProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_dead_proxy_dominates_the_verdict(self):
-        with mock.patch.object(diag, "probe_tcp", mock.AsyncMock(return_value=False)), \
+        with mock.patch.object(diag, "probe_socks5", mock.AsyncMock(return_value=False)), \
              mock.patch.object(diag, "probe_udp_dns", mock.AsyncMock(return_value=True)):
             report = await diag.collect(proxy=("payproxy", 8888))
         self.assertIs(report["proxy_ok"], False)

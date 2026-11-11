@@ -487,6 +487,28 @@ def _looks_like_connect_failure(exc: BaseException) -> bool:
     return any(word in text for word in ("socks", "proxy", "timed out", "connect"))
 
 
+async def _proxy_reachable(proxy: Dict[str, Any], timeout: float) -> Optional[bool]:
+    """Reachability of the configured proxy with the RIGHT protocol.
+
+    A TCP connect is not enough: `payproxy:8888` (tinyproxy, HTTP) accepts TCP
+    and then ignores the SOCKS5 greeting, which is exactly how a "healthy"
+    preflight produced hours of live=0 on 2026-11-11.  SOCKS5 endpoints get a
+    real greeting; anything else falls back to a TCP check.
+    """
+    host = str(proxy.get("hostname") or "")
+    port = int(proxy.get("port") or 0)
+    if str(proxy.get("scheme", "socks5")).lower() == "socks5":
+        try:
+            from services import media_diagnostics as _diag
+            return await _diag.probe_socks5(
+                host, port, timeout=timeout,
+                username=proxy.get("username"), password=proxy.get("password"))
+        except Exception as exc:
+            logger.warning("[VoiceProxy] SOCKS5 preflight unavailable (%r); "
+                           "falling back to a TCP check", exc)
+    return await _tcp_reachable(host, port, timeout=timeout)
+
+
 async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """The proxy to actually use, after a cached reachability preflight.
 
@@ -507,19 +529,20 @@ async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[D
     probed_at = float(_VOICE_PROXY_STATE.get("probed_at") or 0.0)
     if probed_at and now - probed_at < VOICE_PROXY_PREFLIGHT_TTL:
         return proxy if _VOICE_PROXY_STATE.get("ok") else None
-    ok = await _tcp_reachable(
-        str(proxy.get("hostname")), int(proxy.get("port")),
-        timeout=float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0)),
-    )
+    ok = await _proxy_reachable(
+        proxy, timeout=float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0)))
     _VOICE_PROXY_STATE["ok"] = ok
     _VOICE_PROXY_STATE["probed_at"] = now
     if ok:
-        logger.info("[VoiceProxy] preflight OK acc=%s -> %s (SOCKS5)", account_id, target)
+        logger.info("[VoiceProxy] preflight OK acc=%s -> %s (SOCKS5 greeting accepted)",
+                    account_id, target)
         return proxy
     if _voice_proxy_required():
         raise RuntimeError(
             f"voice proxy {target} is unreachable and VOICE_PROXY_REQUIRED=true")
-    _disable_voice_proxy(f"preflight failed (no TCP listener on {target})")
+    _disable_voice_proxy(
+        f"preflight failed (no SOCKS5 service on {target}; an HTTP proxy "
+        "accepts TCP but never answers the greeting)")
     return None
 
 
