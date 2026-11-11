@@ -1057,6 +1057,15 @@ class OrderExecutor:
 	    # shortfall report explains exactly which slots are missing and why.
 	    max_stall_rounds = max(1, int(getattr(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 20)))
 	    stall_rounds = 0
+	    # Zero-join watchdog (incident 1405-08-20): a build that finishes wave
+	    # after wave with NOTHING joined is not slow, it is broken (media/UDP
+	    # path down, call closed, wrong link). Order 1349 reached wave 319 with
+	    # live=0/10 and never ended because the stall counter only advanced when
+	    # there were NO candidates. A wave with candidates that fails 100% is the
+	    # same stall; count it and end the build (the caller then fails the order
+	    # and the unused prepayment is refunded atomically).
+	    max_zero_join_waves = max(0, int(getattr(Config, "VOICE_BUILD_MAX_ZERO_JOIN_WAVES", 8)))
+	    zero_join_waves = 0
 	    last_live_seen = -1
 	    # A run of 406 errors suggests a systemic auth-key collision (including
 	    # same-process reseller copies), not proof of another server or a usable
@@ -1517,6 +1526,29 @@ class OrderExecutor:
                 f"in {wave_duration:.0f}s) | "
                 f"{join_brain.format_progress(order_id, live, target_count)}"
             )
+	        # ── ZERO-JOIN WATCHDOG ────────────────────────────────────────
+	        # Only trips while NOTHING at all is delivered: once at least one
+	        # account is inside, a run of failed top-ups must never end (and
+	        # refund) a service the customer is already using.
+	        if wave_ok == 0 and live == 0:
+	            zero_join_waves += 1
+	            if max_zero_join_waves and zero_join_waves >= max_zero_join_waves:
+	                logger.error(
+	                    "Order %s: %s consecutive waves joined ZERO accounts "
+	                    "(live=0/%s). This is a transport/media-path failure, not "
+	                    "an account problem: JoinGroupCall/WebRTC never completed "
+	                    "for ANY account. Ending the build instead of spinning "
+	                    "for hours; the order fails and the unused prepayment is "
+	                    "refunded. Diagnose: docker compose exec -T bot python "
+	                    "tools/check_udp.py ; WARP tunnel/MTU ; zombie count ; "
+	                    "whether the voice chat is still active on Telegram.",
+	                    order_id, zero_join_waves, target_count,
+	                )
+	                if order_id in self.active_orders:
+	                    self.active_orders[order_id]["build_abort_reason"] = "ZERO_JOIN_WAVES"
+	                break
+	        else:
+	            zero_join_waves = 0
 	        if pending_unsettled:
 	            logger.error("[VoiceFill] order=%s build halted: %s join task(s) did not unwind",
 	                         order_id, len(pending_unsettled))

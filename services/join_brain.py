@@ -135,7 +135,7 @@ class _OrderPolicy:
         "growth_after_waves", "clean_waves", "flood_waves", "error_rate_shrink",
         "paused_until", "flood_pause_seconds",
         "successes", "dead", "flooded", "retryable_fails", "permanent_fails",
-        "system_fails",
+        "system_fails", "system_streak",
         "wave_count", "wave_duration_ewma", "wave_duration_samples",
         "last_wave_at", "wave_sizes", "joined_per_wave",
     )
@@ -162,6 +162,10 @@ class _OrderPolicy:
         # Telegram-side infrastructure failures (500/INTERDC/timeout): counted
         # separately because they are NOT the accounts' fault.
         self.system_fails = 0
+        # Consecutive infra-only waves. Drives the ESCALATING pause: an outage
+        # that survives 5 waves is not a hiccup, and retrying it every 20s for
+        # hours (order 1349 reached wave 319 with live=0) only wastes attempts.
+        self.system_streak = 0
         # ETA bookkeeping
         self.wave_count = 0
         self.wave_duration_ewma: Optional[float] = None
@@ -191,6 +195,7 @@ class _OrderPolicy:
             "retryable_fails": self.retryable_fails,
             "permanent_fails": self.permanent_fails,
             "system_fails": self.system_fails,
+            "system_streak": self.system_streak,
             "wave_duration_ewma": self.wave_duration_ewma,
             "eta_seconds": eta_s,
             "avg_join_rate": avg_join_rate,
@@ -313,16 +318,29 @@ class AdaptiveJoinBrain:
             # build (see the order-928 window=1 incident); pause instead.
             policy.clean_waves = 0
             policy.flood_waves = 0
-            pause = max(0, int(getattr(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20)))
+            policy.system_streak += 1
+            base = max(0, int(getattr(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20)))
+            cap = max(base, int(getattr(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 300)))
+            # 20 → 40 → 80 → 160 → 300 (cap). The streak is what turns "one
+            # slow join" into "the media path is down": every repeat doubles the
+            # gap, so a multi-hour outage no longer costs a wave every ~110s.
+            pause = min(cap, base * (2 ** max(0, policy.system_streak - 1))) if base else 0
             until = time.time() + pause
             if pause > 0 and until > policy.paused_until:
                 policy.paused_until = until
                 logger.warning(
                     "[JoinBrain] order=%s wave failed on Telegram-side errors "
-                    "(infra=%s) → pause new waves %.0fs",
-                    order_id, infra_failures, pause,
+                    "(infra=%s, streak=%s) → pause new waves %.0fs "
+                    "(escalating; check media/UDP path, not the accounts)",
+                    order_id, infra_failures, policy.system_streak, pause,
                 )
             return
+        if joined > 0:
+            # Any delivery proves the media path works again: reset the
+            # escalation AND release the pending pause (there is no reason to
+            # keep the next wave waiting after progress).
+            policy.system_streak = 0
+            policy.paused_until = 0.0
         if error_rate <= 0.05:
             # Clean wave → remember and maybe widen.
             policy.clean_waves += 1

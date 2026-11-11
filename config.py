@@ -271,6 +271,18 @@ class Config:
     # When a whole wave fails on Telegram-side errors, pause NEW waves for this
     # long instead of narrowing the window (the accounts themselves are fine).
     VOICE_SYSTEM_PAUSE_SECONDS = int(os.getenv('VOICE_SYSTEM_PAUSE_SECONDS', '20'))
+    # Incident 1405-08-20 (orders 1349/1352): the outage was NOT a hiccup. Every
+    # wave spent ~90s on a transport timeout and then paused only 20s, so the
+    # build hammered Telegram for HOURS with live=0/N (wave 319). The pause now
+    # DOUBLES after every consecutive infra-only wave (20 → 40 → 80 …) and is
+    # capped here. A single successful join resets it.
+    VOICE_SYSTEM_PAUSE_MAX_SECONDS = int(os.getenv('VOICE_SYSTEM_PAUSE_MAX_SECONDS', '300'))
+    # A build that completes this many waves in a row with ZERO joined accounts
+    # is not "slow" — it is broken (media/UDP path down, wrong link, closed
+    # call). It now ends with the existing loud shortfall path (which refunds
+    # the unused prepayment atomically) instead of spinning until the process
+    # is restarted. 0 disables the watchdog.
+    VOICE_BUILD_MAX_ZERO_JOIN_WAVES = int(os.getenv('VOICE_BUILD_MAX_ZERO_JOIN_WAVES', '8'))
     # Hard bound on a build that keeps making no progress while slots are still
     # unfilled but retryable (e.g. Telegram is failing inter-DC for minutes).
     # Counted in "waiting for a retry backoff" rounds with no growth in the
@@ -492,6 +504,31 @@ class Config:
     VOICE_STRATEGY_FAILURE_THRESHOLD = int(os.getenv('VOICE_STRATEGY_FAILURE_THRESHOLD', '3'))
     VOICE_STRATEGY_COOLDOWN_SECONDS = int(os.getenv('VOICE_STRATEGY_COOLDOWN_SECONDS', '60'))
     VOICE_STRATEGY_CACHE_TTL = int(os.getenv('VOICE_STRATEGY_CACHE_TTL', '86400'))
+    # A chat-level cooldown longer than this is not slept inside a join task
+    # (a wave slot would be blocked for minutes); the join is deferred instead
+    # and the paused scheduler retries later.
+    VOICE_STRATEGY_INLINE_WAIT_MAX = int(os.getenv('VOICE_STRATEGY_INLINE_WAIT_MAX', '45'))
+    # ── MEDIA TRANSPORT BREAKER (per chat, cross-account) ───────────────────
+    # `join transport failed: TimeoutError` means the WebRTC/UDP handshake to
+    # Telegram's media server never completed. It is NOT an account fault: in
+    # the 1405-08-20 incident five DIFFERENT accounts failed identically on one
+    # chat while other chats were fine. The breaker only opens after several
+    # DISTINCT accounts corroborate the failure, then pauses joins for that
+    # chat (escalating on every reopen) and logs one actionable line instead
+    # of thousands of per-account retries.
+    VOICE_MEDIA_BREAKER_ENABLED = os.getenv('VOICE_MEDIA_BREAKER_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+    VOICE_MEDIA_BREAKER_MIN_ACCOUNTS = int(os.getenv('VOICE_MEDIA_BREAKER_MIN_ACCOUNTS', '3'))
+    VOICE_MEDIA_BREAKER_WINDOW_SECONDS = int(os.getenv('VOICE_MEDIA_BREAKER_WINDOW_SECONDS', '600'))
+    VOICE_MEDIA_BREAKER_SECONDS = int(os.getenv('VOICE_MEDIA_BREAKER_SECONDS', '240'))
+    VOICE_MEDIA_BREAKER_MAX_SECONDS = int(os.getenv('VOICE_MEDIA_BREAKER_MAX_SECONDS', '900'))
+    VOICE_MEDIA_BREAKER_RESET_SECONDS = int(os.getenv('VOICE_MEDIA_BREAKER_RESET_SECONDS', '1800'))
+    # ── HOST HYGIENE TELEMETRY ──────────────────────────────────────────────
+    # Unreaped children (ffmpeg/ntgcalls) show up as ZOMBIE processes. The boot
+    # banner of the 1405-08-20 server reported 883 of them; they burn PID slots
+    # and are invisible in RSS/RAM. Counted in [HostResources] and warned once
+    # per hour above this threshold (host-wide truth still needs `ps` on the
+    # host — a container sees only its own PID namespace).
+    VOICE_ZOMBIE_WARN_THRESHOLD = int(os.getenv('VOICE_ZOMBIE_WARN_THRESHOLD', '100'))
 
     HEALTH_CHECK_INTERVAL = int(os.getenv('HEALTH_CHECK_INTERVAL', '3600') or 3600)
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()

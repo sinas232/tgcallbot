@@ -728,6 +728,8 @@ class VoiceCallManager:
         self._busy_accounts: Dict[int, int] = {}  # includes prewarm and full join lifecycle
         self._idle_reaper_task: Optional[asyncio.Task] = None
         self._last_memory_log = 0.0
+        self._last_zombie_warn = 0.0
+        self._last_media_probe = 0.0
         self._reaped_total = 0
         self._listener_bindings: Set[Tuple[int, int]] = set()
         self._listener_trials: Dict[int, Tuple[int, float]] = {}
@@ -894,40 +896,131 @@ class VoiceCallManager:
         except OSError as exc:
             logger.warning("[VoiceStrategy] cache write failed: %s", exc)
 
-    async def _wait_for_join_strategy(self, chat_id: int) -> None:
-        """Honor a learned cooldown before issuing another join request."""
+    async def _wait_for_join_strategy(self, chat_id: int) -> float:
+        """Honor a learned cooldown before issuing another join request.
+
+        Returns the seconds that are STILL blocked when the cooldown is longer
+        than ``VOICE_STRATEGY_INLINE_WAIT_MAX`` (0 = free to join now). A short
+        cooldown is slept here; a long one is handed back to the caller, because
+        sleeping it inside a join task would hold a wave slot for minutes and
+        make the wave deadline look like a media failure of THIS account.
+        """
         key = str(int(chat_id))
         async with self._strategy_lock:
             policy = self._strategy_cache.get(key) or {}
             wait_for = max(0.0, float(policy.get("cooldown_until", 0)) - time.time())
             if wait_for <= 0:
-                return
+                return 0.0
+            inline_max = max(0.0, float(getattr(Config, "VOICE_STRATEGY_INLINE_WAIT_MAX", 45)))
             logger.warning(
                 "[VoiceStrategy] chat=%s cooldown active; waiting %.1fs (failure=%s)",
-                chat_id, wait_for, policy.get("failure_class", "unknown"),
+                chat_id, min(wait_for, inline_max), policy.get("failure_class", "unknown"),
             )
             self._vc_event_log(None, None, "strategy_cooldown_wait", {
                 "chat_id": int(chat_id), "wait_seconds": round(wait_for, 1),
+                "inline_max": inline_max,
                 "failure_class": policy.get("failure_class"),
             })
+            if wait_for > inline_max:
+                return wait_for - inline_max
             await asyncio.sleep(wait_for)
+            return 0.0
 
-    def _record_join_strategy(self, chat_id: int, success: bool, message: str) -> None:
+    def media_transport_blocked_seconds(self, chat_id: int) -> float:
+        """Seconds the media-transport breaker still blocks this chat (0 = open).
+
+        Read-only and sleep-free, so hot paths (the shared per-order monitor)
+        can skip a doomed join without blocking on a minutes-long cooldown.
+        """
+        try:
+            policy = self._strategy_cache.get(str(int(chat_id))) or {}
+            return max(0.0, float(policy.get("media_breaker_until") or 0) - time.time())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _schedule_media_probe(self, chat_id: int) -> None:
+        """Run the read-only media diagnostics once per 5 minutes (best effort)."""
+        try:
+            now = time.time()
+            if now - self._last_media_probe < 300:
+                return
+            self._last_media_probe = now
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (unit tests / sync callers): do not probe.
+            return
+        except Exception:
+            return
+
+        async def _probe() -> None:
+            try:
+                from services import media_diagnostics as diag
+                report = await diag.collect()
+                logger.error("[MediaProbe] chat=%s %s", chat_id,
+                             diag.format_report(report))
+                self._vc_event_log(None, None, "media_probe", {
+                    "chat_id": int(chat_id), **report,
+                })
+            except Exception as exc:  # telemetry must never break the join path
+                logger.debug("media probe failed: %r", exc)
+
+        try:
+            task = loop.create_task(_probe())
+
+            def _consume(_t: asyncio.Task) -> None:
+                try:
+                    _t.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            task.add_done_callback(_consume)
+        except Exception:
+            pass
+
+    def _record_join_strategy(self, chat_id: int, success: bool, message: str,
+                              account_id: Optional[int] = None) -> None:
         key = str(int(chat_id))
         policy = self._strategy_cache.setdefault(key, {})
         now = time.time()
         if success:
+            had_breaker = bool(policy.get("media_breaker_opens"))
             policy.update({
                 "preferred_strategy": "verified_standard_join",
                 "consecutive_failures": 0,
                 "cooldown_until": 0,
                 "last_success_at": now,
                 "updated_at": now,
+                # A successful join proves the media path works: forget the
+                # corroborated transport failures so a later, unrelated blip
+                # does not inherit yesterday's escalation.
+                "transport_failures": {},
+                "media_breaker_opens": 0,
+                "media_breaker_last_open": 0,
+                "media_breaker_until": 0,
             })
             self._save_strategy_cache()
+            if had_breaker:
+                logger.info(
+                    "[MediaTransport] chat=%s: join succeeded again — media "
+                    "transport breaker cleared", chat_id,
+                )
             return
 
         failure_class = _classify_error(Exception(message), message)
+
+        # ── CORROBORATED MEDIA-TRANSPORT BREAKER ─────────────────────────
+        # A transport failure (empty TimeoutError from ntgcalls/WebRTC, "Join
+        # transport failed", transport timeout) is NOT an account problem. One
+        # chat can be unreachable for every account while other chats join
+        # fine (incident 1405-08-20, chat -1004473844619). Only after several
+        # DISTINCT accounts corroborate it does the chat get a real cooldown;
+        # the cooldown escalates on every reopen so an ongoing outage is not
+        # retried every ~2 minutes for hours.
+        if failure_class == FAILURE_NETWORK and self._is_transport_failure(message):
+            if self._note_media_transport_failure(key, policy, account_id, message, now):
+                self._save_strategy_cache()
+                return
+
         failures = int(policy.get("consecutive_failures", 0)) + 1
         policy.update({
             "preferred_strategy": "verified_standard_join",
@@ -945,6 +1038,134 @@ class VoiceCallManager:
                 "consecutive_failures": failures, "cooldown_seconds": cooldown,
             })
         self._save_strategy_cache()
+
+    # ── MEDIA-TRANSPORT BREAKER HELPERS ──────────────────────────────────
+    @staticmethod
+    def _is_transport_failure(message: str) -> bool:
+        """True when the failure is the WebRTC/media handshake, not the account.
+
+        ntgcalls reports an unreachable media server as a BARE ``TimeoutError``
+        (empty message), which the executor sees as
+        ``Join transport failed: TimeoutError: TimeoutError``. An account that
+        is dead / banned / not a member fails *before* that point with a
+        Telegram error code, so this test is deliberately narrow.
+        """
+        text = (message or "").strip().lower()
+        if not text:
+            return True
+        return any(
+            token in text
+            for token in (
+                "join transport failed",
+                "join transport",
+                "timeouterror",
+                "timed out",
+                "timeout",
+            )
+        )
+
+    def _note_media_transport_failure(
+        self, key: str, policy: Dict, account_id: Optional[int],
+        message: str, now: float,
+    ) -> bool:
+        """Record a transport failure; open the chat breaker when corroborated.
+
+        Returns True when the breaker is (now) open — the caller then stops
+        treating this chat as joinable for the cooldown period. Distinct
+        accounts are what make this trustworthy: a single account failing
+        says something about that account, five failing identically says the
+        chat's media server is unreachable from this host.
+        """
+        try:
+            if not getattr(Config, "VOICE_MEDIA_BREAKER_ENABLED", True):
+                return False
+            window = max(30.0, float(getattr(Config, "VOICE_MEDIA_BREAKER_WINDOW_SECONDS", 600)))
+            min_accounts = max(1, int(getattr(Config, "VOICE_MEDIA_BREAKER_MIN_ACCOUNTS", 3)))
+
+            seen = {
+                str(a): float(ts)
+                for a, ts in (policy.get("transport_failures") or {}).items()
+                if now - float(ts) <= window
+            }
+            if account_id is not None:
+                seen[str(int(account_id))] = now
+            policy["transport_failures"] = seen
+            policy["last_transport_error"] = str(message)[:200]
+            policy["updated_at"] = now
+
+            if len(seen) < min_accounts:
+                logger.warning(
+                    "[MediaTransport] chat=%s: join media transport failed "
+                    "(account=%s, %s/%s distinct accounts in %.0fs) — "
+                    "not corroborated yet, no chat-wide pause",
+                    key, account_id, len(seen), min_accounts, window,
+                )
+                self._vc_event_log(None, account_id, "media_transport_failure", {
+                    "chat_id": int(key),
+                    "distinct_accounts": len(seen),
+                    "required_accounts": min_accounts,
+                    "detail": str(message)[:160],
+                })
+                return False
+
+            # Already open: keep the remaining cooldown and do NOT escalate
+            # once per failing account (three accounts of the same wave would
+            # otherwise double the pause three times). `media_breaker_until` is
+            # tracked separately from the generic chat cooldown so a plain
+            # 3-failures cooldown can never masquerade as an open breaker.
+            if float(policy.get("media_breaker_until") or 0) > now:
+                return True
+
+            base = max(1.0, float(getattr(Config, "VOICE_MEDIA_BREAKER_SECONDS", 240)))
+            cap = max(base, float(getattr(Config, "VOICE_MEDIA_BREAKER_MAX_SECONDS", 900)))
+            reset_after = max(60.0, float(getattr(Config, "VOICE_MEDIA_BREAKER_RESET_SECONDS", 1800)))
+
+            opens = int(policy.get("media_breaker_opens") or 0)
+            last_open = float(policy.get("media_breaker_last_open") or 0)
+            opens = opens + 1 if last_open and now - last_open <= reset_after else 1
+            cooldown = min(cap, base * (2 ** max(0, opens - 1)))
+
+            policy["media_breaker_opens"] = opens
+            policy["media_breaker_last_open"] = now
+            policy["failure_class"] = FAILURE_NETWORK
+            # A NEW open must be corroborated from scratch: keeping the old
+            # names would let one stale failure reopen the breaker alone.
+            policy["transport_failures"] = {}
+            policy["media_breaker_until"] = max(
+                float(policy.get("media_breaker_until") or 0), now + cooldown,
+            )
+            policy["cooldown_until"] = max(
+                float(policy.get("cooldown_until") or 0), now + cooldown,
+            )
+
+            logger.error(
+                "[MediaTransport] chat=%s: join media transport failed on %s "
+                "DISTINCT accounts within %.0fs (last detail: %s). Pausing join "
+                "attempts for this chat for %.0fs (open #%s). "
+                "The accounts are not at fault — the WebRTC/UDP path to "
+                "Telegram's media server for this call is not completing. "
+                "Check inside the bot container: `python tools/check_udp.py`, "
+                "the WARP tunnel/MTU, zombie processes (`ps -eo stat= | "
+                "grep -c '^Z'`), and whether the voice chat is still active.",
+                key, len(seen), window,
+                (policy.get("last_transport_error") or "")[:80],
+                cooldown, opens,
+            )
+            self._vc_event_log(None, account_id, "media_transport_breaker_open", {
+                "chat_id": int(key),
+                "distinct_accounts": len(seen),
+                "account_ids": sorted(int(a) for a in seen.keys())[:20],
+                "cooldown_seconds": int(cooldown),
+                "open_count": opens,
+                "detail": (policy.get("last_transport_error") or "")[:160],
+            })
+            # One-shot, throttled egress/WARP/host probe so the log itself says
+            # WHY the media path is down (UDP blocked vs WARP MTU vs zombies).
+            self._schedule_media_probe(int(key))
+            return True
+        except Exception as exc:  # telemetry must never break a join path
+            logger.debug("media transport breaker skipped: %r", exc)
+            return False
 
     # ─── Logging helpers ───
 
@@ -2460,7 +2681,29 @@ class VoiceCallManager:
                         # against the cgroup limit Docker will enforce.
                         try:
                             from services.host_resources import snapshot as _snap
-                            logger.info("[HostResources] %s", _snap())
+                            host_snap = _snap()
+                            logger.info("[HostResources] %s", host_snap)
+                            # Zombies hold PID slots, not RAM: an 800+ zombie
+                            # host looks memory-healthy while fork/thread
+                            # creation starts failing (which surfaces later as
+                            # "media transport timeout"). Warn at most hourly.
+                            zombies = host_snap.get("zombies")
+                            limit = max(0, int(getattr(Config, "VOICE_ZOMBIE_WARN_THRESHOLD", 100)))
+                            if zombies is not None and limit and zombies >= limit \
+                                    and now - self._last_zombie_warn >= 3600:
+                                self._last_zombie_warn = now
+                                logger.error(
+                                    "[HostHealth] %s zombie process(es) inside this "
+                                    "container (threshold %s; ffmpeg children=%s, all "
+                                    "children=%s). Unreaped ffmpeg/ntgcalls children "
+                                    "consume PID slots and can make new media joins "
+                                    "fail. Recreate the bot container (and reboot the "
+                                    "host if `ps -eo stat= | grep -c '^Z'` is high on "
+                                    "the host) while no order is running.",
+                                    zombies, limit,
+                                    host_snap.get("ffmpeg_children"),
+                                    host_snap.get("child_processes"),
+                                )
                         except Exception as _exc:
                             logger.warning("[HostResources] snapshot failed: %r", _exc)
                 except asyncio.CancelledError:
@@ -4117,6 +4360,16 @@ class VoiceCallManager:
             # cancelled / replaced by the executor).
             if account_id not in self.joined_accounts_by_order.get(order_id, {}):
                 return False
+            # A corroborated media-transport outage for this chat (several
+            # DISTINCT accounts failing the WebRTC handshake) makes a rejoin
+            # futile: skip it instead of spending the recovery budget and a
+            # wave slot on a path that is known to be down.
+            blocked_for = self.media_transport_blocked_seconds(int(chat_id))
+            if blocked_for > 0:
+                self._vc_event_log(order_id, account_id, "media_breaker_recovery_skipped", {
+                    "chat_id": int(chat_id), "remaining_s": round(blocked_for, 1),
+                })
+                return False
             try:
                 await self._ensure_membership(app, chat_id, target)
             except Exception:
@@ -4775,11 +5028,36 @@ class VoiceCallManager:
 
                 # STEP 5: JOIN (single account, verified before returning)
                 self._set_state(order_id, account_id, JOINING, "issuing native play")
-                await self._wait_for_join_strategy(int(chat_id))
+                # A long chat-wide cooldown (esp. the corroborated media-
+                # transport breaker) is NOT slept inside the join: that would
+                # hold the wave slot for minutes and, when the wave deadline
+                # cancels it, look like THIS account's media failure. Defer
+                # immediately instead — the account keeps its attempt budget
+                # and the paused scheduler retries after the breaker.
+                blocked_for = await self._wait_for_join_strategy(int(chat_id))
+                if blocked_for > 0:
+                    msg = (
+                        f"Join media transport unavailable for chat {int(chat_id)} "
+                        f"({int(blocked_for)}s breaker left) (retry deferred)"
+                    )
+                    self._set_state(
+                        order_id, account_id, RETRY_PENDING, msg,
+                        {"failure_class": FAILURE_NETWORK},
+                    )
+                    self._vc_event_log(order_id, account_id, "media_breaker_deferred", {
+                        "chat_id": int(chat_id),
+                        "remaining_s": round(blocked_for, 1),
+                    })
+                    logger.info(
+                        "[MediaTransport] order=%s acc=%s chat=%s: join deferred, "
+                        "breaker has %.0fs left (account budget kept)",
+                        order_id, account_id, int(chat_id), blocked_for,
+                    )
+                    return False, msg, int(chat_id)
                 async with JOIN_CALL_SEMAPHORE:
                     ok, msg = await self._join_with_retries(pytg, app, int(chat_id), account_id, order_id, target)
 
-                self._record_join_strategy(int(chat_id), ok, msg)
+                self._record_join_strategy(int(chat_id), ok, msg, account_id=account_id)
 
                 if not ok:
                     # _join_with_retries/_join_call already set the appropriate failed/rate-limited state.

@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from services import cgroup_paths
 
@@ -249,6 +249,83 @@ def cpu_percent(
     return round((used_cores / float(cores)) * 100.0, 1)
 
 
+# ─── PROCESS HYGIENE (zombies / unreaped children) ────────────────────────
+# The 1405-08-20 boot banner reported 883 ZOMBIE processes on the host while
+# RAM/CPU looked healthy. Zombies are children that exited but were never
+# reaped: they hold PID slots (not RSS), so a leak like this eventually makes
+# fork/thread creation fail in ways that look like a network problem.
+# A container sees only its own PID namespace, so this is the CONTAINER's
+# number — the host-wide truth still requires `ps` on the host. Read-only and
+# fail-open: telemetry must never raise.
+PROC_ROOT = "/proc"
+
+
+def iter_process_stats(proc_root: str = PROC_ROOT) -> Iterator[Tuple[str, str, str, str]]:
+    """Yield (pid, comm, state, ppid) for every readable process.
+
+    ``/proc/<pid>/stat`` starts with ``pid (comm) state ppid ...`` and ``comm``
+    may itself contain spaces AND parentheses, so the split MUST happen after
+    the LAST ')'. Each argument is injectable for tests.
+    """
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        path = os.path.join(proc_root, entry, "stat")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        close = raw.rfind(")")
+        open_ = raw.find("(")
+        if close == -1 or open_ == -1 or close + 2 > len(raw):
+            continue
+        fields = raw[close + 2:].split()
+        if len(fields) < 2:
+            continue
+        yield entry, raw[open_ + 1:close], fields[0], fields[1]
+
+
+def count_zombie_processes(proc_root: str = PROC_ROOT) -> Optional[int]:
+    """Number of ``Z`` (defunct) processes visible in this PID namespace.
+
+    ``None`` means "this box does not expose /proc here" — never report that as
+    zero, or a broken reader looks like a perfectly healthy host.
+    """
+    if not os.path.isdir(proc_root):
+        return None
+    try:
+        return sum(1 for _pid, _comm, state, _ppid in iter_process_stats(proc_root)
+                   if state == "Z")
+    except Exception:
+        return None
+
+
+def count_child_processes(comm: Optional[str] = None,
+                          proc_root: str = PROC_ROOT,
+                          parent_pid: Optional[int] = None) -> Optional[int]:
+    """Direct children of THIS process (optionally filtered by ``comm``).
+
+    py-tgcalls spawns one ffmpeg per playing stream; a child that is never
+    collected shows up here as a zombie. ``comm='ffmpeg'`` counts those.
+    ``None`` means /proc is not readable (unknown, not zero).
+    """
+    if not os.path.isdir(proc_root):
+        return None
+    try:
+        parent = str(os.getpid() if parent_pid is None else int(parent_pid))
+        return sum(
+            1 for _pid, name, _state, ppid in iter_process_stats(proc_root)
+            if ppid == parent and (comm is None or name == comm)
+        )
+    except Exception:
+        return None
+
+
 def snapshot(
     prev_usec: Optional[int] = None,
     prev_mono: Optional[float] = None,
@@ -289,4 +366,8 @@ def snapshot(
         out["mem_limit_mb"] = None
         out["mem_used_mb"] = None
         out["mem_error"] = repr(exc)
+    # Process hygiene: never fatal, always present (None = unreadable).
+    out["child_processes"] = count_child_processes()
+    out["ffmpeg_children"] = count_child_processes(comm="ffmpeg")
+    out["zombies"] = count_zombie_processes()
     return out

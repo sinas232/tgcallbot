@@ -151,6 +151,57 @@ class _FakeVCM:
         return 0
 
 
+class EscalatingInfraPauseTests(unittest.TestCase):
+    """A multi-hour Telegram-side outage must not be retried every ~110s.
+
+    The 2026-11-11 log showed orders 1349/1352 still opening single-account
+    waves at wave 319/15 with ``live=0``. Each wave cost ~90s and was followed
+    by a FIXED 20s pause, so the build hammered Telegram for hours without ever
+    escalating or giving up. The pause now doubles on every consecutive
+    infra-only wave (capped) and a single delivered account resets it.
+    """
+
+    def _brain(self):
+        brain = AdaptiveJoinBrain()
+        brain.register_order(ORDER, initial=4, min_window=1, max_window=4)
+        return brain
+
+    def test_consecutive_infra_waves_escalate_and_stop_at_the_cap(self):
+        brain = self._brain()
+        with mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20), \
+                mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 300):
+            pauses = []
+            for _ in range(6):
+                before = time.time()
+                brain.finish_wave(ORDER, joined=0, failed=1, ok_rate=0.0,
+                                  duration_s=1.0, infra_failures=1)
+                pauses.append(int(round(brain._orders[ORDER].paused_until - before)))
+
+        self.assertEqual(pauses, [20, 40, 80, 160, 300, 300])
+        self.assertEqual(brain._orders[ORDER].system_streak, 6)
+        self.assertEqual(brain._orders[ORDER].window, 4,
+                         "an outage must never narrow a healthy window")
+
+    def test_a_single_joined_account_resets_the_escalation(self):
+        brain = self._brain()
+        with mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 20), \
+                mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 300):
+            for _ in range(3):
+                brain.finish_wave(ORDER, joined=0, failed=1, ok_rate=0.0,
+                                  duration_s=1.0, infra_failures=1)
+            self.assertEqual(brain._orders[ORDER].system_streak, 3)
+
+            brain.finish_wave(ORDER, joined=1, failed=0, ok_rate=1.0,
+                              duration_s=1.0, infra_failures=0)
+            self.assertEqual(brain._orders[ORDER].system_streak, 0)
+
+            before = time.time()
+            brain.finish_wave(ORDER, joined=0, failed=1, ok_rate=0.0,
+                              duration_s=1.0, infra_failures=1)
+            pause = brain._orders[ORDER].paused_until - before
+        self.assertLess(pause, 25, "the next outage starts again from the base")
+
+
 class FillLoopSystemFailureTests(unittest.TestCase):
     """Drive the real _voice_batched_fill loop with a fake join transport."""
 
@@ -269,6 +320,62 @@ class FillLoopSystemFailureTests(unittest.TestCase):
         self.assertEqual(
             self.ex.active_orders[ORDER]["build_shortfall"]["terminal"], [700])
 
+    def test_zero_join_waves_end_the_build_instead_of_spinning_for_hours(self):
+        """Orders 1349/1352 sat at live=0 for hundreds of waves.
+
+        ``VOICE_BUILD_MAX_STALL_ROUNDS`` only counted rounds where NO candidate
+        was available, so a build whose candidates failed 100% could spin
+        forever. Now a run of zero-join waves ends it (and the caller fails the
+        order, refunding the unused prepayment atomically).
+        """
+        pool = [{"id": i, "session_string": "s"} for i in (132, 133, 134, 135)]
+        patches = [
+            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 1),
+            mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 999),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 0),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 0),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_ZERO_JOIN_WAVES", 3),
+            mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0),
+        ]
+        with self.assertLogs("services.order_executor", level="ERROR") as logs:
+            joined, _dead = self._run_fill(
+                [{"success": False, "status": "failed", "msg": TIMEOUT_MSG}] * 20,
+                target=4, pool=pool, patches=patches)
+
+        self.assertEqual(joined, [])
+        self.assertTrue(any("joined ZERO accounts" in line for line in logs.output),
+                        "the give-up must be loud and explain the media path")
+        self.assertEqual(
+            self.ex.active_orders[ORDER].get("build_abort_reason"),
+            "ZERO_JOIN_WAVES")
+
+    def test_the_watchdog_never_ends_a_service_that_is_already_live(self):
+        """Once ONE account is inside, top-up failures must not abort the order."""
+        pool = [{"id": 132, "session_string": "s"},
+                {"id": 133, "session_string": "s"}]
+        patches = [
+            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 1),
+            mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 3),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 0),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 0),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_ZERO_JOIN_WAVES", 2),
+            mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0),
+        ]
+        with self.assertLogs("services.order_executor", level="WARNING") as logs:
+            joined, _dead = self._run_fill(
+                [{"success": True, "acc": {"id": 132}, "chat_id": -1001}]
+                + [{"success": False, "status": "failed", "msg": TIMEOUT_MSG}] * 20,
+                target=2, pool=pool, patches=patches)
+
+        self.assertEqual([e["acc"]["id"] for e in joined], [132])
+        self.assertFalse(any("joined ZERO accounts" in line for line in logs.output),
+                         "a live service must never be aborted by top-up failures")
+        self.assertNotEqual(
+            self.ex.active_orders[ORDER].get("build_abort_reason"),
+            "ZERO_JOIN_WAVES")
+
     def test_a_permanent_stack_does_not_hang_the_build(self):
         """A system outage with no progress must end the build, not wait forever."""
         patches = [
@@ -276,6 +383,11 @@ class FillLoopSystemFailureTests(unittest.TestCase):
             mock.patch.object(Config, "VOICE_SYSTEM_FAILURE_PAUSE_SECONDS", 1),
             mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 2),
             mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 1),
+            # The infra pause now DOUBLES on every consecutive zero-join wave
+            # (2026-11-11: an outage was retried every ~110s for hours). Pin the
+            # cap here as well, otherwise this test measures the production cap
+            # (300s) instead of "the build gives up".
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 1),
         ]
         started = time.time()
         joined, _dead = self._run_fill(
