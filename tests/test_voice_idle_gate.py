@@ -128,6 +128,32 @@ class DeployScriptWiringTests(unittest.TestCase):
     def test_wait_idle_flag_is_parsed(self):
         self.assertIn("--wait-idle)", self.script)
 
+    def test_gate_does_not_use_docker_compose_exec(self):
+        """`docker compose exec` hung on the live host (2026-11-21).
+
+        The gate must run through the bounded `dexec` helper (plain
+        `docker exec` + `timeout`), so a stuck attach cannot freeze the deploy.
+        """
+        self.assertIn("dexec --timeout", self.script)
+        self.assertIn("timeout -k 5", self.script)
+        in_heredoc = False
+        for line in self.script.splitlines():
+            stripped = line.strip()
+            if in_heredoc:
+                if stripped == "EOT":
+                    in_heredoc = False
+                continue
+            if stripped.startswith("#"):
+                continue
+            if "<<EOT" in stripped or "<<'EOT'" in stripped:
+                in_heredoc = True
+                continue
+            if stripped.endswith("\\"):
+                continue   # line-wrapped help text, not a command
+            self.assertFalse(
+                stripped.startswith("docker compose") and "exec -T bot" in stripped,
+                f"unbounded compose exec in the apply path: {stripped}")
+
     def test_script_still_compiles(self):
         result = subprocess.run(["bash", "-n", os.path.join(REPO_ROOT, "tools", "deploy_voice_fix.sh")],
                                 capture_output=True, text=True)

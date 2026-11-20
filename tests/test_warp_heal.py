@@ -29,10 +29,15 @@ class WarpHealScriptTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", SCRIPT_PATH], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_probe_is_the_compose_healthcheck(self):
-        self.assertIn("/sys/class/net/CloudflareWARP", self.script)
-        self.assertIn("--socks5 127.0.0.1:1080", self.script)
-        self.assertIn("warp=on", self.script)
+    def test_tunnel_verdict_comes_from_dockers_own_healthcheck(self):
+        """The healthcheck already proves TUN + `warp=on`; don't re-run curl.
+
+        The first version re-ran the healthcheck with `docker compose exec` and
+        hung at that step on the live server (the operator was left with a
+        frozen shell), so the verdict is read from `docker inspect` instead.
+        """
+        self.assertIn("State.Health.Status", self.script)
+        self.assertIn("docker inspect", self.script)
 
     def test_only_healing_action_is_warp_cli_connect(self):
         self.assertIn("warp-cli --accept-tos connect", self.script)
@@ -51,7 +56,17 @@ class WarpHealScriptTests(unittest.TestCase):
 
     def test_final_verdict_is_net_check_inside_the_bot(self):
         self.assertIn("tools/net_check.py", self.script)
-        self.assertIn("exec -T bot", self.script)
+        self.assertIn('docker exec "$BOT_C" python3 tools/net_check.py', self.script)
+
+    def test_every_docker_call_is_wrapped_in_timeout(self):
+        """A hung `docker exec` must never freeze the operator's shell again."""
+        code = "\n".join(line for line in self.script.splitlines()
+                         if not line.lstrip().startswith("#"))
+        for line in code.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("docker ") or stripped.startswith('docker exec'):
+                self.fail(f"bare docker call without a timeout: {stripped}")
+        self.assertIn("run() { timeout -k 5", self.script)
 
 
 if __name__ == "__main__":

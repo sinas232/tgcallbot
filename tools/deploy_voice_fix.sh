@@ -169,17 +169,43 @@ rm -f /tmp/voicefix-overlay.$$
 COMPOSE_ARGS=(-f "$BASE_FILE")
 [ -f "$OVERLAY" ] && COMPOSE_ARGS+=(-f "$OVERLAY")
 
+# Bounded exec into the bot. `docker compose exec` can freeze the operator's
+# shell (2026-11-21: a `docker compose exec -T warp` hung and the run stalled at
+# that step), so every call here resolves the container id once, uses plain
+# `docker exec` and is wrapped in `timeout`.
+bot_cid() {
+  local cid
+  cid="$(docker compose "${COMPOSE_ARGS[@]}" ps -q bot 2>/dev/null | head -1)"
+  if [ -z "$cid" ]; then
+    cid="$(docker ps -q -f name=telegram_bot_container 2>/dev/null | head -1)"
+  fi
+  printf '%s' "$cid"
+}
+dexec() {
+  local cid tmo=90
+  cid="$(bot_cid)"
+  [ -n "$cid" ] || return 125
+  if [ "${1:-}" = "--timeout" ]; then tmo="$2"; shift 2; fi
+  timeout -k 5 "$tmo" docker exec "$cid" "$@"
+}
+
 echo
 echo "=== 4/5 effective config =============================================="
 docker compose "${COMPOSE_ARGS[@]}" config 2>/dev/null \
   | grep -iE 'use_proxy|socks5_(host|port)' || true
 
 if [ "$APPLY" = "1" ]; then
-  docker compose "${COMPOSE_ARGS[@]}" exec -T bot "$PYBIN" -m py_compile \
-    services/voice_call_manager.py services/media_diagnostics.py \
-    services/../tools/prod_join_probe.py 2>/dev/null \
-    || "$PYBIN" -m py_compile services/voice_call_manager.py services/media_diagnostics.py
-  echo "  syntax ok"
+  if dexec --timeout 120 "$PYBIN" -m py_compile \
+        services/voice_call_manager.py services/media_diagnostics.py tools/prod_join_probe.py \
+        >/dev/null 2>&1; then
+    echo "  syntax ok (inside the bot container)"
+  elif "$PYBIN" -m py_compile services/voice_call_manager.py services/media_diagnostics.py \
+        tools/prod_join_probe.py; then
+    echo "  syntax ok (host fallback)"
+  else
+    echo "*** SYNTAX ERROR — nothing was restarted" >&2
+    exit 2
+  fi
 fi
 
 if [ "$RECREATE" != "1" ]; then
@@ -205,7 +231,14 @@ if [ "$WAIT_IDLE" -ge 0 ]; then
   echo "=== idle gate: is any paid order running right now? ==================="
   # The ONLY durable answer: the orders table. docker logs guessing is not
   # proof, and recreating the bot kills every live voice session.
-  if ! docker compose "${COMPOSE_ARGS[@]}" exec -T bot "$PYBIN" \
+  # `docker exec` on the container id, NOT `docker compose exec`: on
+  # 2026-11-21 a `docker compose exec -T warp` froze the operator's shell, so
+  # this path is bounded by `timeout` and needs no compose resolution.
+  if [ -z "$(bot_cid)" ]; then
+    echo "*** the bot container is not running — nothing to gate, not restarting"
+    exit 2
+  fi
+  if ! dexec --timeout $((WAIT_IDLE + 120)) "$PYBIN" \
         tools/voice_idle_gate.py --wait "$WAIT_IDLE"; then
     cat <<EOT
 
@@ -235,7 +268,7 @@ fi
 
 echo
 echo "--- proof that the container really got the values ----------------------"
-ACTUAL="$(docker compose "${COMPOSE_ARGS[@]}" exec -T bot printenv USE_PROXY SOCKS5_HOST SOCKS5_PORT 2>/dev/null | tr '\n' ' ')"
+ACTUAL="$(dexec --timeout 30 printenv USE_PROXY SOCKS5_HOST SOCKS5_PORT 2>/dev/null | tr '\n' ' ')"
 echo "  container env: $ACTUAL"
 WANT="$USE_PROXY_VALUE $SOCKS_HOST_VALUE $SOCKS_PORT_VALUE "
 if [ "$ACTUAL" != "$WANT" ]; then
@@ -259,7 +292,7 @@ fi
 
 echo
 echo "--- egress check (direct TCP + SOCKS5 CONNECT to DC1..DC5) --------------"
-docker compose "${COMPOSE_ARGS[@]}" exec -T bot python tools/net_check.py 2>/dev/null \
+dexec --timeout 180 python tools/net_check.py 2>/dev/null \
   | sed -n '1,25p' || echo "  (bot not ready yet — re-run: python tools/net_check.py)"
 
 echo
