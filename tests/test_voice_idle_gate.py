@@ -221,6 +221,22 @@ class DeployScriptWiringTests(unittest.TestCase):
         self.assertIn("order=1428", text)
         self.assertIn("running_30m_left", text)
 
+    def test_egress_check_is_retried_before_it_reports_dead(self):
+        """A freshly recreated tunnel must not be judged in its first 12s.
+
+        2026-11-20 21:22: net_check ran right after `up` and printed
+        "NO path to Telegram" while WARP was still coming up; the next run was
+        all `ok`. The deploy now retries before it says anything scary.
+        """
+        self.assertIn("for attempt in 1 2 3 4 5 6", self.script)
+        self.assertIn("waiting 15s for the tunnel", self.script)
+        self.assertIn("both paths reach Telegram|proxy works, DIRECT does not", self.script)
+
+    def test_startup_fingerprint_shows_the_lines_that_matter(self):
+        for needle in ("Instance database lock", "VoiceNet", "resuming with",
+                       "VoiceClient", "live="):
+            self.assertIn(needle, self.script)
+
     def test_script_still_compiles(self):
         result = subprocess.run(["bash", "-n", os.path.join(REPO_ROOT, "tools", "deploy_voice_fix.sh")],
                                 capture_output=True, text=True)

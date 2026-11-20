@@ -320,14 +320,35 @@ EOT
 fi
 
 echo
-echo "--- egress check (direct TCP + SOCKS5 CONNECT to DC1..DC5) --------------"
-dexec --timeout 180 python tools/net_check.py 2>/dev/null \
-  | sed -n '1,25p' || echo "  (bot not ready yet — re-run: python tools/net_check.py)"
+echo "--- egress check (retried until the tunnel settles, max ~2 min) --------"
+# 2026-11-20 21:22: the check ran 12s after `up` and printed a scary
+# "NO path to Telegram" while the freshly recreated WARP tunnel was still
+# coming up — the very next run was all `ok`. Proof must be earned by a retry,
+# not by a single snapshot of a container that started 12 seconds ago.
+EGRESS_OK=0
+NET_OUT=""
+for attempt in 1 2 3 4 5 6; do
+  NET_OUT="$(dexec --timeout 180 python tools/net_check.py 2>&1 || true)"
+  if printf '%s' "$NET_OUT" | grep -qE 'both paths reach Telegram|proxy works, DIRECT does not'; then
+    printf '%s\n' "$NET_OUT" | sed -n '1,22p'
+    EGRESS_OK=1
+    break
+  fi
+  echo "  attempt $attempt/6: no usable path yet — waiting 15s for the tunnel"
+  printf '%s\n' "$NET_OUT" | sed -n '/direct:/,/^---/p' | head -14
+  [ "$attempt" = "6" ] || sleep 15
+done
+if [ "$EGRESS_OK" != "1" ]; then
+  echo "*** STILL no egress path to Telegram. The tunnel must be recreated with the"
+  echo "*** bot (it shares warp's netns); orders resume afterwards with their"
+  echo "*** remaining time:"
+  echo "    bash tools/deploy_voice_fix.sh --apply --restart-warp"
+fi
 
 echo
 echo "--- startup fingerprint -------------------------------------------------"
-docker compose "${COMPOSE_ARGS[@]}" logs --tail 80 bot \
-  | grep -E 'SOCKS5 proxy|VoicePatch|VoiceProxy' || true
+docker compose "${COMPOSE_ARGS[@]}" logs --tail 120 bot \
+  | grep -E 'Instance database lock|InstanceAlreadyRunning|VoiceNet|VoiceProxy|resuming with|VoiceClient|live=' || true
 
 cat <<EOT
 
