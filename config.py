@@ -84,6 +84,9 @@ class Config:
     # 2026-11-11: SOCKS5_HOST pointed at the HTTP payproxy ⇒ live=0 for hours).
     VOICE_PROXY_REQUIRED = os.getenv('VOICE_PROXY_REQUIRED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
     VOICE_PROXY_PREFLIGHT_TIMEOUT = float(os.getenv('VOICE_PROXY_PREFLIGHT_TIMEOUT', '3') or 3)
+    # A "proxy is dead" verdict expires so a transient tunnel outage (503 from
+    # the warp SOCKS5) cannot pin the whole process to DIRECT for its lifetime.
+    VOICE_PROXY_REENABLE_SECONDS = float(os.getenv('VOICE_PROXY_REENABLE_SECONDS', '120') or 120)
 
     # Database
     DATABASE_URL = _safe_encode_db_url(os.getenv('DATABASE_URL', ''))

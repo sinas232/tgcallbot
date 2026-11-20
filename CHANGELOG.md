@@ -9,6 +9,48 @@
 
 ---
 
+## ویس: حکمِ «پروکسی مرده» دیگر برای همیشه قفل نمی‌شود (۱۴۰۵/۰۸/۳۰)
+
+<div dir="rtl">
+
+**شاهد از سرویسِ زنده (۲۱ نوامبر ۰۰:۲۹):** سفارشِ ۱۴۲۸ روی `live=10/10` بود ولی
+`native_binding={'present': 5, 'missing': 5}` و سفارشِ ۱۴۲۹ در `live=0` می‌ماند:
+
+```
+pyrogram ... ERROR - Proxy connection failed: ProxyError 503 Service Unavailable
+[VoiceClient] acc=126 opening via DIRECT (no proxy)
+[VoiceClient] acc=126 start failed via DIRECT: TimeoutError
+[JoinBrain] wave failed on Telegram-side errors ... check media/UDP path
+```
+
+**علتِ اصلی (دو لایه):**
+۱) تونلِ WARP قطع شده بود: پروکسیِ SOCKS5 کانتینرِ warp به‌جای تونل،
+`503 Service Unavailable` می‌داد — و «مسیرِ DIRECT» روی این هاست از داخلِ TUN کار
+نمی‌کند، پس هر کلاینتِ نو ۲۰ ثانیه تایم‌اوت می‌خورد.
+۲) **باگِ کد:** اولین شکستِ پیش‌بررسی، `_disable_voice_proxy()` را صدا می‌زد که
+«پروکسی مرده» را **تا آخرِ عمرِ پروسه** قفل می‌کرد. پس حتی بعد از بازگشتِ تونل،
+همهٔ کلاینت‌های بعدی با `opening via DIRECT (no proxy)` باز می‌شدند و سفارش‌های
+تازه در `live=0` گیر می‌کردند.
+
+**فیکس:** حکمِ مرده‌بودن حالا **انقضا** دارد (`VOICE_PROXY_REENABLE_SECONDS`،
+پیش‌فرض ۱۲۰ ثانیه) و پروکسی دوباره تست می‌شود؛ همچنین شکستِ خودِ DIRECT فوراً
+همان حکم را باطل می‌کند. خطِ لاگ هم دیگر «no proxy» نمی‌گوید و علت را می‌آورد:
+`opening via DIRECT (proxy 127.0.0.1:1080 DEAD: ProxyError 503 ...)`.
+
+**ابزارِ تعمیر بدونِ کشتنِ سفارش:** `tools/warp_heal.sh` وضعیتِ کانتینرها را
+چاپ می‌کند، تونل را با همان چکِ compose (`warp=on` از طریق SOCKS5) اثبات می‌کند،
+در صورتِ خرابی `warp-cli connect` می‌زند — **بدونِ ری‌استارتِ ربات** — و در پایان
+`tools/net_check.py` را داخلِ ربات اجرا می‌کند. اگر تونل در جا برنگشت، فقط
+دستورِ امنِ `--restart-warp --wait-idle` را پیشنهاد می‌دهد.
+
+**تست:** ۵ تستِ جدید در `tests/test_voice_proxy_failopen.py` (انقضای حکم،
+بازپروب، باطل‌شدن با شکستِ DIRECT، متنِ لاگ) و ۶ تست در
+`tests/test_warp_heal.py` (اسکریپت هرگز کانتینر را ری‌استارت نمی‌کند).
+
+</div>
+
+---
+
 ## ویس: ترمیمِ مدیا وقتی لیستِ حاضران خوانده نمی‌شود (۱۴۰۵/۰۸/۲۰ ج)
 
 <div dir="rtl">

@@ -87,6 +87,44 @@ class VoiceProxyFailOpenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await vcm._effective_voice_proxy(134))
         probe.assert_not_awaited()
 
+    async def test_dead_verdict_expires_and_the_proxy_is_reprobed(self):
+        """2026-11-21: a transient `503` from the warp SOCKS5 latched forever.
+
+        `_disable_voice_proxy()` marked the proxy dead for the whole process, so
+        every later client logged `opening via DIRECT (no proxy)` — a path this
+        host cannot use through the TUN — and new orders sat at live=0 with
+        `start failed via DIRECT: TimeoutError` even after the tunnel came back.
+        """
+        vcm._disable_voice_proxy("ProxyError 503 Service Unavailable")
+        vcm._VOICE_PROXY_STATE["disabled_at"] = vcm.time.monotonic() - 1_000.0
+        self.assertFalse(vcm._voice_proxy_circuit_open(),
+                         "an old DEAD verdict must expire, not outlive the outage")
+        with mock.patch.object(vcm, "_proxy_reachable", mock.AsyncMock(return_value=True)):
+            proxy = await vcm._effective_voice_proxy(126)
+        self.assertEqual(proxy["hostname"], "payproxy")
+
+    async def test_fresh_dead_verdict_still_short_circuits(self):
+        vcm._disable_voice_proxy("ProxyError 503 Service Unavailable")
+        self.assertTrue(vcm._voice_proxy_circuit_open())
+
+    async def test_direct_start_failure_resets_the_dead_verdict(self):
+        vcm._disable_voice_proxy("ProxyError 503 Service Unavailable")
+        vcm._note_direct_failure()
+        self.assertFalse(vcm._voice_proxy_circuit_open(),
+                         "DIRECT failing proves nothing about the proxy")
+
+    def test_direct_path_note_names_the_proxy_and_the_reason(self):
+        vcm._VOICE_PROXY_STATE["target"] = "127.0.0.1:1080"
+        vcm._disable_voice_proxy("ProxyError 503 Service Unavailable")
+        note = vcm._direct_path_note()
+        self.assertIn("127.0.0.1:1080", note)
+        self.assertIn("503", note)
+        self.assertNotIn("no proxy", note)
+
+    def test_direct_path_note_without_a_configured_proxy(self):
+        Config.USE_PROXY = False
+        self.assertEqual(vcm._direct_path_note(), "DIRECT (no proxy configured)")
+
     async def test_required_proxy_stays_fail_closed(self):
         Config.VOICE_PROXY_REQUIRED = True
         with mock.patch.object(vcm, "_proxy_reachable", mock.AsyncMock(return_value=False)):

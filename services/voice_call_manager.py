@@ -426,6 +426,7 @@ _VOICE_PROXY_STATE: Dict[str, Any] = {
     "reason": "",
     "ok": None,
     "probed_at": 0.0,
+    "disabled_at": 0.0,
     "target": "",
 }
 VOICE_PROXY_PREFLIGHT_TTL = 60.0
@@ -442,21 +443,78 @@ def _voice_proxy_target(proxy: Optional[Dict[str, Any]] = None) -> str:
     return f"{proxy.get('hostname')}:{proxy.get('port')}"
 
 
+def _voice_proxy_reenable_seconds() -> float:
+    """How long a "proxy is dead" verdict may stand before we test it again."""
+    try:
+        return max(15.0, float(getattr(Config, "VOICE_PROXY_REENABLE_SECONDS", 120) or 120))
+    except (TypeError, ValueError):
+        return 120.0
+
+
 def _voice_proxy_circuit_open() -> bool:
-    """True when the proxy was found dead and the process now connects direct."""
-    return bool(_VOICE_PROXY_STATE.get("disabled"))
+    """True while the proxy is considered dead (bounded, never permanent).
+
+    2026-11-21 00:29: the warp SOCKS5 answered `503 Service Unavailable` during a
+    tunnel outage, `_disable_voice_proxy()` latched for the whole process, and
+    every later client opened ``DIRECT (no proxy)`` — which this host cannot use
+    through the TUN — so each new order died at ``live=0`` with
+    ``start failed via DIRECT: TimeoutError`` long after the tunnel recovered.
+    The verdict now expires (VOICE_PROXY_REENABLE_SECONDS, default 120s) and the
+    proxy is re-probed instead of being written off for the process lifetime.
+    """
+    if not _VOICE_PROXY_STATE.get("disabled"):
+        return False
+    disabled_at = float(_VOICE_PROXY_STATE.get("disabled_at") or 0.0)
+    if disabled_at and (time.monotonic() - disabled_at) >= _voice_proxy_reenable_seconds():
+        _VOICE_PROXY_STATE["disabled"] = False
+        _VOICE_PROXY_STATE["ok"] = None
+        _VOICE_PROXY_STATE["probed_at"] = 0.0
+        logger.warning(
+            "[VoiceProxy] re-probing %s — the DEAD verdict expired after %.0fs (%s)",
+            _VOICE_PROXY_STATE.get("target") or "the proxy",
+            time.monotonic() - disabled_at,
+            _VOICE_PROXY_STATE.get("reason") or "unknown",
+        )
+        return False
+    return True
 
 
 def _disable_voice_proxy(reason: str) -> None:
     if not _VOICE_PROXY_STATE.get("disabled"):
         logger.critical(
-            "[VoiceProxy] DISABLED for this process (%s): clients connect DIRECT. "
-            "Fix USE_PROXY/SOCKS5_HOST/SOCKS5_PORT (a SOCKS5 proxy is required; an "
-            "HTTP proxy such as payproxy cannot be used) or set "
-            "VOICE_PROXY_REQUIRED=true to fail closed.", reason,
+            "[VoiceProxy] DISABLED for %.0fs (%s): clients connect DIRECT until the "
+            "verdict expires. Fix USE_PROXY/SOCKS5_HOST/SOCKS5_PORT (a SOCKS5 proxy is "
+            "required; an HTTP proxy such as payproxy cannot be used) or set "
+            "VOICE_PROXY_REQUIRED=true to fail closed.",
+            _voice_proxy_reenable_seconds(), reason,
         )
     _VOICE_PROXY_STATE["disabled"] = True
+    _VOICE_PROXY_STATE["disabled_at"] = time.monotonic()
     _VOICE_PROXY_STATE["reason"] = str(reason)[:200]
+
+
+def _direct_path_note() -> str:
+    """Why this client is about to open DIRECT instead of through the proxy."""
+    proxy = _voice_proxy_config()
+    if proxy is None:
+        return "DIRECT (no proxy configured)"
+    if not _VOICE_PROXY_STATE.get("disabled"):
+        return "DIRECT (proxy not used)"
+    target = _VOICE_PROXY_STATE.get("target") or f"{proxy.get('hostname')}:{proxy.get('port')}"
+    reason = str(_VOICE_PROXY_STATE.get("reason") or "preflight failed")[:70]
+    return f"DIRECT (proxy {target} DEAD: {reason})"
+
+
+def _note_direct_failure() -> None:
+    """A DIRECT start failed → the proxy may be healthy again; re-probe at once."""
+    if not _VOICE_PROXY_STATE.get("disabled"):
+        return
+    _VOICE_PROXY_STATE["disabled"] = False
+    _VOICE_PROXY_STATE["ok"] = None
+    _VOICE_PROXY_STATE["probed_at"] = 0.0
+    logger.warning(
+        "[VoiceProxy] DIRECT start failed while the proxy was written off — "
+        "re-testing %s on the next client", _VOICE_PROXY_STATE.get("target") or "the proxy")
 
 
 async def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> Optional[bool]:
@@ -541,7 +599,7 @@ async def _effective_voice_proxy(account_id: Optional[int] = None) -> Optional[D
         return None
     target = _voice_proxy_target(proxy)
     _VOICE_PROXY_STATE["target"] = target
-    if _VOICE_PROXY_STATE["disabled"]:
+    if _voice_proxy_circuit_open():
         return None
     timeout = float(getattr(Config, "VOICE_PROXY_PREFLIGHT_TIMEOUT", 3.0))
     now = time.monotonic()
@@ -2472,7 +2530,7 @@ class VoiceCallManager:
                 # (proxy or direct) each client opened through. Without it a
                 # silent 20s timeout says nothing about the cause.
                 logger.info("[VoiceClient] acc=%s opening via %s", account_id,
-                            _voice_proxy_target(proxy) if proxy else "DIRECT (no proxy)")
+                            _voice_proxy_target(proxy) if proxy else _direct_path_note())
                 try:
                     app = await _open(proxy)
                 except BaseException as exc:
@@ -2485,6 +2543,10 @@ class VoiceCallManager:
                         account_id,
                         _voice_proxy_target(proxy) if proxy else "DIRECT",
                         type(exc).__name__)
+                    if proxy is None:
+                        # DIRECT failed too → the "proxy is dead" verdict is
+                        # not trustworthy any more; test the proxy again.
+                        _note_direct_failure()
                     if (proxy is None or _voice_proxy_required()
                             or not _looks_like_connect_failure(exc)):
                         raise
