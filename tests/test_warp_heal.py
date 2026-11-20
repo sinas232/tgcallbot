@@ -54,6 +54,25 @@ class WarpHealScriptTests(unittest.TestCase):
     def test_fallback_is_the_idle_gated_recreate(self):
         self.assertIn("deploy_voice_fix.sh --apply --restart-warp --wait-idle", self.script)
 
+    def test_quiet_mode_is_cron_safe(self):
+        """The tunnel flapped three times; a watchdog must not spam the log.
+
+        `--quiet` keeps only the lines that mean something is wrong and still
+        performs the reconnect, so a 10-minute cron entry can guard the egress
+        without touching the bot container.
+        """
+        self.assertIn("--quiet|-q) QUIET=1", self.script)
+        self.assertIn("grep --line-buffered -E", self.script)
+        self.assertIn("warp_heal check", self.script)
+        self.assertIn("*/10 * * * *", self.script)
+
+    def test_quiet_mode_still_reconnects(self):
+        code = "\n".join(line for line in self.script.splitlines()
+                          if not line.lstrip().startswith("#"))
+        self.assertIn("warp-cli connect", code)
+        # the quiet filter must be output-only: it may not skip the healing path
+        self.assertLess(code.index("QUIET=1"), code.index("warp-cli connect"))
+
     def test_final_verdict_is_net_check_inside_the_bot(self):
         self.assertIn("tools/net_check.py", self.script)
         self.assertIn('docker exec "$BOT_C" python3 tools/net_check.py', self.script)

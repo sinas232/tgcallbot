@@ -32,7 +32,23 @@
 #
 # Every docker call is wrapped in `timeout`: a stuck `exec` (seen on 2026-11-21,
 # the script froze at step 2) must never leave the operator with a hung shell.
+#
+# WATCHDOG (optional): the tunnel flapped three times on 2026-11-20/21 (503 from
+# the SOCKS5 while the container still reported healthy). `--quiet` prints only
+# the lines that mean something is wrong, so it can run from cron:
+#
+#   */10 * * * * cd /opt/tgcallbot && timeout 300 bash tools/warp_heal.sh --quiet >> logs/warp_heal.log 2>&1
 set -uo pipefail
+
+QUIET=0
+for _arg in "$@"; do
+  case "$_arg" in --quiet|-q) QUIET=1 ;; esac
+done
+[ "${WARP_HEAL_QUIET:-0}" = "1" ] && QUIET=1
+if [ "$QUIET" = "1" ]; then
+  # cron.log stays empty while everything is fine; a flap still shows up.
+  exec > >(grep --line-buffered -E 'warp_heal check|tunnel DOWN|still down|NOT healthy|health after|NO path|unreachable|STILL') 2>&1
+fi
 
 REPO="${WARP_HEAL_REPO:-/opt/tgcallbot}"
 WARP_C="${WARP_HEAL_WARP_CONTAINER:-warp_container}"
@@ -41,6 +57,7 @@ cd "$REPO" || { echo "ERROR: $REPO not found" >&2; exit 2; }
 
 run() { timeout -k 5 "$@"; }
 
+echo "warp_heal check $(date -u +%FT%TZ)"
 echo "=== 1/4 container state ================================================"
 run 20 docker ps --format '{{.Names}}  {{.Status}}' | grep -E 'warp|routefix|bot' || true
 WARP_HEALTH="$(run 15 docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$WARP_C" 2>/dev/null || echo unknown)"
