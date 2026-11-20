@@ -52,7 +52,8 @@ OUTCOME_OK = "OK"                      # account joined + verified
 OUTCOME_DEAD = "DEAD"                  # session revoked / auth invalid → replace account
 OUTCOME_FLOOD = "FLOOD"                # FloodWait even after internal retries → system pressure
 OUTCOME_FAIL = "FAIL"                  # transient/retryable (network, group-call state...)
-OUTCOME_PERMANENT = "PERMANENT"        # invalid link, restricted... → replace account
+OUTCOME_PERMANENT = "PERMANENT"        # restricted/frozen account → replace account
+OUTCOME_LINK_DEAD = "LINK_DEAD"        # the invite link itself expired/revoked → fail fast
 OUTCOME_SYSTEM = "SYSTEM"              # Telegram-side infra failure (500/INTERDC/timeout)
 
 
@@ -66,6 +67,21 @@ def classify_message(msg: str) -> str:
     text = (msg or "").upper()
     if is_auth_key_duplicated(text):
         return OUTCOME_DEAD  # skip this order slot; text alone cannot authorize DB deletion
+
+    # ── The LINK is dead, not the account ─────────────────────────────────
+    # Telegram answers the IDENTICAL error to every healthy account, so no
+    # amount of pool replacement can fix it. Order 1430 (2026-11-21 00:58)
+    # spent 8 waves on
+    #   "Telegram says: [400 INVITE_HASH_EXPIRED] - The invite link is ..."
+    # and then reported "transport/media-path failure ... check UDP/WARP",
+    # sending the operator after a fault that did not exist. Classifying it
+    # as its own bucket lets the executor end the build immediately with the
+    # right reason (and the normal atomic refund).
+    if any(k in text for k in (
+        "INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID", "INVITE_HASH_EMPTY",
+        "CHANNEL_PRIVATE", "CHANNEL_INVALID",
+    )):
+        return OUTCOME_LINK_DEAD
 
     # ── Permanent ACCOUNT conditions, checked BEFORE the flood bucket ──────
     # FROZEN_METHOD_INVALID is returned by Telegram with error code 420 - the
@@ -383,7 +399,9 @@ class AdaptiveJoinBrain:
             policy.successes += 1
         elif outcome == OUTCOME_DEAD:
             policy.dead += 1
-        elif outcome == OUTCOME_PERMANENT:
+        elif outcome in (OUTCOME_PERMANENT, OUTCOME_LINK_DEAD):
+            # Account-independent terminal signals: they never narrow the
+            # window (the pool is not at fault) and never pause new waves.
             policy.permanent_fails += 1
         elif outcome == OUTCOME_FLOOD:
             policy.flooded += 1

@@ -13,7 +13,8 @@ from telegram_client import TelegramAccountClient
 from utils.helpers import format_jalali_datetime
 from config import Config
 from services.join_brain import (join_brain, OUTCOME_OK, OUTCOME_DEAD,
-                                 OUTCOME_FLOOD, OUTCOME_PERMANENT)
+                                 OUTCOME_FLOOD, OUTCOME_PERMANENT,
+                                 OUTCOME_LINK_DEAD)
 from services.session_ownership import (SessionInUseError, is_auth_key_duplicated,
                                         is_fatal_auth_error, fatal_auth_category)
 from services import self_healing
@@ -1066,6 +1067,9 @@ class OrderExecutor:
 	    # and the unused prepayment is refunded atomically).
 	    max_zero_join_waves = max(0, int(getattr(Config, "VOICE_BUILD_MAX_ZERO_JOIN_WAVES", 8)))
 	    zero_join_waves = 0
+	    # Set as soon as Telegram rejects the INVITE LINK itself (all accounts
+	    # get the identical error); the wave loop then ends the build at once.
+	    link_dead_abort = False
 	    last_live_seen = -1
 	    # A run of 406 errors suggests a systemic auth-key collision (including
 	    # same-process reseller copies), not proof of another server or a usable
@@ -1435,6 +1439,25 @@ class OrderExecutor:
 	                    wave_system += 1
 	                    continue
 
+	                if outcome == OUTCOME_LINK_DEAD:
+	                    # The LINK is dead, not the account: every healthy account
+	                    # gets the identical [400 INVITE_HASH_EXPIRED]. Retrying
+	                    # other accounts cannot help and the customer needs a
+	                    # FRESH link, so end the build now (the caller then fails
+	                    # the order with the real reason and refunds the unused
+	                    # prepayment atomically). Order 1430 burned 8 waves and
+	                    # then blamed the transport.
+	                    link_dead_abort = True
+	                    join_brain.report_result(order_id, outcome, msg)
+	                    wave_fail += 1
+	                    wave_account_specific += 1
+	                    logger.error(
+	                        f"Order {order_id}: account {aid} rejected by Telegram "
+	                        f"({msg[:120]}) - the INVITE LINK itself is expired/revoked; "
+	                        "ending the build instead of retrying other accounts"
+	                    )
+	                    continue
+
 	                if outcome == OUTCOME_PERMANENT:
 	                    # A permanent failure produces the IDENTICAL error on every retry,
 	                    # so spending the attempt budget on it is pointless - and _voice_banned
@@ -1487,6 +1510,25 @@ class OrderExecutor:
 	                    exc_info=True,
 	                )
 	                wave_fail += 1
+
+	        if link_dead_abort:
+	            logger.error(
+	                f"Order {order_id}: build aborted - Telegram rejected the invite link "
+	                "(expired/revoked); the customer must supply a fresh link. "
+	                "Unused prepayment is refunded."
+	            )
+	            try:
+	                self.active_orders[order_id]["build_abort_reason"] = "INVITE_LINK_DEAD"
+	                # A dead link must never end a service that is already live:
+	                # recompute the authoritative count before leaving the loop,
+	                # because the caller fails the order only at live == 0.
+	                live = int(vcm.get_active_count(order_id))
+	                self.active_orders[order_id]["live_count"] = live
+	            except Exception as _link_bookkeeping_err:
+	                logger.warning(
+	                    "Order %s: link-dead abort bookkeeping failed (%r); the loop "
+	                    "still exits", order_id, _link_bookkeeping_err)
+	            break
 
 	        if dup406_streak >= 5:
 	            logger.error(
@@ -1541,7 +1583,9 @@ class OrderExecutor:
 	                    "for hours; the order fails and the unused prepayment is "
 	                    "refunded. Diagnose: docker compose exec -T bot python "
 	                    "tools/check_udp.py ; WARP tunnel/MTU ; zombie count ; "
-	                    "whether the voice chat is still active on Telegram.",
+	                    "whether the voice chat is still active on Telegram ; "
+	                    "and whether the INVITE LINK is still valid (an expired "
+	                    "link produces zero joins with no transport fault).",
 	                    order_id, zero_join_waves, target_count,
 	                )
 	                if order_id in self.active_orders:

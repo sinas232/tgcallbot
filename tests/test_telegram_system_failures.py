@@ -221,6 +221,7 @@ class FillLoopSystemFailureTests(unittest.TestCase):
         self.ex._voice_second_chance[ORDER] = 0
         self.ex._voice_retry_after[ORDER] = {}
         self.vcm = _FakeVCM()
+        self.attempt_log = []
         join_brain.join_brain.forget_order(ORDER)
 
     def tearDown(self):
@@ -235,6 +236,7 @@ class FillLoopSystemFailureTests(unittest.TestCase):
         async def fake_join(order_id, acc, order_type, target_link, duration_minutes=0):
             res = queue.pop(0) if queue else {"success": False, "status": "failed",
                                               "msg": "no more results"}
+            self.attempt_log.append(acc["id"])
             if res.get("success"):
                 self.vcm.live.add(acc["id"])
             return res
@@ -396,6 +398,97 @@ class FillLoopSystemFailureTests(unittest.TestCase):
         self.assertEqual(joined, [])
         self.assertLess(time.time() - started, 30,
                         "the build must give up after the bounded stall rounds")
+
+
+class ExpiredInviteLinkTests(FillLoopSystemFailureTests):
+    """Order 1430 (2026-11-21 00:58): the LINK was dead, the transport was fine.
+
+    Verbatim from the deployment log::
+
+        Order 1430: account 134 attempt 1 failed (Telegram says:
+            [400 INVITE_HASH_EXPIRED] - The invite link i); retry in 48s
+        ...
+        Order 1430: 8 consecutive waves joined ZERO accounts (live=0/10).
+            This is a transport/media-path failure, not an account problem ...
+        Order 1430 failed; billable used=0.0 refunded=200000.0 (atomic)
+
+    Eight accounts were burned and the operator was sent to check UDP/WARP for
+    a fault that did not exist. The link is the problem: every healthy account
+    gets the identical answer, and only a FRESH link can fix it.
+    """
+
+    EXPIRED = ("membership failed: Group join failed: Telegram says: "
+               "[400 INVITE_HASH_EXPIRED] - The invite link is expired.")
+
+    def _patches(self):
+        return [
+            mock.patch.object(Config, "VOICE_ACCOUNT_ATTEMPT_LIMIT", 5),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_ZERO_JOIN_WAVES", 8),
+            mock.patch.object(Config, "VOICE_BUILD_MAX_STALL_ROUNDS", 999),
+            mock.patch.object(Config, "VOICE_SECOND_CHANCE_ROUNDS", 0),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_SECONDS", 0),
+            mock.patch.object(Config, "VOICE_SYSTEM_PAUSE_MAX_SECONDS", 0),
+        ]
+
+    def test_expired_link_has_its_own_outcome(self):
+        self.assertEqual(join_brain.classify_message(self.EXPIRED),
+                         join_brain.OUTCOME_LINK_DEAD)
+        self.assertEqual(
+            join_brain.classify_message("Telegram says: [400 CHANNEL_PRIVATE] - x"),
+            join_brain.OUTCOME_LINK_DEAD)
+        # regression: a frozen ACCOUNT must still be PERMANENT, not LINK_DEAD
+        self.assertEqual(join_brain.classify_message(FROZEN_MSG),
+                         join_brain.OUTCOME_PERMANENT)
+
+    def test_build_aborts_on_the_first_expired_link(self):
+        pool = [{"id": i, "session_string": "s"} for i in (132, 133, 134, 135)]
+        with self.assertLogs("services.order_executor", level="ERROR") as logs:
+            joined, _dead = self._run_fill(
+                [{"success": False, "status": "failed", "msg": self.EXPIRED}] * 20,
+                target=4, pool=pool, patches=self._patches())
+
+        self.assertEqual(joined, [])
+        self.assertEqual(len(self.attempt_log), 1,
+                         "only ONE account may be burned on a dead link")
+        self.assertEqual(
+            self.ex.active_orders[ORDER].get("build_abort_reason"),
+            "INVITE_LINK_DEAD")
+        self.assertTrue(any("INVITE LINK itself" in line for line in logs.output))
+
+    def test_a_dead_link_never_ends_a_service_that_is_already_live(self):
+        """Top-up phase: the accounts inside stay, only new joins are refused."""
+        pool = [{"id": 132, "session_string": "s"}, {"id": 133, "session_string": "s"}]
+        with self.assertLogs("services.order_executor", level="ERROR"):
+            joined, _dead = self._run_fill(
+                [{"success": True, "acc": {"id": 132}, "chat_id": -1001},
+                 {"success": False, "status": "failed", "msg": self.EXPIRED}],
+                target=2, pool=pool, patches=self._patches())
+        self.assertEqual([e["acc"]["id"] for e in joined], [132])
+        self.assertEqual(self.ex.active_orders[ORDER].get("live_count"), 1,
+                         "the authoritative count must be recomputed before the abort")
+
+    def test_a_dead_link_never_bans_the_account(self):
+        with self.assertLogs("services.order_executor", level="ERROR"):
+            self._run_fill(
+                [{"success": False, "status": "failed", "msg": self.EXPIRED}] * 5,
+                target=2, pool=[{"id": 132, "session_string": "s"}],
+                patches=self._patches())
+        self.assertNotIn(132, self.ex._voice_banned[ORDER],
+                         "the account is healthy; the link is not")
+        self.assertNotIn(132, self.ex._voice_terminal[ORDER])
+
+    def test_the_dead_link_does_not_pause_or_narrow_the_brain(self):
+        brain = join_brain.join_brain
+        brain.forget_order(ORDER)
+        with self.assertLogs("services.order_executor", level="ERROR"):
+            self._run_fill(
+                [{"success": False, "status": "failed", "msg": self.EXPIRED}] * 5,
+                target=4, pool=[{"id": i, "session_string": "s"} for i in (132, 133)],
+                patches=self._patches())
+        policy = brain._orders.get(ORDER)
+        if policy is not None:
+            self.assertEqual(policy.permanent_fails, 1)
+            self.assertEqual(policy.system_streak, 0)
 
 
 if __name__ == "__main__":
