@@ -154,6 +154,26 @@ class DeployScriptWiringTests(unittest.TestCase):
                 stripped.startswith("docker compose") and "exec -T bot" in stripped,
                 f"unbounded compose exec in the apply path: {stripped}")
 
+    def test_detach_mode_queues_the_wait_outside_the_ssh_session(self):
+        """A queued deploy must survive the operator closing the terminal.
+
+        2026-11-21: the gate was correctly waiting on order 1428 (30m left) when
+        the run looked "stuck" — a foreground wait dies with the SSH session and
+        the deploy would silently never happen.
+        """
+        self.assertIn("--detach) DETACH=1 ;;", self.script)
+        self.assertIn("setsid nohup bash", self.script)
+        self.assertIn("VOICE_FIX_DETACHED=1", self.script)
+        self.assertIn("logs/deploy-voicefix-", self.script)
+        # must not re-detach itself forever
+        self.assertIn('"${VOICE_FIX_DETACHED:-0}" != "1"', self.script)
+
+    def test_busy_gate_message_names_the_running_orders(self):
+        from tools import voice_idle_gate as gate
+        text = gate._describe([(1428, "voice_chat", "running", 30.0)])
+        self.assertIn("order=1428", text)
+        self.assertIn("running_30m_left", text)
+
     def test_script_still_compiles(self):
         result = subprocess.run(["bash", "-n", os.path.join(REPO_ROOT, "tools", "deploy_voice_fix.sh")],
                                 capture_output=True, text=True)

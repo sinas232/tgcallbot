@@ -43,6 +43,7 @@
 #   bash tools/deploy_voice_fix.sh --apply --recreate --use-proxy false  # DIRECT
 #   bash tools/deploy_voice_fix.sh --apply --restart-warp                # fresh tunnel
 #   bash tools/deploy_voice_fix.sh --apply --wait-idle 3600               # queue for an idle window
+#   bash tools/deploy_voice_fix.sh --apply --wait-idle 7200 --detach      # same, survives SSH loss
 #
 # ⚠️  NEVER restart or recreate the `warp` container on its own: the bot runs
 #     with `network_mode: service:warp`, so it shares that network namespace.
@@ -65,6 +66,8 @@ BASE_FILE="${VOICE_FIX_COMPOSE:-docker-compose.yml}"
 USE_PROXY_VALUE="true"
 SOCKS_HOST_VALUE="127.0.0.1"
 SOCKS_PORT_VALUE="1080"
+ORIG_ARGS=("$@")
+DETACH=0
 APPLY=0
 RECREATE=0
 RESTART_WARP=0
@@ -74,6 +77,7 @@ while [ $# -gt 0 ]; do
     --apply) APPLY=1 ;;
     --recreate) APPLY=1; RECREATE=1 ;;
     --restart-warp) APPLY=1; RECREATE=1; RESTART_WARP=1 ;;
+    --detach) DETACH=1 ;;
     --wait-idle)
       APPLY=1; RECREATE=1
       if [ $# -ge 2 ] && [ "${2#--}" = "$2" ]; then WAIT_IDLE="$2"; shift; else WAIT_IDLE=1800; fi ;;
@@ -86,6 +90,26 @@ while [ $# -gt 0 ]; do
   shift
 done
 cd "$REPO" || { echo "ERROR: $REPO not found" >&2; exit 2; }
+
+# An idle window can be an hour away. An SSH drop would kill a foreground wait
+# and the queued deploy would simply never happen (2026-11-21, order 1428 had
+# 30m left). --detach re-executes this same command under setsid with its own
+# log, so the wait survives the session and the operator can just follow along.
+if [ "$DETACH" = "1" ] && [ "${VOICE_FIX_DETACHED:-0}" != "1" ]; then
+  mkdir -p logs
+  DETACH_LOG="logs/deploy-voicefix-$(date +%Y%m%d-%H%M%S).log"
+  ARGS_NO_DETACH=()
+  for arg in "${ORIG_ARGS[@]}"; do
+    [ "$arg" = "--detach" ] || ARGS_NO_DETACH+=("$arg")
+  done
+  VOICE_FIX_DETACHED=1 setsid nohup bash "$0" "${ARGS_NO_DETACH[@]}" \
+      >"$DETACH_LOG" 2>&1 </dev/null &
+  echo "detached: pid $! (survives this SSH session)"
+  echo "log:      $REPO/$DETACH_LOG"
+  echo "follow:   tail -f $REPO/$DETACH_LOG"
+  exit 0
+fi
+
 PYBIN="${VOICE_FIX_PYTHON:-python3}"
 
 echo "=== 1/5 files from origin/$BRANCH ======================================"
