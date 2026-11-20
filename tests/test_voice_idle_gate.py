@@ -107,6 +107,51 @@ class RestartBlockingRuleTests(unittest.TestCase):
             self.assertFalse(blocks, status)
 
 
+class OrderSnapshotTests(unittest.TestCase):
+    """`--order N` must answer "what does the durable table say about THIS one?".
+
+    2026-11-21 01:04: order 1428 was `live=10/10` but order 1430 had no worker at
+    all after the restart — the log tail could not tell whether it was failed,
+    stranded (`status=running` with no worker) or finished.
+    """
+
+    def test_running_order_without_start_is_not_started(self):
+        from datetime import datetime
+        text = gate.format_order({"id": 1430, "type": "voice_chat", "status": "running",
+                                  "started_at": None, "duration": 120,
+                                  "blocks": False, "left": None})
+        self.assertIn("id=1430", text)
+        self.assertIn("status=running", text)
+        self.assertIn("left=not_started", text)
+        self.assertIn("blocks_restart=no", text)
+
+    def test_started_order_shows_minutes_and_blocks(self):
+        from datetime import datetime
+        text = gate.format_order({"id": 1428, "type": "voice_chat", "status": "running",
+                                  "started_at": datetime(2026, 11, 21, 0, 58),
+                                  "duration": 60, "blocks": True, "left": 11.4})
+        self.assertIn("left=11m", text)
+        self.assertIn("blocks_restart=yes", text)
+
+    def test_missing_order_is_reported_not_invented(self):
+        self.assertEqual(gate.format_order(None), "ORDER: not found")
+
+    def test_order_flag_is_parsed(self):
+        with mock.patch.object(gate, "_order_snapshot", mock.AsyncMock(return_value=None)), \
+             mock.patch("builtins.print") as printed:
+            code = gate.main(["--order", "1430"])
+        self.assertEqual(code, 4)
+        self.assertIn("not found", str(printed.call_args.args[0]))
+
+    def test_order_flag_survives_an_unreachable_database(self):
+        with mock.patch.object(gate, "_order_snapshot",
+                               mock.AsyncMock(side_effect=RuntimeError("dsn"))), \
+             mock.patch("builtins.print") as printed:
+            code = gate.main(["--order", "1430"])
+        self.assertEqual(code, 2)
+        self.assertIn("not reachable", str(printed.call_args.args[0]))
+
+
 class IdleGateWaitTests(unittest.TestCase):
     def test_wait_returns_idle_as_soon_as_the_order_finishes(self):
         answers = [

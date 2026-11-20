@@ -11,6 +11,7 @@ lock):
 
     docker compose exec -T bot python tools/voice_idle_gate.py
     docker compose exec -T bot python tools/voice_idle_gate.py --wait 1800
+    docker compose exec -T bot python tools/voice_idle_gate.py --order 1430
 
 Exit codes:
     0  idle      -> safe to restart/recreate
@@ -105,6 +106,50 @@ def _describe(busy) -> str:
     return ", ".join(parts)
 
 
+def format_order(snapshot) -> str:
+    """One fixed line about a single order — no links, user ids or sessions."""
+    if snapshot is None:
+        return "ORDER: not found"
+    started = snapshot.get("started_at")
+    left = snapshot.get("left")
+    if left is None:
+        left_text = "unknown" if started else "not_started"
+    else:
+        left_text = f"{left:.0f}m"
+    return (
+        f"ORDER: id={snapshot['id']} type={snapshot.get('type')} "
+        f"status={snapshot.get('status')} started_at={started} "
+        f"duration={snapshot.get('duration')}m left={left_text} "
+        f"blocks_restart={'yes' if snapshot.get('blocks') else 'no'}"
+    )
+
+
+async def _order_snapshot(order_id: int):
+    """Read ONE order from the durable table (never from memory)."""
+    from sqlalchemy import select
+
+    from database import AsyncSessionLocal, Order
+
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(
+            select(Order).where(Order.id == int(order_id))
+        )).scalars().first()
+    if row is None:
+        return None
+    now = datetime.utcnow()
+    blocks, left = order_blocks_restart(row, now)
+    return {
+        "id": row.id,
+        "type": row.order_type,
+        "status": row.status,
+        "started_at": row.started_at,
+        "duration": row.duration_minutes,
+        "scheduled_for": row.scheduled_for,
+        "blocks": blocks,
+        "left": left,
+    }
+
+
 async def _check() -> int:
     try:
         busy = await _busy_orders()
@@ -136,7 +181,18 @@ def main(argv=None) -> int:
     parser.add_argument("--wait", type=int, default=0,
                         help="seconds to wait for an idle window (0 = single check)")
     parser.add_argument("--poll", type=int, default=30, help="poll interval while waiting")
+    parser.add_argument("--order", type=int,
+                        help="print one order's durable state (status/start/left) and exit")
     args = parser.parse_args(argv)
+
+    if args.order:
+        try:
+            snapshot = asyncio.run(_order_snapshot(args.order))
+        except Exception as exc:  # DB unreachable
+            print(f"ORDER: error ({type(exc).__name__}) — database not reachable")
+            return 2
+        print(format_order(snapshot))
+        return 0 if snapshot is not None else 4
 
     if args.wait > 0:
         code = asyncio.run(_wait(args.wait, max(5, args.poll)))
