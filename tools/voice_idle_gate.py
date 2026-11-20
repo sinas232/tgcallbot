@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timedelta
 import os
 import sys
 
@@ -34,10 +35,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IMMINENT_START_MINUTES = 10
 
 
+def order_blocks_restart(order, now):
+    """Does this order really block a restart? -> (blocks, minutes_left)
+
+    A restart only costs live voice presence; the bot rebuilds it from the
+    ``orders`` table on startup (``get_running_orders`` → the recovery worker
+    resumes the order with the time it has left and tells the customer that the
+    rejoin is free).
+
+    2026-11-21: the gate counted every ``running`` row, so order 1430 — stuck in
+    the join phase with ``started_at IS NULL`` and ``live=0``, i.e. serving
+    nobody — blocked the very deploy that could have fixed it, while order 1428
+    kept ticking down. A row like that must NOT block:
+
+      * ``started_at IS NULL``          -> still joining, nothing served yet,
+      * ``started_at + duration`` past  -> paid window already over (cleanup),
+      * otherwise                       -> it IS being served; wait (or accept
+                                           the ~1-2 min rejoin by forcing).
+    """
+    if (order.status or "") != "running":
+        return False, None
+    start = order.started_at
+    duration = int(order.duration_minutes or 0)
+    if start is None:
+        return False, None
+    if duration <= 0:
+        return True, None          # serving, end unknown → conservative
+    left = (start + timedelta(minutes=duration) - now).total_seconds() / 60.0
+    if left <= 0:
+        return False, None
+    return True, left
+
+
 async def _busy_orders():
     """[(order_id, order_type, status, minutes_left_or_start)] for busy orders."""
-    from datetime import datetime, timedelta
-
     from sqlalchemy import select
 
     from database import AsyncSessionLocal, Order
@@ -52,11 +83,9 @@ async def _busy_orders():
     busy = []
     for order in rows:
         if order.status == "running":
-            left = None
-            if order.started_at and order.duration_minutes:
-                end = order.started_at + timedelta(minutes=int(order.duration_minutes))
-                left = max(0.0, (end - now).total_seconds() / 60.0)
-            busy.append((order.id, order.order_type, "running", left))
+            blocks, left = order_blocks_restart(order, now)
+            if blocks:
+                busy.append((order.id, order.order_type, "running", left))
             continue
         start = order.scheduled_for
         if start is not None and start <= horizon:

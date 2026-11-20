@@ -39,7 +39,10 @@
 # USAGE
 #   bash tools/deploy_voice_fix.sh                       # dry run
 #   bash tools/deploy_voice_fix.sh --apply               # write files, no restart
-#   bash tools/deploy_voice_fix.sh --apply --recreate    # apply + restart bot
+#   bash tools/deploy_voice_fix.sh --apply --recreate    # apply + restart bot NOW
+#       (live voice sessions drop for ~1-2 min; on startup the recovery worker
+#        resumes every order still marked `running` with its remaining time and
+#        tells the customer the rejoin is free — see main.py order recovery)
 #   bash tools/deploy_voice_fix.sh --apply --recreate --use-proxy false  # DIRECT
 #   bash tools/deploy_voice_fix.sh --apply --restart-warp                # fresh tunnel
 #   bash tools/deploy_voice_fix.sh --apply --wait-idle 3600               # queue for an idle window
@@ -278,6 +281,8 @@ fi
 
 echo
 echo "=== 5/5 recreating containers (this drops live voice sessions) ========="
+echo "  the bot resumes running orders from the orders table after restart:"
+echo "  remaining paid time is preserved and the customer is told the rejoin is free"
 if [ "$RESTART_WARP" = "1" ]; then
   echo "  recreating warp + routefix + bot together (shared network namespace)"
   # routefix installs the docker-subnet ip rule INSIDE the warp netns; without

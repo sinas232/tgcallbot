@@ -60,6 +60,53 @@ class IdleGateContractTests(unittest.TestCase):
         self.assertNotIn("http", text)
 
 
+class RestartBlockingRuleTests(unittest.TestCase):
+    """Only an order that is actually being served may block a restart."""
+
+    NOW = __import__("datetime").datetime(2026, 11, 21, 0, 30, 0)
+
+    def _order(self, status="running", started_at=None, duration=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(status=status, started_at=started_at,
+                               duration_minutes=duration)
+
+    def test_order_still_joining_does_not_block(self):
+        """Order 1430: running with started_at NULL and live=0 blocks nothing.
+
+        It was stuck in the join phase, so it had no live session a restart
+        could kill — yet it was the reason the deploy waited (and the deploy was
+        the fix it needed).
+        """
+        blocks, left = gate.order_blocks_restart(self._order(started_at=None, duration=60), self.NOW)
+        self.assertFalse(blocks)
+        self.assertIsNone(left)
+
+    def test_served_order_blocks_with_minutes_left(self):
+        from datetime import timedelta
+        start = self.NOW - timedelta(minutes=30)
+        blocks, left = gate.order_blocks_restart(self._order(started_at=start, duration=60), self.NOW)
+        self.assertTrue(blocks)
+        self.assertAlmostEqual(left, 30.0, places=3)
+
+    def test_finished_window_does_not_block(self):
+        from datetime import timedelta
+        start = self.NOW - timedelta(minutes=90)
+        blocks, _ = gate.order_blocks_restart(self._order(started_at=start, duration=60), self.NOW)
+        self.assertFalse(blocks, "a finished paid window must not hold the deploy hostage")
+
+    def test_served_order_with_unknown_end_still_blocks(self):
+        from datetime import timedelta
+        start = self.NOW - timedelta(minutes=5)
+        blocks, left = gate.order_blocks_restart(self._order(started_at=start, duration=None), self.NOW)
+        self.assertTrue(blocks)
+        self.assertIsNone(left)
+
+    def test_terminal_status_never_blocks(self):
+        for status in ("stopped", "completed", "failed", "pending"):
+            blocks, _ = gate.order_blocks_restart(self._order(status=status), self.NOW)
+            self.assertFalse(blocks, status)
+
+
 class IdleGateWaitTests(unittest.TestCase):
     def test_wait_returns_idle_as_soon_as_the_order_finishes(self):
         answers = [
