@@ -111,10 +111,14 @@ if [ "$cstate" != "running" ]; then
 fi
 
 # ── 2. is the log itself readable? (it stopped being so on 2026-11-28) ──────
-logcfg="$(run "$DOCKER" inspect -f '{{.HostConfig.LogConfig.Type}}|{{.LogPath}}' \
+# NOTE: in `docker inspect` the log options live in LogConfig.Config, not
+# LogConfig.Options (asking for .Options fails the template outright).
+logcfg="$(run "$DOCKER" inspect -f '{{.HostConfig.LogConfig.Type}}|{{.LogPath}}|{{.HostConfig.LogConfig.Config}}' \
            "$CONTAINER" 2>/dev/null | tail -n 1)"
 log_driver="${logcfg%%|*}"
-log_path="${logcfg#*|}"
+log_rest="${logcfg#*|}"
+log_path="${log_rest%%|*}"
+log_config="${log_rest#*|}"
 logs_err="$(run "$DOCKER" logs --tail 1 --timestamps "$CONTAINER" 2>&1 >/dev/null)"
 last_line="$(run "$DOCKER" logs --tail 1 --timestamps "$CONTAINER" 2>/dev/null | tail -n 1)"
 last_ts="$(printf '%s' "$last_line" | awk '{print $1}')"
@@ -126,6 +130,15 @@ fi
 echo
 echo "=== 2. log: readable? how long silent? ================================"
 echo "  driver=${log_driver:-?}"
+case "$log_config" in
+  *max-size*) echo "  rotation: $log_config" ;;
+  *)  if [ "$log_driver" = "json-file" ]; then
+        echo "  rotation: NONE (unbounded json-file) ***"
+        echo "     without max-size this file grows forever; at 31.8 MB \`docker logs\`"
+        echo "     stopped being readable on 2026-11-28. compose must carry:"
+        echo "       logging: {driver: json-file, options: {max-size: 50m, max-file: 5}}"
+      fi ;;
+esac
 if [ -n "$log_path" ] && [ -f "$log_path" ]; then
   echo "  file:   $(ls -l --time-style=long-iso "$log_path" 2>/dev/null \
                   | awk '{print $5" bytes, mtime "$6" "$7}')  ($log_path)"

@@ -38,7 +38,9 @@ FAKE_DOCKER = textwrap.dedent(
       inspect)
         [ "${FAKE_INSPECT_MISSING:-0}" = "1" ] && exit 1
         case "$*" in
-          *LogConfig.Type*) printf '%s\\n' "${FAKE_LOGCFG:-json-file|/var/lib/docker/containers/x/x-json.log}" ;;
+          *LogConfig.Type*)
+            printf '%s\\n' "${FAKE_LOGCFG:-json-file|/var/lib/docker/containers/x/x-json.log|map[max-file:5 max-size:50m]}"
+            ;;
           *) printf '%s\\n' "${FAKE_INSPECT:-running|2080|0|2026-11-27T07:18:38.472817131Z}" ;;
         esac
         ;;
@@ -180,6 +182,20 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("silence below", proc.stdout)
         self.assertIn("cannot be read", proc.stdout)
         self.assertNotIn("kill", self._called(), "a dump nobody can read is pointless")
+
+    def test_the_log_rotation_is_reported(self):
+        self.env.update(FAKE_LAST_LINE=f"{self._stamp(0.001)} x", FAKE_PROBE="answered")
+        proc = self._run()
+        self.assertIn("rotation: map[max-file:5 max-size:50m]", proc.stdout)
+
+    def test_an_unbounded_log_file_is_called_out(self):
+        """31.8 MB with no max-size is how `docker logs` stopped working."""
+        self.env.update(FAKE_LAST_LINE=f"{self._stamp(0.001)} x", FAKE_PROBE="answered",
+                        FAKE_LOGCFG="json-file|/var/lib/docker/containers/x/x-json.log|map[]")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("rotation: NONE", proc.stdout)
+        self.assertIn("max-size: 50m", proc.stdout)
 
     def test_an_unreadable_log_still_shows_where_the_threads_wait(self):
         self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
