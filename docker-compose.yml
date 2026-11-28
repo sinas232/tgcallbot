@@ -152,6 +152,19 @@ services:
       # پروکسی درخواست‌های درگاه پرداخت (بدون WARP، از IP ایرانی هاست).
       # اگر خالی شود، درخواست‌های پرداخت مستقیم (از WARP) می‌روند.
       - PAYMENT_HTTP_PROXY=${PAYMENT_HTTP_PROXY:-http://payproxy:8888}
+      # ── نگهبان حلقهٔ رویداد (frozen event loop) — ۱۴۰۵/۰۹/۰۷ ─────────────
+      # اگر حلقهٔ asyncio قفل کند، پروسه زنده می‌ماند (docker «Up» نشان
+      # می‌دهد) ولی ربات هیچ پاسخی نمی‌دهد — همان حادثهٔ ۱۴۰۵/۰۹/۰۷ که پنج
+      # ساعت بی‌صدا ماند. نگهبان از یک نخ جدا هر چند ثانیه یک callback داخل
+      # حلقه می‌گذارد؛ اگر اجرا نشود، استک همهٔ نخ‌ها را CRITICAL چاپ می‌کند.
+      - LOOP_STALL_WATCHDOG=${LOOP_STALL_WATCHDOG:-1}
+      - LOOP_STALL_SECONDS=${LOOP_STALL_SECONDS:-90}
+      - LOOP_STALL_PROBE_SECONDS=${LOOP_STALL_PROBE_SECONDS:-10}
+      - LOOP_STALL_DUMP_SECONDS=${LOOP_STALL_DUMP_SECONDS:-60}
+      # 0 = هرگز خودکشی نکن؛ 600 = اگر ۱۰ دقیقه قفل بود، exit(1) تا داکر
+      # کانتینر را ری‌استارت کند و سفارش‌های در حال اجرا با زمان باقی‌مانده
+      # ادامه پیدا کنند.
+      - LOOP_STALL_RESTART_SECONDS=${LOOP_STALL_RESTART_SECONDS:-0}
     depends_on:
       warp:
         condition: service_healthy

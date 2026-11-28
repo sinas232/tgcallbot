@@ -1600,7 +1600,7 @@ def register_handlers(application: Application) -> None:
 _INSTANCE_LOCK_FILE = None
 
 
-def _acquire_instance_singleton_lock() -> None:
+async def _acquire_instance_singleton_lock() -> None:
     """Lock the real project data dir; NEVER run without flock on Linux.
 
     A relative path depends on the caller's working directory. For example,
@@ -1628,7 +1628,13 @@ def _acquire_instance_singleton_lock() -> None:
                     "🔒 نمونهٔ دیگری از ربات قفل %s را دارد؛ این نمونه بدون "
                     "اتصال به سشن‌ها منتظر می‌ماند. A second bot is running; "
                     "waiting rather than duplicating Telegram auth keys.", lock_path)
-                time.sleep(30)
+                # await, never time.sleep: this runs INSIDE main_loop, so a
+                # blocking wait here freezes the whole event loop for as long
+                # as the lock is held elsewhere — the loop then does nothing
+                # (no log, no /start) while the process stays alive, which is
+                # exactly the "Up but dead" state the watchdog reports. A
+                # waiting instance should be responsive and loud, not frozen.
+                await asyncio.sleep(30)
         _INSTANCE_LOCK_FILE = fh
         fh.seek(0)
         fh.truncate()
@@ -1642,7 +1648,7 @@ def _acquire_instance_singleton_lock() -> None:
 
 async def main_loop():
     """حلقه اصلی اجرای برنامه"""
-    _acquire_instance_singleton_lock()
+    await _acquire_instance_singleton_lock()
 
     # A second checkout/container/server may share the PostgreSQL account
     # table without sharing ./data. Acquire the DB-wide lock BEFORE bot/MTProto
@@ -1889,4 +1895,17 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         logger.info("using the default asyncio event loop (uvloop unavailable)")
     asyncio.set_event_loop(loop)
+    # ── Frozen-loop watchdog (2026-11-28 incident) ───────────────────────
+    # The container was `Up 23 hours` while the bot answered nothing: the
+    # process lives on when the event loop blocks, so Docker (and any "is it
+    # running?" check) still says healthy. This daemon thread asks the loop to
+    # run a trivial callback every LOOP_STALL_PROBE_SECONDS and, when it
+    # cannot, prints every thread's stack so the blocked call is named instead
+    # of guessed. Armed HERE — before the first `await`, and before the
+    # startup path that can block — so a stall during boot is caught too.
+    try:
+        from services.loop_watchdog import install as _install_loop_watchdog
+        _install_loop_watchdog(loop)
+    except Exception as _watchdog_exc:  # never keep the bot from starting
+        logger.warning("loop watchdog not armed: %s", _watchdog_exc)
     loop.run_until_complete(main_loop())

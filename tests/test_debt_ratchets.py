@@ -36,6 +36,10 @@ REQUIRED_DOCUMENTED = {
     'REDIS_MEM_LIMIT', 'REDIS_CPU_LIMIT',
     'VOICE_STARVED_WAIT_ROUNDS', 'VOICE_STARVED_WAIT_SECONDS',
     'ORDER_RECOVERY_ENABLED',
+    # 1405-09-07 frozen-loop incident: an operator must be able to discover
+    # these five while the bot is silent — the whole point of the watchdog.
+    'LOOP_STALL_WATCHDOG', 'LOOP_STALL_SECONDS', 'LOOP_STALL_PROBE_SECONDS',
+    'LOOP_STALL_DUMP_SECONDS', 'LOOP_STALL_RESTART_SECONDS',
 }
 
 # Pre-existing undocumented knobs at the time this ratchet was added.
