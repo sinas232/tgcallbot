@@ -64,9 +64,9 @@ FAKE_DOCKER = textwrap.dedent(
         fi
         case "$*" in
           */proc/*)
-            printf '%s\n' "${FAKE_WCHAN:-PIPELINE-INFO pid=7 cmd=python main.py
-TID 7 ep_poll
-TID 8 futex_wait_queue_me}"
+            printf '%s\n' "${FAKE_WCHAN:-PIPELINE-INFO pid=8 comm=python3 cmd=/usr/local/bin/python main.py
+TID 8 ep_poll
+TID 9 futex_wait_queue_me}"
             exit 0 ;;
           *voice_idle_gate*)
             printf '%s\\n' "${FAKE_GATE:-IDLE-GATE: idle (no running order)}"
@@ -183,6 +183,33 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("cannot be read", proc.stdout)
         self.assertNotIn("kill", self._called(), "a dump nobody can read is pointless")
 
+    def test_a_line_written_to_the_containers_stderr_is_not_a_failure(self):
+        """REGRESSION (06:40 UTC): the bot logs to the container's stderr, the CLI
+        forwards it to ITS stderr, and the doctor called every normal line a
+        `docker logs` failure."""
+        self.env.update(FAKE_LAST_LINE=f"{self._stamp(0.002)} aiohttp.access - INFO - GET /health 200",
+                        FAKE_PROBE="answered")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("FAILED", proc.stdout)
+        self.assertNotIn("proves NOTHING", proc.stdout)
+        self.assertIn("silence:", proc.stdout)
+        self.assertIn("aiohttp.access", proc.stdout)
+
+    def test_the_real_bot_pid_is_used_when_init_is_pid_one(self):
+        self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
+                        FAKE_WCHAN="PIPELINE-INFO pid=8 comm=python3 cmd=/usr/local/bin/python main.py\nTID 8 ep_poll")
+        proc = self._run()
+        self.assertIn("bot process inside the container: pid=8 (python3)", proc.stdout)
+        self.assertNotIn("THE BOT PROCESS IS GONE", proc.stdout)
+
+    def test_a_container_with_only_init_alive_is_reported_as_gone(self):
+        self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
+                        FAKE_WCHAN="PIPELINE-INFO pid=1 comm=docker-init cmd=/sbin/docker-init -- sh -c\nTID 1 do_sigtimedwait.isra.0")
+        proc = self._run()
+        self.assertIn("THE BOT PROCESS IS GONE", proc.stdout)
+        self.assertIn("sigtimedwait", proc.stdout)
+
     def test_the_log_rotation_is_reported(self):
         self.env.update(FAKE_LAST_LINE=f"{self._stamp(0.001)} x", FAKE_PROBE="answered")
         proc = self._run()
@@ -199,7 +226,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_an_unreadable_log_still_shows_where_the_threads_wait(self):
         self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
-                        FAKE_WCHAN="PIPELINE-INFO pid=7 cmd=python main.py\nTID 7 pipe_write\nTID 8 futex_wait_queue_me")
+                        FAKE_WCHAN="PIPELINE-INFO pid=8 comm=python3 cmd=/usr/local/bin/python main.py\nTID 8 pipe_write\nTID 9 futex_wait_queue_me")
         proc = self._run()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("thread waits", proc.stdout)
@@ -209,7 +236,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_an_idle_wchan_is_not_called_a_freeze(self):
         self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
-                        FAKE_WCHAN="PIPELINE-INFO pid=7 cmd=python main.py\nTID 7 ep_poll")
+                        FAKE_WCHAN="PIPELINE-INFO pid=8 comm=python3 cmd=/usr/local/bin/python main.py\nTID 8 ep_poll")
         proc = self._run()
         self.assertIn("idle in the loop's own wait", proc.stdout)
         self.assertIn("main thread kernel wait: ep_poll", proc.stdout)

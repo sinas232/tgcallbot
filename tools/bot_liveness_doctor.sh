@@ -119,12 +119,24 @@ log_driver="${logcfg%%|*}"
 log_rest="${logcfg#*|}"
 log_path="${log_rest%%|*}"
 log_config="${log_rest#*|}"
-logs_err="$(run "$DOCKER" logs --tail 1 --timestamps "$CONTAINER" 2>&1 >/dev/null)"
-last_line="$(run "$DOCKER" logs --tail 1 --timestamps "$CONTAINER" 2>/dev/null | tail -n 1)"
-last_ts="$(printf '%s' "$last_line" | awk '{print $1}')"
+# IMPORTANT: read stdout+stderr TOGETHER. `docker logs` demultiplexes by
+# stream, and this bot logs through Python's StreamHandler — i.e. the
+# container's STDERR, which the CLI forwards to ITS stderr. Reading only
+# stdout here made every normal log line look like a `docker logs` failure
+# (2026-11-28 06:40: "FAILED" while the line was right there).
+logs_tail="$(run "$DOCKER" logs --tail 1 --timestamps "$CONTAINER" 2>&1 | tail -n 1)"
+last_ts="$(printf '%s' "$logs_tail" | awk '{print $1}')"
+last_line=""
+logs_err=""
+log_unreadable=0
 silence=""
 if last_epoch="$(to_epoch "$last_ts")"; then
+  last_line="$logs_tail"
   silence="$(( now - last_epoch ))"
+else
+  # No parseable timestamp: either a real daemon/driver error, or an empty log.
+  logs_err="$logs_tail"
+  log_unreadable=1
 fi
 
 echo
@@ -143,18 +155,17 @@ if [ -n "$log_path" ] && [ -f "$log_path" ]; then
   echo "  file:   $(ls -l --time-style=long-iso "$log_path" 2>/dev/null \
                   | awk '{print $5" bytes, mtime "$6" "$7}')  ($log_path)"
 fi
-if [ -n "$logs_err" ]; then
-  echo "  *** \`docker logs\` FAILED — the log is not readable, so silence below"
-  echo "      proves NOTHING:"
-  printf '%s\n' "$logs_err" | short
+if [ "$log_unreadable" = "1" ]; then
+  echo "  *** \`docker logs\` FAILED — no readable line, so silence below proves NOTHING:"
+  if [ -n "$logs_err" ]; then
+    printf '%s\n' "$logs_err" | short
+  else
+    echo "     (empty log: the container has written nothing yet)"
+  fi
 else
   echo "  last log line: ${last_ts:-<none>}"
-  if [ -n "$silence" ]; then
-    echo "  silence: ${silence}s   limit: ${SILENCE_LIMIT}s"
-  else
-    echo "  silence: unknown (no parseable timestamp)"
-  fi
-  [ -n "$last_line" ] && printf '%s\n' "$last_line" | short
+  echo "  silence: ${silence}s   limit: ${SILENCE_LIMIT}s"
+  printf '%s\n' "$last_line" | short
 fi
 
 # ── 3. LOOP PROBE: the decisive test, independent of any log ───────────────
@@ -223,7 +234,7 @@ top_frame=""
 if [ "$DO_DUMP" = "0" ]; then
   echo
   echo "=== 4. python stacks — skipped (--no-dump) ============================="
-elif [ -n "$logs_err" ]; then
+elif [ "$log_unreadable" = "1" ]; then
   echo
   echo "=== 4. python stacks — cannot be read ================================="
   echo "  SIGUSR1 was NOT sent: the dump goes to stdout/stderr, and \`docker logs\`"
@@ -263,30 +274,38 @@ fi
 # do_sigtimedwait forever and says nothing about the bot. So the real pid is
 # the process whose cmdline mentions main.py.
 wchan_main=""
-if [ -n "$logs_err" ]; then
+if [ "$log_unreadable" = "1" ]; then
   echo
   echo "=== 4b. thread waits (works even when the log cannot be read) ========="
   wchan_out="$(timeout -k 5 20 "$DOCKER" exec "$CONTAINER" sh -c '
     pid=""
     for p in /proc/[0-9]*; do
-      cmd=$(tr -d "\000" < "$p/cmdline" 2>/dev/null | head -c 200)
-      case "$cmd" in *main.py*) pid="${p##*/}"; break ;; esac
+      comm=$(cat "$p/comm" 2>/dev/null)
+      case "$comm" in
+        python*)
+          cmd=$(tr -d "\000" < "$p/cmdline" 2>/dev/null | head -c 200)
+          case "$cmd" in *main.py*) pid="${p##*/}"; break ;; esac
+          ;;
+      esac
     done
     [ -z "$pid" ] && pid=1
-    echo "PIPELINE-INFO pid=$pid cmd=$(tr -d "\000" < /proc/$pid/cmdline 2>/dev/null | head -c 80)"
+    echo "PIPELINE-INFO pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr -d "\000" < /proc/$pid/cmdline 2>/dev/null | head -c 80)"
     for t in /proc/$pid/task/*; do
       printf "TID %s %s\n" "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
     done' 2>&1)"
   bot_pid="$(printf '%s\n' "$wchan_out" | sed -n 's/^PIPELINE-INFO pid=\([0-9]*\).*/\1/p')"
+  bot_comm="$(printf '%s\n' "$wchan_out" | sed -n 's/^PIPELINE-INFO .*comm=\([^ ]*\).*/\1/p' | head -n 1)"
   bot_cmd="$(printf '%s\n' "$wchan_out" | sed -n 's/^PIPELINE-INFO .*cmd=//p' | head -n 1)"
   tids="$(printf '%s\n' "$wchan_out" | grep '^TID ')"
   if [ -n "$tids" ]; then
-    if [ "$bot_pid" = "1" ] && [ -z "$bot_cmd" ]; then
-      echo "  no process with main.py in its cmdline: only an init is running,"
-      echo "  so THE BOT PROCESS IS GONE (the container is 'Up' because init is)."
-    else
-      echo "  bot process inside the container: pid=$bot_pid  cmd=${bot_cmd:-?}"
-    fi
+    case "$bot_comm" in
+      python*)
+        echo "  bot process inside the container: pid=$bot_pid ($bot_comm) cmd=${bot_cmd:-?}" ;;
+      *)
+        echo "  no PYTHON process running main.py: pid $bot_pid is '$bot_comm'."
+        echo "  THE BOT PROCESS IS GONE — the container says 'Up' only because its"
+        echo "  init is still alive; a restart is the only recovery." ;;
+    esac
     printf '%s\n' "$tids" | sed 's/^TID /    tid /' | head -n 12
     wchan_main="$(printf '%s\n' "$tids" | head -n 1 | awk '{print $3}')"
     case "$wchan_main" in
@@ -356,7 +375,7 @@ if [ "$probe" = "timeout" ]; then
   echo
   echo "  keep the evidence first:"
   echo "    docker logs $CONTAINER > /tmp/bot-frozen-\$(date -u +%Y%m%dT%H%M%SZ).log 2>&1"
-  if [ -n "$logs_err" ]; then
+  if [ "$log_unreadable" = "1" ]; then
     echo "    (note: \`docker logs\` is unreadable here, so that file will be empty —"
     echo "     this report IS the evidence: the /health timeout plus section 4b.)"
   fi
