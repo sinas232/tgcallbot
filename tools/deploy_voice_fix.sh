@@ -202,9 +202,9 @@ COMPOSE_ARGS=(-f "$BASE_FILE")
 # `docker exec` and is wrapped in `timeout`.
 bot_cid() {
   local cid
-  cid="$(docker compose "${COMPOSE_ARGS[@]}" ps -q bot 2>/dev/null | head -1)"
+  cid="$(docker compose "${COMPOSE_ARGS[@]}" ps -q bot 2>/dev/null | head -n 1)"
   if [ -z "$cid" ]; then
-    cid="$(docker ps -q -f name=telegram_bot_container 2>/dev/null | head -1)"
+    cid="$(docker ps -q -f name=telegram_bot_container 2>/dev/null | head -n 1)"
   fi
   printf '%s' "$cid"
 }
@@ -335,7 +335,7 @@ for attempt in 1 2 3 4 5 6; do
     break
   fi
   echo "  attempt $attempt/6: no usable path yet — waiting 15s for the tunnel"
-  printf '%s\n' "$NET_OUT" | sed -n '/direct:/,/^---/p' | head -14
+  printf '%s\n' "$NET_OUT" | sed -n '/direct:/,/^---/p' | head -n 14
   [ "$attempt" = "6" ] || sleep 15
 done
 if [ "$EGRESS_OK" != "1" ]; then

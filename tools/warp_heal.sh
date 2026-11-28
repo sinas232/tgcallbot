@@ -79,7 +79,7 @@ fi
 
 echo
 echo "=== 3/4 Telegram CONNECT probe from inside the bot (real path) ========"
-run 150 docker exec "$BOT_C" python3 tools/net_check.py 2>&1 | tail -16
+run 150 docker exec "$BOT_C" python3 tools/net_check.py 2>&1 | tail -n 16
 NET_RC=${PIPESTATUS[0]}
 [ "$NET_RC" = "0" ] || echo "  (net_check exit code $NET_RC — see the verdict below)"
 
