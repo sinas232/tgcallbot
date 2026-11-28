@@ -210,6 +210,43 @@ class RedeployTests(unittest.TestCase):
         self.assertNotIn("git fetch", calls)
         self.assertIn("compose", calls)
 
+    # ── detached mode (2026-11-28: the child died and left an empty log) ────
+    def test_the_detached_child_actually_runs(self):
+        """REGRESSION: `bash "$0"` with a relative $0 after `cd "$REPO"` dies
+        instantly ("No such file or directory") and leaves an empty log — the
+        exact "nothing happens" the operator reported."""
+        env = dict(self.env)
+        env.pop("BOT_REDEPLOY_DETACHED", None)      # take the real detach branch
+        proc = subprocess.run(["bash", str(SCRIPT)], capture_output=True,
+                              text=True, env=env, timeout=120, cwd=str(self.repo))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("detached: pid", proc.stdout)
+        log = next((self.repo / "logs").glob("redeploy-*.log"))
+        deadline = 20
+        body = ""
+        while deadline > 0:
+            body = log.read_text(encoding="utf-8")
+            if "DONE:" in body or "INCOMPLETE" in body or "REFUSED" in body:
+                break
+            deadline -= 0.1
+            subprocess.run(["sleep", "0.1"])
+        self.assertIn("redeploy_bot", body, "the detached child wrote nothing")
+        self.assertNotIn("No such file or directory", body)
+        self.assertIn("DONE:", body, body)
+
+    def test_the_detached_child_keeps_the_original_arguments(self):
+        """`for arg in "$@"` AFTER the parse loop is empty: --wait was lost."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('ORIG_ARGS=("$@")', source)
+        self.assertIn('for arg in "${ORIG_ARGS[@]}"', source)
+        self.assertIn('bash "$SELF"', source)
+
+    def test_foreground_runs_keep_a_log_file(self):
+        """A dying terminal must not take the only copy of the proof."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('exec > >(tee -a "$LOG")', source)
+        self.assertIn('${BOT_REDEPLOY_DETACHED:-0}" != "1"', source)
+
     # ── guarantees ──────────────────────────────────────────────────────────
     def test_it_runs_detached_by_default(self):
         source = SCRIPT.read_text(encoding="utf-8")

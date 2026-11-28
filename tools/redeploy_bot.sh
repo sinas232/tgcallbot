@@ -52,6 +52,14 @@ DETACH=1
 RESET=1
 FORCE_RESET=0
 
+# `$0` may be a RELATIVE path ("tools/redeploy_bot.sh") and we `cd "$REPO"`
+# below: the detached child would then be started with a path that no longer
+# resolves, die instantly, and leave an empty log behind (2026-11-28 — this is
+# exactly what "جوابی نمیده" was). Anchor it once, before anything moves.
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+[ -f "$SELF" ] || SELF="$0"
+ORIG_ARGS=("$@")
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --foreground)   DETACH=0 ;;
@@ -73,15 +81,24 @@ if [ "$DETACH" = "1" ] && [ "${BOT_REDEPLOY_DETACHED:-0}" != "1" ]; then
   mkdir -p logs
   LOG="logs/redeploy-$(date +%Y%m%d-%H%M%S).log"
   ARGS=()
-  for arg in "$@"; do
-    [ "$arg" = "--foreground" ] || ARGS+=("$arg")
+  for arg in "${ORIG_ARGS[@]}"; do
+    case "$arg" in --foreground) ;; *) ARGS+=("$arg") ;; esac
   done
-  BOT_REDEPLOY_DETACHED=1 setsid nohup bash "$0" --foreground "${ARGS[@]}" \
+  BOT_REDEPLOY_DETACHED=1 setsid nohup bash "$SELF" --foreground ${ARGS[@]+"${ARGS[@]}"} \
       >"$LOG" 2>&1 </dev/null &
   echo "detached: pid $!  (survives this SSH session)"
   echo "log:      $REPO/$LOG"
   echo "follow:   tail -f $REPO/$LOG"
   exit 0
+fi
+
+# Even in the foreground, keep a file: the terminal can vanish mid-recreate.
+mkdir -p logs
+LOG="logs/redeploy-$(date +%Y%m%d-%H%M%S).log"
+# ...but not when already detached: the child's stdout is the log file, and
+# teeing into a second (same-second filename) log would interleave two writers.
+if [ "${BOT_REDEPLOY_TEE:-0}" != "1" ] && [ "${BOT_REDEPLOY_DETACHED:-0}" != "1" ]; then
+  BOT_REDEPLOY_TEE=1 exec > >(tee -a "$LOG") 2>&1
 fi
 
 echo "redeploy_bot $(date -u +%FT%TZ)  repo=$REPO branch=$BRANCH"
