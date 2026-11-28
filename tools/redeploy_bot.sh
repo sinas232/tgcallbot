@@ -122,18 +122,43 @@ fi
 
 # ── 2. sync the tree, without eating local work ────────────────────────────
 if [ "$RESET" = "1" ]; then
+  "$GIT" fetch -q origin "$BRANCH" || { echo "ERROR: git fetch failed"; exit 3; }
+  target="$("$GIT" rev-parse --short "origin/$BRANCH")"
+
+  # A file the branch already carries is NOT local work: the deploy helpers
+  # write exactly these files with `git show origin/<branch>:<path> > <path>`
+  # (that is how tools/bot_liveness_doctor.sh got here), and refusing on them
+  # would block the very deploy that fixes things. So compare each modified
+  # path with the fetched branch and only real divergences count. Untracked
+  # files are never touched by `reset --hard` and never block.
   dirty="$("$GIT" status --porcelain 2>/dev/null)"
-  if [ -n "$dirty" ] && [ "$FORCE_RESET" != "1" ]; then
+  at_risk=""
+  ignored=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$line" in
+      "??"*) ignored=$((ignored + 1)) ;;                       # untracked: survives
+      *)
+        if "$GIT" diff --quiet "origin/$BRANCH" -- "$path" 2>/dev/null; then
+          ignored=$((ignored + 1))                             # already the target content
+        else
+          at_risk="$at_risk$path"$'\n'
+        fi ;;
+    esac
+  done <<<"$dirty"
+
+  if [ -n "$at_risk" ] && [ "$FORCE_RESET" != "1" ]; then
     echo
-    echo "REFUSED: the tree has local changes; 'git reset --hard' would delete them:"
-    printf '%s\n' "$dirty" | head -n 20 | sed 's/^/    /'
+    echo "REFUSED: these paths really differ from origin/$BRANCH; reset --hard"
+    echo "would delete them:"
+    printf '%s' "$at_risk" | head -n 20 | sed 's/^/    /'
     echo
     echo "  sync only what you need (git show origin/<branch>:<path> > <path>), or"
     echo "  re-run with --force-reset if those edits really are disposable."
     exit 2
   fi
-  "$GIT" fetch -q origin "$BRANCH" || { echo "ERROR: git fetch failed"; exit 3; }
-  target="$("$GIT" rev-parse --short "origin/$BRANCH")"
+  [ "$ignored" -gt 0 ] && echo "ignored $ignored file(s) that are untracked or already identical to $target"
   "$GIT" reset --hard "origin/$BRANCH" >/dev/null || { echo "ERROR: git reset failed"; exit 3; }
   echo "synced to $target"
 else

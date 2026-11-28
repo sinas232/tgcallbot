@@ -59,6 +59,12 @@ FAKE_GIT = textwrap.dedent(
       fetch)     exit 0 ;;
       rev-parse) printf '%s\\n' "${FAKE_SHA:-2c4aea9}" ;;
       reset)     exit 0 ;;
+      diff)
+        # `git diff --quiet origin/<branch> -- <path>`: 1 = really different
+        for p in ${FAKE_DIFFERS:-}; do
+          case " $* " in *" $p "*) exit 1 ;; esac
+        done
+        exit 0 ;;
       *) exit 0 ;;
     esac
     """
@@ -113,19 +119,44 @@ class RedeployTests(unittest.TestCase):
 
     # ── refusals ────────────────────────────────────────────────────────────
     def test_a_dirty_tree_is_never_reset_hard(self):
-        self.env["FAKE_DIRTY"] = " M main.py\n?? notes.txt"
+        self.env.update(FAKE_DIRTY=" M main.py\n?? notes.txt", FAKE_DIFFERS="main.py")
         proc = self._run()
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("local changes", proc.stdout)
+        self.assertIn("really differ", proc.stdout)
         self.assertIn("--force-reset", proc.stdout)
         self.assertNotIn("git reset", self._called())
         self.assertNotIn("compose", self._called(), "must not even try to recreate")
 
     def test_force_reset_allows_it(self):
-        self.env["FAKE_DIRTY"] = " M main.py"
+        self.env.update(FAKE_DIRTY=" M main.py", FAKE_DIFFERS="main.py")
         proc = self._run("--force-reset")
         self.assertIn("git reset --hard", self._called())
         self.assertIn("compose", self._called())
+
+    def test_a_file_that_already_equals_the_branch_does_not_block(self):
+        """`git show origin/<branch>:path > path` is not local work — the deploy
+        helpers write exactly those files (that is how the doctor got here)."""
+        self.env.update(FAKE_DIRTY=" M tools/bot_liveness_doctor.sh", FAKE_DIFFERS="")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("already identical", proc.stdout)
+        self.assertIn("git reset --hard", self._called())
+
+    def test_untracked_files_never_block_a_reset(self):
+        self.env.update(FAKE_DIRTY="?? .env.bak-20261128\n?? logs/redeploy-1.log",
+                        FAKE_DIFFERS="")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ignored 2 file(s)", proc.stdout)
+
+    def test_the_refusal_names_only_the_real_divergences(self):
+        self.env.update(FAKE_DIRTY=" M main.py\n M config.py\n?? x.log",
+                        FAKE_DIFFERS="main.py config.py")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("main.py", proc.stdout)
+        self.assertIn("config.py", proc.stdout)
+        self.assertNotIn("x.log", proc.stdout.split("REFUSED")[1])
 
     def test_a_live_order_refuses_the_recreate(self):
         """The standing rule: a recreate drops every live voice session."""
