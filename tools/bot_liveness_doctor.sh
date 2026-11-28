@@ -245,22 +245,44 @@ fi
 # file, dead pipe) the dump is lost, but /proc still tells where each thread
 # waits: ep_poll = idle in the loop, futex = blocked on a lock, pipe_write =
 # blocked writing a log line (a full log pipe freezes the loop by itself).
+#
+# NOTE: with `init: true`, PID 1 is tini, NOT the bot — it sits in
+# do_sigtimedwait forever and says nothing about the bot. So the real pid is
+# the process whose cmdline mentions main.py.
 wchan_main=""
 if [ -n "$logs_err" ]; then
   echo
   echo "=== 4b. thread waits (works even when the log cannot be read) ========="
   wchan_out="$(timeout -k 5 20 "$DOCKER" exec "$CONTAINER" sh -c '
-    for t in /proc/1/task/*; do
-      printf "%s %s\n" "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
+    pid=""
+    for p in /proc/[0-9]*; do
+      cmd=$(tr -d "\000" < "$p/cmdline" 2>/dev/null | head -c 200)
+      case "$cmd" in *main.py*) pid="${p##*/}"; break ;; esac
+    done
+    [ -z "$pid" ] && pid=1
+    echo "PIPELINE-INFO pid=$pid cmd=$(tr -d "\000" < /proc/$pid/cmdline 2>/dev/null | head -c 80)"
+    for t in /proc/$pid/task/*; do
+      printf "TID %s %s\n" "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
     done' 2>&1)"
-  if printf '%s' "$wchan_out" | grep -q '^[0-9]'; then
-    printf '%s\n' "$wchan_out" | head -n 12 | sed 's/^/    pid\/tid /'
-    wchan_main="$(printf '%s\n' "$wchan_out" | head -n 1 | awk '{print $2}')"
+  bot_pid="$(printf '%s\n' "$wchan_out" | sed -n 's/^PIPELINE-INFO pid=\([0-9]*\).*/\1/p')"
+  bot_cmd="$(printf '%s\n' "$wchan_out" | sed -n 's/^PIPELINE-INFO .*cmd=//p' | head -n 1)"
+  tids="$(printf '%s\n' "$wchan_out" | grep '^TID ')"
+  if [ -n "$tids" ]; then
+    if [ "$bot_pid" = "1" ] && [ -z "$bot_cmd" ]; then
+      echo "  no process with main.py in its cmdline: only an init is running,"
+      echo "  so THE BOT PROCESS IS GONE (the container is 'Up' because init is)."
+    else
+      echo "  bot process inside the container: pid=$bot_pid  cmd=${bot_cmd:-?}"
+    fi
+    printf '%s\n' "$tids" | sed 's/^TID /    tid /' | head -n 12
+    wchan_main="$(printf '%s\n' "$tids" | head -n 1 | awk '{print $3}')"
     case "$wchan_main" in
       ep_poll*|*epoll*|do_epoll*) echo "  main thread: idle in the loop's own wait (ep_poll) — healthy shape" ;;
       *futex*)  echo "  main thread: blocked on a futex/lock — a coroutine is holding it" ;;
       *pipe_wr*|*pipe_wait*|*pipe_*) echo "  main thread: BLOCKED WRITING TO THE LOG PIPE — logging itself is"
                 echo "               what freezes the loop; the log driver is the root cause" ;;
+      *sigtimedwait*|*sigtimed*) echo "  main thread: waiting on signals — that is tini/an init, not the bot"
+                echo "               (check the pid line above: the real bot may be gone)" ;;
       "")       : ;;
       *)        echo "  main thread: waiting in $wchan_main" ;;
     esac

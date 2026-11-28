@@ -1895,6 +1895,18 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         logger.info("using the default asyncio event loop (uvloop unavailable)")
     asyncio.set_event_loop(loop)
+    # ── Non-blocking logging (same incident, the actual trap) ────────────
+    # Logging writes happen on the event loop thread. On 2026-11-28 the
+    # container's json log file reached 31.8 MB and `docker logs` could no
+    # longer read it back, while the bot went silent at 01:08:30 and answered
+    # nothing for five hours. A stalled log write must cost log lines, not the
+    # only thread that runs /start, the timers and the updater: the handlers
+    # move to a background thread behind a bounded, drop-on-full queue.
+    try:
+        from services.log_pipeline import install as _install_log_pipeline
+        _install_log_pipeline()
+    except Exception as _log_pipeline_exc:  # never keep the bot from starting
+        logger.warning("async logging not armed: %s", _log_pipeline_exc)
     # ── Frozen-loop watchdog (2026-11-28 incident) ───────────────────────
     # The container was `Up 23 hours` while the bot answered nothing: the
     # process lives on when the event loop blocks, so Docker (and any "is it

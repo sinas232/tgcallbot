@@ -26,6 +26,11 @@ Environment (all optional):
     LOOP_STALL_RESTART_SECONDS=0     exit(1) after this long stalled so Docker
                                      restarts the bot (0 = never; recovery resumes
                                      running orders with their remaining time)
+    LOOP_STALL_FILE=<repo>/logs/loop_stall.log
+                                     the report is ALSO appended here, on the
+                                     host bind-mount: 2026-11-28 proved
+                                     `docker logs` can become unreadable exactly
+                                     when the evidence matters most
 """
 from __future__ import annotations
 
@@ -41,6 +46,13 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 _TASK_STACK_LIMIT = 12
+
+# `.:/app` is bind-mounted from the host, so this file is readable from the host
+# without `docker logs` and survives a restart/recreate of the container.
+_STALL_FILE_DEFAULT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "logs", "loop_stall.log",
+)
 
 _STATE: Dict[str, Any] = {
     "installed": False,
@@ -124,6 +136,30 @@ def format_stall_report(stalled_for: float, threads: str,
     return "\n".join(parts)
 
 
+def stall_file_path() -> str:
+    return os.getenv("LOOP_STALL_FILE", "") or _STALL_FILE_DEFAULT
+
+
+def write_stall_file(report: str) -> str:
+    """Append one report to a host-visible file; returns the path ("" on error).
+
+    The log line is best effort — the whole point of the incident is that the
+    log can stop being readable. This file cannot: it is a plain append on the
+    bind mount, written from the watchdog thread, and it is what an operator
+    reads after `docker logs` says nothing.
+    """
+    path = stall_file_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n" + "=" * 78 + "\n")
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + "\n")
+            fh.write(report.rstrip() + "\n")
+        return path
+    except OSError:
+        return ""
+
+
 def _thread_stacks() -> str:
     """Python stacks of every thread — this works while the loop is blocked."""
     out: List[str] = []
@@ -183,14 +219,21 @@ def _monitor(loop, interval: float, stall_seconds: float, dump_seconds: float,
         # longer than LOOP_STALL_RESTART_SECONDS must exit on schedule, not
         # wait for the next permitted dump.
         if restart_after > 0 and stalled_for >= restart_after:
+            report = format_stall_report(stalled_for, _thread_stacks(),
+                                         str(_STATE.get("task_snapshot") or ""),
+                                         restart_after)
+            write_stall_file(report)          # durable: survives this exit
             logger.critical(
                 "[LoopWatchdog] stalled %.0fs (>= LOOP_STALL_RESTART_SECONDS=%.0f) — "
                 "exiting so Docker restarts the bot; running orders resume with their "
                 "remaining time.", stalled_for, restart_after)
             try:
-                logger.critical(format_stall_report(stalled_for, _thread_stacks(),
-                                                    str(_STATE.get("task_snapshot") or ""),
-                                                    restart_after))
+                logger.critical(report)
+                try:
+                    from services.log_pipeline import flush as _flush_logs
+                    _flush_logs(1.0)
+                except Exception as exc:   # the file below is already the record
+                    logger.debug("[LoopWatchdog] log flush skipped: %s", exc)
             finally:
                 logging.shutdown()
                 os._exit(1)
@@ -199,10 +242,14 @@ def _monitor(loop, interval: float, stall_seconds: float, dump_seconds: float,
         last_dump = now
         _STATE["last_dump"] = now
         _STATE["stalls"] = int(_STATE.get("stalls") or 0) + 1
-        logger.critical(
-            format_stall_report(stalled_for, _thread_stacks(),
-                                str(_STATE.get("task_snapshot") or ""), restart_after)
-        )
+        report = format_stall_report(stalled_for, _thread_stacks(),
+                                     str(_STATE.get("task_snapshot") or ""),
+                                     restart_after)
+        path = write_stall_file(report)       # durable even if logs are unreadable
+        if path:
+            logger.critical("%s\n[LoopWatchdog] the same report is in %s", report, path)
+        else:
+            logger.critical(report)
 
 
 def install(loop=None) -> bool:

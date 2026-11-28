@@ -61,10 +61,10 @@ FAKE_DOCKER = textwrap.dedent(
           exit 127
         fi
         case "$*" in
-          */proc/1/task*)
-            printf '%s\n' "${FAKE_WCHAN:-2080 ep_poll
-2081 futex_wait_queue_me
-2082 futex_wait_queue_me}"
+          */proc/*)
+            printf '%s\n' "${FAKE_WCHAN:-PIPELINE-INFO pid=7 cmd=python main.py
+TID 7 ep_poll
+TID 8 futex_wait_queue_me}"
             exit 0 ;;
           *voice_idle_gate*)
             printf '%s\\n' "${FAKE_GATE:-IDLE-GATE: idle (no running order)}"
@@ -183,7 +183,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_an_unreadable_log_still_shows_where_the_threads_wait(self):
         self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
-                        FAKE_WCHAN="2080 pipe_write\n2081 futex_wait_queue_me")
+                        FAKE_WCHAN="PIPELINE-INFO pid=7 cmd=python main.py\nTID 7 pipe_write\nTID 8 futex_wait_queue_me")
         proc = self._run()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("thread waits", proc.stdout)
@@ -193,7 +193,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_an_idle_wchan_is_not_called_a_freeze(self):
         self.env.update(FAKE_LOGS_BROKEN="1", FAKE_PROBE="timeout",
-                        FAKE_WCHAN="2080 ep_poll")
+                        FAKE_WCHAN="PIPELINE-INFO pid=7 cmd=python main.py\nTID 7 ep_poll")
         proc = self._run()
         self.assertIn("idle in the loop's own wait", proc.stdout)
         self.assertIn("main thread kernel wait: ep_poll", proc.stdout)

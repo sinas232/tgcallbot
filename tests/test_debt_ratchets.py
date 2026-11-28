@@ -40,6 +40,10 @@ REQUIRED_DOCUMENTED = {
     # these five while the bot is silent — the whole point of the watchdog.
     'LOOP_STALL_WATCHDOG', 'LOOP_STALL_SECONDS', 'LOOP_STALL_PROBE_SECONDS',
     'LOOP_STALL_DUMP_SECONDS', 'LOOP_STALL_RESTART_SECONDS',
+    # 2026-11-28 log-pipeline incident: the log file reached 31.8 MB and
+    # `docker logs` stopped being readable exactly when it was needed.
+    'LOG_PIPELINE_ASYNC', 'LOG_PIPELINE_QUEUE',
+    'BOT_LOG_MAX_SIZE', 'BOT_LOG_MAX_FILE',
 }
 
 # Pre-existing undocumented knobs at the time this ratchet was added.
