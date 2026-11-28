@@ -241,6 +241,39 @@ class RedeployTests(unittest.TestCase):
         self.assertIn('for arg in "${ORIG_ARGS[@]}"', source)
         self.assertIn('bash "$SELF"', source)
 
+    def test_a_second_run_refuses_while_the_first_holds_the_lock(self):
+        """2026-11-28 07:14: two pastes produced two detached runs 11s apart and
+        BOTH recreated the container — the idle gate cannot see that race."""
+        (self.repo / "logs").mkdir(exist_ok=True)
+        lock = self.repo / "logs" / ".redeploy.lock"
+        holder = subprocess.Popen(
+            ["bash", "-c", f'exec 9>>"{lock}"; flock 9; '
+                           f'printf "pid 999 since test\\n" > "{lock}"; sleep 30'])
+        try:
+            for _ in range(50):
+                if lock.exists() and "999" in lock.read_text(encoding="utf-8"):
+                    break
+                subprocess.run(["sleep", "0.05"])
+            proc = subprocess.run(["bash", str(SCRIPT), "--foreground"],
+                                  capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("REFUSED: another redeploy", proc.stdout)
+            self.assertIn("pid 999", proc.stdout)
+            self.assertNotIn("recreating", proc.stdout)
+            self.assertNotIn("compose", self._called())
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_the_lock_allows_a_second_run_after_the_first_finishes(self):
+        first = subprocess.run(["bash", str(SCRIPT), "--foreground"],
+                               capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = subprocess.run(["bash", str(SCRIPT), "--foreground"],
+                                capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("DONE:", second.stdout)
+
     def test_foreground_runs_keep_a_log_file(self):
         """A dying terminal must not take the only copy of the proof."""
         source = SCRIPT.read_text(encoding="utf-8")

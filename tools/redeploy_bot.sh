@@ -101,6 +101,21 @@ if [ "${BOT_REDEPLOY_TEE:-0}" != "1" ] && [ "${BOT_REDEPLOY_DETACHED:-0}" != "1"
   BOT_REDEPLOY_TEE=1 exec > >(tee -a "$LOG") 2>&1
 fi
 
+# ── 0. only one of these may run at a time ─────────────────────────────────
+# 2026-11-28 07:14: two pastes of the same block produced two detached runs
+# eleven seconds apart, and both recreated the container — while order 1503 was
+# opening. The idle gate cannot see that race: each run asked the table and got
+# IDLE a moment before the other one recreated. The lock can.
+LOCK="logs/.redeploy.lock"
+exec 9>>"$LOCK" || { echo "ERROR: cannot open $LOCK"; exit 3; }   # >> : opening the fd must not wipe the holder's pid
+if ! flock -n 9; then
+  holder="$(cat "$LOCK" 2>/dev/null)"
+  echo "REFUSED: another redeploy already holds $LOCK (${holder:-pid unknown})."
+  echo "          tail -f $(ls -t logs/redeploy-*.log 2>/dev/null | head -n 1)"
+  exit 2
+fi
+printf '%s\n' "pid $$ since $(date -u +%FT%TZ)" > "$LOCK"   # safe: we hold the lock
+
 echo "redeploy_bot $(date -u +%FT%TZ)  repo=$REPO branch=$BRANCH"
 
 # ── 1. never recreate under a live order ───────────────────────────────────
