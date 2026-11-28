@@ -44,6 +44,8 @@ REQUIRED_DOCUMENTED = {
     # `docker logs` stopped being readable exactly when it was needed.
     'LOG_PIPELINE_ASYNC', 'LOG_PIPELINE_QUEUE',
     'BOT_LOG_MAX_SIZE', 'BOT_LOG_MAX_FILE',
+    # 2026-11-28: silence had no shape — these make a stalled loop measurable.
+    'LOOP_HEARTBEAT', 'LOOP_HEARTBEAT_SECONDS',
 }
 
 # Pre-existing undocumented knobs at the time this ratchet was added.

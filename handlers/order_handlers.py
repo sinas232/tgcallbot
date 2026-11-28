@@ -22,6 +22,7 @@ from utils.helpers import clean_number, format_jalali_datetime, format_price, ge
 from services.pending_orders import submission_notice
 from services.order_executor import order_executor
 from services.anti_spam import anti_spam
+from helpers.bounded import bounded
 from services.link_validator import validate_order_link, rejection_message, help_text as link_help_text
 
 logger = logging.getLogger(__name__)
@@ -634,26 +635,40 @@ async def chat_closed_decision_callback(update: Update, context: ContextTypes.DE
     logger.info("chat_closed_decision_callback fired: user=%s order=%s choice=%s",
                 tg_user_id, order_id, choice)
 
+    async def _reply(text: str) -> None:
+        """Receipts are bounded: a stuck API call must not hold the handler.
+
+        2026-11-28: the last log line before a five-hour freeze was written by
+        this callback, and the very next statement was an unbounded
+        ``query.edit_message_text``. Whether that call is what wedged the event
+        loop is unproven — but an unbounded await in a button handler is a hole
+        either way (the customer never gets the receipt and the conversation
+        never closes).
+        """
+        await bounded(query.edit_message_text(text), label="chat_closed:edit_message")
+
     try:
-        user = await DatabaseManager.get_user(tg_user_id, bot_id=bot_id)
+        user = await bounded(DatabaseManager.get_user(tg_user_id, bot_id=bot_id),
+                             label="chat_closed:get_user")
         if not user:
-            await query.edit_message_text("❌ حساب شما در سیستم یافت نشد.")
+            await _reply("❌ حساب شما در سیستم یافت نشد.")
             return ConversationHandler.END
 
-        order = await DatabaseManager.get_order(order_id)
+        order = await bounded(DatabaseManager.get_order(order_id),
+                              label="chat_closed:get_order")
         if not order or order.get('bot_id', 1) != bot_id or order['user_id'] != user['id']:
-            await query.edit_message_text("❌ این سفارش برای شما یا این ربات نیست.")
+            await _reply("❌ این سفارش برای شما یا این ربات نیست.")
             return ConversationHandler.END
 
         if order['status'] not in ('running', 'scheduled', 'pending'):
-            await query.edit_message_text(
+            await _reply(
                 "ℹ️ این سفارش دیگر فعال نیست (قبلاً لغو/تکمیل شده است)."
             )
             return ConversationHandler.END
 
         if choice == 'keep':
             await order_executor.continue_after_chat_closed(order_id)
-            await query.edit_message_text(
+            await _reply(
                 "✅ باشه، سفارش تا پایان مهلت ادامه می‌دهد.\n\n"
                 "اگر در همان گروه یک «ویس‌چت تازه» شروع کنید، اکانت‌ها خودشان ملحق می‌شوند.\n"
                 "اگر تا پایان مهلتِ تنظیم‌شده کال تازه‌ای شروع نشود، سفارش خودکار بسته "
@@ -666,17 +681,17 @@ async def chat_closed_decision_callback(update: Update, context: ContextTypes.DE
                 order_id, bot_id=bot_id, expected_user_id=user['id'],
             )
         except ValueError:
-            await query.edit_message_text("ℹ️ این سفارش قبلاً لغو یا تسویه شده است.")
+            await _reply("ℹ️ این سفارش قبلاً لغو یا تسویه شده است.")
             return ConversationHandler.END
 
-        await query.edit_message_text(_chat_closed_result_text(
+        await _reply(_chat_closed_result_text(
             "✅ سفارش خاتمه یافت؛ فقط زمان استفاده‌شده تا لحظهٔ بسته‌شدن کال محاسبه شد.",
             summary,
         ))
     except Exception:
         logger.exception("chat_closed_decision failed: order=%s", order_id)
         try:
-            await query.edit_message_text(
+            await _reply(
                 "❌ خطای غیرمنتظره هنگام پردازش درخواست. لطفاً دوباره تلاش کنید."
             )
         except Exception:

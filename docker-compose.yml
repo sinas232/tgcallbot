@@ -180,6 +180,11 @@ services:
       # کانتینر را ری‌استارت کند و سفارش‌های در حال اجرا با زمان باقی‌مانده
       # ادامه پیدا کنند.
       - LOOP_STALL_RESTART_SECONDS=${LOOP_STALL_RESTART_SECONDS:-0}
+      # ضربانِ حلقه: یک خط در دقیقه از داخلِ حلقه. `gap=` روی رباتِ سالم ~۶۰s
+      # است و روی اولین تیک بعد از یک قفلِ پنج‌ساعته ~۱۸۰۰۰s — یعنی سکوت
+      # دقیقاً اندازه‌گیری می‌شود، نه حدس. 0 = خاموش.
+      - LOOP_HEARTBEAT=${LOOP_HEARTBEAT:-1}
+      - LOOP_HEARTBEAT_SECONDS=${LOOP_HEARTBEAT_SECONDS:-60}
     depends_on:
       warp:
         condition: service_healthy

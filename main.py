@@ -1920,4 +1920,14 @@ if __name__ == "__main__":
         _install_loop_watchdog(loop)
     except Exception as _watchdog_exc:  # never keep the bot from starting
         logger.warning("loop watchdog not armed: %s", _watchdog_exc)
+    # ── Event-loop heartbeat ───────────────────────────────────────────────
+    # One line per minute from INSIDE the loop: `gap=` is ~60 on a healthy bot
+    # and ~18000 on the first tick after a five-hour freeze. Without it,
+    # "nothing to log" and "nothing can run" look the same in `docker logs`
+    # (2026-11-28: the only proof of the freeze was a manual /health probe).
+    try:
+        from services.loop_heartbeat import install as _install_loop_heartbeat
+        _install_loop_heartbeat(loop)
+    except Exception as _heartbeat_exc:  # never keep the bot from starting
+        logger.warning("loop heartbeat not armed: %s", _heartbeat_exc)
     loop.run_until_complete(main_loop())
